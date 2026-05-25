@@ -15,6 +15,7 @@ use crate::state_db;
 
 const PROVIDER_CODEX: &str = "codex";
 const PROVIDER_CLAUDE: &str = "claude";
+const PROVIDER_GEMINI: &str = "gemini";
 
 struct BackupThread {
     id: String,
@@ -52,6 +53,13 @@ pub fn create_backup(
                 .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
         );
         return create_claude_backup(claude, PathBuf::from(backup_dir), ids, name, note);
+    }
+    if provider.as_deref().unwrap_or(PROVIDER_CODEX) == PROVIDER_GEMINI {
+        let gemini = PathBuf::from(
+            claude_dir
+                .unwrap_or_else(|| paths::default_gemini_dir().to_string_lossy().into_owned()),
+        );
+        return create_gemini_backup(gemini, PathBuf::from(backup_dir), ids, name, note);
     }
 
     let codex = PathBuf::from(&codex_dir);
@@ -302,6 +310,108 @@ fn create_claude_backup(
         });
     }
     write_backup_history(&tmp, ids.iter().map(String::as_str), &history_index)?;
+
+    fs::write(
+        tmp.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
+    fs::rename(&tmp, &final_path)?;
+    summarize_backup(&final_path)
+}
+
+fn create_gemini_backup(
+    gemini: PathBuf,
+    backup_root: PathBuf,
+    ids: Vec<String>,
+    name: Option<String>,
+    note: Option<String>,
+) -> AppResult<BackupSummary> {
+    fs::create_dir_all(&backup_root)?;
+
+    let final_name = name
+        .map(|n| n.trim().to_string())
+        .unwrap_or_else(|| format!("backup-{}", chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S")));
+    validate_backup_name(&final_name)?;
+    let tmp = backup_root.join(format!(".{}.partial", final_name));
+    let final_path = backup_root.join(&final_name);
+    if final_path.exists() {
+        return Err(AppError::Other(format!("备份已存在: {}", final_name)));
+    }
+    if tmp.exists() {
+        return Err(AppError::Other(format!(
+            "存在未完成的临时备份目录，请先检查或移除: {}",
+            tmp.to_string_lossy()
+        )));
+    }
+
+    let sessions = crate::gemini_sessions::scan_sessions(&gemini)?;
+    let by_id: HashMap<String, crate::models::SessionSummary> =
+        sessions.into_iter().map(|s| (s.id.clone(), s)).collect();
+
+    let mut manifest = Manifest {
+        version: 2,
+        provider: Some(PROVIDER_GEMINI.to_string()),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        codex_dir: String::new(),
+        claude_dir: Some(gemini.to_string_lossy().into_owned()),
+        note,
+        sessions: Vec::new(),
+    };
+
+    for id in &ids {
+        let session = by_id
+            .get(id)
+            .ok_or_else(|| AppError::NotFound(format!("Gemini 会话不存在: {id}")))?;
+        let source = PathBuf::from(&session.rollout_path);
+        if !source.is_file() {
+            return Err(AppError::NotFound(format!(
+                "Gemini 会话文件不存在，备份未开始写入。id={} path={}",
+                id,
+                source.to_string_lossy()
+            )));
+        }
+
+        let source_rel = crate::gemini_sessions::session_relpath(&gemini, &source);
+        let source_rel_string = source_rel.to_string_lossy().replace('\\', "/");
+        let dest_rel = PathBuf::from(PROVIDER_GEMINI).join(&source_rel);
+        let dest = tmp.join(&dest_rel);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&source, &dest)?;
+        let sha = sha256_file(&dest)?;
+        let bytes = fs::metadata(&dest)?.len();
+
+        let associated = crate::gemini_sessions::associated_paths(&gemini, id)?;
+        let mut sidecar_rel: Option<String> = None;
+        if !associated.is_empty() {
+            let rel = PathBuf::from("sidecars").join(paths::sanitize_slug(id));
+            let sidecar_root = tmp.join(&rel);
+            for item in associated {
+                copy_path_recursive(&item.abs, &sidecar_root.join(&item.rel))?;
+            }
+            sidecar_rel = Some(rel.to_string_lossy().replace('\\', "/"));
+        }
+
+        manifest.sessions.push(ManifestSession {
+            provider: Some(PROVIDER_GEMINI.to_string()),
+            id: session.id.clone(),
+            rollout_relpath: dest_rel.to_string_lossy().replace('\\', "/"),
+            source_relpath: Some(source_rel_string),
+            sidecar_relpath: sidecar_rel,
+            title: session.title.clone(),
+            cwd: session.cwd.clone(),
+            created_at: session.created_at,
+            updated_at: session.updated_at,
+            tokens_used: session.tokens_used,
+            model: session.model.clone(),
+            bytes_rollout: bytes,
+            logs_count: 0,
+            history_rows: 0,
+            sha256_rollout: sha,
+        });
+    }
 
     fs::write(
         tmp.join("manifest.json"),
@@ -600,9 +710,6 @@ pub fn restore_session(
 ) -> AppResult<RestoreResult> {
     let backup = PathBuf::from(&backup_path);
     let codex = PathBuf::from(&codex_dir);
-    let claude = PathBuf::from(
-        claude_dir.unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
-    );
     let raw = fs::read_to_string(backup.join("manifest.json"))?;
     let manifest: Manifest = serde_json::from_str(&raw)?;
     let target = manifest
@@ -614,7 +721,17 @@ pub fn restore_session(
         .as_deref()
         .unwrap_or_else(|| manifest_session_provider(&manifest, target));
     if provider == PROVIDER_CLAUDE {
+        let claude = PathBuf::from(
+            claude_dir
+                .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
+        );
         restore_one_claude(&backup, &claude, target, overwrite)
+    } else if provider == PROVIDER_GEMINI {
+        let gemini = PathBuf::from(
+            claude_dir
+                .unwrap_or_else(|| paths::default_gemini_dir().to_string_lossy().into_owned()),
+        );
+        restore_one_gemini(&backup, &gemini, target, overwrite)
     } else {
         restore_one(&backup, &codex, target, overwrite)
     }
@@ -630,9 +747,6 @@ pub fn restore_all(
 ) -> AppResult<Vec<RestoreResult>> {
     let backup = PathBuf::from(&backup_path);
     let codex = PathBuf::from(&codex_dir);
-    let claude = PathBuf::from(
-        claude_dir.unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
-    );
     let raw = fs::read_to_string(backup.join("manifest.json"))?;
     let manifest: Manifest = serde_json::from_str(&raw)?;
     let mut out = Vec::new();
@@ -642,7 +756,17 @@ pub fn restore_all(
             .unwrap_or_else(|| manifest_session_provider(&manifest, s));
         out.push(
             (if session_provider == PROVIDER_CLAUDE {
+                let claude =
+                    PathBuf::from(claude_dir.clone().unwrap_or_else(|| {
+                        paths::default_claude_dir().to_string_lossy().into_owned()
+                    }));
                 restore_one_claude(&backup, &claude, s, overwrite)
+            } else if session_provider == PROVIDER_GEMINI {
+                let gemini =
+                    PathBuf::from(claude_dir.clone().unwrap_or_else(|| {
+                        paths::default_gemini_dir().to_string_lossy().into_owned()
+                    }));
+                restore_one_gemini(&backup, &gemini, s, overwrite)
             } else {
                 restore_one(&backup, &codex, s, overwrite)
             })
@@ -727,6 +851,81 @@ fn restore_one_claude(
         &backup.join("history.jsonl"),
         &target.id,
     )?;
+
+    result.ok = true;
+    Ok(result)
+}
+
+fn restore_one_gemini(
+    backup: &Path,
+    gemini: &Path,
+    target: &ManifestSession,
+    overwrite: bool,
+) -> AppResult<RestoreResult> {
+    let mut result = RestoreResult {
+        id: target.id.clone(),
+        ok: false,
+        threads_inserted: false,
+        logs_inserted: 0,
+        history_appended: 0,
+        rollout_copied: false,
+        conflict: false,
+        error: None,
+    };
+
+    let backup_rel = paths::checked_relative_path(&target.rollout_relpath)?;
+    let source_rel = target
+        .source_relpath
+        .as_deref()
+        .unwrap_or(&target.rollout_relpath);
+    let target_rel = paths::checked_relative_path(source_rel)?;
+    let src = backup.join(&backup_rel);
+    let dest = gemini.join(&target_rel);
+
+    if dest.exists() && !overwrite {
+        result.conflict = true;
+        return Ok(result);
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(&src, &dest)?;
+    result.rollout_copied = true;
+
+    if let Some(sidecar_rel) = target.sidecar_relpath.as_deref() {
+        let sidecar_src = backup.join(paths::checked_relative_path(sidecar_rel)?);
+        if sidecar_src.exists() {
+            for entry in walkdir::WalkDir::new(&sidecar_src)
+                .into_iter()
+                .filter_map(|entry| entry.ok())
+            {
+                let rel = entry.path().strip_prefix(&sidecar_src).map_err(|e| {
+                    AppError::Path(format!(
+                        "无法计算 Gemini sidecar 相对路径 {}: {}",
+                        entry.path().to_string_lossy(),
+                        e
+                    ))
+                })?;
+                if rel.as_os_str().is_empty() {
+                    continue;
+                }
+                let target_path = gemini.join(rel);
+                if entry.file_type().is_dir() {
+                    fs::create_dir_all(&target_path)?;
+                } else if entry.file_type().is_file() {
+                    if target_path.exists() && overwrite {
+                        remove_path_recursive(&target_path)?;
+                    }
+                    if !target_path.exists() {
+                        if let Some(parent) = target_path.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        fs::copy(entry.path(), &target_path)?;
+                    }
+                }
+            }
+        }
+    }
 
     result.ok = true;
     Ok(result)

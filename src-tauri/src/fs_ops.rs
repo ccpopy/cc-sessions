@@ -72,6 +72,7 @@ pub fn resume_command_text(provider: Option<String>, session_id: String) -> AppR
     let text = match provider.as_deref().unwrap_or("codex") {
         "codex" => format!("codex resume {}", session_id),
         "claude" => format!("claude --resume {}", session_id),
+        "gemini" => format!("gemini --resume {}", session_id),
         other => return Err(AppError::Other(format!("不支持的 provider: {other}"))),
     };
     Ok(text)

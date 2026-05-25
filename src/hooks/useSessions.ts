@@ -12,13 +12,14 @@ export function useSessions(provider: SessionProvider, query: string) {
 
   const refresh = useCallback(async () => {
     if (!settings?.codex_dir) return;
+    const providerDir = provider === "gemini" ? settings.gemini_dir : settings.claude_dir;
     const requestId = ++requestSeq.current;
     setLoading(true);
     setError(null);
     try {
       const list = query.trim()
-        ? await api.searchSessions(provider, settings.codex_dir, settings.claude_dir, query.trim())
-        : await api.listSessions(provider, settings.codex_dir, settings.claude_dir);
+        ? await api.searchSessions(provider, settings.codex_dir, providerDir, query.trim())
+        : await api.listSessions(provider, settings.codex_dir, providerDir);
       if (requestSeq.current !== requestId) return;
       setSessions(list);
     } catch (e: any) {
@@ -28,7 +29,7 @@ export function useSessions(provider: SessionProvider, query: string) {
     } finally {
       if (requestSeq.current === requestId) setLoading(false);
     }
-  }, [settings?.codex_dir, settings?.claude_dir, provider, query]);
+  }, [settings?.codex_dir, settings?.claude_dir, settings?.gemini_dir, provider, query]);
 
   useEffect(() => {
     if (timer.current) window.clearTimeout(timer.current);
@@ -48,13 +49,14 @@ export function useProjectGroups(provider: SessionProvider) {
 
   const refresh = useCallback(async () => {
     if (!settings?.codex_dir) return;
+    const providerDir = provider === "gemini" ? settings.gemini_dir : settings.claude_dir;
     setLoading(true);
     try {
-      setGroups(await api.groupByProject(provider, settings.codex_dir, settings.claude_dir));
+      setGroups(await api.groupByProject(provider, settings.codex_dir, providerDir));
     } finally {
       setLoading(false);
     }
-  }, [settings?.codex_dir, settings?.claude_dir, provider]);
+  }, [settings?.codex_dir, settings?.claude_dir, settings?.gemini_dir, provider]);
 
   useEffect(() => {
     void refresh();

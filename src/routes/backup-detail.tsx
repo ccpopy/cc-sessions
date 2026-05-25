@@ -173,7 +173,8 @@ export default function BackupDetailRoute({ provider = "codex" }: { provider?: S
                         size="sm"
                         className="gap-1.5"
                         onClick={async () => {
-                          const text = await api.copyResumeCommand(itemProvider, s.id);
+                          const text = sess.resume_command || (await api.copyResumeCommand(itemProvider, s.id));
+                          await navigator.clipboard.writeText(text);
                           toast.success("已复制：" + text);
                         }}
                       >
@@ -218,7 +219,7 @@ export default function BackupDetailRoute({ provider = "codex" }: { provider?: S
             provider: itemProvider,
             backup_path: backupPath,
             codex_dir: settings.codex_dir,
-            claude_dir: settings.claude_dir,
+            claude_dir: itemProvider === "gemini" ? settings.gemini_dir : settings.claude_dir,
             id: restoreTarget.id,
             overwrite: overwrite === "overwrite",
           });
@@ -279,8 +280,19 @@ function toSessionSummary(m: ManifestSession, backupPath: string, provider: Sess
     rollout_bytes: m.bytes_rollout,
     logs_count: m.logs_count,
     has_backup: true,
-    resume_command: provider === "claude" ? `claude --resume ${m.id}` : `codex resume ${m.id}`,
+    resume_command: resumeCommandForBackup(provider, m.id, m.source_relpath || m.rollout_relpath || ""),
   };
+}
+
+function resumeCommandForBackup(provider: SessionProvider, id: string, relpath: string): string {
+  if (provider === "claude") return `claude --resume ${id}`;
+  if (provider === "gemini") {
+    const normalized = relpath.replace(/\\/g, "/");
+    return normalized.includes("/antigravity") || normalized.startsWith("antigravity")
+      ? "agy"
+      : `gemini --resume ${id}`;
+  }
+  return `codex resume ${id}`;
 }
 
 function rolloutAbs(backupPath: string, rel: string): string {

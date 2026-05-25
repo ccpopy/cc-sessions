@@ -126,6 +126,13 @@ pub fn list_sessions(
             );
             crate::claude_sessions::scan_sessions(&p)
         }
+        "gemini" => {
+            let p = PathBuf::from(
+                claude_dir
+                    .unwrap_or_else(|| paths::default_gemini_dir().to_string_lossy().into_owned()),
+            );
+            crate::gemini_sessions::scan_sessions(&p)
+        }
         other => Err(AppError::Other(format!("不支持的 provider: {other}"))),
     }
 }
@@ -233,7 +240,7 @@ pub fn set_archived(
     v: bool,
 ) -> AppResult<()> {
     if provider_or_codex(provider) != "codex" {
-        return Err(AppError::Other("Claude 会话不支持归档".into()));
+        return Err(AppError::Other("该 provider 不支持归档".into()));
     }
     let p = PathBuf::from(&codex_dir);
     let conn = state_db::open(&p)?;
@@ -261,6 +268,11 @@ pub fn delete_session(
             let dir = claude_dir
                 .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned());
             delete_one_claude(Path::new(&dir), &id)
+        }
+        "gemini" => {
+            let dir = claude_dir
+                .unwrap_or_else(|| paths::default_gemini_dir().to_string_lossy().into_owned());
+            crate::gemini_sessions::delete_session(Path::new(&dir), &id)
         }
         other => Err(AppError::Other(format!("不支持的 provider: {other}"))),
     }
@@ -309,6 +321,29 @@ pub fn delete_sessions(
                         rollout_missing: false,
                         ok: false,
                         error: Some(e.to_string()),
+                    })
+                })
+                .collect())
+        }
+        "gemini" => {
+            let dir = PathBuf::from(
+                claude_dir
+                    .unwrap_or_else(|| paths::default_gemini_dir().to_string_lossy().into_owned()),
+            );
+            Ok(ids
+                .iter()
+                .map(|id| {
+                    crate::gemini_sessions::delete_session(&dir, id).unwrap_or_else(|e| {
+                        DeleteResult {
+                            id: id.clone(),
+                            threads_rows_deleted: 0,
+                            logs_rows_deleted: 0,
+                            history_rows_deleted: 0,
+                            rollout_deleted: false,
+                            rollout_missing: false,
+                            ok: false,
+                            error: Some(e.to_string()),
+                        }
                     })
                 })
                 .collect())

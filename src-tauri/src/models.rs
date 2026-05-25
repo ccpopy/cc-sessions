@@ -5,6 +5,8 @@ pub struct Settings {
     pub codex_dir: String,
     #[serde(default = "default_claude_dir")]
     pub claude_dir: String,
+    #[serde(default = "default_gemini_dir")]
+    pub gemini_dir: String,
     pub backup_dir: String,
     #[serde(default = "default_open_cmd")]
     pub open_command: String,
@@ -22,6 +24,12 @@ fn default_claude_dir() -> String {
         .into_owned()
 }
 
+fn default_gemini_dir() -> String {
+    crate::paths::default_gemini_dir()
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn default_refresh_ms() -> u64 {
     5000
 }
@@ -30,10 +38,12 @@ impl Default for Settings {
     fn default() -> Self {
         let codex = crate::paths::default_codex_dir();
         let claude = crate::paths::default_claude_dir();
+        let gemini = crate::paths::default_gemini_dir();
         let backup = crate::paths::default_backup_dir();
         Self {
             codex_dir: codex.to_string_lossy().into_owned(),
             claude_dir: claude.to_string_lossy().into_owned(),
+            gemini_dir: gemini.to_string_lossy().into_owned(),
             backup_dir: backup.to_string_lossy().into_owned(),
             open_command: "auto".into(),
             refresh_interval_ms: 5000,

@@ -42,6 +42,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const [cloning, setCloning] = useState(false);
   const showBranchRecords = useMemo(() => isExplicitBranchRecordQuery(query), [query]);
   const isCodex = provider === "codex";
+  const providerLabel = labelForProvider(provider);
 
   const refreshOverlay = useCallback(async () => {
     if (!settings?.codex_dir || !isCodex) return;
@@ -173,7 +174,8 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
 
   const onCopyResume = async (s: SessionSummary) => {
     try {
-        const text = await api.copyResumeCommand(s.provider, s.id);
+      const text = s.resume_command || (await api.copyResumeCommand(s.provider, s.id));
+      await navigator.clipboard.writeText(text);
       toast.success("已复制：" + text);
     } catch (e: any) {
       toast.error("复制失败：" + String(e?.message ?? e));
@@ -224,7 +226,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   return (
     <>
       <TopBar
-        title={provider === "codex" ? "Codex 会话" : "Claude 会话"}
+        title={`${providerLabel} 会话`}
         stats={loading ? "加载中…" : `${visibleSessions.length} 条`}
         onRefresh={refresh}
         onBulkBackup={onBulkBackup}
@@ -289,7 +291,9 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
                 ? "尝试清除搜索或换个关键字"
                 : provider === "codex"
                   ? "打开 Codex 后会自动出现在此"
-                  : "打开 Claude Code 后会自动出现在此"
+                  : provider === "claude"
+                    ? "打开 Claude Code 后会自动出现在此"
+                    : "打开 Gemini CLI 或 Antigravity 后会自动出现在此"
             }
             icon={<MessageSquare className="h-10 w-10" />}
           />
@@ -362,7 +366,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             provider,
             settings.codex_dir,
             ids,
-            settings.claude_dir,
+            provider === "gemini" ? settings.gemini_dir : settings.claude_dir,
           );
           const okCount = r.filter((x) => x.ok).length;
           const failed = r.filter((x) => !x.ok);
@@ -446,11 +450,16 @@ function DeleteSummary({
             <b>{targets.length}</b> 个 rollout 文件（共 <b>{humanBytes(totalBytes)}</b>，
             <b>{humanTokens(totalTokens)}</b> token）。
           </>
-        ) : (
+        ) : provider === "claude" ? (
           <>
             将删除 <b>{targets.length}</b> 个 jsonl 会话文件
             （共 <b>{humanBytes(totalBytes)}</b>，
             <b>{humanTokens(totalTokens)}</b> token），同名 sidecar 目录会一并清理。
+          </>
+        ) : (
+          <>
+            将删除 <b>{targets.length}</b> 个 Gemini / Antigravity 会话文件
+            （共 <b>{humanBytes(totalBytes)}</b>），并清理同 ID 的 protobuf 摘要、标注和 CLI 日志行。
           </>
         )}
       </div>
@@ -472,4 +481,10 @@ function DeleteSummary({
       )}
     </div>
   );
+}
+
+function labelForProvider(provider: SessionProvider): string {
+  if (provider === "claude") return "Claude";
+  if (provider === "gemini") return "Gemini";
+  return "Codex";
 }

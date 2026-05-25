@@ -75,10 +75,11 @@ export function StatsDashboard() {
   useEffect(() => {
     if (!settings?.codex_dir) return;
     const [from, to] = rangeToTs(range);
+    const providerDir = provider === "gemini" ? settings.gemini_dir : settings.claude_dir;
     const common = {
       provider,
       codex_dir: settings.codex_dir,
-      claude_dir: settings.claude_dir,
+      claude_dir: providerDir,
       from_ts: from,
       to_ts: to,
       cwd_filter: [] as string[],
@@ -100,7 +101,7 @@ export function StatsDashboard() {
         setHeat(h);
       })
       .finally(() => setLoading(false));
-  }, [settings?.codex_dir, settings?.claude_dir, provider, range, bucket, includeArchived, tick]);
+  }, [settings?.codex_dir, settings?.claude_dir, settings?.gemini_dir, provider, range, bucket, includeArchived, tick]);
 
   return (
     <div className="space-y-4 p-6">
@@ -110,6 +111,7 @@ export function StatsDashboard() {
             <TabsTrigger value="all">全部</TabsTrigger>
             <TabsTrigger value="codex">Codex</TabsTrigger>
             <TabsTrigger value="claude">Claude</TabsTrigger>
+            <TabsTrigger value="gemini">Gemini</TabsTrigger>
           </TabsList>
         </Tabs>
         <Select value={range} onValueChange={(v) => setRange(v as Range)}>
@@ -389,7 +391,9 @@ function modelStatLabel(m: ModelStat): string {
 }
 
 function providerLabel(provider: string): string {
-  return provider === "claude" ? "Claude" : "Codex";
+  if (provider === "claude") return "Claude";
+  if (provider === "gemini") return "Gemini";
+  return "Codex";
 }
 
 function HeatmapCard({ data }: { data: number[][] }) {

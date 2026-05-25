@@ -215,7 +215,8 @@ export function PreviewDialog({
   const copyResume = async () => {
     if (!session) return;
     try {
-      const text = await api.copyResumeCommand(session.provider, session.id);
+      const text = session.resume_command || (await api.copyResumeCommand(session.provider, session.id));
+      await navigator.clipboard.writeText(text);
       toast.success(`已复制：${text}`);
     } catch (e: any) {
       toast.error("复制失败：" + String(e?.message ?? e));

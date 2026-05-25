@@ -59,6 +59,10 @@ export default function App() {
             <Route path="/claude/backups" element={<BackupsRoute provider="claude" />} />
             <Route path="/claude/backups/:name" element={<BackupDetailRoute provider="claude" />} />
             <Route path="/claude/transfer" element={<TransferRoute provider="claude" />} />
+            <Route path="/gemini/sessions" element={<SessionsRoute provider="gemini" />} />
+            <Route path="/gemini/repair" element={<RepairRoute provider="gemini" />} />
+            <Route path="/gemini/backups" element={<BackupsRoute provider="gemini" />} />
+            <Route path="/gemini/backups/:name" element={<BackupDetailRoute provider="gemini" />} />
             <Route path="/sessions" element={<Navigate to="/codex/sessions" replace />} />
             <Route path="/repair" element={<Navigate to="/codex/repair" replace />} />
             <Route path="/backups" element={<Navigate to="/codex/backups" replace />} />

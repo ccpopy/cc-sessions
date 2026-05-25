@@ -38,9 +38,11 @@ export function SettingsSheet({ trigger }: Props) {
   const load = useSettings((s) => s.load);
   const [codex, setCodex] = useState("");
   const [claude, setClaude] = useState("");
+  const [gemini, setGemini] = useState("");
   const [backup, setBackup] = useState("");
   const [codexValidation, setCodexValidation] = useState<DirValidation | null>(null);
   const [claudeValidation, setClaudeValidation] = useState<DirValidation | null>(null);
+  const [geminiValidation, setGeminiValidation] = useState<DirValidation | null>(null);
   const [updateState, setUpdateState] = useState<UpdateCheckResult>({ state: "idle" });
   const [currentVersion, setCurrentVersion] = useState("");
   const [currentVersionError, setCurrentVersionError] = useState("");
@@ -49,6 +51,7 @@ export function SettingsSheet({ trigger }: Props) {
     if (!settings) return;
     setCodex(settings.codex_dir);
     setClaude(settings.claude_dir);
+    setGemini(settings.gemini_dir);
     setBackup(settings.backup_dir);
   }, [settings]);
 
@@ -90,6 +93,19 @@ export function SettingsSheet({ trigger }: Props) {
     return () => window.clearTimeout(id);
   }, [claude]);
 
+  useEffect(() => {
+    if (!gemini) return;
+    const id = window.setTimeout(async () => {
+      try {
+        const v = await api.validateGeminiDir(gemini);
+        setGeminiValidation(v);
+      } catch {
+        setGeminiValidation(null);
+      }
+    }, 200);
+    return () => window.clearTimeout(id);
+  }, [gemini]);
+
   const pick = async (setter: (s: string) => void, cur: string) => {
     const picked = await openDialog({ directory: true, defaultPath: cur });
     if (typeof picked === "string") setter(picked);
@@ -105,9 +121,14 @@ export function SettingsSheet({ trigger }: Props) {
     setClaude(d);
   };
 
+  const useDefaultGemini = async () => {
+    const d = await api.defaultGeminiDir();
+    setGemini(d);
+  };
+
   const onSave = async () => {
     try {
-      await save({ codex_dir: codex, claude_dir: claude, backup_dir: backup });
+      await save({ codex_dir: codex, claude_dir: claude, gemini_dir: gemini, backup_dir: backup });
       toast.success("设置已保存");
       await load();
     } catch (e: any) {
@@ -224,6 +245,27 @@ export function SettingsSheet({ trigger }: Props) {
               </Button>
             </div>
             <ValidationBadge v={claudeValidation} provider="claude" />
+          </div>
+
+          <Separator />
+
+          <div className="space-y-2">
+            <Label className="text-sm font-medium">Gemini / Antigravity 目录</Label>
+            <div className="flex gap-2">
+              <Input
+                value={gemini}
+                onChange={(e) => setGemini(e.target.value)}
+                placeholder={"C:\\Users\\<me>\\.gemini"}
+                className="font-mono text-xs"
+              />
+              <Button variant="outline" size="icon" onClick={() => pick(setGemini, gemini)} title="选择目录">
+                <FolderOpen className="h-4 w-4" />
+              </Button>
+              <Button variant="outline" size="icon" onClick={useDefaultGemini} title="使用默认">
+                <Home className="h-4 w-4" />
+              </Button>
+            </div>
+            <ValidationBadge v={geminiValidation} provider="gemini" />
           </div>
 
           <Separator />
@@ -359,7 +401,7 @@ function parseVersion(version: string): number[] {
     .filter((part) => Number.isFinite(part));
 }
 
-function ValidationBadge({ v, provider }: { v: DirValidation | null; provider: "codex" | "claude" }) {
+function ValidationBadge({ v, provider }: { v: DirValidation | null; provider: "codex" | "claude" | "gemini" }) {
   if (!v) return null;
   if (v.valid) {
     return (
@@ -371,7 +413,15 @@ function ValidationBadge({ v, provider }: { v: DirValidation | null; provider: "
   }
   const reasons: string[] = [];
   if (provider === "codex" && !v.has_state_db) reasons.push("缺 state_5.sqlite");
-  if (!v.has_sessions) reasons.push(provider === "codex" ? "缺 sessions/" : "缺 projects/");
+  if (!v.has_sessions) {
+    reasons.push(
+      provider === "codex"
+        ? "缺 sessions/"
+        : provider === "claude"
+          ? "缺 projects/"
+          : "缺 tmp/ 或 antigravity*/conversations/",
+    );
+  }
   return (
     <Badge variant="outline" className="gap-1 border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400">
       <AlertTriangle className="h-3 w-3" />

@@ -42,9 +42,11 @@ export function TopBar({
     (loc.pathname.startsWith("/sessions") ||
       loc.pathname.startsWith("/codex/sessions") ||
       loc.pathname.startsWith("/claude/sessions") ||
+      loc.pathname.startsWith("/gemini/sessions") ||
       loc.pathname.startsWith("/backups/") ||
       loc.pathname.startsWith("/codex/backups/") ||
-      loc.pathname.startsWith("/claude/backups/"));
+      loc.pathname.startsWith("/claude/backups/") ||
+      loc.pathname.startsWith("/gemini/backups/"));
 
   const hasSelection = selected.size > 0;
 

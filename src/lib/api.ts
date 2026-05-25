@@ -1,11 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type SessionProvider = "codex" | "claude";
+export type SessionProvider = "codex" | "claude" | "gemini";
 export type StatsProvider = "all" | SessionProvider;
 
 export type Settings = {
   codex_dir: string;
   claude_dir: string;
+  gemini_dir: string;
   backup_dir: string;
   open_command: string;
   refresh_interval_ms: number;
@@ -102,6 +103,21 @@ export type DeleteResult = {
   rollout_missing: boolean;
   ok: boolean;
   error: string | null;
+};
+
+export type GeminiOrphanSummary = {
+  surface: string;
+  id: string;
+  linked_ids: string[];
+  title: string;
+};
+
+export type GeminiOrphanReport = {
+  scanned_summaries: number;
+  orphan_summaries: number;
+  removed_summaries: number;
+  dry_run: boolean;
+  items: GeminiOrphanSummary[];
 };
 
 export type BackupSummary = {
@@ -470,8 +486,10 @@ export const api = {
   openLatestReleasePage: () => invoke<void>("open_latest_release_page"),
   defaultCodexDir: () => invoke<string>("default_codex_dir"),
   defaultClaudeDir: () => invoke<string>("default_claude_dir"),
+  defaultGeminiDir: () => invoke<string>("default_gemini_dir"),
   validateCodexDir: (path: string) => invoke<DirValidation>("validate_codex_dir", { path }),
   validateClaudeDir: (path: string) => invoke<DirValidation>("validate_claude_dir", { path }),
+  validateGeminiDir: (path: string) => invoke<DirValidation>("validate_gemini_dir", { path }),
 
   listSessions: (provider: SessionProvider, codexDir: string, claudeDir?: string) =>
     invoke<SessionSummary[]>("list_sessions", { provider, codexDir, claudeDir }),
@@ -682,6 +700,10 @@ export const api = {
     invoke<HistoryOrphanReport>("diagnose_claude_history_orphans", { claudeDir }),
   pruneClaudeHistoryOrphans: (claudeDir: string, dryRun: boolean) =>
     invoke<HistoryPruneReport>("prune_claude_history_orphans", { claudeDir, dryRun }),
+  diagnoseGeminiOrphans: (geminiDir: string) =>
+    invoke<GeminiOrphanReport>("diagnose_gemini_orphans", { geminiDir }),
+  pruneGeminiOrphans: (geminiDir: string, dryRun: boolean) =>
+    invoke<GeminiOrphanReport>("prune_gemini_orphans", { geminiDir, dryRun }),
   cloneSessionForProvider: (p: {
     codex_dir: string;
     session_id: string;

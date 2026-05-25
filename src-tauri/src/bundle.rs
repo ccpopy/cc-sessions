@@ -39,6 +39,7 @@ use crate::state_db;
 const BUNDLE_VERSION: u32 = 1;
 const PROVIDER_CODEX: &str = "codex";
 const PROVIDER_CLAUDE: &str = "claude";
+const PROVIDER_GEMINI: &str = "gemini";
 const DEFAULT_SANDBOX_POLICY: &str = "read-only";
 const DEFAULT_APPROVAL_MODE: &str = "on-request";
 const DEFAULT_MEMORY_MODE: &str = "enabled";
@@ -176,6 +177,12 @@ pub fn export_session_bundles(
     machine_label: Option<String>,
     export_group: Option<String>,
 ) -> AppResult<Vec<ExportReport>> {
+    if provider.as_deref().unwrap_or(PROVIDER_CODEX) == PROVIDER_GEMINI {
+        return Err(AppError::Other(
+            "Gemini / Antigravity 会话包含 protobuf 与跨目录附属状态，当前请使用「备份」功能导出"
+                .into(),
+        ));
+    }
     if provider.as_deref().unwrap_or(PROVIDER_CODEX) == PROVIDER_CLAUDE {
         let claude = PathBuf::from(
             claude_dir
@@ -531,6 +538,12 @@ pub fn export_all_bundles(
     export_group: Option<String>,
     active_only: bool,
 ) -> AppResult<Vec<ExportReport>> {
+    if provider.as_deref().unwrap_or(PROVIDER_CODEX) == PROVIDER_GEMINI {
+        return Err(AppError::Other(
+            "Gemini / Antigravity 会话包含 protobuf 与跨目录附属状态，当前请使用「备份」功能导出"
+                .into(),
+        ));
+    }
     if provider.as_deref().unwrap_or(PROVIDER_CODEX) == PROVIDER_CLAUDE {
         let claude = PathBuf::from(
             claude_dir
@@ -648,6 +661,11 @@ pub fn import_session_bundles(
     strict: bool,
     project_mappings: Vec<ProjectPathMapping>,
 ) -> AppResult<Vec<ImportReport>> {
+    if provider.as_deref() == Some(PROVIDER_GEMINI) {
+        return Err(AppError::Other(
+            "Gemini / Antigravity bundle 导入暂不支持，请使用「备份」还原".into(),
+        ));
+    }
     let codex = PathBuf::from(&codex_dir);
     let claude = PathBuf::from(
         claude_dir.unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),

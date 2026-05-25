@@ -22,7 +22,7 @@ export default function BackupsRoute({ provider = "codex" }: { provider?: Sessio
   const [restoreTarget, setRestoreTarget] = useState<BackupSummary | null>(null);
 
   const totalSize = useMemo(() => backups.reduce((a, b) => a + b.total_bytes, 0), [backups]);
-  const providerLabel = provider === "codex" ? "Codex" : "Claude";
+  const providerLabel = provider === "codex" ? "Codex" : provider === "claude" ? "Claude" : "Gemini";
 
   return (
     <>
@@ -145,7 +145,7 @@ export default function BackupsRoute({ provider = "codex" }: { provider?: Sessio
             provider,
             backup_path: restoreTarget.path,
             codex_dir: settings.codex_dir,
-            claude_dir: settings.claude_dir,
+            claude_dir: provider === "gemini" ? settings.gemini_dir : settings.claude_dir,
             overwrite: false,
           });
           const ok = r.filter((x) => x.ok).length;

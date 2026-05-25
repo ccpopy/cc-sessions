@@ -4,6 +4,7 @@ pub mod claude_sessions;
 pub mod error;
 pub mod family;
 pub mod fs_ops;
+pub mod gemini_sessions;
 pub mod history;
 pub mod logs_db;
 pub mod models;
@@ -42,8 +43,10 @@ pub fn run() {
             settings::app_version,
             settings::default_codex_dir,
             settings::default_claude_dir,
+            settings::default_gemini_dir,
             settings::validate_codex_dir,
             settings::validate_claude_dir,
+            settings::validate_gemini_dir,
             sessions::list_sessions,
             sessions::group_sessions_by_project,
             sessions::search_sessions,
@@ -77,6 +80,8 @@ pub fn run() {
             repair::prune_orphan_entries,
             repair::diagnose_claude_history_orphans,
             repair::prune_claude_history_orphans,
+            gemini_sessions::diagnose_gemini_orphans,
+            gemini_sessions::prune_gemini_orphans,
             repair::clone_session_for_provider,
             repair::fork_session_at_event,
             repair::batch_clone_for_current_provider,

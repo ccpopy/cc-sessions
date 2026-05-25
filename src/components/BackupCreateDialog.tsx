@@ -57,7 +57,7 @@ export function BackupCreateDialog({ open, onOpenChange, provider, sessions, onD
       const r = await api.createBackup({
         provider,
         codex_dir: settings.codex_dir,
-        claude_dir: settings.claude_dir,
+        claude_dir: provider === "gemini" ? settings.gemini_dir : settings.claude_dir,
         backup_dir: settings.backup_dir,
         ids: sessions.map((s) => s.id),
         name,

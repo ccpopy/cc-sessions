@@ -27,6 +27,13 @@ fn load_sessions(
             );
             crate::claude_sessions::scan_sessions(&claude)
         }
+        "gemini" => {
+            let gemini = PathBuf::from(
+                claude_dir
+                    .unwrap_or_else(|| paths::default_gemini_dir().to_string_lossy().into_owned()),
+            );
+            crate::gemini_sessions::scan_sessions(&gemini)
+        }
         "all" => {
             let mut out =
                 crate::sessions::list_sessions(Some("codex".into()), codex_dir.to_string(), None)?;
@@ -35,6 +42,9 @@ fn load_sessions(
                     .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
             );
             out.extend(crate::claude_sessions::scan_sessions(&claude)?);
+            out.extend(crate::gemini_sessions::scan_sessions(
+                &paths::default_gemini_dir(),
+            )?);
             Ok(out)
         }
         other => Err(AppError::Other(format!("不支持的 provider: {other}"))),

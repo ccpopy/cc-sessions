@@ -59,8 +59,10 @@ import {
 import { useSettings } from "@/stores/settings";
 import {
   api,
+  type DirValidation,
   type DiagnosticReport,
   type FamilyIntegrityReport,
+  type GeminiOrphanReport,
   type HistoryOrphanReport,
   type ProjectConfigReport,
   type ProviderInfo,
@@ -69,7 +71,9 @@ import {
 } from "@/lib/api";
 
 export default function RepairRoute({ provider = "codex" }: { provider?: SessionProvider }) {
-  return provider === "claude" ? <ClaudeRepairRoute /> : <CodexRepairRoute />;
+  if (provider === "claude") return <ClaudeRepairRoute />;
+  if (provider === "gemini") return <GeminiRepairRoute />;
+  return <CodexRepairRoute />;
 }
 
 function CodexRepairRoute() {
@@ -1040,6 +1044,177 @@ function ClaudeRepairRoute() {
                   toast.success(`已从 Claude history 删除 ${result.removed_rows} 行`);
                   await refresh();
                 });
+              }}
+            >
+              确认清理
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  );
+}
+
+function GeminiRepairRoute() {
+  const settings = useSettings((s) => s.settings);
+  const geminiDir = settings?.gemini_dir ?? "";
+  const [validation, setValidation] = useState<DirValidation | null>(null);
+  const [orphans, setOrphans] = useState<GeminiOrphanReport | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [confirmPrune, setConfirmPrune] = useState(false);
+
+  const refresh = useCallback(async () => {
+    if (!geminiDir) return;
+    setLoading(true);
+    try {
+      const [nextValidation, nextOrphans] = await Promise.all([
+        api.validateGeminiDir(geminiDir),
+        api.diagnoseGeminiOrphans(geminiDir),
+      ]);
+      setValidation(nextValidation);
+      setOrphans(nextOrphans);
+    } catch (e) {
+      toast.error(`Gemini 目录检查失败：${String((e as Error)?.message ?? e)}`);
+    } finally {
+      setLoading(false);
+    }
+  }, [geminiDir]);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  return (
+    <>
+      <TopBar title="Gemini 清理" onRefresh={refresh} showListTools={false} />
+      <ScrollArea className="flex-1">
+        <div className="min-w-0 max-w-full space-y-4 p-4 sm:p-6">
+          {!geminiDir ? (
+            <EmptyState
+              icon={<Wrench className="h-10 w-10" />}
+              title="尚未配置 Gemini 目录"
+              description="请先在设置里填写 ~/.gemini 路径"
+            />
+          ) : (
+            <Card className="min-w-0 overflow-hidden">
+              <CardHeader className="pb-3">
+                <CardTitle className="flex min-w-0 flex-wrap items-center gap-2 text-base">
+                  <Wrench className="h-4 w-4" />
+                  数据源检查
+                  {loading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="min-w-0 space-y-3">
+                <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                  <Stat label="目录有效" value={validation?.valid ? "是" : "否"} warn={validation?.valid === false} />
+                  <Stat label="会话数量" value={validation?.threads_count ?? "-"} />
+                  <Stat
+                    label="会话存储"
+                    value={validation?.has_sessions ? "已发现" : "未发现"}
+                    warn={validation?.has_sessions === false}
+                  />
+                  <Stat label="数据库依赖" value="无" />
+                </div>
+                <div className="min-w-0 rounded-md bg-muted/30 p-3 text-xs text-muted-foreground [overflow-wrap:anywhere]">
+                  文件路径：<code>{geminiDir}</code>
+                </div>
+                <Separator />
+                <div className="space-y-2 text-xs text-muted-foreground">
+                  <div>
+                    Gemini CLI 会话读取 <code>tmp/*/chats/</code> 下的 JSON / JSONL 文件。
+                  </div>
+                  <div>
+                    Antigravity 会话读取 <code>antigravity*/conversations/*.pb</code>，标题和项目路径来自可解析的{" "}
+                    <code>agyhub_summaries_proto.pb</code> history summary index。
+                  </div>
+                  <div>
+                    从会话页删除时会同步清理同 ID 的会话文件、<code>annotations/*.pbtxt</code>、CLI{" "}
+                    <code>logs.json</code> 行，以及 history summary protobuf 条目；无法归属到具体会话的全局配置不会被修改。
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+          )}
+          {geminiDir && (
+            <Card className="min-w-0 overflow-hidden">
+              <CardHeader className="pb-3">
+                <CardTitle className="flex min-w-0 flex-wrap items-center gap-2 text-base">
+                  <Trash2 className="h-4 w-4" />
+                  Antigravity orphan summaries
+                  {loading && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="min-w-0 space-y-3">
+                <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                  <Stat label="summary 条目" value={orphans?.scanned_summaries ?? "-"} />
+                  <Stat
+                    label="orphan summary"
+                    value={orphans?.orphan_summaries ?? "-"}
+                    warn={(orphans?.orphan_summaries ?? 0) > 0}
+                  />
+                  <Stat label="已清理" value={orphans?.removed_summaries ?? "-"} />
+                  <Stat label="模式" value={orphans?.dry_run === false ? "执行" : "诊断"} />
+                </div>
+                {orphans?.items.length ? (
+                  <div className="max-h-56 overflow-auto rounded-md border">
+                    {orphans.items.slice(0, 30).map((item) => (
+                      <div key={`${item.surface}:${item.id}`} className="min-w-0 border-b px-3 py-2 text-xs last:border-b-0">
+                        <div className="flex min-w-0 items-center gap-2">
+                          <Badge variant="outline" className="h-5 shrink-0 font-normal">
+                            {item.surface}
+                          </Badge>
+                          <span className="min-w-0 truncate font-medium">{item.title}</span>
+                        </div>
+                        <div className="mt-1 break-all font-mono text-muted-foreground">
+                          {item.id}
+                          {item.linked_ids.length > 0 ? ` / ${item.linked_ids.join(", ")}` : ""}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="rounded-md bg-muted/30 p-3 text-xs text-muted-foreground">
+                    未发现会话文件已缺失但仍留在 Antigravity 历史列表中的 orphan summary。
+                  </div>
+                )}
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    variant="destructive"
+                    size="sm"
+                    className="gap-1.5"
+                    disabled={!orphans || orphans.orphan_summaries === 0}
+                    onClick={() => setConfirmPrune(true)}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                    清理 orphan summaries
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+          )}
+        </div>
+      </ScrollArea>
+      <AlertDialog open={confirmPrune} onOpenChange={setConfirmPrune}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>清理 Antigravity orphan summaries</AlertDialogTitle>
+            <AlertDialogDescription>
+              将从 <code>agyhub_summaries_proto.pb</code> 删除已没有对应 <code>conversations/*.pb</code> 的 history summary。
+              这会影响 Antigravity 左侧历史列表，但不会删除仍存在的会话文件。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={async () => {
+                try {
+                  const result = await api.pruneGeminiOrphans(geminiDir, false);
+                  setOrphans(result);
+                  toast.success(`已清理 ${result.removed_summaries} 条 orphan summary`);
+                  await refresh();
+                } catch (e) {
+                  toast.error(`清理失败：${String((e as Error)?.message ?? e)}`);
+                }
               }}
             >
               确认清理

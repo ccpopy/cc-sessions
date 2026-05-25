@@ -34,6 +34,12 @@ pub fn default_claude_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".claude"))
 }
 
+pub fn default_gemini_dir() -> PathBuf {
+    dirs::home_dir()
+        .map(|h| h.join(".gemini"))
+        .unwrap_or_else(|| PathBuf::from(".gemini"))
+}
+
 pub fn default_backup_dir() -> PathBuf {
     let cc_root = default_codex_dir();
     cc_root
@@ -53,6 +59,15 @@ pub fn validate_claude_dir(path: &Path) -> (bool, bool) {
     let exists = path.is_dir();
     let has_projects = path.join("projects").is_dir();
     (exists, has_projects)
+}
+
+pub fn validate_gemini_dir(path: &Path) -> (bool, bool) {
+    let exists = path.is_dir();
+    let has_cli_chats = path.join("tmp").is_dir();
+    let has_antigravity = ["antigravity-cli", "antigravity", "antigravity-ide"]
+        .iter()
+        .any(|surface| path.join(surface).join("conversations").is_dir());
+    (exists, has_cli_chats || has_antigravity)
 }
 
 pub fn claude_projects_dir(claude: &Path) -> PathBuf {

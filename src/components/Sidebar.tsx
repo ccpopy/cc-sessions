@@ -24,7 +24,7 @@ import { ThemeToggle } from "@/components/ThemeToggle";
 import { useSettings } from "@/stores/settings";
 import { cn } from "@/lib/utils";
 
-type Accent = "codex" | "claude" | "global";
+type Accent = "codex" | "claude" | "gemini" | "global";
 
 type NavItem = {
   to: string;
@@ -46,6 +46,12 @@ const claudeItems: NavItem[] = [
   { to: "/claude/transfer", icon: Package, label: "导出 / 导入" },
 ];
 
+const geminiItems: NavItem[] = [
+  { to: "/gemini/sessions", icon: MessageSquare, label: "会话" },
+  { to: "/gemini/repair", icon: Wrench, label: "清理" },
+  { to: "/gemini/backups", icon: Archive, label: "备份" },
+];
+
 const globalItems: NavItem[] = [
   { to: "/stats", icon: BarChart3, label: "统计" },
 ];
@@ -53,24 +59,28 @@ const globalItems: NavItem[] = [
 const accentDot: Record<Accent, string> = {
   codex: "bg-emerald-500",
   claude: "bg-orange-500",
+  gemini: "bg-sky-500",
   global: "bg-foreground/60",
 };
 
 const accentBar: Record<Accent, string> = {
   codex: "bg-emerald-500/90",
   claude: "bg-orange-500/90",
+  gemini: "bg-sky-500/90",
   global: "bg-foreground/70",
 };
 
 const accentActiveBar: Record<Accent, string> = {
   codex: "bg-emerald-500 shadow-[0_0_10px_-1px_hsl(142_76%_45%/0.55)]",
   claude: "bg-orange-500 shadow-[0_0_10px_-1px_hsl(24_95%_55%/0.55)]",
+  gemini: "bg-sky-500 shadow-[0_0_10px_-1px_hsl(199_89%_48%/0.55)]",
   global: "bg-foreground/80",
 };
 
 const accentActiveIcon: Record<Accent, string> = {
   codex: "text-emerald-600 dark:text-emerald-400",
   claude: "text-orange-600 dark:text-orange-400",
+  gemini: "text-sky-600 dark:text-sky-400",
   global: "text-foreground",
 };
 
@@ -79,6 +89,8 @@ const accentActiveTint: Record<Accent, string> = {
     "bg-emerald-500/10 ring-1 ring-inset ring-emerald-500/20 dark:bg-emerald-500/12",
   claude:
     "bg-orange-500/10 ring-1 ring-inset ring-orange-500/20 dark:bg-orange-500/12",
+  gemini:
+    "bg-sky-500/10 ring-1 ring-inset ring-sky-500/20 dark:bg-sky-500/12",
   global: "bg-sidebar-accent ring-1 ring-inset ring-border/60",
 };
 
@@ -105,7 +117,7 @@ export function Sidebar() {
             CC Sessions
           </div>
           <div className="mt-0.5 truncate text-[9.5px] font-semibold uppercase leading-tight tracking-[0.14em] text-muted-foreground/75">
-            Codex · Claude
+            Codex · Claude · Gemini
           </div>
         </div>
       </SidebarHeader>
@@ -113,6 +125,7 @@ export function Sidebar() {
       <SidebarContent className="gap-0 py-1">
         <NavGroup label="Codex" accent="codex" items={codexItems} pathname={location.pathname} />
         <NavGroup label="Claude" accent="claude" items={claudeItems} pathname={location.pathname} />
+        <NavGroup label="Gemini" accent="gemini" items={geminiItems} pathname={location.pathname} />
         <NavGroup label="全局" accent="global" items={globalItems} pathname={location.pathname} />
       </SidebarContent>
 
@@ -122,6 +135,9 @@ export function Sidebar() {
         )}
         {settings?.claude_dir && (
           <DirCard label="Claude 目录" path={settings.claude_dir} accent="claude" />
+        )}
+        {settings?.gemini_dir && (
+          <DirCard label="Gemini 目录" path={settings.gemini_dir} accent="gemini" />
         )}
         <div className="mt-0.5 flex items-center gap-1">
           <ThemeToggle className="flex-1" />

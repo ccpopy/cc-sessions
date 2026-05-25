@@ -274,6 +274,7 @@ fn preview_range_by_provider(
     match provider.as_deref().unwrap_or("codex") {
         "codex" => preview_range_impl(path, offset, limit),
         "claude" => crate::claude_sessions::preview_range(path, offset, limit),
+        "gemini" => crate::gemini_sessions::preview_range(path, offset, limit),
         other => Err(crate::error::AppError::Other(format!(
             "不支持的 provider: {other}"
         ))),
@@ -313,6 +314,9 @@ pub fn preview_session_meta(
 ) -> AppResult<SessionMetaBrief> {
     if provider.as_deref().unwrap_or("codex") == "claude" {
         return crate::claude_sessions::preview_meta(&rollout_path);
+    }
+    if provider.as_deref().unwrap_or("codex") == "gemini" {
+        return crate::gemini_sessions::preview_meta(&rollout_path);
     }
     let f = File::open(PathBuf::from(&rollout_path))?;
     let mut reader = BufReader::new(f);

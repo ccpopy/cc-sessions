@@ -67,6 +67,11 @@ pub fn default_claude_dir() -> String {
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
+pub fn default_gemini_dir() -> String {
+    paths::default_gemini_dir().to_string_lossy().into_owned()
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn validate_codex_dir(path: String) -> AppResult<DirValidation> {
     let p = PathBuf::from(&path);
     let (exists, has_state, has_sessions) = paths::validate_codex_dir(&p);
@@ -96,6 +101,23 @@ pub fn validate_claude_dir(path: String) -> AppResult<DirValidation> {
         valid: exists && has_projects,
         has_state_db: false,
         has_sessions: has_projects,
+        threads_count,
+    })
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn validate_gemini_dir(path: String) -> AppResult<DirValidation> {
+    let p = PathBuf::from(&path);
+    let (exists, has_sessions) = paths::validate_gemini_dir(&p);
+    let threads_count = if has_sessions {
+        crate::gemini_sessions::scan_sessions(&p)?.len() as u32
+    } else {
+        0
+    };
+    Ok(DirValidation {
+        valid: exists && has_sessions,
+        has_state_db: false,
+        has_sessions,
         threads_count,
     })
 }

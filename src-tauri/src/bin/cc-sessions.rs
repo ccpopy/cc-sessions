@@ -59,6 +59,7 @@ struct CliContext {
     provider: Option<String>,
     codex_dir: String,
     claude_dir: String,
+    gemini_dir: String,
     family_lock: family::FamilyLock,
 }
 
@@ -92,6 +93,8 @@ fn run_cli() -> CliResult<()> {
         .unwrap_or_else(|| paths::default_codex_dir().to_string_lossy().into_owned());
     let claude_dir = take_value(&mut args, "--claude-dir")?
         .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned());
+    let gemini_dir = take_value(&mut args, "--gemini-dir")?
+        .unwrap_or_else(|| paths::default_gemini_dir().to_string_lossy().into_owned());
 
     if help {
         print_help();
@@ -103,6 +106,7 @@ fn run_cli() -> CliResult<()> {
         provider,
         codex_dir,
         claude_dir,
+        gemini_dir,
         family_lock: family::FamilyLock::default(),
     };
 
@@ -111,6 +115,7 @@ fn run_cli() -> CliResult<()> {
             ctx.provider.clone(),
             ctx.codex_dir.clone(),
             ctx.claude_dir.clone(),
+            ctx.gemini_dir.clone(),
         )
         .map_err(CliError::message);
     };
@@ -122,6 +127,7 @@ fn run_cli() -> CliResult<()> {
                 ctx.provider.clone(),
                 ctx.codex_dir.clone(),
                 ctx.claude_dir.clone(),
+                ctx.gemini_dir.clone(),
             )
             .map_err(CliError::message)
         }
@@ -155,9 +161,10 @@ fn print_help() {
 
 全局选项:
   --json                    输出 JSON
-  --provider <codex|claude|all>
+  --provider <codex|claude|gemini|all>
   --codex-dir <路径>         默认读取 ~/.codex
   --claude-dir <路径>        默认读取 ~/.claude
+  --gemini-dir <路径>        默认读取 ~/.gemini
   -h, --help                显示帮助
 
 常用命令:
@@ -180,6 +187,7 @@ fn print_help() {
   cc-sessions menu
   cc-sessions list --limit 20 --sort size
   cc-sessions --provider claude search "hello"
+  cc-sessions --provider gemini list --limit 20
   cc-sessions preview ~/.codex/sessions/.../rollout-xxx.jsonl --mode all --limit 40
   cc-sessions repair diagnose --json
   cc-sessions backup create --backup-dir ./backups --id <session-id> --name first-backup
@@ -216,21 +224,27 @@ fn cmd_search(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
         let mut codex_hits = sessions::search_sessions(
             Some("codex".to_string()),
             ctx.codex_dir.clone(),
-            Some(ctx.claude_dir.clone()),
+            Some(provider_aux_dir(ctx, "codex")),
             query.clone(),
         )?;
         codex_hits.extend(sessions::search_sessions(
             Some("claude".to_string()),
             ctx.codex_dir.clone(),
-            Some(ctx.claude_dir.clone()),
+            Some(provider_aux_dir(ctx, "claude")),
+            query.clone(),
+        )?);
+        codex_hits.extend(sessions::search_sessions(
+            Some("gemini".to_string()),
+            ctx.codex_dir.clone(),
+            Some(provider_aux_dir(ctx, "gemini")),
             query,
         )?);
         codex_hits
     } else {
         sessions::search_sessions(
-            Some(provider),
+            Some(provider.clone()),
             ctx.codex_dir.clone(),
-            Some(ctx.claude_dir.clone()),
+            Some(provider_aux_dir(ctx, &provider)),
             query,
         )?
     };
@@ -351,7 +365,16 @@ fn cmd_resume_command(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> 
     let id = take_value(&mut args, "--id")?.or_else(|| pop_command(&mut args));
     ensure_no_args(&args)?;
     let id = required(id, "resume-command 需要 session id")?;
-    let command = fs_ops::resume_command_text(Some(concrete_provider(ctx)?), id)?;
+    let provider = concrete_provider(ctx)?;
+    let command = if provider == "gemini" {
+        load_sessions(ctx, provider.clone())?
+            .into_iter()
+            .find(|session| session.id == id)
+            .map(|session| session.resume_command)
+            .unwrap_or_else(|| format!("gemini --resume {id}"))
+    } else {
+        fs_ops::resume_command_text(Some(provider), id)?
+    };
     output(ctx, &command, |command| println!("{command}"))
 }
 
@@ -364,14 +387,15 @@ fn cmd_stats(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
     let to_ts = take_i64(&mut args, "--to-ts")?;
     let cwd_filter = take_values(&mut args, "--cwd")?;
     let include_archived = take_flag(&mut args, "--include-archived");
+    let provider_dir = provider_aux_dir(ctx, &provider);
 
     match subcommand.as_str() {
         "kpi" => {
             ensure_no_args(&args)?;
             let data = stats::stats_kpi(
-                Some(provider),
+                Some(provider.clone()),
                 ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
+                Some(provider_dir.clone()),
                 from_ts,
                 to_ts,
                 cwd_filter,
@@ -388,9 +412,9 @@ fn cmd_stats(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             let limit = take_usize(&mut args, "--limit")?.unwrap_or(20);
             ensure_no_args(&args)?;
             let data = stats::stats_by_project(
-                Some(provider),
+                Some(provider.clone()),
                 ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
+                Some(provider_dir.clone()),
                 from_ts,
                 to_ts,
                 limit,
@@ -413,9 +437,9 @@ fn cmd_stats(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
         "models" => {
             ensure_no_args(&args)?;
             let data = stats::stats_by_model(
-                Some(provider),
+                Some(provider.clone()),
                 ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
+                Some(provider_dir.clone()),
                 from_ts,
                 to_ts,
                 cwd_filter,
@@ -439,9 +463,9 @@ fn cmd_stats(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             let bucket = take_value(&mut args, "--bucket")?.unwrap_or_else(|| "day".to_string());
             ensure_no_args(&args)?;
             let data = stats::stats_timeseries(
-                Some(provider),
+                Some(provider.clone()),
                 ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
+                Some(provider_dir.clone()),
                 from_ts,
                 to_ts,
                 bucket,
@@ -458,9 +482,9 @@ fn cmd_stats(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
         "heatmap" => {
             ensure_no_args(&args)?;
             let data = stats::stats_heatmap(
-                Some(provider),
+                Some(provider.clone()),
                 ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
+                Some(provider_dir.clone()),
                 from_ts,
                 to_ts,
                 cwd_filter,
@@ -493,10 +517,11 @@ fn cmd_backup(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             let name = take_value(&mut args, "--name")?;
             let note = take_value(&mut args, "--note")?;
             ensure_no_args(&args)?;
+            let provider = concrete_provider(ctx)?;
             let summary = backup::create_backup(
-                Some(concrete_provider(ctx)?),
+                Some(provider.clone()),
                 ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
+                Some(provider_aux_dir(ctx, &provider)),
                 backup_dir,
                 ids,
                 name,
@@ -556,11 +581,12 @@ fn cmd_backup(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             let id = required(take_value(&mut args, "--id")?, "restore 需要 --id")?;
             let overwrite = take_flag(&mut args, "--overwrite");
             ensure_no_args(&args)?;
+            let provider = concrete_provider(ctx)?;
             let result = backup::restore_session(
-                Some(concrete_provider(ctx)?),
+                Some(provider.clone()),
                 backup_path,
                 ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
+                Some(provider_aux_dir(ctx, &provider)),
                 id,
                 overwrite,
             )?;
@@ -578,11 +604,12 @@ fn cmd_backup(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             let backup_path = backup_path_arg(&mut args)?;
             let overwrite = take_flag(&mut args, "--overwrite");
             ensure_no_args(&args)?;
+            let provider = concrete_provider(ctx)?;
             let results = backup::restore_all(
-                Some(concrete_provider(ctx)?),
+                Some(provider.clone()),
                 backup_path,
                 ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
+                Some(provider_aux_dir(ctx, &provider)),
                 overwrite,
             )?;
             output(ctx, &results, |items| {
@@ -612,10 +639,11 @@ fn cmd_bundle(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             let machine_label = take_value(&mut args, "--machine-label")?;
             let export_group = take_value(&mut args, "--export-group")?;
             ensure_no_args(&args)?;
+            let provider = concrete_provider(ctx)?;
             let reports = bundle::export_session_bundles(
-                Some(concrete_provider(ctx)?),
+                Some(provider.clone()),
                 ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
+                Some(provider_aux_dir(ctx, &provider)),
                 out_dir,
                 ids,
                 machine_label,
@@ -632,10 +660,11 @@ fn cmd_bundle(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             let export_group = take_value(&mut args, "--export-group")?;
             let active_only = take_flag(&mut args, "--active-only");
             ensure_no_args(&args)?;
+            let provider = concrete_provider(ctx)?;
             let reports = bundle::export_all_bundles(
-                Some(concrete_provider(ctx)?),
+                Some(provider.clone()),
                 ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
+                Some(provider_aux_dir(ctx, &provider)),
                 out_dir,
                 machine_label,
                 export_group,
@@ -661,11 +690,12 @@ fn cmd_bundle(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             let make_visible = take_flag(&mut args, "--make-visible");
             let strict = take_flag(&mut args, "--strict");
             ensure_no_args(&args)?;
+            let provider = concrete_provider(ctx)?;
             let reports = bundle::import_session_bundles(
-                Some(concrete_provider(ctx)?),
+                Some(provider.clone()),
                 src_dir,
                 ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
+                Some(provider_aux_dir(ctx, &provider)),
                 mode,
                 make_visible,
                 strict,
@@ -1133,6 +1163,7 @@ fn cmd_settings(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             output(ctx, &defaults, |settings| {
                 println!("codex_dir\t{}", settings.codex_dir);
                 println!("claude_dir\t{}", settings.claude_dir);
+                println!("gemini_dir\t{}", settings.gemini_dir);
                 println!("backup_dir\t{}", settings.backup_dir);
                 println!("refresh_interval_ms\t{}", settings.refresh_interval_ms);
             })
@@ -1144,6 +1175,7 @@ fn cmd_settings(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             output(ctx, &settings, |settings| {
                 println!("codex_dir\t{}", settings.codex_dir);
                 println!("claude_dir\t{}", settings.claude_dir);
+                println!("gemini_dir\t{}", settings.gemini_dir);
                 println!("backup_dir\t{}", settings.backup_dir);
                 println!("refresh_interval_ms\t{}", settings.refresh_interval_ms);
             })
@@ -1152,9 +1184,11 @@ fn cmd_settings(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             ensure_no_args(&args)?;
             let codex = settings::validate_codex_dir(ctx.codex_dir.clone())?;
             let claude = settings::validate_claude_dir(ctx.claude_dir.clone())?;
+            let gemini = settings::validate_gemini_dir(ctx.gemini_dir.clone())?;
             let report = HashMap::from([
                 ("codex", serde_json::to_value(codex)?),
                 ("claude", serde_json::to_value(claude)?),
+                ("gemini", serde_json::to_value(gemini)?),
             ]);
             output(ctx, &report, |report| {
                 for (name, value) in report {
@@ -1168,26 +1202,31 @@ fn cmd_settings(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
 
 fn load_sessions(ctx: &CliContext, provider: String) -> CliResult<Vec<SessionSummary>> {
     match provider.as_str() {
-        "codex" | "claude" => Ok(sessions::list_sessions(
-            Some(provider),
-            ctx.codex_dir.clone(),
-            Some(ctx.claude_dir.clone()),
-        )?),
+        "codex" | "claude" | "gemini" => list_provider_sessions(ctx, &provider),
         "all" => {
-            let mut list = sessions::list_sessions(
-                Some("codex".to_string()),
-                ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
-            )?;
-            list.extend(sessions::list_sessions(
-                Some("claude".to_string()),
-                ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
-            )?);
+            let mut list = list_provider_sessions(ctx, "codex")?;
+            list.extend(list_provider_sessions(ctx, "claude")?);
+            list.extend(list_provider_sessions(ctx, "gemini")?);
             list.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
             Ok(list)
         }
         other => Err(CliError::message(format!("不支持的 provider: {other}"))),
+    }
+}
+
+fn list_provider_sessions(ctx: &CliContext, provider: &str) -> CliResult<Vec<SessionSummary>> {
+    Ok(sessions::list_sessions(
+        Some(provider.to_string()),
+        ctx.codex_dir.clone(),
+        Some(provider_aux_dir(ctx, provider)),
+    )?)
+}
+
+fn provider_aux_dir(ctx: &CliContext, provider: &str) -> String {
+    if provider == "gemini" {
+        ctx.gemini_dir.clone()
+    } else {
+        ctx.claude_dir.clone()
     }
 }
 
@@ -1233,7 +1272,7 @@ fn group_projects(list: Vec<SessionSummary>, include_archived: bool) -> Vec<Proj
 fn session_provider(ctx: &CliContext) -> CliResult<String> {
     let provider = ctx.provider.clone().unwrap_or_else(|| "codex".to_string());
     match provider.as_str() {
-        "codex" | "claude" | "all" => Ok(provider),
+        "codex" | "claude" | "gemini" | "all" => Ok(provider),
         other => Err(CliError::message(format!("不支持的 provider: {other}"))),
     }
 }
@@ -1242,7 +1281,7 @@ fn concrete_provider(ctx: &CliContext) -> CliResult<String> {
     let provider = session_provider(ctx)?;
     if provider == "all" {
         Err(CliError::message(
-            "此命令只支持 --provider codex 或 --provider claude",
+            "此命令只支持 --provider codex、--provider claude 或 --provider gemini",
         ))
     } else {
         Ok(provider)

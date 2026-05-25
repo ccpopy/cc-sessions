@@ -31,14 +31,21 @@ struct MenuContext {
     provider: Option<String>,
     codex_dir: String,
     claude_dir: String,
+    gemini_dir: String,
     family_lock: family::FamilyLock,
 }
 
-pub fn run(provider: Option<String>, codex_dir: String, claude_dir: String) -> MenuResult<()> {
+pub fn run(
+    provider: Option<String>,
+    codex_dir: String,
+    claude_dir: String,
+    gemini_dir: String,
+) -> MenuResult<()> {
     let mut ctx = MenuContext {
         provider,
         codex_dir,
         claude_dir,
+        gemini_dir,
         family_lock: family::FamilyLock::default(),
     };
 
@@ -56,27 +63,30 @@ fn main_menu(ctx: &mut MenuContext) -> MenuResult<Flow> {
         &[
             ("Codex 目录", ctx.codex_dir.as_str()),
             ("Claude 目录", ctx.claude_dir.as_str()),
+            ("Gemini 目录", ctx.gemini_dir.as_str()),
         ],
     );
     println!("1. Codex 会话");
     println!("2. Claude 会话");
-    println!("3. 统计");
-    println!("4. 备份");
-    println!("5. 导入 / 导出 Bundle");
-    println!("6. 修复 / 诊断");
-    println!("7. 设置与路径检查");
-    println!("8. 帮助");
+    println!("3. Gemini 会话");
+    println!("4. 统计");
+    println!("5. 备份");
+    println!("6. 导入 / 导出 Bundle");
+    println!("7. 修复 / 诊断");
+    println!("8. 设置与路径检查");
+    println!("9. 帮助");
     println!("0. 退出");
 
     match prompt("请选择: ")?.as_str() {
         "1" => run_child(|| sessions_menu(ctx, "codex")),
         "2" => run_child(|| sessions_menu(ctx, "claude")),
-        "3" => run_child(|| stats_menu(ctx)),
-        "4" => run_child(|| backup_menu(ctx)),
-        "5" => run_child(|| bundle_menu(ctx)),
-        "6" => run_child(|| repair_menu(ctx)),
-        "7" => run_child(|| settings_menu(ctx)),
-        "8" => {
+        "3" => run_child(|| sessions_menu(ctx, "gemini")),
+        "4" => run_child(|| stats_menu(ctx)),
+        "5" => run_child(|| backup_menu(ctx)),
+        "6" => run_child(|| bundle_menu(ctx)),
+        "7" => run_child(|| repair_menu(ctx)),
+        "8" => run_child(|| settings_menu(ctx)),
+        "9" => {
             show_interactive_help()?;
             Ok(Flow::Main)
         }
@@ -126,7 +136,7 @@ fn sessions_menu(ctx: &mut MenuContext, provider: &str) -> MenuResult<Flow> {
                 let mut hits = sessions::search_sessions(
                     Some(provider.to_string()),
                     ctx.codex_dir.clone(),
-                    Some(ctx.claude_dir.clone()),
+                    Some(provider_aux_dir(ctx, provider)),
                     query,
                 )
                 .map_err(to_string)?;
@@ -572,8 +582,12 @@ fn show_session_meta(provider: &str, session: &SessionSummary) -> MenuResult<()>
 }
 
 fn show_resume_command(provider: &str, session: &SessionSummary) -> MenuResult<()> {
-    let command = fs_ops::resume_command_text(Some(provider.to_string()), session.id.clone())
-        .map_err(to_string)?;
+    let command = if !session.resume_command.is_empty() {
+        session.resume_command.clone()
+    } else {
+        fs_ops::resume_command_text(Some(provider.to_string()), session.id.clone())
+            .map_err(to_string)?
+    };
     println!("{command}");
     pause()?;
     Ok(())
@@ -590,7 +604,7 @@ fn create_backup_for_session(
     let summary = backup::create_backup(
         Some(provider.to_string()),
         ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
+        Some(provider_aux_dir(ctx, provider)),
         backup_dir,
         vec![session.id.clone()],
         name,
@@ -611,7 +625,7 @@ fn export_bundle_for_session(
     let reports = bundle::export_session_bundles(
         Some(provider.to_string()),
         ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
+        Some(provider_aux_dir(ctx, provider)),
         out_dir,
         vec![session.id.clone()],
         None,
@@ -625,7 +639,7 @@ fn export_bundle_for_session(
 
 fn toggle_archived(ctx: &MenuContext, provider: &str, session: &SessionSummary) -> MenuResult<()> {
     if provider != "codex" {
-        println!("Claude 会话不支持归档。");
+        println!("该 provider 不支持归档。");
         return pause().map(|_| ());
     }
     let target = !session.archived;
@@ -656,7 +670,7 @@ fn delete_session(ctx: &MenuContext, provider: &str, session: &SessionSummary) -
     let result = sessions::delete_session(
         Some(provider.to_string()),
         ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
+        Some(provider_aux_dir(ctx, provider)),
         session.id.clone(),
     )
     .map_err(to_string)?;
@@ -718,7 +732,7 @@ fn delete_selected_sessions(
     let results = sessions::delete_sessions(
         Some(provider.to_string()),
         ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
+        Some(provider_aux_dir(ctx, provider)),
         ids,
     )
     .map_err(to_string)?;
@@ -781,10 +795,12 @@ fn stats_provider(ctx: &MenuContext) -> MenuResult<String> {
     println!("1. 全部");
     println!("2. Codex");
     println!("3. Claude");
+    println!("4. Gemini");
     match prompt("请选择: ")?.as_str() {
         "1" => Ok("all".to_string()),
         "2" => Ok("codex".to_string()),
         "3" => Ok("claude".to_string()),
+        "4" => Ok("gemini".to_string()),
         _ => Err("无效统计范围。".to_string()),
     }
 }
@@ -792,9 +808,9 @@ fn stats_provider(ctx: &MenuContext) -> MenuResult<String> {
 fn stats_kpi(ctx: &MenuContext) -> MenuResult<()> {
     let provider = stats_provider(ctx)?;
     let data = stats::stats_kpi(
-        Some(provider),
+        Some(provider.clone()),
         ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
+        Some(provider_aux_dir(ctx, &provider)),
         None,
         None,
         Vec::new(),
@@ -816,9 +832,9 @@ fn stats_projects(ctx: &MenuContext) -> MenuResult<()> {
     let provider = stats_provider(ctx)?;
     let limit = prompt_usize("显示数量", 20)?;
     let data = stats::stats_by_project(
-        Some(provider),
+        Some(provider.clone()),
         ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
+        Some(provider_aux_dir(ctx, &provider)),
         None,
         None,
         limit,
@@ -843,9 +859,9 @@ fn stats_projects(ctx: &MenuContext) -> MenuResult<()> {
 fn stats_models(ctx: &MenuContext) -> MenuResult<()> {
     let provider = stats_provider(ctx)?;
     let data = stats::stats_by_model(
-        Some(provider),
+        Some(provider.clone()),
         ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
+        Some(provider_aux_dir(ctx, &provider)),
         None,
         None,
         Vec::new(),
@@ -871,9 +887,9 @@ fn stats_timeseries(ctx: &MenuContext) -> MenuResult<()> {
     let provider = stats_provider(ctx)?;
     let bucket = prompt_default("时间粒度 day/week", "day")?;
     let data = stats::stats_timeseries(
-        Some(provider),
+        Some(provider.clone()),
         ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
+        Some(provider_aux_dir(ctx, &provider)),
         None,
         None,
         bucket,
@@ -897,9 +913,9 @@ fn stats_timeseries(ctx: &MenuContext) -> MenuResult<()> {
 fn stats_heatmap(ctx: &MenuContext) -> MenuResult<()> {
     let provider = stats_provider(ctx)?;
     let data = stats::stats_heatmap(
-        Some(provider),
+        Some(provider.clone()),
         ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
+        Some(provider_aux_dir(ctx, &provider)),
         None,
         None,
         Vec::new(),
@@ -956,9 +972,11 @@ fn backup_menu(ctx: &mut MenuContext) -> MenuResult<Flow> {
 fn choose_concrete_provider() -> MenuResult<String> {
     println!("1. Codex");
     println!("2. Claude");
+    println!("3. Gemini");
     match prompt("请选择 provider: ")?.as_str() {
         "1" => Ok("codex".to_string()),
         "2" => Ok("claude".to_string()),
+        "3" => Ok("gemini".to_string()),
         _ => Err("无效 provider。".to_string()),
     }
 }
@@ -970,9 +988,9 @@ fn backup_create_by_id(ctx: &MenuContext) -> MenuResult<()> {
     let name = prompt_optional("备份名称（留空自动生成）: ")?;
     let note = prompt_optional("备注（可留空）: ")?;
     let summary = backup::create_backup(
-        Some(provider),
+        Some(provider.clone()),
         ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
+        Some(provider_aux_dir(ctx, &provider)),
         backup_dir,
         ids,
         name,
@@ -1032,10 +1050,10 @@ fn backup_restore_one(ctx: &MenuContext) -> MenuResult<()> {
     let id = prompt_required("session id: ")?;
     let overwrite = confirm_yes("如目标已存在，是否允许覆盖？输入 yes 才会覆盖。")?;
     let result = backup::restore_session(
-        Some(provider),
+        Some(provider.clone()),
         path,
         ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
+        Some(provider_aux_dir(ctx, &provider)),
         id,
         overwrite,
     )
@@ -1057,10 +1075,10 @@ fn backup_restore_all(ctx: &MenuContext) -> MenuResult<()> {
     }
     let overwrite = confirm_yes("如目标已存在，是否允许覆盖？输入 yes 才会覆盖。")?;
     let results = backup::restore_all(
-        Some(provider),
+        Some(provider.clone()),
         path,
         ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
+        Some(provider_aux_dir(ctx, &provider)),
         overwrite,
     )
     .map_err(to_string)?;
@@ -1124,9 +1142,9 @@ fn bundle_export(ctx: &MenuContext) -> MenuResult<()> {
     let out_dir = prompt_required("导出目录: ")?;
     let ids = prompt_ids()?;
     let reports = bundle::export_session_bundles(
-        Some(provider),
+        Some(provider.clone()),
         ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
+        Some(provider_aux_dir(ctx, &provider)),
         out_dir,
         ids,
         None,
@@ -1143,9 +1161,9 @@ fn bundle_export_all(ctx: &MenuContext) -> MenuResult<()> {
     let out_dir = prompt_required("导出目录: ")?;
     let active_only = confirm_default_no("是否只导出 active 会话？")?;
     let reports = bundle::export_all_bundles(
-        Some(provider),
+        Some(provider.clone()),
         ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
+        Some(provider_aux_dir(ctx, &provider)),
         out_dir,
         None,
         None,
@@ -1177,10 +1195,10 @@ fn bundle_import(ctx: &MenuContext) -> MenuResult<()> {
     let make_visible = confirm_default_no("是否导入后写入本地可见索引？")?;
     let strict = confirm_default_no("是否启用严格校验？")?;
     let reports = bundle::import_session_bundles(
-        Some(provider),
+        Some(provider.clone()),
         src_dir,
         ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
+        Some(provider_aux_dir(ctx, &provider)),
         mode,
         make_visible,
         strict,
@@ -1632,8 +1650,9 @@ fn settings_menu(ctx: &mut MenuContext) -> MenuResult<Flow> {
         println!("2. 校验当前路径");
         println!("3. 修改本次运行的 Codex 目录");
         println!("4. 修改本次运行的 Claude 目录");
-        println!("5. 返回上一层");
-        println!("6. 返回主菜单");
+        println!("5. 修改本次运行的 Gemini 目录");
+        println!("6. 返回上一层");
+        println!("7. 返回主菜单");
         println!("0. 退出");
 
         match prompt("请选择: ")?.as_str() {
@@ -1645,8 +1664,11 @@ fn settings_menu(ctx: &mut MenuContext) -> MenuResult<Flow> {
             "4" => {
                 ctx.claude_dir = prompt_default("Claude 目录", &ctx.claude_dir)?;
             }
-            "5" => return Ok(Flow::Back),
-            "6" => return Ok(Flow::Main),
+            "5" => {
+                ctx.gemini_dir = prompt_default("Gemini 目录", &ctx.gemini_dir)?;
+            }
+            "6" => return Ok(Flow::Back),
+            "7" => return Ok(Flow::Main),
             "0" => return Ok(Flow::Exit),
             _ => {
                 println!("无效选择。");
@@ -1660,6 +1682,7 @@ fn settings_defaults() -> MenuResult<()> {
     let defaults = cc_session_manager_lib::models::Settings::default();
     println!("codex_dir              {}", defaults.codex_dir);
     println!("claude_dir             {}", defaults.claude_dir);
+    println!("gemini_dir             {}", defaults.gemini_dir);
     println!("backup_dir             {}", defaults.backup_dir);
     println!("refresh_interval_ms    {}", defaults.refresh_interval_ms);
     pause()?;
@@ -1669,6 +1692,7 @@ fn settings_defaults() -> MenuResult<()> {
 fn settings_validate(ctx: &MenuContext) -> MenuResult<()> {
     let codex = settings::validate_codex_dir(ctx.codex_dir.clone()).map_err(to_string)?;
     let claude = settings::validate_claude_dir(ctx.claude_dir.clone()).map_err(to_string)?;
+    let gemini = settings::validate_gemini_dir(ctx.gemini_dir.clone()).map_err(to_string)?;
     println!(
         "codex   valid={} state_db={} sessions={} threads={}",
         codex.valid, codex.has_state_db, codex.has_sessions, codex.threads_count
@@ -1677,6 +1701,10 @@ fn settings_validate(ctx: &MenuContext) -> MenuResult<()> {
         "claude  valid={} projects={} sessions={}",
         claude.valid, claude.has_sessions, claude.threads_count
     );
+    println!(
+        "gemini  valid={} sessions={} threads={}",
+        gemini.valid, gemini.has_sessions, gemini.threads_count
+    );
     pause()?;
     Ok(())
 }
@@ -1684,7 +1712,7 @@ fn settings_validate(ctx: &MenuContext) -> MenuResult<()> {
 fn show_interactive_help() -> MenuResult<()> {
     print_header("帮助", &[]);
     println!("直接运行 cc-sessions 会进入交互菜单。");
-    println!("输入菜单序号即可进入下一层，例如 1 进入 Codex 会话。");
+    println!("输入菜单序号即可进入下一层，例如 1 进入 Codex 会话，3 进入 Gemini 会话。");
     println!("列表页支持 n 下一页、p 上一页、b 返回上一层、m 返回主菜单、0 退出。");
     println!("列表页支持 s 多选当前页序号、u 取消选择、c 清空选择、d 删除已选会话。");
     println!("会话预览默认只显示用户和助手消息；选择“全部事件”才会显示工具调用。");
@@ -1701,13 +1729,21 @@ fn load_sessions(
     let mut list = sessions::list_sessions(
         Some(provider.to_string()),
         ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
+        Some(provider_aux_dir(ctx, provider)),
     )
     .map_err(to_string)?;
     if !include_archived {
         list.retain(|session| !session.archived);
     }
     Ok(list)
+}
+
+fn provider_aux_dir(ctx: &MenuContext, provider: &str) -> String {
+    if provider == "gemini" {
+        ctx.gemini_dir.clone()
+    } else {
+        ctx.claude_dir.clone()
+    }
 }
 
 fn group_projects(sessions: Vec<SessionSummary>) -> Vec<ProjectGroup> {
@@ -1886,6 +1922,7 @@ fn provider_label(provider: &str) -> &'static str {
     match provider {
         "codex" => "Codex",
         "claude" => "Claude",
+        "gemini" => "Gemini",
         _ => "未知",
     }
 }
