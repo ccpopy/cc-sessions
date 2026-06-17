@@ -5,6 +5,7 @@ import { Loader2, MessageSquare, Network, RotateCw } from "lucide-react";
 import { TopBar } from "@/components/TopBar";
 import { SessionList } from "@/components/SessionList";
 import { PreviewDialog } from "@/components/PreviewDialog";
+import { MarkdownExportDialog } from "@/components/MarkdownExportDialog";
 import { BackupCreateDialog } from "@/components/BackupCreateDialog";
 import { DangerDialog } from "@/components/DangerDialog";
 import { EmptyState } from "@/components/EmptyState";
@@ -38,6 +39,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const setShowSubagentSessions = useView((s) => s.setShowSubagentSessions);
 
   const [preview, setPreview] = useState<SessionSummary | null>(null);
+  const [exportTarget, setExportTarget] = useState<SessionSummary | null>(null);
   const [backupTargets, setBackupTargets] = useState<SessionSummary[]>([]);
   const [deleteTargets, setDeleteTargets] = useState<SessionSummary[]>([]);
   const [overlay, setOverlay] = useState<Map<string, FamilyOverlay>>(new Map());
@@ -332,6 +334,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             onDelete={(s) => setDeleteTargets([s])}
             onClone={isCodex ? onCloneOne : undefined}
             onOpenFamily={isCodex ? (s) => setFamilySheetId(s.id) : undefined}
+            onExportMarkdown={setExportTarget}
           />
         )}
       </ScrollArea>
@@ -346,6 +349,12 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
           await refresh();
           await refreshOverlay();
         }}
+      />
+
+      <MarkdownExportDialog
+        open={!!exportTarget}
+        onOpenChange={(v) => !v && setExportTarget(null)}
+        session={exportTarget}
       />
 
       <FamilyHistorySheet

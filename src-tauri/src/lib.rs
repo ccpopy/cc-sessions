@@ -6,6 +6,7 @@ pub mod family;
 pub mod fs_ops;
 pub mod history;
 pub mod logs_db;
+pub mod markdown_export;
 pub mod models;
 pub mod paths;
 pub mod repair;
@@ -54,6 +55,7 @@ pub fn run() {
             rollout::preview_session_head,
             rollout::preview_session_range,
             rollout::preview_session_meta,
+            markdown_export::export_session_markdown,
             backup::create_backup,
             backup::list_backups,
             backup::open_backup,

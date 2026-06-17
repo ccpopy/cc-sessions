@@ -12,7 +12,7 @@ use url::Url;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{ImportMode, ProjectPathMapping, Settings, SwitchStrategy};
-use crate::{backup, bundle, family, fs_ops, repair, rollout, sessions, settings, stats};
+use crate::{backup, bundle, family, fs_ops, markdown_export, repair, rollout, sessions, settings, stats};
 
 const WEBUI_TOKEN_HEADER: &str = "X-CC-Sessions-Webui-Token";
 const WEBUI_SETTINGS_ENV: &str = "CC_SESSIONS_WEBUI_SETTINGS";
@@ -209,6 +209,13 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
         "preview_session_meta" => to_result_value(rollout::preview_session_meta(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "rolloutPath")?,
+        )),
+        "export_session_markdown" => to_result_value(markdown_export::export_session_markdown(
+            opt_string_arg(&args, "provider")?,
+            string_arg(&args, "rolloutPath")?,
+            opt_string_arg(&args, "outPath")?,
+            arg(&args, "header")?,
+            arg(&args, "options")?,
         )),
         "create_backup" => to_result_value(backup::create_backup(
             opt_string_arg(&args, "provider")?,

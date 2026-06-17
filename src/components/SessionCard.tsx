@@ -4,6 +4,7 @@ import {
   CheckCircle2,
   Copy,
   Eye,
+  FileText,
   FolderOpen,
   GitBranch,
   Inbox,
@@ -50,6 +51,7 @@ type Props = {
   onDelete?: (s: SessionSummary) => void;
   onClone?: (s: SessionSummary) => void;
   onOpenFamily?: (s: SessionSummary) => void;
+  onExportMarkdown?: (s: SessionSummary) => void;
   query?: string;
   showProject?: boolean;
   overlay?: FamilyOverlay;
@@ -68,6 +70,7 @@ export const SessionCard = memo(function SessionCard({
   onDelete,
   onClone,
   onOpenFamily,
+  onExportMarkdown,
   query = "",
   showProject = true,
   overlay,
@@ -284,6 +287,12 @@ export const SessionCard = memo(function SessionCard({
                   <Archive className="h-4 w-4" />
                   单条备份
                 </DropdownMenuItem>
+                {onExportMarkdown && (
+                  <DropdownMenuItem onClick={() => onExportMarkdown(s)}>
+                    <FileText className="h-4 w-4" />
+                    导出为 Markdown
+                  </DropdownMenuItem>
+                )}
                 {onOpenFamily && (
                   <DropdownMenuItem onClick={() => onOpenFamily(s)}>
                     <Network className="h-4 w-4" />

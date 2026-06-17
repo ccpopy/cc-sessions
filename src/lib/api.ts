@@ -531,6 +531,37 @@ export type FamilyOverlay = {
 
 export type ZipReport = { path: string; files: number; bytes: number };
 
+// ========================= Markdown 导出 =========================
+
+export type MarkdownExportOptions = {
+  include_front_matter: boolean;
+  include_reasoning: boolean;
+  include_tools: boolean;
+  ai_handoff_preamble: boolean;
+  selected_indices?: number[] | null;
+};
+
+export type MarkdownExportHeader = {
+  title: string;
+  session_id: string;
+  provider: SessionProvider;
+  model?: string | null;
+  reasoning_effort?: string | null;
+  cwd?: string;
+  created_at?: number;
+  updated_at?: number;
+  tokens_used?: number;
+  resume_command?: string;
+};
+
+export type MarkdownExportReport = {
+  ok: boolean;
+  out_path: string | null;
+  markdown: string;
+  message_count: number;
+  bytes: number;
+};
+
 export const api = {
   appVersion: () => invokeCommand<string>("app_version"),
   getSettings: () => invokeCommand<Settings>("get_settings"),
@@ -574,6 +605,21 @@ export const api = {
     invokeCommand<PreviewEvent[]>("preview_session_range", { provider, rolloutPath, offset, limit }),
   previewMeta: (provider: SessionProvider, rolloutPath: string) =>
     invokeCommand<SessionMetaBrief>("preview_session_meta", { provider, rolloutPath }),
+
+  exportSessionMarkdown: (p: {
+    provider: SessionProvider;
+    rollout_path: string;
+    out_path?: string | null;
+    header: MarkdownExportHeader;
+    options: MarkdownExportOptions;
+  }) =>
+    invokeCommand<MarkdownExportReport>("export_session_markdown", {
+      provider: p.provider,
+      rolloutPath: p.rollout_path,
+      outPath: p.out_path ?? null,
+      header: p.header,
+      options: p.options,
+    }),
 
   createBackup: (p: {
     provider: SessionProvider;

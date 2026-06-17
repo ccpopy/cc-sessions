@@ -22,6 +22,7 @@ type Handlers = {
   onDelete?: (s: SessionSummary) => void;
   onClone?: (s: SessionSummary) => void;
   onOpenFamily?: (s: SessionSummary) => void;
+  onExportMarkdown?: (s: SessionSummary) => void;
 };
 
 type Props = Handlers & {

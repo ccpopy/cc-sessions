@@ -612,6 +612,65 @@ pub struct GuiVisibilityFixReport {
     pub errors: Vec<String>,
 }
 
+// ========================= Markdown 导出 =========================
+
+/// 导出 Markdown 时的内容取舍开关。默认只保留 user/assistant 对话。
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarkdownExportOptions {
+    /// 是否写入 YAML front matter（标题/模型/时间等元信息）
+    #[serde(default = "default_true")]
+    pub include_front_matter: bool,
+    /// 是否包含模型推理 / thinking（默认关闭：可能不可读或加密）
+    #[serde(default)]
+    pub include_reasoning: bool,
+    /// 是否包含工具调用 / 工具返回（默认关闭：执行噪音）
+    #[serde(default)]
+    pub include_tools: bool,
+    /// 是否在正文前加入"给另一个 AI 当上下文"的引导前言
+    #[serde(default)]
+    pub ai_handoff_preamble: bool,
+    /// 仅导出这些事件（按 PreviewEvent.index / 文件行号）；None = 全部对话
+    #[serde(default)]
+    pub selected_indices: Option<Vec<usize>>,
+}
+
+/// 由前端从 SessionSummary 透传的展示信息（标题/模型/时间等不一定都在 rollout 里）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarkdownExportHeader {
+    pub title: String,
+    pub session_id: String,
+    pub provider: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub cwd: String,
+    #[serde(default)]
+    pub created_at: i64,
+    #[serde(default)]
+    pub updated_at: i64,
+    #[serde(default)]
+    pub tokens_used: i64,
+    #[serde(default)]
+    pub resume_command: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MarkdownExportReport {
+    pub ok: bool,
+    /// 实际写入的文件路径（out_path 为空时为 None，仅返回 markdown 文本供复制）
+    pub out_path: Option<String>,
+    pub markdown: String,
+    /// 实际导出的 user/assistant 对话条数
+    pub message_count: u32,
+    pub bytes: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct FamilyOverlay {
     pub session_id: String,
