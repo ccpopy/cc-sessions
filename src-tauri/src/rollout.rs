@@ -7,6 +7,8 @@ use serde_json::Value;
 use crate::error::AppResult;
 use crate::models::{PreviewEvent, SessionMetaBrief};
 
+const PREVIEW_CAPACITY_HINT_MAX: usize = 1024;
+
 fn classify(index: usize, raw: Value) -> PreviewEvent {
     let timestamp = raw
         .get("timestamp")
@@ -279,7 +281,7 @@ fn preview_range_by_provider(
 fn preview_range_impl(path: &str, offset: usize, limit: usize) -> AppResult<Vec<PreviewEvent>> {
     let f = File::open(PathBuf::from(path))?;
     let reader = BufReader::new(f);
-    let mut out = Vec::with_capacity(limit);
+    let mut out = Vec::with_capacity(preview_capacity_hint(limit));
     let mut event_index = 0usize;
     for (i, line) in reader.lines().enumerate() {
         let line = line?;
@@ -300,6 +302,10 @@ fn preview_range_impl(path: &str, offset: usize, limit: usize) -> AppResult<Vec<
         }
     }
     Ok(out)
+}
+
+fn preview_capacity_hint(limit: usize) -> usize {
+    limit.min(PREVIEW_CAPACITY_HINT_MAX)
 }
 
 pub fn read_rollout_token_total(path: &Path) -> AppResult<i64> {
@@ -476,5 +482,44 @@ mod tests {
         let event = classify(0, raw);
 
         assert_eq!(event.text_summary, "tokens: 42");
+    }
+
+    #[test]
+    fn preview_range_accepts_unbounded_limit_without_unbounded_preallocation() -> AppResult<()> {
+        let file = temp_file("cc-session-manager-rollout-unbounded-limit-test");
+        {
+            let mut out = File::create(&file)?;
+            for value in [
+                serde_json::json!({
+                    "type": "session_meta",
+                    "payload": {"id": "session-1"}
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hello"}]
+                    }
+                }),
+            ] {
+                writeln!(out, "{}", serde_json::to_string(&value)?)?;
+            }
+        }
+
+        let events = preview_session_range(
+            Some("codex".to_string()),
+            file.to_string_lossy().into_owned(),
+            0,
+            usize::MAX,
+        )?;
+        fs::remove_file(file).ok();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events.last().map(|event| event.text_summary.as_str()),
+            Some("hello")
+        );
+        Ok(())
     }
 }

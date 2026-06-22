@@ -19,7 +19,9 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::error::AppResult;
-use crate::models::{MarkdownExportHeader, MarkdownExportOptions, MarkdownExportReport, PreviewEvent};
+use crate::models::{
+    MarkdownExportHeader, MarkdownExportOptions, MarkdownExportReport, PreviewEvent,
+};
 use crate::rollout::preview_session_range;
 
 /// 一条事件归一化后的语义类别。
@@ -94,7 +96,11 @@ fn render_markdown(
                 if role == "user" && first_user_message.is_none() {
                     first_user_message = Some(text.clone());
                 }
-                let label = if role == "user" { "👤 User" } else { "🤖 Assistant" };
+                let label = if role == "user" {
+                    "👤 User"
+                } else {
+                    "🤖 Assistant"
+                };
                 let time = format_event_time(&e.timestamp);
                 let heading = if time.is_empty() {
                     format!("## {label}")
@@ -206,7 +212,10 @@ fn segment(e: &PreviewEvent) -> Segment {
         match role {
             "assistant" => {
                 if !text.trim().is_empty() {
-                    Segment::Message { role: "assistant", text }
+                    Segment::Message {
+                        role: "assistant",
+                        text,
+                    }
                 } else {
                     let thinking = collect_claude_thinking(content);
                     if !thinking.trim().is_empty() {
@@ -256,7 +265,10 @@ fn segment(e: &PreviewEvent) -> Segment {
                     return Segment::Skip;
                 }
                 match role {
-                    "assistant" => Segment::Message { role: "assistant", text },
+                    "assistant" => Segment::Message {
+                        role: "assistant",
+                        text,
+                    },
                     "user" => {
                         if is_internal_user_text(&text) {
                             Segment::Skip
@@ -420,6 +432,17 @@ mod tests {
     use super::*;
     use crate::models::PreviewEvent;
     use serde_json::json;
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    fn temp_file(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{name}-{}-{}.jsonl",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ))
+    }
 
     fn ev(index: usize, raw: Value) -> PreviewEvent {
         PreviewEvent {
@@ -508,8 +531,14 @@ mod tests {
     #[test]
     fn tools_and_reasoning_hidden_by_default() {
         let events = vec![
-            ev(0, json!({"type": "response_item", "payload": {"type": "function_call", "name": "shell"}})),
-            ev(1, json!({"type": "response_item", "payload": {"type": "reasoning", "content": [{"type": "text", "text": "thinking"}]}})),
+            ev(
+                0,
+                json!({"type": "response_item", "payload": {"type": "function_call", "name": "shell"}}),
+            ),
+            ev(
+                1,
+                json!({"type": "response_item", "payload": {"type": "reasoning", "content": [{"type": "text", "text": "thinking"}]}}),
+            ),
         ];
         let (md, _) = render_markdown(&events, &header(), &default_options());
         assert!(!md.contains("shell"));
@@ -526,8 +555,14 @@ mod tests {
     #[test]
     fn respects_selected_indices() {
         let events = vec![
-            ev(3, json!({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "keep me"}]}})),
-            ev(7, json!({"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "drop me"}]}})),
+            ev(
+                3,
+                json!({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "keep me"}]}}),
+            ),
+            ev(
+                7,
+                json!({"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "drop me"}]}}),
+            ),
         ];
         let mut opts = default_options();
         opts.selected_indices = Some(vec![3]);
@@ -535,5 +570,35 @@ mod tests {
         assert_eq!(count, 1);
         assert!(md.contains("keep me"));
         assert!(!md.contains("drop me"));
+    }
+
+    #[test]
+    fn export_session_markdown_reads_full_codex_session_without_unbounded_preallocation(
+    ) -> AppResult<()> {
+        let file = temp_file("cc-session-manager-markdown-export-unbounded-limit-test");
+        {
+            let mut out = File::create(&file)?;
+            for value in [
+                json!({"type": "session_meta", "payload": {"id": "id"}}),
+                json!({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "question"}]}}),
+                json!({"type": "response_item", "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "answer"}]}}),
+            ] {
+                writeln!(out, "{}", serde_json::to_string(&value)?)?;
+            }
+        }
+
+        let report = export_session_markdown(
+            Some("codex".to_string()),
+            file.to_string_lossy().into_owned(),
+            None,
+            header(),
+            default_options(),
+        )?;
+        fs::remove_file(file).ok();
+
+        assert_eq!(report.message_count, 2);
+        assert!(report.markdown.contains("question"));
+        assert!(report.markdown.contains("answer"));
+        Ok(())
     }
 }

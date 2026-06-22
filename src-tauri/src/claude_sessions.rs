@@ -13,6 +13,7 @@ use crate::paths;
 const PROVIDER: &str = "claude";
 const SUBAGENT_SOURCE: &str = "subagent";
 const TITLE_MAX_CHARS: usize = 80;
+const PREVIEW_CAPACITY_HINT_MAX: usize = 1024;
 
 pub fn scan_sessions(claude_dir: &Path) -> AppResult<Vec<SessionSummary>> {
     let root = paths::claude_projects_dir(claude_dir);
@@ -36,7 +37,7 @@ pub fn scan_sessions(claude_dir: &Path) -> AppResult<Vec<SessionSummary>> {
 pub fn preview_range(path: &str, offset: usize, limit: usize) -> AppResult<Vec<PreviewEvent>> {
     let f = File::open(PathBuf::from(path))?;
     let reader = BufReader::new(f);
-    let mut out = Vec::with_capacity(limit);
+    let mut out = Vec::with_capacity(preview_capacity_hint(limit));
     let mut event_index = 0usize;
     for (i, line) in reader.lines().enumerate() {
         let line = line?;
@@ -58,6 +59,10 @@ pub fn preview_range(path: &str, offset: usize, limit: usize) -> AppResult<Vec<P
         }
     }
     Ok(out)
+}
+
+fn preview_capacity_hint(limit: usize) -> usize {
+    limit.min(PREVIEW_CAPACITY_HINT_MAX)
 }
 
 pub fn preview_meta(path: &str) -> AppResult<SessionMetaBrief> {
@@ -1193,6 +1198,39 @@ mod tests {
         assert_eq!(first.len(), 200);
         assert_eq!(second.len(), 26);
         assert_eq!(second.last().map(|event| event.index), Some(225));
+        Ok(())
+    }
+
+    #[test]
+    fn preview_range_accepts_unbounded_limit_without_unbounded_preallocation() -> AppResult<()> {
+        let claude = temp_dir("cc-session-manager-claude-unbounded-limit-test");
+        let file = write_session_values(
+            &claude,
+            "claude-unbounded.jsonl",
+            vec![
+                serde_json::json!({
+                    "sessionId": "claude-unbounded",
+                    "timestamp": "2026-04-20T10:00:00Z",
+                    "type": "user",
+                    "message": {"role": "user", "content": "hello"}
+                }),
+                serde_json::json!({
+                    "sessionId": "claude-unbounded",
+                    "timestamp": "2026-04-20T10:00:10Z",
+                    "type": "assistant",
+                    "message": {"role": "assistant", "content": "answer"}
+                }),
+            ],
+        )?;
+
+        let events = preview_range(&file.to_string_lossy(), 0, usize::MAX)?;
+        fs::remove_dir_all(&claude).ok();
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events.last().map(|event| event.text_summary.as_str()),
+            Some("answer")
+        );
         Ok(())
     }
 }
