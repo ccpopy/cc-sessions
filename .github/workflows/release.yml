@@ -10,15 +10,20 @@ permissions:
 
 jobs:
   build:
-    name: Build ${{ matrix.platform }}
+    name: Build ${{ matrix.label }}
     runs-on: ${{ matrix.platform }}
     strategy:
       fail-fast: false
       matrix:
-        platform:
-          - windows-latest
-          - macos-latest
-          - ubuntu-latest
+        include:
+          - platform: windows-latest
+            label: windows
+          - platform: macos-latest
+            label: macos-arm64
+          - platform: macos-15-intel
+            label: macos-intel
+          - platform: ubuntu-latest
+            label: linux
 
     steps:
       - name: Checkout
@@ -96,17 +101,16 @@ jobs:
             ## Changes
 
             ### 新增
-            - 新增 Claude GUI 会话列表可见性诊断与修复能力，可检测因标题推导失败而从 VS Code 等 GUI 历史列表中消失的 Claude Code 会话。
-            - 新增 `cc-sessions repair claude-gui [--fix] [--dry-run]`，支持在 CLI 中预览或补写 `custom-title` 记录来恢复 GUI 显示。
-            - 桌面端和浏览器 Web UI 的 Claude 修复页新增 GUI 会话列表修复入口，包含扫描统计、可修复会话列表、效果预览和确认修复流程。
+            - 新增会话导出为 Markdown，支持从会话卡片导出人眼可读的 Markdown 文件或复制 Markdown 文本。
+            - Markdown 导出支持 YAML 头信息、AI 交接前言、推理过程、工具调用和消息片段选择，便于个人知识管理和跨 AI 传递上下文。
+            - GitHub Release 新增 macOS Intel 构建产物，并继续保留 macOS Apple Silicon、Windows 和 Linux 产物。
 
             ### 改进
-            - 交互式 CLI 的修复菜单补充 Claude GUI 会话列表修复和 Claude history 残留清理入口，减少需要记忆子命令的场景。
-            - Claude GUI 会话列表修复会复刻官方 GUI 的标题推导规则，只对可确认不可见且能从会话内容推导标题的会话进行处理。
+            - macOS CLI 包按架构区分为 `macos-arm64` 和 `macos-intel`，避免两个 macOS Release job 上传同名产物时互相覆盖。
+            - README 补充 Markdown 导出能力说明，并更新发布产物说明。
 
             ### 修复
-            - 修复通知弹窗样式未加载导致 toast 撑开页面布局的问题。
-            - 修复 Claude Code 在中转 provider、长会话 compact 后续聊等场景下，GUI 因无法从会话文件头尾窗口推导标题而不显示历史会话的问题；修复时会在 jsonl 末尾追加与官方重命名一致的 `custom-title` 记录，不改动既有会话内容。
+            - 修复 Markdown 导出弹窗打开后，大会话因完整读取时错误预分配内存导致桌面端闪退的问题。
           releaseDraft: false
           prerelease: false
 
@@ -120,17 +124,11 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $version = node -p "require('./package.json').version"
-          $platform = switch ("${{ runner.os }}") {
-            "Windows" { "windows" }
-            "macOS" { "macos" }
-            "Linux" { "linux" }
-            default { throw "Unsupported runner OS: ${{ runner.os }}" }
+          $assets = @(Get-ChildItem -Path "release" -Filter "cc-sessions-cli-v$version-*.zip" -File)
+          if ($assets.Count -ne 1) {
+            throw "Expected exactly one CLI package for this job, found $($assets.Count)."
           }
-          $asset = "release/cc-sessions-cli-v$version-$platform.zip"
-          if (!(Test-Path $asset)) {
-            throw "CLI package was not found: $asset"
-          }
-          gh release upload "${{ github.ref_name }}" $asset --clobber
+          gh release upload "${{ github.ref_name }}" $assets[0].FullName --clobber
 
       - name: Create Windows portable executable
         if: matrix.platform == 'windows-latest'

@@ -15,6 +15,7 @@ CC Sessions 是一款本地桌面应用，用于浏览、检索、备份、导�
 - 支持按 ID、标题、首条消息及工作目录进行搜索。
 - 预览 JSONL 会话内容，区分用户消息、助手消息、推理过程、工具调用与工具返回。
 - 备份、恢复、导入、导出会话包。
+- 将会话导出为人眼可读的 Markdown，用于知识归档或多 AI 之间的上下文传递。
 - 修复 Codex 本地索引、重建 `threads` 表、清理 orphan 记录。
 - Codex 会话支持 provider 分支管理，并可从稳定对话节点创建回溯分支。
 - 设置页面支持手动检查 GitHub Release 更新，并跳转至最新 Release 下载页面。
@@ -206,11 +207,11 @@ git push origin main
 git push origin v0.2.6
 ```
 
-工作流会在 Windows、macOS 和 Linux 上分别构建 Tauri 安装产物。macOS 打包要求 `src-tauri/icons/icon.icns` 存在，本仓库已提交 Tauri 生成的跨平台图标文件。
+工作流会在 Windows、macOS Apple Silicon、macOS Intel 和 Linux 上分别构建 Tauri 安装产物。macOS 打包要求 `src-tauri/icons/icon.icns` 存在，本仓库已提交 Tauri 生成的跨平台图标文件。
 
 Windows Release 会额外上传 `cc-session-manager-portable-v版本号-windows.exe`，这是无需安装即可直接运行的便携版可执行文件。
 
-Release 也会在 Windows、macOS 和 Linux job 中分别上传 `cc-sessions-cli-v版本号-平台.zip`，这是不依赖桌面环境的 CLI 版本。远程仓库推送版本 tag 触发发布时，CLI 包会和桌面安装包一起出现在同一个 GitHub Release 中。
+Release 也会在 Windows、macOS Apple Silicon、macOS Intel 和 Linux job 中分别上传 `cc-sessions-cli-v版本号-平台.zip`，这是不依赖桌面环境的 CLI 版本；macOS CLI 包名会区分 `macos-arm64` 和 `macos-intel`。远程仓库推送版本 tag 触发发布时，CLI 包会和桌面安装包一起出现在同一个 GitHub Release 中。
 
 ## 手动打包
 
@@ -263,6 +264,8 @@ xattr -d com.apple.quarantine cc-session-manager
 [linux.do](https://linux.do) —— 真诚、友善、团结、专业，共建你我引以为荣之社区。
 
 [codex-session-cloner](https://github.com/goodnightzsj/codex-session-cloner) —— 参考了修复和会话导出导入的代码
+
+[thful](https://github.com/thful) —— 参与 Markdown 导出功能测试并反馈问题。
 
 ## License
 

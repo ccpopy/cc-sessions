@@ -88,9 +88,16 @@ function readPackageVersion() {
 
 function platformLabel() {
   if (process.platform === "win32") return "windows";
-  if (process.platform === "darwin") return "macos";
+  if (process.platform === "darwin") return `macos-${macosArchitectureLabel()}`;
   if (process.platform === "linux") return "linux";
   return process.platform;
+}
+
+function macosArchitectureLabel() {
+  const arch = os.arch();
+  if (arch === "arm64") return "arm64";
+  if (arch === "x64") return "intel";
+  throw new Error(`Unsupported macOS architecture: ${arch}`);
 }
 
 function executableName() {
