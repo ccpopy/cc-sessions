@@ -14,6 +14,8 @@ CC Sessions 是一款本地桌面应用，用于浏览、检索、备份、导�
 - 按 Codex / Claude Code 来源查看会话列表。
 - 支持按 ID、标题、首条消息及工作目录进行搜索。
 - 预览 JSONL 会话内容，区分用户消息、助手消息、推理过程、工具调用与工具返回。
+- 会话消息级编辑：在预览中原地改写用户/助手消息文本、删除单条上下文事件（自动级联配对的工具调用/返回、Codex 镜像行与关联推理，Claude 自动重连 parentUuid 链）；每次写入前自动保存原始快照并记录编辑日志，支持逐步撤销与一键还原，编辑后可直接 `resume` 续聊同一会话。思考/推理内容（Codex 加密、Claude 带签名）只可删除、不可改写。
+- 归档管理与官方 Codex app 对齐：归档会把 rollout 移入 `archived_sessions/` 并同步 threads 表与 `session_index.jsonl`，取消归档按文件名日期移回 `sessions/YYYY/MM/DD/`；官方 app 里已归档的会话也会纳入列表（含 threads 记录缺失的孤儿归档文件），可直接取消归档或删除。
 - 备份、恢复、导入、导出会话包。
 - 将会话导出为人眼可读的 Markdown，用于知识归档或多 AI 之间的上下文传递。
 - 修复 Codex 本地索引、重建 `threads` 表、清理 orphan 记录。
@@ -266,6 +268,8 @@ xattr -d com.apple.quarantine cc-session-manager
 [codex-session-cloner](https://github.com/goodnightzsj/codex-session-cloner) —— 参考了修复和会话导出导入的代码
 
 [thful](https://github.com/thful) —— 参与 Markdown 导出功能测试并反馈问题。
+
+L站用户 @fengtang —— 帮忙测试了本次更新内容。
 
 ## License
 

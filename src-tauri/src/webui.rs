@@ -12,7 +12,10 @@ use url::Url;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{ImportMode, ProjectPathMapping, Settings, SwitchStrategy};
-use crate::{backup, bundle, family, fs_ops, markdown_export, repair, rollout, sessions, settings, stats};
+use crate::{
+    backup, bundle, edit, family, fs_ops, markdown_export, repair, rollout, sessions, settings,
+    stats,
+};
 
 const WEBUI_TOKEN_HEADER: &str = "X-CC-Sessions-Webui-Token";
 const WEBUI_SETTINGS_ENV: &str = "CC_SESSIONS_WEBUI_SETTINGS";
@@ -209,6 +212,51 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
         "preview_session_meta" => to_result_value(rollout::preview_session_meta(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "rolloutPath")?,
+        )),
+        "plan_session_event_deletion" => to_result_value(edit::plan_session_event_deletion(
+            string_arg(&args, "provider")?,
+            string_arg(&args, "rolloutPath")?,
+            arg(&args, "lineNos")?,
+        )),
+        "edit_session_event_text" => to_result_value(edit::edit_session_event_text_with_lock(
+            string_arg(&args, "provider")?,
+            string_arg(&args, "rolloutPath")?,
+            string_arg(&args, "sessionId")?,
+            string_arg(&args, "backupDir")?,
+            usize_arg(&args, "lineNo")?,
+            string_arg(&args, "newText")?,
+            &state.family_lock,
+        )),
+        "delete_session_events" => to_result_value(edit::delete_session_events_with_lock(
+            string_arg(&args, "provider")?,
+            string_arg(&args, "rolloutPath")?,
+            string_arg(&args, "sessionId")?,
+            string_arg(&args, "backupDir")?,
+            arg(&args, "lineNos")?,
+            &state.family_lock,
+        )),
+        "undo_last_session_edit" => to_result_value(edit::undo_last_session_edit_with_lock(
+            string_arg(&args, "provider")?,
+            string_arg(&args, "rolloutPath")?,
+            string_arg(&args, "sessionId")?,
+            string_arg(&args, "backupDir")?,
+            &state.family_lock,
+        )),
+        "restore_session_edit_snapshot" => {
+            to_result_value(edit::restore_session_edit_snapshot_with_lock(
+                string_arg(&args, "provider")?,
+                string_arg(&args, "rolloutPath")?,
+                string_arg(&args, "sessionId")?,
+                string_arg(&args, "backupDir")?,
+                string_arg(&args, "snapshotName")?,
+                &state.family_lock,
+            ))
+        }
+        "session_edit_history" => to_result_value(edit::session_edit_history(
+            string_arg(&args, "provider")?,
+            string_arg(&args, "rolloutPath")?,
+            string_arg(&args, "sessionId")?,
+            string_arg(&args, "backupDir")?,
         )),
         "export_session_markdown" => to_result_value(markdown_export::export_session_markdown(
             opt_string_arg(&args, "provider")?,

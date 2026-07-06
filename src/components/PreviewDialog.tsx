@@ -6,9 +6,13 @@ import {
   FileJson,
   FolderOpen,
   GitBranch,
+  History,
   MessageSquare,
+  Pencil,
   Sparkles,
   Terminal,
+  Trash2,
+  Undo2,
   User,
   Wrench,
 } from "lucide-react";
@@ -35,7 +39,14 @@ import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
-import { api, type PreviewEvent, type SessionSummary } from "@/lib/api";
+import { Textarea } from "@/components/ui/textarea";
+import {
+  api,
+  type DeletePlan,
+  type EditHistory,
+  type PreviewEvent,
+  type SessionSummary,
+} from "@/lib/api";
 import { copyText } from "@/lib/clipboard";
 import { formatTimeString, humanTokens } from "@/lib/format";
 import { shouldIgnoreTextEditingHotkey } from "@/lib/keyboard";
@@ -49,7 +60,9 @@ type Props = {
   session: SessionSummary | null;
   customRolloutPath?: string;
   codexDir?: string;
+  backupDir?: string;
   onForked?: () => void | Promise<void>;
+  onEdited?: () => void | Promise<void>;
 };
 
 type DiffCommentPrompt = {
@@ -69,6 +82,20 @@ type ForkAction = {
   onSelect: (event: PreviewEvent) => void;
 };
 
+type EditActions = {
+  enabled: boolean;
+  pending: boolean;
+  canEditText: (event: PreviewEvent) => boolean;
+  canDelete: (event: PreviewEvent) => boolean;
+  onEdit: (event: PreviewEvent) => void;
+  onDelete: (event: PreviewEvent) => void;
+};
+
+type NodeActionSet = {
+  fork: ForkAction;
+  edit: EditActions;
+};
+
 const PAGE = 200;
 
 export function PreviewDialog({
@@ -77,7 +104,9 @@ export function PreviewDialog({
   session,
   customRolloutPath,
   codexDir,
+  backupDir,
   onForked,
+  onEdited,
 }: Props) {
   const rolloutPath = customRolloutPath ?? session?.rollout_path ?? "";
   const provider = session?.provider ?? "codex";
@@ -88,11 +117,20 @@ export function PreviewDialog({
   const [onlyMsg, setOnlyMsg] = useState(true);
   const [forkTarget, setForkTarget] = useState<PreviewEvent | null>(null);
   const [forking, setForking] = useState(false);
+  const [editTarget, setEditTarget] = useState<PreviewEvent | null>(null);
+  const [editText, setEditText] = useState("");
+  const [mutating, setMutating] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<PreviewEvent | null>(null);
+  const [deletePlan, setDeletePlan] = useState<DeletePlan | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [editHistory, setEditHistory] = useState<EditHistory | null>(null);
   const offsetRef = useRef(0);
   const loadingRef = useRef(false);
   const doneRef = useRef(false);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const canForkSession = provider === "codex" && !customRolloutPath && !!session && !!codexDir;
+  // 备份/导入预览（customRolloutPath）不允许编辑，只能编辑真实会话文件
+  const canMutateSession = !customRolloutPath && !!session && !!backupDir && !!rolloutPath;
 
   const loadMore = useCallback(async () => {
     if (loadingRef.current || doneRef.current || !rolloutPath) return;
@@ -117,17 +155,21 @@ export function PreviewDialog({
     }
   }, [provider, rolloutPath]);
 
-  useEffect(() => {
-    if (!open || !rolloutPath) return;
+  const resetAndReload = useCallback(() => {
     setEvents([]);
     setDone(false);
     doneRef.current = false;
     loadingRef.current = false;
-    setFilter("");
-    setOnlyMsg(true);
     offsetRef.current = 0;
     void loadMore();
-  }, [open, rolloutPath, loadMore]);
+  }, [loadMore]);
+
+  useEffect(() => {
+    if (!open || !rolloutPath) return;
+    setFilter("");
+    setOnlyMsg(true);
+    resetAndReload();
+  }, [open, rolloutPath, resetAndReload]);
 
   useEffect(() => {
     if (!open || loading || done) return;
@@ -282,6 +324,156 @@ export function PreviewDialog({
     }
   };
 
+  const requestEditAt = (event: PreviewEvent) => {
+    if (!canMutateSession) return;
+    setEditText(editableText(event));
+    setEditTarget(event);
+  };
+
+  const confirmEdit = async () => {
+    if (!session || !backupDir || !rolloutPath || !editTarget) return;
+    setMutating(true);
+    try {
+      const report = await api.editSessionEventText({
+        provider,
+        rollout_path: rolloutPath,
+        session_id: session.id,
+        backup_dir: backupDir,
+        line_no: editTarget.index,
+        new_text: editText,
+      });
+      toast.success(`已改写消息（含镜像共 ${report.changed_lines} 行）`, {
+        description: report.snapshot_created
+          ? `编辑前已自动保存原始快照 ${report.snapshot_created}`
+          : "本次编辑已记入编辑历史，可随时撤销",
+      });
+      setEditTarget(null);
+      resetAndReload();
+      await onEdited?.();
+    } catch (e: any) {
+      toast.error("改写失败", { description: String(e?.message ?? e) });
+    } finally {
+      setMutating(false);
+    }
+  };
+
+  const requestDeleteAt = (event: PreviewEvent) => {
+    if (!canMutateSession || !rolloutPath) return;
+    setDeletePlan(null);
+    setDeleteTarget(event);
+    api
+      .planSessionEventDeletion(provider, rolloutPath, [event.index])
+      .then(setDeletePlan)
+      .catch((e: any) => {
+        toast.error("生成删除计划失败", { description: String(e?.message ?? e) });
+        setDeleteTarget(null);
+      });
+  };
+
+  const confirmDelete = async () => {
+    if (!session || !backupDir || !rolloutPath || !deleteTarget) return;
+    setMutating(true);
+    try {
+      const report = await api.deleteSessionEvents({
+        provider,
+        rollout_path: rolloutPath,
+        session_id: session.id,
+        backup_dir: backupDir,
+        line_nos: [deleteTarget.index],
+      });
+      toast.success(`已删除 ${report.deleted_lines} 个事件`, {
+        description: report.snapshot_created
+          ? `删除前已自动保存原始快照 ${report.snapshot_created}`
+          : "本次删除已记入编辑历史，可随时撤销",
+      });
+      setDeleteTarget(null);
+      setDeletePlan(null);
+      resetAndReload();
+      await onEdited?.();
+    } catch (e: any) {
+      toast.error("删除失败", { description: String(e?.message ?? e) });
+    } finally {
+      setMutating(false);
+    }
+  };
+
+  const loadEditHistory = useCallback(async () => {
+    if (!session || !backupDir || !rolloutPath) return;
+    try {
+      const h = await api.sessionEditHistory({
+        provider,
+        rollout_path: rolloutPath,
+        session_id: session.id,
+        backup_dir: backupDir,
+      });
+      setEditHistory(h);
+    } catch (e: any) {
+      toast.error("读取编辑历史失败", { description: String(e?.message ?? e) });
+    }
+  }, [backupDir, provider, rolloutPath, session]);
+
+  const openEditHistory = () => {
+    setEditHistory(null);
+    setHistoryOpen(true);
+    void loadEditHistory();
+  };
+
+  const undoLastEdit = async () => {
+    if (!session || !backupDir || !rolloutPath) return;
+    setMutating(true);
+    try {
+      await api.undoLastSessionEdit({
+        provider,
+        rollout_path: rolloutPath,
+        session_id: session.id,
+        backup_dir: backupDir,
+      });
+      toast.success("已撤销最近一次编辑");
+      await loadEditHistory();
+      resetAndReload();
+      await onEdited?.();
+    } catch (e: any) {
+      toast.error("撤销失败", { description: String(e?.message ?? e) });
+    } finally {
+      setMutating(false);
+    }
+  };
+
+  const restoreSnapshot = async (name: string) => {
+    if (!session || !backupDir || !rolloutPath) return;
+    setMutating(true);
+    try {
+      const report = await api.restoreSessionEditSnapshot({
+        provider,
+        rollout_path: rolloutPath,
+        session_id: session.id,
+        backup_dir: backupDir,
+        snapshot_name: name,
+      });
+      toast.success(`已还原快照 ${name}`, {
+        description: report.snapshot_created
+          ? `还原前状态已另存为 ${report.snapshot_created}`
+          : undefined,
+      });
+      await loadEditHistory();
+      resetAndReload();
+      await onEdited?.();
+    } catch (e: any) {
+      toast.error("还原快照失败", { description: String(e?.message ?? e) });
+    } finally {
+      setMutating(false);
+    }
+  };
+
+  const editActions: EditActions = {
+    enabled: canMutateSession,
+    pending: mutating,
+    canEditText: (e) => canEditEventText(provider, e),
+    canDelete: (e) => canDeleteEvent(provider, e),
+    onEdit: requestEditAt,
+    onDelete: requestDeleteAt,
+  };
+
   return (
     <>
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -370,6 +562,17 @@ export function PreviewDialog({
                     <FolderOpen className="h-3.5 w-3.5" />
                     打开目录
                   </Button>
+                  {canMutateSession && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-8 gap-1.5 px-2.5"
+                      onClick={openEditHistory}
+                    >
+                      <History className="h-3.5 w-3.5" />
+                      编辑历史
+                    </Button>
+                  )}
                   <Separator orientation="vertical" className="mx-1 h-4 bg-border/60" />
                 </>
               )}
@@ -400,10 +603,13 @@ export function PreviewDialog({
               <EventBubble
                 key={e.index}
                 e={e}
-                forkAction={{
-                  enabled: canForkSession && isStableForkNode(e),
-                  pending: forking,
-                  onSelect: requestForkAt,
+                actions={{
+                  fork: {
+                    enabled: canForkSession && isStableForkNode(e),
+                    pending: forking,
+                    onSelect: requestForkAt,
+                  },
+                  edit: editActions,
                 }}
               />
             ))}
@@ -458,29 +664,207 @@ export function PreviewDialog({
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
+
+    {/* 编辑消息文本 */}
+    <Dialog open={!!editTarget} onOpenChange={(v) => !v && !mutating && setEditTarget(null)}>
+      <DialogContent className="sm:max-w-[640px]">
+        <DialogHeader>
+          <DialogTitle>改写消息文本</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-3">
+          <div className="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+            <span className="font-mono">line {editTarget ? editTarget.index + 1 : ""}</span>
+            <span className="mx-2 text-muted-foreground/50">·</span>
+            会话文件会原地改写（会话 ID 不变，可直接 resume 续聊）；Codex 镜像行会同步更新，
+            思考/推理与工具块保持原样。编辑前会自动保存原始快照，可在「编辑历史」中撤销或还原。
+          </div>
+          <Textarea
+            value={editText}
+            onChange={(e) => setEditText(e.target.value)}
+            rows={10}
+            className="max-h-[50vh] font-mono text-sm"
+            placeholder="消息文本"
+          />
+        </div>
+        <div className="flex justify-end gap-2">
+          <Button variant="outline" disabled={mutating} onClick={() => setEditTarget(null)}>
+            取消
+          </Button>
+          <Button disabled={mutating || !editText.trim()} onClick={() => void confirmEdit()}>
+            {mutating ? "保存中…" : "保存改写"}
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+
+    {/* 删除事件（展示级联计划） */}
+    <AlertDialog
+      open={!!deleteTarget}
+      onOpenChange={(v) => {
+        if (!v && !mutating) {
+          setDeleteTarget(null);
+          setDeletePlan(null);
+        }
+      }}
+    >
+      <AlertDialogContent className="sm:max-w-[640px]">
+        <AlertDialogHeader>
+          <AlertDialogTitle>删除会话事件</AlertDialogTitle>
+          <AlertDialogDescription>
+            为保证续聊不报错，配对的工具调用/返回、镜像行与关联推理会一起删除。
+            删除前会自动保存原始快照，可在「编辑历史」中撤销或还原。
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        {!deletePlan && (
+          <div className="py-2 text-center text-xs text-muted-foreground">正在生成删除计划…</div>
+        )}
+        {deletePlan && deletePlan.blocked.length > 0 && (
+          <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+            {deletePlan.blocked.map((b, i) => (
+              <div key={i}>{b}</div>
+            ))}
+          </div>
+        )}
+        {deletePlan && deletePlan.blocked.length === 0 && (
+          <div className="max-h-64 space-y-1 overflow-auto rounded-md border bg-muted/40 p-2">
+            {deletePlan.lines.map((l) => (
+              <div key={l.line_no} className="flex items-center gap-2 text-xs">
+                <span className="w-14 shrink-0 font-mono text-muted-foreground">
+                  line {l.line_no + 1}
+                </span>
+                <Badge
+                  variant={l.reason === "selected" ? "default" : "outline"}
+                  className="h-4 shrink-0 px-1 py-0 text-[10px] font-normal"
+                >
+                  {deleteReasonLabel(l.reason)}
+                </Badge>
+                <span className="shrink-0 text-muted-foreground">{l.role}</span>
+                <span className="min-w-0 flex-1 truncate">{l.summary}</span>
+              </div>
+            ))}
+          </div>
+        )}
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={mutating}>取消</AlertDialogCancel>
+          <AlertDialogAction
+            disabled={mutating || !deletePlan || deletePlan.blocked.length > 0}
+            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            onClick={(e) => {
+              e.preventDefault();
+              void confirmDelete();
+            }}
+          >
+            {mutating
+              ? "删除中…"
+              : `删除 ${deletePlan?.lines.length ?? 0} 个事件`}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+
+    {/* 编辑历史：撤销 / 快照还原 */}
+    <Dialog open={historyOpen} onOpenChange={(v) => !mutating && setHistoryOpen(v)}>
+      <DialogContent className="sm:max-w-[640px]">
+        <DialogHeader>
+          <DialogTitle>编辑历史</DialogTitle>
+        </DialogHeader>
+        {!editHistory ? (
+          <div className="py-6 text-center text-xs text-muted-foreground">加载中…</div>
+        ) : (
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <div className="text-xs text-muted-foreground">
+                {editHistory.entries.length > 0
+                  ? `共 ${editHistory.entries.length} 次操作`
+                  : "该会话还没有编辑记录"}
+              </div>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 gap-1.5"
+                disabled={mutating || !editHistory.undo_available}
+                title={editHistory.undo_blocked_reason ?? undefined}
+                onClick={() => void undoLastEdit()}
+              >
+                <Undo2 className="h-3.5 w-3.5" />
+                撤销最近一次
+              </Button>
+            </div>
+            {editHistory.undo_blocked_reason && (
+              <div className="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+                {editHistory.undo_blocked_reason}
+              </div>
+            )}
+            {editHistory.entries.length > 0 && (
+              <div className="max-h-48 space-y-1 overflow-auto rounded-md border bg-muted/30 p-2">
+                {editHistory.entries.map((entry) => (
+                  <div key={entry.op_id} className="flex items-center gap-2 text-xs">
+                    <span className="shrink-0 font-mono text-muted-foreground">
+                      {formatTimeString(entry.ts)}
+                    </span>
+                    <Badge variant="outline" className="h-4 shrink-0 px-1 py-0 text-[10px] font-normal">
+                      {editKindLabel(entry.kind)}
+                    </Badge>
+                    <span className="min-w-0 flex-1 truncate">{entry.description}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div>
+              <div className="mb-1.5 text-xs font-medium">原始快照</div>
+              {editHistory.snapshots.length === 0 ? (
+                <div className="text-xs text-muted-foreground">
+                  暂无快照（首次改写或删除时会自动创建）
+                </div>
+              ) : (
+                <div className="max-h-40 space-y-1 overflow-auto rounded-md border bg-muted/30 p-2">
+                  {editHistory.snapshots.map((snap) => (
+                    <div key={snap.name} className="flex items-center gap-2 text-xs">
+                      <span className="min-w-0 flex-1 truncate font-mono">{snap.name}</span>
+                      <span className="shrink-0 text-muted-foreground">
+                        {formatTimeString(snap.created_at)}
+                      </span>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-6 shrink-0 px-2 text-xs"
+                        disabled={mutating}
+                        onClick={() => void restoreSnapshot(snap.name)}
+                      >
+                        还原
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
     </>
   );
 }
 
 /* ---------- 单条事件（聊天气泡）---------- */
 
-function EventBubble({ e, forkAction }: { e: PreviewEvent; forkAction: ForkAction }) {
+function EventBubble({ e, actions }: { e: PreviewEvent; actions: NodeActionSet }) {
   const ts = formatTimeString(e.timestamp);
 
   if (isEventMessage(e)) {
-    return <EventMessageBubble e={e} ts={ts} forkAction={forkAction} />;
+    return <EventMessageBubble e={e} ts={ts} actions={actions} />;
   }
   if (e.role === "user") {
-    return <UserBubble e={e} ts={ts} forkAction={forkAction} />;
+    return <UserBubble e={e} ts={ts} actions={actions} />;
   }
   if (e.role === "assistant") {
-    return <AssistantBubble e={e} ts={ts} forkAction={forkAction} />;
+    return <AssistantBubble e={e} ts={ts} actions={actions} />;
   }
   if (e.role === "reasoning") {
-    return <ReasoningBubble e={e} ts={ts} />;
+    return <ReasoningBubble e={e} ts={ts} actions={actions} />;
   }
   if (e.role === "tool_call" || e.role === "tool_result") {
-    return <ToolBubble e={e} ts={ts} />;
+    return <ToolBubble e={e} ts={ts} actions={actions} />;
   }
   if (e.role === "meta") {
     return <MetaLine e={e} ts={ts} />;
@@ -491,11 +875,11 @@ function EventBubble({ e, forkAction }: { e: PreviewEvent; forkAction: ForkActio
 function EventMessageBubble({
   e,
   ts,
-  forkAction,
+  actions,
 }: {
   e: PreviewEvent;
   ts: string;
-  forkAction: ForkAction;
+  actions: NodeActionSet;
 }) {
   const [open, setOpen] = useState(false);
   return (
@@ -517,7 +901,7 @@ function EventMessageBubble({
             </span>
             {ts && <span className="shrink-0 font-mono text-muted-foreground/70">{ts}</span>}
           </button>
-          <ForkNodeButton event={e} action={forkAction} />
+          <NodeActionButtons event={e} actions={actions} />
         </div>
         {open && (
           <div className="mt-1.5 overflow-auto rounded-md border bg-card p-3 text-xs">
@@ -533,23 +917,23 @@ function EventMessageBubble({
   );
 }
 
-function UserBubble({ e, ts, forkAction }: { e: PreviewEvent; ts: string; forkAction: ForkAction }) {
+function UserBubble({ e, ts, actions }: { e: PreviewEvent; ts: string; actions: NodeActionSet }) {
   const text = extractText(e);
   const embeddedTranscript = parseEmbeddedTranscriptPrompt(text);
   if (embeddedTranscript) {
-    return <EmbeddedTranscriptBubble e={e} ts={ts} prompt={embeddedTranscript} forkAction={forkAction} />;
+    return <EmbeddedTranscriptBubble e={e} ts={ts} prompt={embeddedTranscript} actions={actions} />;
   }
 
   const diffComments = parseDiffCommentPrompt(text);
   if (diffComments) {
-    return <DiffCommentBubble e={e} ts={ts} prompt={diffComments} forkAction={forkAction} />;
+    return <DiffCommentBubble e={e} ts={ts} prompt={diffComments} actions={actions} />;
   }
 
   return (
     <div className="group flex justify-end gap-3">
       <div className="flex min-w-0 max-w-[85%] flex-col items-end overflow-hidden">
         <div className="mb-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
-          <ForkNodeButton event={e} action={forkAction} />
+          <NodeActionButtons event={e} actions={actions} />
           <span>你</span>
           <EventSourceBadge e={e} />
           {ts && <span className="font-mono">· {ts}</span>}
@@ -569,19 +953,19 @@ function EmbeddedTranscriptBubble({
   e,
   ts,
   prompt,
-  forkAction,
+  actions,
 }: {
   e: PreviewEvent;
   ts: string;
   prompt: EmbeddedTranscriptPrompt;
-  forkAction: ForkAction;
+  actions: NodeActionSet;
 }) {
   const [open, setOpen] = useState(false);
   return (
     <div className="group flex justify-end gap-3">
       <div className="flex min-w-0 max-w-[85%] flex-col items-end overflow-hidden">
         <div className="mb-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
-          <ForkNodeButton event={e} action={forkAction} />
+          <NodeActionButtons event={e} actions={actions} />
           <span>你</span>
           <EventSourceBadge e={e} />
           {ts && <span className="font-mono">· {ts}</span>}
@@ -624,12 +1008,12 @@ function DiffCommentBubble({
   e,
   ts,
   prompt,
-  forkAction,
+  actions,
 }: {
   e: PreviewEvent;
   ts: string;
   prompt: DiffCommentPrompt;
-  forkAction: ForkAction;
+  actions: NodeActionSet;
 }) {
   const countLabel = `${prompt.comments.length} 条批注`;
 
@@ -637,7 +1021,7 @@ function DiffCommentBubble({
     <div className="group flex justify-end gap-3">
       <div className="flex min-w-0 max-w-[85%] flex-col items-end overflow-hidden">
         <div className="mb-1 flex items-center gap-1.5 text-[11px] text-muted-foreground">
-          <ForkNodeButton event={e} action={forkAction} />
+          <NodeActionButtons event={e} actions={actions} />
           <span>你</span>
           <EventSourceBadge e={e} />
           {ts && <span className="font-mono">· {ts}</span>}
@@ -682,11 +1066,11 @@ function DiffCommentBubble({
 function AssistantBubble({
   e,
   ts,
-  forkAction,
+  actions,
 }: {
   e: PreviewEvent;
   ts: string;
-  forkAction: ForkAction;
+  actions: NodeActionSet;
 }) {
   const text = extractText(e);
   return (
@@ -697,7 +1081,7 @@ function AssistantBubble({
           <span>Assistant</span>
           <EventSourceBadge e={e} />
           {ts && <span className="font-mono">· {ts}</span>}
-          <ForkNodeButton event={e} action={forkAction} />
+          <NodeActionButtons event={e} actions={actions} />
         </div>
         <div className="chat-md max-w-full rounded-2xl rounded-tl-sm border bg-card px-4 py-3 text-card-foreground shadow-sm">
           {text ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown> : (
@@ -709,23 +1093,26 @@ function AssistantBubble({
   );
 }
 
-function ReasoningBubble({ e, ts }: { e: PreviewEvent; ts: string }) {
+function ReasoningBubble({ e, ts, actions }: { e: PreviewEvent; ts: string; actions: NodeActionSet }) {
   const text = extractText(e);
   const [open, setOpen] = useState(false);
   return (
-    <div className="flex gap-3">
+    <div className="group flex gap-3">
       <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-muted">
         <Sparkles className="h-4 w-4 text-muted-foreground/70" />
       </div>
       <div className="min-w-0 flex-1">
-        <button
-          onClick={() => setOpen((x) => !x)}
-          className="flex items-center gap-1.5 text-[11px] text-muted-foreground hover:text-foreground"
-        >
-          <ChevronDown className={cn("h-3 w-3 transition-transform", open && "rotate-180")} />
-          推理过程
-          {ts && <span className="font-mono">· {ts}</span>}
-        </button>
+        <div className="flex items-center gap-1.5">
+          <button
+            onClick={() => setOpen((x) => !x)}
+            className="flex items-center gap-1.5 text-[11px] text-muted-foreground hover:text-foreground"
+          >
+            <ChevronDown className={cn("h-3 w-3 transition-transform", open && "rotate-180")} />
+            推理过程
+            {ts && <span className="font-mono">· {ts}</span>}
+          </button>
+          <NodeActionButtons event={e} actions={actions} />
+        </div>
         {open && text && (
           <pre className="mt-1.5 whitespace-pre-wrap break-words rounded-md border border-dashed bg-muted/40 px-3 py-2 font-mono text-xs text-muted-foreground">
             {text}
@@ -736,11 +1123,11 @@ function ReasoningBubble({ e, ts }: { e: PreviewEvent; ts: string }) {
   );
 }
 
-function ToolBubble({ e, ts }: { e: PreviewEvent; ts: string }) {
+function ToolBubble({ e, ts, actions }: { e: PreviewEvent; ts: string; actions: NodeActionSet }) {
   const [open, setOpen] = useState(false);
   const isCall = e.role === "tool_call";
   return (
-    <div className="flex gap-3">
+    <div className="group flex gap-3">
       <div
         className={cn(
           "flex h-8 w-8 shrink-0 items-center justify-center rounded-full",
@@ -750,18 +1137,21 @@ function ToolBubble({ e, ts }: { e: PreviewEvent; ts: string }) {
         {isCall ? <Wrench className="h-4 w-4" /> : <Terminal className="h-4 w-4" />}
       </div>
       <div className="min-w-0 flex-1">
-        <button
-          onClick={() => setOpen((x) => !x)}
-          className="flex w-full items-center gap-2 rounded-md border bg-card px-3 py-2 text-left text-xs shadow-sm hover:bg-accent"
-        >
-          <ChevronDown className={cn("h-3.5 w-3.5 shrink-0 transition-transform", open && "rotate-180")} />
-          <span className="font-medium">{isCall ? "工具调用" : "工具返回"}</span>
-          <span className="truncate font-mono text-muted-foreground">{e.kind}</span>
-          <span className="ml-auto min-w-0 flex-1 truncate text-muted-foreground">
-            {e.text_summary || ""}
-          </span>
-          {ts && <span className="shrink-0 font-mono text-muted-foreground/70">{ts}</span>}
-        </button>
+        <div className="flex w-full items-center gap-2 rounded-md border bg-card px-3 py-2 text-left text-xs shadow-sm hover:bg-accent">
+          <button
+            onClick={() => setOpen((x) => !x)}
+            className="flex min-w-0 flex-1 items-center gap-2 text-left"
+          >
+            <ChevronDown className={cn("h-3.5 w-3.5 shrink-0 transition-transform", open && "rotate-180")} />
+            <span className="font-medium">{isCall ? "工具调用" : "工具返回"}</span>
+            <span className="truncate font-mono text-muted-foreground">{e.kind}</span>
+            <span className="ml-auto min-w-0 flex-1 truncate text-muted-foreground">
+              {e.text_summary || ""}
+            </span>
+            {ts && <span className="shrink-0 font-mono text-muted-foreground/70">{ts}</span>}
+          </button>
+          <NodeActionButtons event={e} actions={actions} />
+        </div>
         {open && (
           <div className="mt-1.5 overflow-auto rounded-md border bg-card p-3 text-xs">
             <JsonView
@@ -825,24 +1215,67 @@ function DefaultBubble({ e, ts }: { e: PreviewEvent; ts: string }) {
   );
 }
 
-function ForkNodeButton({ event, action }: { event: PreviewEvent; action: ForkAction }) {
-  if (!action.enabled) return null;
+function NodeActionButtons({ event, actions }: { event: PreviewEvent; actions: NodeActionSet }) {
+  const showFork = actions.fork.enabled;
+  const showEdit = actions.edit.enabled && actions.edit.canEditText(event);
+  const showDelete = actions.edit.enabled && actions.edit.canDelete(event);
+  if (!showFork && !showEdit && !showDelete) return null;
+  const btnClass =
+    "h-5 shrink-0 gap-1 px-1.5 text-[11px] opacity-0 transition-opacity duration-150 pointer-events-none group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100";
   return (
-    <Button
-      type="button"
-      variant="ghost"
-      size="sm"
-      className="h-5 shrink-0 gap-1 px-1.5 text-[11px] opacity-0 transition-opacity duration-150 pointer-events-none group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100"
-      disabled={action.pending}
-      onClick={(e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        action.onSelect(event);
-      }}
-    >
-      <GitBranch className="h-3 w-3" />
-      回溯
-    </Button>
+    <span className="inline-flex shrink-0 items-center gap-0.5">
+      {showFork && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className={btnClass}
+          disabled={actions.fork.pending}
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            actions.fork.onSelect(event);
+          }}
+        >
+          <GitBranch className="h-3 w-3" />
+          回溯
+        </Button>
+      )}
+      {showEdit && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className={btnClass}
+          disabled={actions.edit.pending}
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            actions.edit.onEdit(event);
+          }}
+        >
+          <Pencil className="h-3 w-3" />
+          编辑
+        </Button>
+      )}
+      {showDelete && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className={cn(btnClass, "text-destructive hover:text-destructive")}
+          disabled={actions.edit.pending}
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            actions.edit.onDelete(event);
+          }}
+        >
+          <Trash2 className="h-3 w-3" />
+          删除
+        </Button>
+      )}
+    </span>
   );
 }
 
@@ -1079,4 +1512,108 @@ function rawType(e: PreviewEvent): string {
 function payloadType(e: PreviewEvent): string {
   const raw = e.raw as { payload?: { type?: unknown } } | null;
   return typeof raw?.payload?.type === "string" ? raw.payload.type : "";
+}
+
+/* ---------- 编辑 / 删除能力判断（与后端 edit.rs 规则对应）---------- */
+
+const CODEX_DELETABLE_RESPONSE_ITEMS = new Set([
+  "message",
+  "reasoning",
+  "function_call",
+  "custom_tool_call",
+  "local_shell_call",
+  "web_search_call",
+  "function_call_output",
+  "custom_tool_call_output",
+]);
+
+function canEditEventText(provider: string, e: PreviewEvent): boolean {
+  if (provider === "codex") {
+    const outer = rawType(e);
+    const pt = payloadType(e);
+    if (outer === "event_msg") return pt === "user_message" || pt === "agent_message";
+    if (outer === "response_item" && pt === "message") {
+      return editableText(e).length > 0;
+    }
+    return false;
+  }
+  // Claude：user/assistant 消息且含文本块（thinking 带签名、工具块结构化，均不可改写）
+  const raw = e.raw as any;
+  if (!raw?.message || (raw?.type !== "user" && raw?.type !== "assistant")) return false;
+  return editableText(e).length > 0;
+}
+
+function canDeleteEvent(provider: string, e: PreviewEvent): boolean {
+  if (provider === "codex") {
+    const outer = rawType(e);
+    const pt = payloadType(e);
+    if (outer === "event_msg") return pt === "user_message" || pt === "agent_message";
+    if (outer === "response_item") return CODEX_DELETABLE_RESPONSE_ITEMS.has(pt);
+    return false;
+  }
+  const raw = e.raw as any;
+  return (
+    !!raw?.message &&
+    typeof raw?.uuid === "string" &&
+    (raw?.type === "user" || raw?.type === "assistant")
+  );
+}
+
+/** 后端改写的目标文本：与 edit.rs 的 replace_text_items 语义一致（text 项按换行拼接） */
+function editableText(e: PreviewEvent): string {
+  const r = e.raw as any;
+  if (!r) return "";
+  if (r.payload) {
+    // Codex
+    if (typeof r.payload.message === "string") return r.payload.message;
+    const c = r.payload.content;
+    if (typeof c === "string") return c;
+    if (Array.isArray(c)) {
+      return c
+        .filter((x: any) => typeof x?.text === "string")
+        .map((x: any) => x.text)
+        .join("\n");
+    }
+    return "";
+  }
+  // Claude
+  const c = r?.message?.content;
+  if (typeof c === "string") return c;
+  if (Array.isArray(c)) {
+    return c
+      .filter((x: any) => x?.type === "text" && typeof x.text === "string")
+      .map((x: any) => x.text)
+      .join("\n");
+  }
+  return "";
+}
+
+function deleteReasonLabel(reason: string): string {
+  switch (reason) {
+    case "selected":
+      return "选中";
+    case "tool_pair":
+      return "工具配对";
+    case "mirror":
+      return "镜像行";
+    case "reasoning_attached":
+      return "关联推理";
+    default:
+      return reason;
+  }
+}
+
+function editKindLabel(kind: string): string {
+  switch (kind) {
+    case "edit_text":
+      return "改写";
+    case "delete_events":
+      return "删除";
+    case "undo":
+      return "撤销";
+    case "restore_snapshot":
+      return "还原";
+    default:
+      return kind;
+  }
 }

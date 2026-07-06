@@ -523,25 +523,25 @@ fn is_toml_key_assignment(line: &str, key: &str) -> bool {
 
 // ========================= 诊断 =========================
 
-struct RolloutBrief {
-    path: PathBuf,
-    relpath: PathBuf,
-    id: String,
-    model_provider: Option<String>,
-    source: Option<String>,
-    cwd: Option<String>,
-    sandbox_policy: Option<String>,
-    approval_mode: Option<String>,
-    memory_mode: Option<String>,
-    model: Option<String>,
-    reasoning_effort: Option<String>,
-    first_user_message: String,
-    tokens_used: i64,
-    updated_at_ms: i64,
-    created_at_ms: i64,
+pub(crate) struct RolloutBrief {
+    pub(crate) path: PathBuf,
+    pub(crate) relpath: PathBuf,
+    pub(crate) id: String,
+    pub(crate) model_provider: Option<String>,
+    pub(crate) source: Option<String>,
+    pub(crate) cwd: Option<String>,
+    pub(crate) sandbox_policy: Option<String>,
+    pub(crate) approval_mode: Option<String>,
+    pub(crate) memory_mode: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
+    pub(crate) first_user_message: String,
+    pub(crate) tokens_used: i64,
+    pub(crate) updated_at_ms: i64,
+    pub(crate) created_at_ms: i64,
 }
 
-fn read_rollout_brief(codex_dir: &Path, path: &Path) -> AppResult<Option<RolloutBrief>> {
+pub(crate) fn read_rollout_brief(codex_dir: &Path, path: &Path) -> AppResult<Option<RolloutBrief>> {
     let f = fs::File::open(path)?;
     let reader = BufReader::new(f);
     let mut id: Option<String> = None;
@@ -1837,7 +1837,7 @@ fn bind_thread_values(values: &[Value]) -> Vec<Box<dyn rusqlite::ToSql>> {
         .collect()
 }
 
-fn upsert_thread_from_rollout(
+pub(crate) fn upsert_thread_from_rollout(
     codex: &Path,
     state: &rusqlite::Connection,
     rollout: &Path,
@@ -2957,7 +2957,7 @@ fn rewrite_provider_inplace(path: &Path, new_provider: &str) -> AppResult<()> {
     Ok(())
 }
 
-fn append_index_line(
+pub(crate) fn append_index_line(
     codex: &Path,
     id: &str,
     thread_name: &str,

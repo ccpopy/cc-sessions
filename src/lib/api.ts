@@ -140,6 +140,50 @@ export type DeleteResult = {
   error: string | null;
 };
 
+export type DeletePlanLine = {
+  line_no: number;
+  role: string;
+  kind: string;
+  summary: string;
+  reason: "selected" | "tool_pair" | "mirror" | "reasoning_attached" | string;
+};
+
+export type DeletePlan = {
+  rollout_path: string;
+  lines: DeletePlanLine[];
+  blocked: string[];
+};
+
+export type EditApplyReport = {
+  op_id: string;
+  kind: string;
+  snapshot_created: string | null;
+  changed_lines: number;
+  deleted_lines: number;
+  restored_lines: number;
+};
+
+export type EditHistoryEntry = {
+  op_id: string;
+  ts: string;
+  kind: string;
+  description: string;
+  changes: number;
+};
+
+export type EditSnapshotInfo = {
+  name: string;
+  created_at: string;
+  bytes: number;
+};
+
+export type EditHistory = {
+  entries: EditHistoryEntry[];
+  snapshots: EditSnapshotInfo[];
+  undo_available: boolean;
+  undo_blocked_reason: string | null;
+};
+
 export type BackupSummary = {
   path: string;
   name: string;
@@ -841,6 +885,80 @@ export const api = {
       sessionId: p.session_id,
       rolloutPath: p.rollout_path,
       eventIndex: p.event_index,
+    }),
+  planSessionEventDeletion: (provider: string, rolloutPath: string, lineNos: number[]) =>
+    invokeCommand<DeletePlan>("plan_session_event_deletion", {
+      provider,
+      rolloutPath,
+      lineNos,
+    }),
+  editSessionEventText: (p: {
+    provider: string;
+    rollout_path: string;
+    session_id: string;
+    backup_dir: string;
+    line_no: number;
+    new_text: string;
+  }) =>
+    invokeCommand<EditApplyReport>("edit_session_event_text", {
+      provider: p.provider,
+      rolloutPath: p.rollout_path,
+      sessionId: p.session_id,
+      backupDir: p.backup_dir,
+      lineNo: p.line_no,
+      newText: p.new_text,
+    }),
+  deleteSessionEvents: (p: {
+    provider: string;
+    rollout_path: string;
+    session_id: string;
+    backup_dir: string;
+    line_nos: number[];
+  }) =>
+    invokeCommand<EditApplyReport>("delete_session_events", {
+      provider: p.provider,
+      rolloutPath: p.rollout_path,
+      sessionId: p.session_id,
+      backupDir: p.backup_dir,
+      lineNos: p.line_nos,
+    }),
+  undoLastSessionEdit: (p: {
+    provider: string;
+    rollout_path: string;
+    session_id: string;
+    backup_dir: string;
+  }) =>
+    invokeCommand<EditApplyReport>("undo_last_session_edit", {
+      provider: p.provider,
+      rolloutPath: p.rollout_path,
+      sessionId: p.session_id,
+      backupDir: p.backup_dir,
+    }),
+  restoreSessionEditSnapshot: (p: {
+    provider: string;
+    rollout_path: string;
+    session_id: string;
+    backup_dir: string;
+    snapshot_name: string;
+  }) =>
+    invokeCommand<EditApplyReport>("restore_session_edit_snapshot", {
+      provider: p.provider,
+      rolloutPath: p.rollout_path,
+      sessionId: p.session_id,
+      backupDir: p.backup_dir,
+      snapshotName: p.snapshot_name,
+    }),
+  sessionEditHistory: (p: {
+    provider: string;
+    rollout_path: string;
+    session_id: string;
+    backup_dir: string;
+  }) =>
+    invokeCommand<EditHistory>("session_edit_history", {
+      provider: p.provider,
+      rolloutPath: p.rollout_path,
+      sessionId: p.session_id,
+      backupDir: p.backup_dir,
     }),
   batchCloneForCurrentProvider: (p: {
     codex_dir: string;

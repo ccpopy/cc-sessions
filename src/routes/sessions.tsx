@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
-import { Loader2, MessageSquare, Network, RotateCw } from "lucide-react";
+import { Archive, Loader2, MessageSquare, Network, RotateCw } from "lucide-react";
 import { TopBar } from "@/components/TopBar";
 import { SessionList } from "@/components/SessionList";
 import { PreviewDialog } from "@/components/PreviewDialog";
@@ -37,6 +37,8 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const setPrefill = useView((s) => s.setPrefillCwd);
   const showSubagentSessions = useView((s) => s.showSubagentSessions);
   const setShowSubagentSessions = useView((s) => s.setShowSubagentSessions);
+  const showArchivedSessions = useView((s) => s.showArchivedSessions);
+  const setShowArchivedSessions = useView((s) => s.setShowArchivedSessions);
 
   const [preview, setPreview] = useState<SessionSummary | null>(null);
   const [exportTarget, setExportTarget] = useState<SessionSummary | null>(null);
@@ -98,11 +100,16 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
       if (isSubagent !== showSubagentSessions) {
         continue;
       }
+      // 归档开关与子代理开关同语义：关=只看活跃，开=只看已归档；
+      // 显式 id:/archived: 查询时不再二次过滤
+      if (isCodex && !showHiddenRecords && session.archived !== showArchivedSessions) {
+        continue;
+      }
       if (isCodex && !showHiddenRecords && isHiddenFamilyBranch(session, sessionOverlay)) continue;
       visible.push(session);
     }
     return visible;
-  }, [sessions, overlay, showHiddenRecords, isCodex, showSubagentSessions]);
+  }, [sessions, overlay, showHiddenRecords, isCodex, showSubagentSessions, showArchivedSessions]);
 
   useEffect(() => {
     if (selected.size === 0) return;
@@ -255,6 +262,17 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             aria-label="显示子代理会话"
           />
         </div>
+        {isCodex && (
+          <div className="flex h-8 shrink-0 items-center gap-2 rounded-md border border-border/70 bg-muted/30 px-2.5 text-xs text-muted-foreground">
+            <Archive className="h-3.5 w-3.5" />
+            <span className="hidden whitespace-nowrap md:inline">已归档</span>
+            <Switch
+              checked={showArchivedSessions}
+              onCheckedChange={setShowArchivedSessions}
+              aria-label="只看已归档会话"
+            />
+          </div>
+        )}
       </TopBar>
 
       {prefillCwd && (
@@ -344,8 +362,13 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         onOpenChange={(v) => !v && setPreview(null)}
         session={preview}
         codexDir={settings.codex_dir}
+        backupDir={settings.backup_dir}
         onForked={async () => {
           setPreview(null);
+          await refresh();
+          await refreshOverlay();
+        }}
+        onEdited={async () => {
           await refresh();
           await refreshOverlay();
         }}

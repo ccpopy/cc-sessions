@@ -101,16 +101,19 @@ jobs:
             ## Changes
 
             ### 新增
-            - 新增会话导出为 Markdown，支持从会话卡片导出人眼可读的 Markdown 文件或复制 Markdown 文本。
-            - Markdown 导出支持 YAML 头信息、AI 交接前言、推理过程、工具调用和消息片段选择，便于个人知识管理和跨 AI 传递上下文。
-            - GitHub Release 新增 macOS Intel 构建产物，并继续保留 macOS Apple Silicon、Windows 和 Linux 产物。
+            - 新增预览弹窗中的消息级编辑和删除入口，Codex 与 Claude 会话都支持在原始会话文件上精确改写。
+            - 新增编辑前自动快照和 `journal.jsonl` 操作日志，支持按字节记录修改过程，便于审计和后续恢复。
+            - 新增官方归档会话支持，可识别 `archived_sessions` 中的会话，并与 `threads` 表、会话索引保持同步。
 
             ### 改进
-            - macOS CLI 包按架构区分为 `macos-arm64` 和 `macos-intel`，避免两个 macOS Release job 上传同名产物时互相覆盖。
-            - README 补充 Markdown 导出能力说明，并更新发布产物说明。
+            - 编辑操作会保留 Codex 镜像事件、Claude thinking、工具调用结果和会话元数据，避免破坏恢复链路。
+            - 删除操作会先生成可确认的删除计划，再按会话结构清理关联工具调用、结果、推理和元数据。
+            - 会话归档列表新增已归档筛选，并支持取消归档时自动移回原会话目录、更新索引和数据库记录。
+            - 修复页和 CLI 复用新的归档识别逻辑，避免将官方归档会话误判为孤立或缺失记录。
 
             ### 修复
-            - 修复 Markdown 导出弹窗打开后，大会话因完整读取时错误预分配内存导致桌面端闪退的问题。
+            - 修复归档状态下删除会话时只查数据库导致无法定位孤立归档文件的问题。
+            - 修复 Codex 分支会话编辑时可能与分支操作互相覆盖的问题，编辑写入会持有同一套 family 锁。
           releaseDraft: false
           prerelease: false
 

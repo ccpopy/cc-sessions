@@ -682,3 +682,64 @@ pub struct FamilyOverlay {
     /// "matches" / "resync" / "clonable" / "has_clone" / "unknown"
     pub clone_state: String,
 }
+
+// ========================= 会话消息级编辑 =========================
+
+/// 删除计划中的一行：除用户选中的行外，还包含按完整性规则级联进来的行。
+#[derive(Debug, Clone, Serialize)]
+pub struct DeletePlanLine {
+    /// 物理行号（与 PreviewEvent.index 一致）
+    pub line_no: usize,
+    pub role: String,
+    pub kind: String,
+    pub summary: String,
+    /// selected（用户选中）/ tool_pair（工具调用配对）/ mirror（Codex 镜像行）
+    /// / reasoning_attached（推理块随所属回复联动）
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeletePlan {
+    pub rollout_path: String,
+    pub lines: Vec<DeletePlanLine>,
+    /// 不允许删除的行与原因（如 session_meta）
+    pub blocked: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EditApplyReport {
+    pub op_id: String,
+    /// edit_text / delete_events / undo / restore_snapshot
+    pub kind: String,
+    /// 本次操作前若新建了原始快照，返回快照文件名
+    pub snapshot_created: Option<String>,
+    pub changed_lines: u32,
+    pub deleted_lines: u32,
+    pub restored_lines: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EditHistoryEntry {
+    pub op_id: String,
+    pub ts: String,
+    pub kind: String,
+    pub description: String,
+    pub changes: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EditSnapshotInfo {
+    pub name: String,
+    pub created_at: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EditHistory {
+    /// 新 → 旧
+    pub entries: Vec<EditHistoryEntry>,
+    /// 新 → 旧
+    pub snapshots: Vec<EditSnapshotInfo>,
+    pub undo_available: bool,
+    pub undo_blocked_reason: Option<String>,
+}

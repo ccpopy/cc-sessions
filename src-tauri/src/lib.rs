@@ -1,6 +1,7 @@
 pub mod backup;
 pub mod bundle;
 pub mod claude_sessions;
+pub mod edit;
 pub mod error;
 pub mod family;
 pub mod fs_ops;
@@ -55,6 +56,12 @@ pub fn run() {
             rollout::preview_session_head,
             rollout::preview_session_range,
             rollout::preview_session_meta,
+            edit::plan_session_event_deletion,
+            edit::edit_session_event_text,
+            edit::delete_session_events,
+            edit::undo_last_session_edit,
+            edit::restore_session_edit_snapshot,
+            edit::session_edit_history,
             markdown_export::export_session_markdown,
             backup::create_backup,
             backup::list_backups,
