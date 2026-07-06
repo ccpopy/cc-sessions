@@ -269,7 +269,7 @@ xattr -d com.apple.quarantine cc-session-manager
 
 [thful](https://github.com/thful) —— 参与 Markdown 导出功能测试并反馈问题。
 
-L站用户 @fengtang —— 帮忙测试了本次更新内容。
+L站用户 @fengtang —— 参与会话编辑、删除和官方归档会话相关功能测试并反馈问题。
 
 ## License
 
