@@ -2900,8 +2900,12 @@ fn clone_session_for_provider_locked(
                 note: Some(format!("cloned_from:{}", cloned_from_id)),
             };
             if matches!(strategy, SwitchStrategy::Scatter) {
-                // 散点模式：保留旧 active 状态（不自动降级）——需要自定义 append
                 if let Some(f) = store.families.get_mut(&family_id) {
+                    for b in f.chain.iter_mut() {
+                        if matches!(b.status, BranchStatus::Active) {
+                            b.status = BranchStatus::Archived;
+                        }
+                    }
                     f.chain.push(new_branch);
                     f.active_id = new_id.clone();
                     f.updated_at = chrono::Utc::now().to_rfc3339();

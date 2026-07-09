@@ -154,9 +154,9 @@ export function FamilyHistorySheet({
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent
         side="right"
-        className="flex min-w-0 w-[560px] max-w-[92vw] flex-col overflow-hidden sm:w-[560px] sm:max-w-[92vw]"
+        className="flex min-w-0 w-[min(560px,92vw)] max-w-none flex-col overflow-hidden sm:max-w-none"
       >
-        <SheetHeader className="min-w-0">
+        <SheetHeader className="min-w-0 pr-8">
           <SheetTitle className="flex min-w-0 items-center gap-2 text-base">
             <GitBranch className="h-4 w-4" />
             会话分支
@@ -174,7 +174,10 @@ export function FamilyHistorySheet({
 
         <Separator className="my-3" />
 
-        <ScrollArea className="min-w-0 flex-1 pr-2" viewportClassName="overflow-x-hidden">
+        <ScrollArea
+          className="min-w-0 max-w-full flex-1 overflow-hidden pr-2"
+          viewportClassName="overflow-x-hidden [&>div]:!block [&>div]:min-w-0 [&>div]:max-w-full"
+        >
           {loading ? (
             <div className="flex items-center gap-1.5 py-6 text-xs text-muted-foreground">
               <Loader2 className="h-3.5 w-3.5 animate-spin" /> 加载中…
@@ -186,20 +189,20 @@ export function FamilyHistorySheet({
               （首次克隆或修复后会自动建档）
             </div>
           ) : (
-            <div className="min-w-0 space-y-3">
-              <div className="min-w-0 rounded-md border bg-muted/20 p-3 text-xs">
+            <div className="min-w-0 max-w-full space-y-3 overflow-hidden">
+              <div className="min-w-0 max-w-full overflow-hidden rounded-md border bg-muted/20 p-3 text-xs">
                 <div className="flex min-w-0 items-center gap-2">
                   <span className="shrink-0 text-muted-foreground">分组 ID</span>
-                  <code className="min-w-0 break-all font-mono text-[11px]">
+                  <code className="min-w-0 wrap-anywhere font-mono text-[11px]">
                     {family.family_id}
                   </code>
                 </div>
-                <div className="mt-1 line-clamp-2 break-words text-muted-foreground">
+                <div className="mt-1 min-w-0 wrap-anywhere text-muted-foreground">
                   {family.title || "（无标题）"}
                 </div>
               </div>
 
-              <div className="space-y-2">
+              <div className="min-w-0 max-w-full space-y-2 overflow-hidden">
                 {family.chain.map((b, idx) => {
                   const isActive = b.id === family.active_id;
                   const isCurrent =
@@ -242,24 +245,29 @@ export function FamilyHistorySheet({
                             >
                               {b.provider || "(未知 provider)"}
                             </Badge>
+                            {isCurrent && (
+                              <Badge variant="outline" className="h-5 px-1.5 font-normal text-emerald-600">
+                                当前 provider
+                              </Badge>
+                            )}
                             {isActive ? (
                               <Badge className="h-5 bg-emerald-500 px-1.5 font-normal text-white">
-                                当前
+                                当前分支
                               </Badge>
                             ) : (
                               <Badge variant="outline" className="h-5 px-1.5 font-normal text-muted-foreground">
-                                {branchStatusLabel(b.status)}
+                                {inactiveBranchStatusLabel(b.status)}
                               </Badge>
                             )}
                             <span className="text-muted-foreground">
                               {safeDate(b.created_at)}
                             </span>
                           </div>
-                          <div className="min-w-0 break-all font-mono text-[11px] text-muted-foreground">
+                          <div className="min-w-0 wrap-anywhere font-mono text-[11px] text-muted-foreground">
                             {b.id}
                           </div>
                           <div
-                            className="min-w-0 break-all font-mono text-[11px] leading-5 text-muted-foreground"
+                            className="min-w-0 wrap-anywhere font-mono text-[11px] leading-5 text-muted-foreground"
                             title={b.rollout_relpath}
                           >
                             {b.rollout_relpath}
@@ -270,7 +278,7 @@ export function FamilyHistorySheet({
                                 <>
                                   <CheckCircle2 className="h-3 w-3 shrink-0 text-emerald-500" />
                                   <span className="shrink-0">校验：</span>
-                                  <code className="break-all font-mono">
+                                  <code className="wrap-anywhere font-mono">
                                     {b.sha256.slice(0, 10)}…
                                   </code>
                                   {b.line_count != null && (
@@ -486,11 +494,10 @@ function BranchSyncBadge({ state }: { state: BranchSyncState }) {
   }
 }
 
-function branchStatusLabel(status: FamilyBranch["status"]): string {
+function inactiveBranchStatusLabel(status: FamilyBranch["status"]): string {
   switch (status) {
-    case "active":
-      return "当前";
     case "archived":
+    case "active":
       return "历史分支";
     case "deleted":
       return "已删除";

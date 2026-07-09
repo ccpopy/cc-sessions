@@ -70,6 +70,11 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     void refreshOverlay();
   }, [refreshOverlay, sessions.length]);
 
+  const refreshAll = useCallback(async () => {
+    await refresh();
+    await refreshOverlay();
+  }, [refresh, refreshOverlay]);
+
   const clonableCount = useMemo(() => {
     let n = 0;
     for (const o of overlay.values()) if (isProviderMaintenanceState(o.clone_state)) n++;
@@ -248,7 +253,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
       <TopBar
         title={provider === "codex" ? "Codex 会话" : "Claude 会话"}
         stats={loading ? "加载中…" : `${visibleSessions.length} 条`}
-        onRefresh={refresh}
+        onRefresh={refreshAll}
         onBulkBackup={onBulkBackup}
         onBulkDelete={onBulkDelete}
         showListTools
