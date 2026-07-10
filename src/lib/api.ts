@@ -636,6 +636,11 @@ export type MarkdownExportReport = {
   bytes: number;
 };
 
+export type PreviewImageData = {
+  data_url: string;
+  mime: string;
+};
+
 export const api = {
   appVersion: () => invokeCommand<string>("app_version"),
   getSettings: () => invokeCommand<Settings>("get_settings"),
@@ -688,6 +693,8 @@ export const api = {
     invokeCommand<PreviewEvent[]>("preview_session_range", { provider, rolloutPath, offset, limit }),
   previewMeta: (provider: SessionProvider, rolloutPath: string) =>
     invokeCommand<SessionMetaBrief>("preview_session_meta", { provider, rolloutPath }),
+  readPreviewImage: (path: string) =>
+    invokeCommand<PreviewImageData>("read_preview_image", { path }),
 
   exportSessionMarkdown: (p: {
     provider: SessionProvider;

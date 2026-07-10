@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, type SessionProvider, type SessionSummary, type ProjectGroup } from "@/lib/api";
 import { useSettings } from "@/stores/settings";
 
@@ -7,8 +7,8 @@ export function useSessions(provider: SessionProvider, query: string) {
   const settingsReady = settings !== null;
   const codexDir = settings?.codex_dir ?? "";
   const claudeDir = settings?.claude_dir ?? "";
-  const scope = JSON.stringify([settingsReady, provider, codexDir, claudeDir, query]);
-  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const scope = JSON.stringify([settingsReady, provider, codexDir, claudeDir]);
+  const [allSessions, setAllSessions] = useState<SessionSummary[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const timer = useRef<number | null>(null);
@@ -45,12 +45,9 @@ export function useSessions(provider: SessionProvider, query: string) {
         setLoading(true);
         setError(null);
         try {
-          const normalizedQuery = query.trim();
-          const list = normalizedQuery
-            ? await api.searchSessions(provider, codexDir, claudeDir, normalizedQuery)
-            : await api.listSessions(provider, codexDir, claudeDir);
+          const list = await api.listSessions(provider, codexDir, claudeDir);
           if (!isCurrent()) return;
-          setSessions(list);
+          setAllSessions(list);
         } catch (error) {
           if (!isCurrent()) return;
           setError(String((error as Error)?.message ?? error));
@@ -66,12 +63,12 @@ export function useSessions(provider: SessionProvider, query: string) {
     });
     inFlight.current = { scope, requestId, promise };
     return promise;
-  }, [claudeDir, codexDir, provider, query, scope, settingsReady]);
+  }, [claudeDir, codexDir, provider, scope, settingsReady]);
 
   useEffect(() => {
     requestSeq.current += 1;
     inFlight.current = null;
-    setSessions([]);
+    setAllSessions([]);
     setLoading(false);
     setError(null);
     if (timer.current) window.clearTimeout(timer.current);
@@ -86,7 +83,46 @@ export function useSessions(provider: SessionProvider, query: string) {
     };
   }, [refresh, scope]);
 
-  return { sessions, loading, error, refresh };
+  const sessions = useMemo(() => filterSessions(allSessions, query), [allSessions, query]);
+  return { sessions, allSessions, loading, error, refresh };
+}
+
+function filterSessions(sessions: readonly SessionSummary[], query: string): SessionSummary[] {
+  const normalized = query.trim();
+  if (!normalized) return sessions.slice();
+
+  const lower = normalized.toLowerCase();
+  const separator = normalized.indexOf(":");
+  const rawKey = separator >= 0 ? normalized.slice(0, separator).trim().toLowerCase() : "";
+  const key = ["id", "cwd", "model", "archived"].includes(rawKey) ? rawKey : null;
+  const value = key ? normalized.slice(separator + 1).trim().toLowerCase() : lower;
+
+  return sessions.filter((session) => {
+    switch (key) {
+      case "id":
+        return session.id.toLowerCase().startsWith(value);
+      case "cwd":
+        return session.cwd.toLowerCase().includes(value);
+      case "model":
+        return session.model?.toLowerCase().includes(value) ?? false;
+      case "archived": {
+        const truthy = ["true", "1", "yes", "on"].includes(value);
+        return session.archived === truthy;
+      }
+      default: {
+        const idLike = value.length >= 4 && /^[0-9a-f-]+$/.test(value);
+        return (
+          (idLike && session.id.toLowerCase().startsWith(value)) ||
+          session.title.toLowerCase().includes(value) ||
+          session.first_user_message.toLowerCase().includes(value) ||
+          session.source?.toLowerCase().includes(value) === true ||
+          session.agent_nickname?.toLowerCase().includes(value) === true ||
+          session.agent_role?.toLowerCase().includes(value) === true ||
+          session.cwd.toLowerCase().includes(value)
+        );
+      }
+    }
+  });
 }
 
 export function useProjectGroups(provider: SessionProvider) {

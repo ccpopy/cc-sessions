@@ -1,7 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
-import { AlertTriangle, Archive, Loader2, MessageSquare, Network, RotateCw } from "lucide-react";
+import {
+  AlertTriangle,
+  Archive,
+  ChevronDown,
+  ListFilter,
+  Loader2,
+  MessageSquare,
+  Network,
+  RotateCw,
+} from "lucide-react";
 import { TopBar } from "@/components/TopBar";
 import { SessionList } from "@/components/SessionList";
 import { PreviewDialog } from "@/components/PreviewDialog";
@@ -12,7 +21,12 @@ import { EmptyState } from "@/components/EmptyState";
 import { FamilyHistorySheet } from "@/components/FamilyHistorySheet";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
-import { Switch } from "@/components/ui/switch";
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { useSessions } from "@/hooks/useSessions";
 import { useBackupIndex } from "@/hooks/useBackups";
 import { useSettings } from "@/stores/settings";
@@ -30,12 +44,16 @@ import { humanBytes, humanTokens } from "@/lib/format";
 import { basename } from "@/lib/cwd";
 import { isSubagentSession } from "@/lib/sessionSource";
 import { sessionIdentity } from "@/lib/sessionIdentity";
+import {
+  selectNormalFamilySessions,
+  sortSessionsByActivity,
+} from "@/lib/sessionVisibility";
 
 export default function SessionsRoute({ provider = "codex" }: { provider?: SessionProvider }) {
   const navigate = useNavigate();
   const settings = useSettings((s) => s.settings);
   const query = useView((s) => s.query);
-  const { sessions, loading, error, refresh } = useSessions(provider, query);
+  const { sessions, allSessions, loading, error, refresh } = useSessions(provider, query);
   const { index: backupIndex, error: backupIndexError } = useBackupIndex(provider);
   const selected = useSelection((s) => s.selected);
   const setSelection = useSelection((s) => s.set);
@@ -46,6 +64,21 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const setShowSubagentSessions = useView((s) => s.setShowSubagentSessions);
   const showArchivedSessions = useView((s) => s.showArchivedSessions);
   const setShowArchivedSessions = useView((s) => s.setShowArchivedSessions);
+
+  const setSubagentView = useCallback(
+    (enabled: boolean) => {
+      if (enabled) setShowArchivedSessions(false);
+      setShowSubagentSessions(enabled);
+    },
+    [setShowArchivedSessions, setShowSubagentSessions],
+  );
+  const setArchivedView = useCallback(
+    (enabled: boolean) => {
+      if (enabled) setShowSubagentSessions(false);
+      setShowArchivedSessions(enabled);
+    },
+    [setShowArchivedSessions, setShowSubagentSessions],
+  );
 
   const [preview, setPreview] = useState<SessionSummary | null>(null);
   const [exportTarget, setExportTarget] = useState<SessionSummary | null>(null);
@@ -59,6 +92,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const [cloning, setCloning] = useState(false);
   const showHiddenRecords = useMemo(() => isExplicitHiddenRecordQuery(query), [query]);
   const isCodex = provider === "codex";
+  const hasActiveVisibilityFilter = showSubagentSessions || (isCodex && showArchivedSessions);
   const overlayScope = JSON.stringify([provider, settings?.codex_dir ?? ""]);
   const refreshScope = JSON.stringify([
     provider,
@@ -69,6 +103,13 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const overlayScopeRef = useRef(overlayScope);
   const refreshScopeRef = useRef(refreshScope);
   const overlayRequestSeq = useRef(0);
+
+  // 两种视图互斥；同时为 true 只可能来自热更新前的旧状态。
+  useEffect(() => {
+    if (showSubagentSessions && showArchivedSessions) {
+      setShowArchivedSessions(false);
+    }
+  }, [setShowArchivedSessions, showArchivedSessions, showSubagentSessions]);
   const refreshAllRequestSeq = useRef(0);
   const overlayFlight = useRef<{
     scope: string;
@@ -154,6 +195,16 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     return promise;
   }, [refresh, refreshOverlay, refreshScope]);
 
+  useEffect(() => {
+    // Codex 通常在另一个窗口持续写入会话；用户切回列表时单次刷新。
+    // 不轮询，避免再次引入大目录重复扫描和高资源占用。
+    const refreshOnWindowFocus = () => {
+      void refreshAll();
+    };
+    window.addEventListener("focus", refreshOnWindowFocus);
+    return () => window.removeEventListener("focus", refreshOnWindowFocus);
+  }, [refreshAll]);
+
   const providerMaintenanceItems = useMemo(() => {
     const items = new Map<string, FamilyOverlay>();
     for (const item of overlay.values()) {
@@ -183,7 +234,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   }, [providerMaintenanceItems]);
 
   const visibleSessions = useMemo(() => {
-    const visible: SessionSummary[] = [];
+    const candidates: SessionSummary[] = [];
     for (const session of sessions) {
       const sessionOverlay = isCodex ? overlay.get(session.id) : undefined;
       const isSubagent = isSubagentSession(session, sessionOverlay);
@@ -195,12 +246,20 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
       if (isCodex && !showHiddenRecords && session.archived !== showArchivedSessions) {
         continue;
       }
-      if (isCodex && !showHiddenRecords && isHiddenFamilyBranch(session, sessionOverlay)) {
+      if (
+        isCodex &&
+        !showHiddenRecords &&
+        showArchivedSessions &&
+        isHiddenArchivedFamilyBranch(sessionOverlay, currentProvider)
+      ) {
         continue;
       }
-      visible.push(session);
+      candidates.push(session);
     }
-    return visible;
+    if (isCodex && !showHiddenRecords && !showArchivedSessions) {
+      return selectNormalFamilySessions(candidates, overlay, currentProvider);
+    }
+    return sortSessionsByActivity(candidates);
   }, [
     sessions,
     overlay,
@@ -208,6 +267,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     isCodex,
     showSubagentSessions,
     showArchivedSessions,
+    currentProvider,
   ]);
 
   useEffect(() => {
@@ -366,26 +426,70 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         onBulkDelete={onBulkDelete}
         showListTools
       >
-        <div className="flex h-8 shrink-0 items-center gap-2 rounded-md border border-border/70 bg-muted/30 px-2.5 text-xs text-muted-foreground">
-          <Network className="h-3.5 w-3.5" />
-          <span className="hidden whitespace-nowrap md:inline">子代理</span>
-          <Switch
-            checked={showSubagentSessions}
-            onCheckedChange={setShowSubagentSessions}
-            aria-label="显示子代理会话"
-          />
-        </div>
-        {isCodex && (
-          <div className="flex h-8 shrink-0 items-center gap-2 rounded-md border border-border/70 bg-muted/30 px-2.5 text-xs text-muted-foreground">
-            <Archive className="h-3.5 w-3.5" />
-            <span className="hidden whitespace-nowrap md:inline">已归档</span>
-            <Switch
-              checked={showArchivedSessions}
-              onCheckedChange={setShowArchivedSessions}
-              aria-label="只看已归档会话"
-            />
-          </div>
-        )}
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 shrink-0 gap-1.5 border-border/70 bg-muted/30 px-2.5 text-xs font-normal text-muted-foreground shadow-none data-[state=open]:bg-accent data-[state=open]:text-accent-foreground"
+              aria-label={
+                hasActiveVisibilityFilter ? "显示更多，当前已启用筛选" : "显示更多"
+              }
+            >
+              <ListFilter className="h-3.5 w-3.5" />
+              <span>显示更多</span>
+              <ChevronDown className="h-3.5 w-3.5 opacity-60" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent
+            align="start"
+            style={{
+              width: "var(--radix-dropdown-menu-trigger-width)",
+              minWidth: "var(--radix-dropdown-menu-trigger-width)",
+            }}
+          >
+            <DropdownMenuCheckboxItem
+              checked={showSubagentSessions}
+              onCheckedChange={(checked) => setSubagentView(checked === true)}
+              className="gap-1.5 px-2 [&>span:first-child]:hidden"
+            >
+              <Network className="h-3.5 w-3.5 text-muted-foreground" />
+              <span className="whitespace-nowrap">子代理</span>
+              <span
+                aria-hidden="true"
+                data-state={showSubagentSessions ? "checked" : "unchecked"}
+                className="ml-auto inline-flex h-3.5 w-6 shrink-0 items-center rounded-full bg-input p-0.5 transition-colors data-[state=checked]:bg-primary"
+              >
+                <span
+                  className={`block h-2.5 w-2.5 rounded-full bg-background shadow-sm transition-transform ${
+                    showSubagentSessions ? "translate-x-2.5" : "translate-x-0"
+                  }`}
+                />
+              </span>
+            </DropdownMenuCheckboxItem>
+            {isCodex && (
+              <DropdownMenuCheckboxItem
+                checked={showArchivedSessions}
+                onCheckedChange={(checked) => setArchivedView(checked === true)}
+                className="gap-1.5 px-2 [&>span:first-child]:hidden"
+              >
+                <Archive className="h-3.5 w-3.5 text-muted-foreground" />
+                <span className="whitespace-nowrap">已归档</span>
+                <span
+                  aria-hidden="true"
+                  data-state={showArchivedSessions ? "checked" : "unchecked"}
+                  className="ml-auto inline-flex h-3.5 w-6 shrink-0 items-center rounded-full bg-input p-0.5 transition-colors data-[state=checked]:bg-primary"
+                >
+                  <span
+                    className={`block h-2.5 w-2.5 rounded-full bg-background shadow-sm transition-transform ${
+                      showArchivedSessions ? "translate-x-2.5" : "translate-x-0"
+                    }`}
+                  />
+                </span>
+              </DropdownMenuCheckboxItem>
+            )}
+          </DropdownMenuContent>
+        </DropdownMenu>
       </TopBar>
 
       {prefillCwd && (
@@ -490,6 +594,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         open={!!preview}
         onOpenChange={(v) => !v && setPreview(null)}
         session={preview}
+        allSessions={allSessions}
         codexDir={settings.codex_dir}
         backupDir={settings.backup_dir}
         onForked={async () => {
@@ -612,18 +717,17 @@ function deleteResultHasMutation(result: DeleteResult): boolean {
 }
 
 /**
- * Codex 主会话列表只显示家族的"当前分支"（active）。
- * - active 分支：照常显示，并带"N 分支"徽标作为历史/恢复入口
- * - 非 active 分支默认隐藏，通过 `id:` / `archived:` 可直接显示隐藏记录
- * - 子代理开关关闭时只显示主会话，开启时只显示子代理
- *   点击分支徽标可进入 FamilyHistorySheet 查看历史分支
- * - 没有 family_id（孤儿会话）：照常显示
+ * 已归档视图与 Codex App 一致：家族分支按当前 provider 显示。
+ * provider 信息不可用时回退到 family store 的 active 分支，避免重复。
  */
-function isHiddenFamilyBranch(
-  _s: SessionSummary,
+function isHiddenArchivedFamilyBranch(
   overlay: FamilyOverlay | undefined,
+  currentProvider: string | null,
 ): boolean {
   if (!overlay?.family_id) return false;
+  if (currentProvider) {
+    return overlay.provider !== currentProvider;
+  }
   return !overlay.is_active_branch;
 }
 

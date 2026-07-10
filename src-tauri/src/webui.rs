@@ -367,6 +367,9 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "sessionId")?,
         )),
+        "read_preview_image" => {
+            to_result_value(fs_ops::read_preview_image(string_arg(&args, "path")?))
+        }
         "get_provider_info" => {
             to_result_value(repair::get_provider_info(string_arg(&args, "codexDir")?))
         }

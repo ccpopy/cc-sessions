@@ -8,7 +8,6 @@ use crate::error::AppResult;
 use crate::models::{PreviewEvent, SessionMetaBrief};
 
 const PREVIEW_CAPACITY_HINT_MAX: usize = 1024;
-
 fn classify(index: usize, raw: Value) -> PreviewEvent {
     let timestamp = raw
         .get("timestamp")
@@ -56,6 +55,11 @@ fn classify(index: usize, raw: Value) -> PreviewEvent {
                 .to_string();
             ("user".into(), "user_message".into(), trim(&text, 120))
         }
+        ("event_msg", "sub_agent_activity") => (
+            "subagent".into(),
+            "sub_agent_activity".into(),
+            subagent_activity_summary(&raw),
+        ),
         ("response_item", "message") => {
             let role_name = raw
                 .get("payload")
@@ -66,6 +70,11 @@ fn classify(index: usize, raw: Value) -> PreviewEvent {
             let text = flatten_content(raw.get("payload").and_then(|p| p.get("content")));
             (role_name, "message".into(), trim(&text, 120))
         }
+        ("response_item", "agent_message") => (
+            "subagent".into(),
+            "agent_message".into(),
+            subagent_message_summary(&raw),
+        ),
         ("response_item", "reasoning") => {
             let text = flatten_content(raw.get("payload").and_then(|p| p.get("content")));
             ("reasoning".into(), "reasoning".into(), trim(&text, 80))
@@ -99,6 +108,50 @@ fn classify(index: usize, raw: Value) -> PreviewEvent {
         text_summary,
         raw,
     }
+}
+
+fn subagent_activity_summary(raw: &Value) -> String {
+    let payload = raw.get("payload");
+    let agent = payload
+        .and_then(|value| value.get("agent_path"))
+        .and_then(Value::as_str)
+        .map(short_agent_name)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("子智能体");
+    let kind = payload
+        .and_then(|value| value.get("kind"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let activity = match kind {
+        "started" => "已启动".to_string(),
+        "interacted" => "有新活动".to_string(),
+        "interrupted" => "已中断".to_string(),
+        other => format!("活动：{other}"),
+    };
+    format!("{agent} {activity}")
+}
+
+fn subagent_message_summary(raw: &Value) -> String {
+    let payload = raw.get("payload");
+    let author = payload
+        .and_then(|value| value.get("author"))
+        .and_then(Value::as_str)
+        .map(short_agent_name)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("子智能体");
+    let message_type = flatten_content(payload.and_then(|value| value.get("content")));
+    if message_type.contains("Message Type: FINAL_ANSWER") {
+        format!("{author} 已完成")
+    } else {
+        format!("{author} 发来更新")
+    }
+}
+
+fn short_agent_name(path: &str) -> &str {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
 }
 
 fn flatten_content(v: Option<&Value>) -> String {
@@ -162,8 +215,13 @@ fn is_internal_codex_context_message(event: &PreviewEvent) -> bool {
         return false;
     }
     let first_line = normalize_prompt_heading(text.lines().next().unwrap_or(""));
-    (first_line.starts_with("AGENTS.md instructions for ") && text.contains("<INSTRUCTIONS>"))
+    is_internal_codex_context_text(&first_line, &text)
+}
+
+fn is_internal_codex_context_text(first_line: &str, text: &str) -> bool {
+    (first_line.starts_with("AGENTS.md instructions") && text.contains("<INSTRUCTIONS>"))
         || (first_line == "<environment_context>" && text.contains("</environment_context>"))
+        || (first_line == "<recommended_plugins>" && text.contains("</recommended_plugins>"))
 }
 
 fn normalize_prompt_heading(line: &str) -> String {
@@ -555,6 +613,101 @@ mod tests {
         let event = classify(0, raw);
 
         assert_eq!(event.text_summary, "tokens: 42");
+    }
+
+    #[test]
+    fn classifies_subagent_activity_as_non_conversation_event() {
+        let raw = serde_json::json!({
+            "timestamp": "2026-07-10T00:00:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "sub_agent_activity",
+                "event_id": "call-activity",
+                "occurred_at_ms": 1_783_626_366_052_i64,
+                "agent_thread_id": "019f486a-54b2-77a2-8576-ec5148028d3b",
+                "agent_path": "/root/audit_backend",
+                "kind": "started"
+            }
+        });
+
+        let event = classify(0, raw);
+
+        assert_eq!(event.role, "subagent");
+        assert_eq!(event.kind, "sub_agent_activity");
+        assert_eq!(event.text_summary, "audit_backend 已启动");
+        assert!(!preview_event_is_conversation(&event));
+    }
+
+    #[test]
+    fn classifies_subagent_message_without_exposing_encrypted_content() {
+        let raw = serde_json::json!({
+            "timestamp": "2026-07-10T00:00:00Z",
+            "type": "response_item",
+            "payload": {
+                "type": "agent_message",
+                "author": "/root/audit_backend",
+                "recipient": "/root",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/audit_backend\nPayload:\n"
+                    },
+                    {
+                        "type": "encrypted_content",
+                        "encrypted_content": "encrypted-secret"
+                    }
+                ]
+            }
+        });
+
+        let event = classify(0, raw);
+
+        assert_eq!(event.role, "subagent");
+        assert_eq!(event.kind, "agent_message");
+        assert_eq!(event.text_summary, "audit_backend 已完成");
+        assert!(!event.text_summary.contains("encrypted-secret"));
+        assert!(!preview_event_is_conversation(&event));
+    }
+
+    #[test]
+    fn preserves_unknown_subagent_activity_kind_in_summary() {
+        let raw = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "sub_agent_activity",
+                "agent_path": "/root/audit_backend",
+                "kind": "future_kind"
+            }
+        });
+
+        let event = classify(0, raw);
+
+        assert_eq!(event.text_summary, "audit_backend 活动：future_kind");
+    }
+
+    #[test]
+    fn recommended_plugins_context_is_not_a_conversation_message() {
+        let raw = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "<recommended_plugins>\nInternal plugin catalog\n</recommended_plugins>"
+                    },
+                    {
+                        "type": "input_text",
+                        "text": "# AGENTS.md instructions\n<INSTRUCTIONS>internal</INSTRUCTIONS>"
+                    }
+                ]
+            }
+        });
+
+        let event = classify(0, raw);
+
+        assert!(!preview_event_is_conversation(&event));
     }
 
     #[test]

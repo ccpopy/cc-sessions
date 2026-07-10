@@ -1,6 +1,6 @@
 [package]
 name = "cc-session-manager"
-version = "0.3.5"
+version = "0.3.6"
 description = "CC Sessions"
 authors = ["zjsmew"]
 edition = "2021"
@@ -51,6 +51,7 @@ toml = "0.8"
 tiny_http = "0.12"
 url = "2"
 getrandom = "0.2"
+base64 = "0.22"
 
 [profile.release]
 panic = "abort"

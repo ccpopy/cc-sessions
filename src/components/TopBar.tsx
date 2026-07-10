@@ -71,7 +71,7 @@ export function TopBar({
             <SearchInput
               value={query}
               onChange={setQuery}
-              className="min-w-0 flex-1 basis-56 sm:max-w-80"
+              className="min-w-0 flex-1 basis-64 sm:max-w-96 lg:min-w-48 xl:max-w-[30rem]"
             />
             <Tabs value={view} onValueChange={(v) => setView(v as View)} className="shrink-0">
               <TabsList className="h-9">

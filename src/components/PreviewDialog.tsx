@@ -8,6 +8,7 @@ import {
   GitBranch,
   History,
   MessageSquare,
+  Network,
   Pencil,
   Sparkles,
   Terminal,
@@ -22,6 +23,7 @@ import { JsonView, defaultStyles } from "react-json-view-lite";
 import "react-json-view-lite/dist/index.css";
 
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { LocalImageAttachments } from "@/components/LocalImageAttachments";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -48,8 +50,13 @@ import {
   type SessionSummary,
 } from "@/lib/api";
 import { copyText } from "@/lib/clipboard";
-import { formatTimeString, humanTokens } from "@/lib/format";
+import { absoluteTime, formatTimeString, humanTokens } from "@/lib/format";
 import { shouldIgnoreTextEditingHotkey } from "@/lib/keyboard";
+import { parseUserMessageAttachments } from "@/lib/messageAttachments";
+import {
+  collectRelatedSubagents,
+  type RelatedSubagentSession,
+} from "@/lib/sessionSource";
 import { parseEmbeddedTranscriptPrompt, type EmbeddedTranscriptPrompt } from "@/lib/sessionText";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
@@ -58,6 +65,7 @@ type Props = {
   open: boolean;
   onOpenChange: (v: boolean) => void;
   session: SessionSummary | null;
+  allSessions?: readonly SessionSummary[];
   customRolloutPath?: string;
   codexDir?: string;
   backupDir?: string;
@@ -102,6 +110,7 @@ export function PreviewDialog({
   open,
   onOpenChange,
   session,
+  allSessions = [],
   customRolloutPath,
   codexDir,
   backupDir,
@@ -131,6 +140,10 @@ export function PreviewDialog({
   const canForkSession = provider === "codex" && !customRolloutPath && !!session && !!codexDir;
   // 备份/导入预览（customRolloutPath）不允许编辑，只能编辑真实会话文件
   const canMutateSession = !customRolloutPath && !!session && !!backupDir && !!rolloutPath;
+  const relatedSubagents = useMemo(() => {
+    if (!session || session.provider !== "codex" || customRolloutPath) return [];
+    return collectRelatedSubagents(session.id, allSessions);
+  }, [allSessions, customRolloutPath, session]);
 
   const loadMore = useCallback(async () => {
     if (loadingRef.current || doneRef.current || !rolloutPath) return;
@@ -590,7 +603,11 @@ export function PreviewDialog({
           onViewportScroll={onScroll}
         >
           <div className="mx-auto w-full max-w-3xl min-w-0 space-y-4 overflow-x-hidden px-6 py-6">
-            {filtered.length === 0 && !loading && (
+            {!onlyMsg && relatedSubagents.length > 0 && (
+              <SubagentOverview key={session?.id} items={relatedSubagents} />
+            )}
+
+            {filtered.length === 0 && !loading && (onlyMsg || relatedSubagents.length === 0) && (
               <div className="flex flex-col items-center justify-center gap-2 py-16 text-center text-muted-foreground">
                 <Sparkles className="h-8 w-8 opacity-50" />
                 <div className="text-sm">
@@ -851,6 +868,9 @@ export function PreviewDialog({
 function EventBubble({ e, actions }: { e: PreviewEvent; actions: NodeActionSet }) {
   const ts = formatTimeString(e.timestamp);
 
+  if (e.role === "subagent") {
+    return <SubagentEventBubble e={e} ts={ts} actions={actions} />;
+  }
   if (isEventMessage(e)) {
     return <EventMessageBubble e={e} ts={ts} actions={actions} />;
   }
@@ -870,6 +890,124 @@ function EventBubble({ e, actions }: { e: PreviewEvent; actions: NodeActionSet }
     return <MetaLine e={e} ts={ts} />;
   }
   return <DefaultBubble e={e} ts={ts} />;
+}
+
+function SubagentOverview({ items }: { items: RelatedSubagentSession[] }) {
+  const [open, setOpen] = useState(true);
+  return (
+    <section className="border-y border-border/70 bg-background/30" aria-label="子智能体概览">
+      <button
+        type="button"
+        className="flex w-full items-center gap-2 px-1 py-2.5 text-left text-xs hover:text-foreground"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+      >
+        <Network className="h-3.5 w-3.5 text-cyan-700 dark:text-cyan-400" />
+        <span className="font-medium">子智能体</span>
+        <span className="tabular-nums text-muted-foreground">{items.length}</span>
+        <ChevronDown
+          className={cn(
+            "ml-auto h-3.5 w-3.5 text-muted-foreground transition-transform",
+            open && "rotate-180",
+          )}
+        />
+      </button>
+      {open && (
+        <div className="border-t border-border/60 px-1">
+          {items.map((item) => (
+            <div
+              key={item.id}
+              className="flex min-w-0 items-start gap-2 border-t border-border/40 py-2.5 first:border-t-0"
+              style={{ paddingLeft: Math.min((item.relativeDepth - 1) * 18, 72) }}
+            >
+              <div className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-cyan-500/10 text-cyan-700 dark:text-cyan-400">
+                <Bot className="h-3 w-3" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+                  <span className="font-medium">{item.nickname ?? "子智能体"}</span>
+                  <span className="font-mono text-[10px] text-muted-foreground" title={item.id}>
+                    {item.id.slice(0, 8)}
+                  </span>
+                  {item.role && (
+                    <Badge variant="outline" className="h-4 px-1 py-0 text-[10px] font-normal">
+                      {item.role}
+                    </Badge>
+                  )}
+                  <span className="ml-auto shrink-0 font-mono text-[10px] text-muted-foreground">
+                    L{item.depth}
+                  </span>
+                </div>
+                <div className="mt-0.5 truncate font-mono text-[11px] text-foreground/70" title={item.agentPath}>
+                  {item.agentPath}
+                </div>
+                <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-muted-foreground">
+                  <span>开始 {absoluteTime(item.createdAt)}</span>
+                  <span>最后活动 {absoluteTime(item.updatedAt)}</span>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function SubagentEventBubble({
+  e,
+  ts,
+  actions,
+}: {
+  e: PreviewEvent;
+  ts: string;
+  actions: NodeActionSet;
+}) {
+  const [open, setOpen] = useState(false);
+  const eventTime = subagentEventTime(e, ts);
+  return (
+    <div className="group flex gap-3">
+      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-cyan-500/10 text-cyan-700 dark:text-cyan-400">
+        <Network className="h-4 w-4" />
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="flex w-full items-start gap-2 border-l-2 border-cyan-500/30 bg-background/50 px-3 py-2 text-xs">
+          <button
+            type="button"
+            onClick={() => setOpen((value) => !value)}
+            className="flex min-w-0 flex-1 items-start gap-2 text-left"
+            aria-expanded={open}
+          >
+            <ChevronDown
+              className={cn(
+                "mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform",
+                open && "rotate-180",
+              )}
+            />
+            <span className="shrink-0 font-medium">{subagentEventLabel(e)}</span>
+            {e.text_summary && (
+              <span className="min-w-0 flex-1 break-words text-muted-foreground">
+                {e.text_summary}
+              </span>
+            )}
+            {eventTime && (
+              <span className="shrink-0 font-mono text-muted-foreground/70">{eventTime}</span>
+            )}
+          </button>
+          <NodeActionButtons event={e} actions={actions} />
+        </div>
+        {open && (
+          <div className="mt-1.5 overflow-auto border-l-2 border-border/70 bg-card p-3 text-xs">
+            <JsonView
+              data={e.raw as object}
+              style={defaultStyles}
+              shouldExpandNode={(level) => level < 2}
+            />
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
 
 function EventMessageBubble({
@@ -929,6 +1067,8 @@ function UserBubble({ e, ts, actions }: { e: PreviewEvent; ts: string; actions: 
     return <DiffCommentBubble e={e} ts={ts} prompt={diffComments} actions={actions} />;
   }
 
+  const message = parseUserMessageAttachments(text);
+
   return (
     <div className="group flex justify-end gap-3">
       <div className="flex min-w-0 max-w-[85%] flex-col items-end overflow-hidden">
@@ -939,9 +1079,10 @@ function UserBubble({ e, ts, actions }: { e: PreviewEvent; ts: string; actions: 
           {ts && <span className="font-mono">· {ts}</span>}
         </div>
         <div className="chat-md max-w-full rounded-2xl rounded-tr-sm bg-primary px-4 py-2.5 text-primary-foreground">
-          {text ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown> : (
+          {message.markdown ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.markdown}</ReactMarkdown> : message.images.length === 0 ? (
             <span className="italic opacity-70">(空消息)</span>
-          )}
+          ) : null}
+          <LocalImageAttachments images={message.images} />
         </div>
       </div>
       <Avatar role="user" />
@@ -1459,6 +1600,7 @@ function cleanDiffCommentText(text: string): string {
 }
 
 function isConversationMessage(e: PreviewEvent): boolean {
+  if (e.role === "subagent") return false;
   if (isInternalCodexContextMessage(e)) return false;
   const raw = e.raw as { message?: { role?: unknown } } | null;
   if (typeof raw?.message?.role === "string") {
@@ -1486,15 +1628,73 @@ function eventMessageLabel(e: PreviewEvent): string {
   return "事件消息";
 }
 
+function subagentEventLabel(e: PreviewEvent): string {
+  if (e.kind === "sub_agent_activity") {
+    const raw = e.raw as { payload?: { kind?: unknown } } | null;
+    switch (raw?.payload?.kind) {
+      case "started":
+        return "子智能体开始工作";
+      case "interacted":
+        return "子智能体有新活动";
+      case "interrupted":
+        return "子智能体已中断";
+      case "completed":
+        return "子智能体已完成";
+      default:
+        return "子智能体活动";
+    }
+  }
+
+  switch (e.kind) {
+    case "spawn_agent":
+      return "启动子智能体";
+    case "spawn_agent_result":
+      return "启动子智能体结果";
+    case "list_agents":
+      return "查看子智能体";
+    case "list_agents_result":
+      return "子智能体列表结果";
+    case "send_message":
+      return "发送子智能体消息";
+    case "send_message_result":
+      return "发送消息结果";
+    case "followup_task":
+      return "安排后续任务";
+    case "followup_task_result":
+      return "后续任务结果";
+    case "interrupt_agent":
+      return "中断子智能体";
+    case "interrupt_agent_result":
+      return "中断操作结果";
+    case "wait_agent":
+      return "等待子智能体";
+    case "wait_agent_result":
+      return "等待结果";
+    default:
+      return "子智能体事件";
+  }
+}
+
+function subagentEventTime(e: PreviewEvent, fallback: string): string {
+  if (e.kind !== "sub_agent_activity") return fallback;
+  const raw = e.raw as { payload?: { occurred_at_ms?: unknown } } | null;
+  const occurredAtMs = raw?.payload?.occurred_at_ms;
+  if (typeof occurredAtMs !== "number" || !Number.isFinite(occurredAtMs)) return fallback;
+  return formatTimeString(new Date(occurredAtMs).toISOString());
+}
+
 function isInternalCodexContextMessage(e: PreviewEvent): boolean {
   if (e.role !== "user") return false;
   const text = extractText(e).trim();
   if (!text) return false;
   const firstLine = normalizePromptHeading(text.split(/\r?\n/, 1)[0] ?? "");
-  if (firstLine.startsWith("AGENTS.md instructions for ") && text.includes("<INSTRUCTIONS>")) {
+  if (firstLine.startsWith("AGENTS.md instructions") && text.includes("<INSTRUCTIONS>")) {
     return true;
   }
   if (firstLine === "<environment_context>" && text.includes("</environment_context>")) {
+    return true;
+  }
+  if (firstLine === "<recommended_plugins>" && text.includes("</recommended_plugins>")) {
     return true;
   }
   return false;

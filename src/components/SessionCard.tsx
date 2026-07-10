@@ -81,7 +81,11 @@ export const SessionCard = memo(function SessionCard({
   const syncAction = syncActionLabel(overlay?.clone_state, currentProvider);
   const isSubagent = isSubagentSession(s, overlay);
   const subagent = subagentLabel(s, isSubagent);
-  const requiresActivation = Boolean(overlay?.family_id && !overlay.is_active_branch);
+  const isUsableCurrentProviderBranch =
+    !s.archived && overlay?.clone_state === "matches";
+  const requiresActivation = Boolean(
+    overlay?.family_id && !overlay.is_active_branch && !isUsableCurrentProviderBranch,
+  );
   const canCopyResume = !(s.provider === "claude" && isSubagent) && !requiresActivation;
 
   return (

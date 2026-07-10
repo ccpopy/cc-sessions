@@ -314,9 +314,10 @@ dependencies = [
 
 [[package]]
 name = "cc-session-manager"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "dirs 5.0.1",
  "getrandom 0.2.17",

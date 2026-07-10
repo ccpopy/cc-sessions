@@ -80,6 +80,7 @@ pub fn run() {
             fs_ops::reveal_cwd,
             fs_ops::open_latest_release_page,
             fs_ops::copy_resume_command,
+            fs_ops::read_preview_image,
             repair::get_provider_info,
             repair::diagnose_project_configs,
             repair::repair_project_configs,
