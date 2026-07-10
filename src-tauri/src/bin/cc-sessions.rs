@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use cc_session_manager_lib::error::AppError;
 use cc_session_manager_lib::models::{
-    BackupSummary, BundleListItem, ImportMode, ProjectGroup, SessionSummary, Settings,
-    SwitchStrategy,
+    BackupSummary, BundleExportTarget, BundleListItem, ImportMode, ProjectGroup, SessionSummary,
+    Settings, SwitchStrategy,
 };
 use cc_session_manager_lib::{
     backup, bundle, family, fs_ops, paths, repair, rollout, sessions, settings, stats, webui,
@@ -213,6 +213,7 @@ fn print_help() {
   cc-sessions --provider claude webui --host 127.0.0.1 --port 17888
   cc-sessions repair diagnose --json
   cc-sessions backup create --backup-dir ./backups --id <session-id> --name first-backup
+  cc-sessions --provider claude bundle export --out-dir ./bundles --id <session-id> --rollout-path <transcript.jsonl>
 "#
     );
 }
@@ -643,6 +644,7 @@ fn cmd_backup(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
                 Some(ctx.claude_dir.clone()),
                 backup_dir,
                 ids,
+                None,
                 name,
                 note,
             )?;
@@ -657,7 +659,8 @@ fn cmd_backup(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
         "open" => {
             let backup_path = backup_path_arg(&mut args)?;
             ensure_no_args(&args)?;
-            let detail = backup::open_backup(backup_path)?;
+            let backup_root = explicit_backup_root(&backup_path)?;
+            let detail = backup::open_backup(backup_root, backup_path)?;
             output(ctx, &detail, |detail| {
                 print_backup_summary(&detail.summary);
                 println!("sessions");
@@ -676,7 +679,8 @@ fn cmd_backup(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
         "verify" => {
             let backup_path = backup_path_arg(&mut args)?;
             ensure_no_args(&args)?;
-            let report = backup::verify_backup(backup_path)?;
+            let backup_root = explicit_backup_root(&backup_path)?;
+            let report = backup::verify_backup(backup_root, backup_path)?;
             output(ctx, &report, |report| {
                 println!("all_ok\t{}", report.all_ok);
                 for item in &report.items {
@@ -692,7 +696,8 @@ fn cmd_backup(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
         "delete" => {
             let backup_path = backup_path_arg(&mut args)?;
             ensure_no_args(&args)?;
-            backup::delete_backup(backup_path.clone())?;
+            let backup_root = explicit_backup_root(&backup_path)?;
+            backup::delete_backup(backup_root, backup_path.clone())?;
             output(ctx, &backup_path, |path| println!("deleted\t{path}"))
         }
         "restore" => {
@@ -700,12 +705,15 @@ fn cmd_backup(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             let id = required(take_value(&mut args, "--id")?, "restore 需要 --id")?;
             let overwrite = take_flag(&mut args, "--overwrite");
             ensure_no_args(&args)?;
+            let backup_root = explicit_backup_root(&backup_path)?;
             let result = backup::restore_session(
                 Some(concrete_provider(ctx)?),
+                backup_root,
                 backup_path,
                 ctx.codex_dir.clone(),
                 Some(ctx.claude_dir.clone()),
                 id,
+                None,
                 overwrite,
             )?;
             output(ctx, &result, |result| {
@@ -722,8 +730,10 @@ fn cmd_backup(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             let backup_path = backup_path_arg(&mut args)?;
             let overwrite = take_flag(&mut args, "--overwrite");
             ensure_no_args(&args)?;
+            let backup_root = explicit_backup_root(&backup_path)?;
             let results = backup::restore_all(
                 Some(concrete_provider(ctx)?),
+                backup_root,
                 backup_path,
                 ctx.codex_dir.clone(),
                 Some(ctx.claude_dir.clone()),
@@ -752,16 +762,39 @@ fn cmd_bundle(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
     match subcommand.as_str() {
         "export" => {
             let out_dir = required(take_value(&mut args, "--out-dir")?, "export 需要 --out-dir")?;
+            let rollout_paths = take_values(&mut args, "--rollout-path")?;
             let ids = require_ids(&mut args)?;
             let machine_label = take_value(&mut args, "--machine-label")?;
             let export_group = take_value(&mut args, "--export-group")?;
             ensure_no_args(&args)?;
+            let targets = if rollout_paths.is_empty() {
+                None
+            } else {
+                if rollout_paths.len() != ids.len() {
+                    return Err(CliError::message(format!(
+                        "--rollout-path 数量必须与 --id 一致: ids={} rollout_paths={}",
+                        ids.len(),
+                        rollout_paths.len()
+                    )));
+                }
+                Some(
+                    ids.iter()
+                        .cloned()
+                        .zip(rollout_paths)
+                        .map(|(id, rollout_path)| BundleExportTarget {
+                            id,
+                            rollout_path: Some(rollout_path),
+                        })
+                        .collect(),
+                )
+            };
             let reports = bundle::export_session_bundles(
                 Some(concrete_provider(ctx)?),
                 ctx.codex_dir.clone(),
                 Some(ctx.claude_dir.clone()),
                 out_dir,
                 ids,
+                targets,
                 machine_label,
                 export_group,
             )?;
@@ -1448,6 +1481,14 @@ fn backup_dir_or_default(args: &mut Vec<String>) -> CliResult<String> {
 fn backup_path_arg(args: &mut Vec<String>) -> CliResult<String> {
     let path = take_value(args, "--backup-path")?.or_else(|| pop_command(args));
     required(path, "需要 --backup-path 或位置参数")
+}
+
+fn explicit_backup_root(path: &str) -> CliResult<String> {
+    std::path::Path::new(path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.to_string_lossy().into_owned())
+        .ok_or_else(|| CliError::message(format!("备份路径缺少父目录: {path}")))
 }
 
 fn parse_switch_strategy(value: Option<String>) -> CliResult<SwitchStrategy> {

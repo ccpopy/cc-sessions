@@ -3,6 +3,7 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import { Toaster } from "sonner";
 
 import { SidebarProvider } from "@/components/ui/sidebar";
+import { Button } from "@/components/ui/button";
 import { Sidebar } from "@/components/Sidebar";
 import { useHotkeys } from "@/hooks/useHotkeys";
 import { webuiDefaultProvider } from "@/lib/runtime";
@@ -19,6 +20,8 @@ const TransferRoute = lazy(() => import("@/routes/transfer"));
 export default function App() {
   const load = useSettings((s) => s.load);
   const settings = useSettings((s) => s.settings);
+  const settingsLoading = useSettings((s) => s.loading);
+  const settingsError = useSettings((s) => s.error);
   const initTheme = useTheme((s) => s.init);
   const toggleTheme = useTheme((s) => s.toggle);
   const defaultProvider = webuiDefaultProvider();
@@ -28,7 +31,9 @@ export default function App() {
   const defaultTransferPath = `/${defaultProvider}/transfer`;
 
   useEffect(() => {
-    void load();
+    void load().catch(() => {
+      // load 已把完整错误写入 store，由启动错误界面显示。
+    });
   }, [load]);
 
   useEffect(() => {
@@ -55,16 +60,16 @@ export default function App() {
         <Suspense fallback={<RouteLoading />}>
           <Routes>
             <Route path="/" element={<Navigate to={defaultSessionsPath} replace />} />
-            <Route path="/codex/sessions" element={<SessionsRoute provider="codex" />} />
-            <Route path="/codex/repair" element={<RepairRoute provider="codex" />} />
-            <Route path="/codex/backups" element={<BackupsRoute provider="codex" />} />
-            <Route path="/codex/backups/:name" element={<BackupDetailRoute provider="codex" />} />
-            <Route path="/codex/transfer" element={<TransferRoute provider="codex" />} />
-            <Route path="/claude/sessions" element={<SessionsRoute provider="claude" />} />
-            <Route path="/claude/repair" element={<RepairRoute provider="claude" />} />
-            <Route path="/claude/backups" element={<BackupsRoute provider="claude" />} />
-            <Route path="/claude/backups/:name" element={<BackupDetailRoute provider="claude" />} />
-            <Route path="/claude/transfer" element={<TransferRoute provider="claude" />} />
+            <Route path="/codex/sessions" element={<SessionsRoute key="codex-sessions" provider="codex" />} />
+            <Route path="/codex/repair" element={<RepairRoute key="codex-repair" provider="codex" />} />
+            <Route path="/codex/backups" element={<BackupsRoute key="codex-backups" provider="codex" />} />
+            <Route path="/codex/backups/:name" element={<BackupDetailRoute key="codex-backup-detail" provider="codex" />} />
+            <Route path="/codex/transfer" element={<TransferRoute key="codex-transfer" provider="codex" />} />
+            <Route path="/claude/sessions" element={<SessionsRoute key="claude-sessions" provider="claude" />} />
+            <Route path="/claude/repair" element={<RepairRoute key="claude-repair" provider="claude" />} />
+            <Route path="/claude/backups" element={<BackupsRoute key="claude-backups" provider="claude" />} />
+            <Route path="/claude/backups/:name" element={<BackupDetailRoute key="claude-backup-detail" provider="claude" />} />
+            <Route path="/claude/transfer" element={<TransferRoute key="claude-transfer" provider="claude" />} />
             <Route path="/sessions" element={<Navigate to={defaultSessionsPath} replace />} />
             <Route path="/repair" element={<Navigate to={defaultRepairPath} replace />} />
             <Route path="/backups" element={<Navigate to={defaultBackupsPath} replace />} />
@@ -76,7 +81,17 @@ export default function App() {
         </Suspense>
       </main>
       <Toaster position="top-center" richColors closeButton />
-      {!settings && <LoadingBoot />}
+      {!settings && (
+        <LoadingBoot
+          error={settingsError}
+          loading={settingsLoading}
+          onRetry={() => {
+            void load().catch(() => {
+              // 重试错误仍由启动错误界面显示。
+            });
+          }}
+        />
+      )}
     </SidebarProvider>
   );
 }
@@ -89,15 +104,45 @@ function RouteLoading() {
   );
 }
 
-function LoadingBoot() {
+function LoadingBoot({
+  error,
+  loading,
+  onRetry,
+}: {
+  error: string | null;
+  loading: boolean;
+  onRetry: () => void;
+}) {
   return (
-    <div className="boot-splash pointer-events-none">
-      <BootCard subtitle="正在加载设置" />
+    <div className="boot-splash">
+      <BootCard subtitle={error ? "设置加载失败" : "正在加载设置"} showProgress={!error}>
+        {error && (
+          <>
+            <div
+              role="alert"
+              className="max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-md border border-destructive/40 bg-destructive/10 p-2.5 text-xs leading-relaxed text-destructive"
+            >
+              {error}
+            </div>
+            <Button type="button" onClick={onRetry} disabled={loading} className="w-full">
+              {loading ? "正在重试…" : "重试"}
+            </Button>
+          </>
+        )}
+      </BootCard>
     </div>
   );
 }
 
-function BootCard({ subtitle }: { subtitle: string }) {
+function BootCard({
+  subtitle,
+  showProgress = true,
+  children,
+}: {
+  subtitle: string;
+  showProgress?: boolean;
+  children?: React.ReactNode;
+}) {
   return (
     <div className="boot-card">
       <div className="boot-brand">
@@ -118,9 +163,12 @@ function BootCard({ subtitle }: { subtitle: string }) {
           <div className="boot-subtitle">{subtitle}</div>
         </div>
       </div>
-      <div className="boot-track">
-        <div className="boot-bar" />
-      </div>
+      {children}
+      {showProgress && (
+        <div className="boot-track">
+          <div className="boot-bar" />
+        </div>
+      )}
     </div>
   );
 }

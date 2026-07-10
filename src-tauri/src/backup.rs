@@ -1,20 +1,31 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
 
+use crate::atomic_file;
 use crate::error::{AppError, AppResult};
 use crate::logs_db;
 use crate::models::{
-    BackupDetail, BackupSummary, Manifest, ManifestSession, RestoreResult, VerifyItem, VerifyReport,
+    BackupDetail, BackupSummary, BundleExportTarget, Manifest, ManifestArtifact, ManifestSession,
+    RestoreResult, VerifyItem, VerifyReport,
 };
+use crate::path_safety::{self, EntryKind};
 use crate::paths;
 use crate::state_db;
 
 const PROVIDER_CODEX: &str = "codex";
 const PROVIDER_CLAUDE: &str = "claude";
+static RESTORE_SNAPSHOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RolloutPresence {
+    Required,
+    AllowMissing,
+}
 
 struct BackupThread {
     id: String,
@@ -36,6 +47,134 @@ fn sha256_file(path: &Path) -> AppResult<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+fn collect_manifest_artifacts(root: &Path) -> AppResult<Vec<ManifestArtifact>> {
+    let metadata = fs::symlink_metadata(root)?;
+    if path_safety::metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
+        return Err(AppError::Path(format!(
+            "sidecar 必须是普通目录且不能是链接或 junction: {}",
+            root.to_string_lossy()
+        )));
+    }
+    let mut artifacts = Vec::new();
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        let entry = entry.map_err(|error| {
+            AppError::Other(format!(
+                "遍历 sidecar 失败 {}: {error}",
+                root.to_string_lossy()
+            ))
+        })?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if path_safety::metadata_is_link_or_reparse(&metadata) {
+            return Err(AppError::Path(format!(
+                "sidecar 包含链接或 junction: {}",
+                entry.path().to_string_lossy()
+            )));
+        }
+        if metadata.is_dir() {
+            continue;
+        }
+        if !metadata.is_file() {
+            return Err(AppError::Path(format!(
+                "sidecar 包含不支持的文件类型: {}",
+                entry.path().to_string_lossy()
+            )));
+        }
+        let relative = entry.path().strip_prefix(root).map_err(|error| {
+            AppError::Path(format!(
+                "无法计算 sidecar 相对路径 {}: {error}",
+                entry.path().to_string_lossy()
+            ))
+        })?;
+        let relative = paths::checked_relative_path(&relative.to_string_lossy())?;
+        artifacts.push(ManifestArtifact {
+            relpath: relative.to_string_lossy().replace('\\', "/"),
+            bytes: metadata.len(),
+            sha256: sha256_file(entry.path())?,
+        });
+    }
+    artifacts.sort_by(|left, right| left.relpath.cmp(&right.relpath));
+    Ok(artifacts)
+}
+
+fn collect_backup_artifacts(root: &Path, names: &[&str]) -> AppResult<Vec<ManifestArtifact>> {
+    let mut artifacts = Vec::with_capacity(names.len());
+    for name in names {
+        let path = root.join(name);
+        path_safety::validate_descendant(
+            root,
+            &path,
+            EntryKind::File,
+            false,
+            &format!("备份辅助文件 {name}"),
+        )?;
+        let metadata = fs::symlink_metadata(&path)?;
+        artifacts.push(ManifestArtifact {
+            relpath: (*name).to_string(),
+            bytes: metadata.len(),
+            sha256: sha256_file(&path)?,
+        });
+    }
+    Ok(artifacts)
+}
+
+fn verify_restore_source(
+    backup: &Path,
+    source: &Path,
+    target: &ManifestSession,
+    provider: &str,
+) -> AppResult<()> {
+    path_safety::validate_descendant(backup, source, EntryKind::File, false, "备份会话文件")?;
+    verify_rollout_identity(source, &target.id, provider)?;
+    let actual = sha256_file(source)?;
+    if actual != target.sha256_rollout {
+        return Err(AppError::Other(format!(
+            "备份校验失败，拒绝还原 id={}: expected={} actual={}",
+            target.id, target.sha256_rollout, actual
+        )));
+    }
+    Ok(())
+}
+
+fn copy_restore_file_atomically(
+    destination_root: &Path,
+    source: &Path,
+    destination: &Path,
+    expected_sha256: &str,
+    label: &str,
+) -> AppResult<()> {
+    path_safety::validate_descendant(destination_root, destination, EntryKind::File, true, label)?;
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let copy = |target: &mut File| -> AppResult<()> {
+        let mut source_file = File::open(source)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = source_file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            target.write_all(&buffer[..read])?;
+        }
+        let actual = hex::encode(hasher.finalize());
+        if actual != expected_sha256 {
+            return Err(AppError::Other(format!(
+                "备份源在还原期间发生变化，已拒绝写入: expected={expected_sha256} actual={actual} source={}",
+                source.to_string_lossy()
+            )));
+        }
+        Ok(())
+    };
+    if destination.is_file() {
+        let expected = atomic_file::fingerprint(destination)?;
+        atomic_file::replace_with_writer_if_unchanged(destination, &expected, copy)
+    } else {
+        atomic_file::create_with_writer_if_absent(destination, copy)
+    }
+}
+
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn create_backup(
     provider: Option<String>,
@@ -43,15 +182,17 @@ pub fn create_backup(
     claude_dir: Option<String>,
     backup_dir: String,
     ids: Vec<String>,
+    targets: Option<Vec<BundleExportTarget>>,
     name: Option<String>,
     note: Option<String>,
 ) -> AppResult<BackupSummary> {
+    let targets = normalize_backup_targets(&ids, targets)?;
     if provider.as_deref().unwrap_or(PROVIDER_CODEX) == PROVIDER_CLAUDE {
         let claude = PathBuf::from(
             claude_dir
                 .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
         );
-        return create_claude_backup(claude, PathBuf::from(backup_dir), ids, name, note);
+        return create_claude_backup(claude, PathBuf::from(backup_dir), targets, name, note);
     }
 
     let codex = PathBuf::from(&codex_dir);
@@ -64,6 +205,20 @@ pub fn create_backup(
     validate_backup_name(&final_name)?;
     let tmp = backup_root.join(format!(".{}.partial", final_name));
     let final_path = backup_root.join(&final_name);
+    path_safety::validate_descendant(
+        &backup_root,
+        &tmp,
+        EntryKind::Directory,
+        true,
+        "备份临时目录",
+    )?;
+    path_safety::validate_descendant(
+        &backup_root,
+        &final_path,
+        EntryKind::Directory,
+        true,
+        "备份目标目录",
+    )?;
     if final_path.exists() {
         return Err(AppError::Other(format!("备份已存在: {}", final_name)));
     }
@@ -82,15 +237,31 @@ pub fn create_backup(
     };
     let mut backup_threads: Vec<BackupThread> = Vec::with_capacity(ids.len());
 
-    for id in &ids {
+    for target in &targets {
+        let id = &target.id;
         let thread = load_backup_thread(&state, &codex, id)?;
-        if !thread.rollout_path.is_file() {
-            return Err(AppError::NotFound(format!(
-                "rollout 文件不存在，备份未开始写入。id={} path={}",
-                id,
-                thread.rollout_path.to_string_lossy()
-            )));
+        if let Some(requested) = target.rollout_path.as_deref() {
+            let requested = PathBuf::from(paths::strip_verbatim(requested));
+            let actual = PathBuf::from(paths::strip_verbatim(
+                &thread.rollout_path.to_string_lossy(),
+            ));
+            if requested != actual {
+                return Err(AppError::Other(format!(
+                    "Codex 备份精确目标与 threads.rollout_path 不一致: id={id} requested={} actual={}",
+                    requested.to_string_lossy(),
+                    actual.to_string_lossy()
+                )));
+            }
         }
+        validate_codex_rollout_relpath(&thread.rollout_relpath.to_string_lossy(), id)?;
+        path_safety::validate_descendant(
+            &codex,
+            &thread.rollout_path,
+            EntryKind::File,
+            false,
+            "Codex rollout 备份源",
+        )?;
+        verify_rollout_identity(&thread.rollout_path, id, PROVIDER_CODEX)?;
         backup_threads.push(thread);
     }
     let history_ids = backup_threads
@@ -103,13 +274,14 @@ pub fn create_backup(
     fs::create_dir_all(tmp.join("sessions"))?;
 
     let mut manifest = Manifest {
-        version: 2,
+        version: 4,
         provider: Some(PROVIDER_CODEX.to_string()),
         created_at: chrono::Utc::now().to_rfc3339(),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         codex_dir: codex.to_string_lossy().into_owned(),
         claude_dir: None,
         note,
+        artifacts: Vec::new(),
         sessions: Vec::new(),
     };
     let mut threads_rows: Vec<serde_json::Value> = Vec::new();
@@ -170,6 +342,7 @@ pub fn create_backup(
             rollout_relpath: thread.rollout_relpath.to_string_lossy().replace('\\', "/"),
             source_relpath: None,
             sidecar_relpath: None,
+            sidecar_files: Vec::new(),
             title: thread.title.clone(),
             cwd: thread.cwd.clone(),
             created_at: thread.created_at,
@@ -189,14 +362,18 @@ pub fn create_backup(
     )?;
 
     fs::write(
-        tmp.join("manifest.json"),
-        serde_json::to_vec_pretty(&manifest)?,
-    )?;
-    fs::write(
         tmp.join("threads.json"),
         serde_json::to_vec_pretty(&threads_rows)?,
     )?;
+    logs_out.flush()?;
+    logs_out.sync_all()?;
     drop(logs_out);
+    manifest.artifacts =
+        collect_backup_artifacts(&tmp, &["threads.json", "logs.ndjson", "history.jsonl"])?;
+    fs::write(
+        tmp.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
 
     fs::rename(&tmp, &final_path)?;
 
@@ -206,7 +383,7 @@ pub fn create_backup(
 fn create_claude_backup(
     claude: PathBuf,
     backup_root: PathBuf,
-    ids: Vec<String>,
+    targets: Vec<BundleExportTarget>,
     name: Option<String>,
     note: Option<String>,
 ) -> AppResult<BackupSummary> {
@@ -218,6 +395,20 @@ fn create_claude_backup(
     validate_backup_name(&final_name)?;
     let tmp = backup_root.join(format!(".{}.partial", final_name));
     let final_path = backup_root.join(&final_name);
+    path_safety::validate_descendant(
+        &backup_root,
+        &tmp,
+        EntryKind::Directory,
+        true,
+        "备份临时目录",
+    )?;
+    path_safety::validate_descendant(
+        &backup_root,
+        &final_path,
+        EntryKind::Directory,
+        true,
+        "备份目标目录",
+    )?;
     if final_path.exists() {
         return Err(AppError::Other(format!("备份已存在: {}", final_name)));
     }
@@ -229,35 +420,42 @@ fn create_claude_backup(
     }
 
     let sessions = crate::claude_sessions::scan_sessions(&claude)?;
-    let by_id: HashMap<String, crate::models::SessionSummary> =
-        sessions.into_iter().map(|s| (s.id.clone(), s)).collect();
-    let history_ids = ids.iter().cloned().collect::<HashSet<_>>();
+    let projects = paths::claude_projects_dir(&claude);
+    let history_ids = targets
+        .iter()
+        .map(|target| target.id.clone())
+        .collect::<HashSet<_>>();
     let history_index =
         crate::history::collect_lines_for_ids(&paths::history_path(&claude), &history_ids)?;
 
     let mut manifest = Manifest {
-        version: 2,
+        version: 4,
         provider: Some(PROVIDER_CLAUDE.to_string()),
         created_at: chrono::Utc::now().to_rfc3339(),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         codex_dir: String::new(),
         claude_dir: Some(claude.to_string_lossy().into_owned()),
         note,
+        artifacts: Vec::new(),
         sessions: Vec::new(),
     };
 
-    for id in &ids {
-        let session = by_id
-            .get(id)
-            .ok_or_else(|| AppError::NotFound(format!("Claude 会话不存在: {id}")))?;
+    let id_counts = targets.iter().fold(HashMap::new(), |mut counts, target| {
+        *counts.entry(target.id.as_str()).or_insert(0usize) += 1;
+        counts
+    });
+    for target in &targets {
+        let id = &target.id;
+        let session = resolve_claude_backup_session(&projects, &sessions, target)?;
         let source = PathBuf::from(&session.rollout_path);
-        if !source.is_file() {
-            return Err(AppError::NotFound(format!(
-                "Claude JSONL 文件不存在，备份未开始写入。id={} path={}",
-                id,
-                source.to_string_lossy()
-            )));
-        }
+        path_safety::validate_descendant(
+            &projects,
+            &source,
+            EntryKind::File,
+            false,
+            "Claude JSONL 备份源",
+        )?;
+        verify_rollout_identity(&source, id, PROVIDER_CLAUDE)?;
         let source_rel = crate::claude_sessions::session_relpath(&claude, &source);
         let source_rel_string = source_rel.to_string_lossy().replace('\\', "/");
         let dest_rel = PathBuf::from(PROVIDER_CLAUDE).join(&source_rel);
@@ -270,11 +468,24 @@ fn create_claude_backup(
         let bytes = fs::metadata(&dest)?.len();
 
         let mut sidecar_rel: Option<String> = None;
+        let mut sidecar_files = Vec::new();
         if let Some(sidecar) = crate::claude_sessions::sidecar_path_for(&source) {
-            if sidecar.exists() {
-                let sidecar_dest_rel = PathBuf::from("sidecars").join(paths::sanitize_slug(id));
-                copy_path_recursive(&sidecar, &tmp.join(&sidecar_dest_rel))?;
-                sidecar_rel = Some(sidecar_dest_rel.to_string_lossy().replace('\\', "/"));
+            match fs::symlink_metadata(&sidecar) {
+                Ok(_) => {
+                    path_safety::validate_tree(&projects, &sidecar, "Claude sidecar 备份源")?;
+                    let sidecar_name = if id_counts.get(id.as_str()).copied().unwrap_or(0) > 1 {
+                        exact_artifact_name(id, &source_rel_string)
+                    } else {
+                        paths::sanitize_slug(id)
+                    };
+                    let sidecar_dest_rel = PathBuf::from("sidecars").join(sidecar_name);
+                    let sidecar_dest = tmp.join(&sidecar_dest_rel);
+                    copy_path_recursive(&sidecar, &sidecar_dest)?;
+                    sidecar_files = collect_manifest_artifacts(&sidecar_dest)?;
+                    sidecar_rel = Some(sidecar_dest_rel.to_string_lossy().replace('\\', "/"));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
         }
 
@@ -289,6 +500,7 @@ fn create_claude_backup(
             rollout_relpath: dest_rel.to_string_lossy().replace('\\', "/"),
             source_relpath: Some(source_rel_string),
             sidecar_relpath: sidecar_rel,
+            sidecar_files,
             title: session.title.clone(),
             cwd: session.cwd.clone(),
             created_at: session.created_at,
@@ -301,7 +513,12 @@ fn create_claude_backup(
             sha256_rollout: sha,
         });
     }
-    write_backup_history(&tmp, ids.iter().map(String::as_str), &history_index)?;
+    write_backup_history(
+        &tmp,
+        targets.iter().map(|target| target.id.as_str()),
+        &history_index,
+    )?;
+    manifest.artifacts = collect_backup_artifacts(&tmp, &["history.jsonl"])?;
 
     fs::write(
         tmp.join("manifest.json"),
@@ -309,6 +526,116 @@ fn create_claude_backup(
     )?;
     fs::rename(&tmp, &final_path)?;
     summarize_backup(&final_path)
+}
+
+fn normalize_backup_targets(
+    ids: &[String],
+    targets: Option<Vec<BundleExportTarget>>,
+) -> AppResult<Vec<BundleExportTarget>> {
+    let targets = match targets {
+        Some(targets) => {
+            if targets.len() != ids.len() {
+                return Err(AppError::Other(format!(
+                    "备份 ids 与 targets 数量不一致: ids={} targets={}",
+                    ids.len(),
+                    targets.len()
+                )));
+            }
+            for (index, (id, target)) in ids.iter().zip(&targets).enumerate() {
+                if target.id != *id {
+                    return Err(AppError::Other(format!(
+                        "备份 ids 与 targets 第 {} 项不一致: id={} target.id={}",
+                        index + 1,
+                        id,
+                        target.id
+                    )));
+                }
+            }
+            targets
+        }
+        None => ids
+            .iter()
+            .cloned()
+            .map(|id| BundleExportTarget {
+                id,
+                rollout_path: None,
+            })
+            .collect(),
+    };
+    let mut seen = HashSet::new();
+    for target in &targets {
+        let identity = (
+            target.id.clone(),
+            target.rollout_path.as_deref().unwrap_or("").to_string(),
+        );
+        if !seen.insert(identity) {
+            return Err(AppError::Other(format!(
+                "备份目标重复: id={} rollout_path={}",
+                target.id,
+                target.rollout_path.as_deref().unwrap_or("未提供")
+            )));
+        }
+    }
+    Ok(targets)
+}
+
+fn resolve_claude_backup_session<'a>(
+    projects: &Path,
+    sessions: &'a [crate::models::SessionSummary],
+    target: &BundleExportTarget,
+) -> AppResult<&'a crate::models::SessionSummary> {
+    let matches = sessions
+        .iter()
+        .filter(|session| session.id == target.id)
+        .collect::<Vec<_>>();
+    let session = if let Some(requested) = target.rollout_path.as_deref() {
+        let requested = paths::strip_verbatim(requested);
+        matches
+            .into_iter()
+            .find(|session| paths::strip_verbatim(&session.rollout_path) == requested)
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "Claude 备份精确目标不存在或 ID 不匹配: id={} rollout_path={}",
+                    target.id, requested
+                ))
+            })?
+    } else {
+        match matches.as_slice() {
+            [session] => *session,
+            [] => {
+                return Err(AppError::NotFound(format!(
+                    "Claude 会话不存在: {}",
+                    target.id
+                )))
+            }
+            duplicates => {
+                return Err(AppError::Other(format!(
+                    "发现 {} 个同 ID Claude 会话，备份必须提供精确 rollout_path: {}",
+                    duplicates.len(),
+                    target.id
+                )))
+            }
+        }
+    };
+    let source = PathBuf::from(&session.rollout_path);
+    path_safety::validate_descendant(
+        projects,
+        &source,
+        EntryKind::File,
+        false,
+        "Claude JSONL 备份源",
+    )?;
+    verify_rollout_identity(&source, &target.id, PROVIDER_CLAUDE)?;
+    Ok(session)
+}
+
+fn exact_artifact_name(id: &str, source_relpath: &str) -> String {
+    let digest = Sha256::digest(source_relpath.as_bytes());
+    format!(
+        "{}-{}",
+        paths::sanitize_slug(id),
+        &hex::encode(digest)[..12]
+    )
 }
 
 fn validate_backup_name(name: &str) -> AppResult<()> {
@@ -451,10 +778,369 @@ fn rel_path(abs: &str, codex: &Path) -> AppResult<PathBuf> {
     }
 }
 
-fn summarize_backup(path: &Path) -> AppResult<BackupSummary> {
+fn validate_codex_rollout_relpath(raw: &str, id: &str) -> AppResult<PathBuf> {
+    let relative = paths::checked_relative_path(raw)?;
+    let root = relative
+        .components()
+        .next()
+        .and_then(|component| match component {
+            std::path::Component::Normal(value) => value.to_str(),
+            _ => None,
+        });
+    if !matches!(root, Some("sessions" | "archived_sessions"))
+        || relative.extension().and_then(|value| value.to_str()) != Some("jsonl")
+    {
+        return Err(AppError::Path(format!(
+            "Codex 备份目标只能是 sessions/ 或 archived_sessions/ 下的 jsonl: {raw}"
+        )));
+    }
+    let stem = relative
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    if stem != id && !stem.ends_with(id) {
+        return Err(AppError::Path(format!(
+            "Codex rollout 文件名与会话 ID 不匹配: id={id} path={raw}"
+        )));
+    }
+    Ok(relative)
+}
+
+fn validate_claude_source_relpath(raw: &str, id: &str) -> AppResult<PathBuf> {
+    let relative = paths::checked_relative_path(raw)?;
+    if relative.extension().and_then(|value| value.to_str()) != Some("jsonl")
+        || relative.file_stem().and_then(|value| value.to_str()) != Some(id)
+    {
+        return Err(AppError::Path(format!(
+            "Claude 备份目标必须是以会话 ID 命名的 jsonl: id={id} path={raw}"
+        )));
+    }
+    Ok(relative)
+}
+
+fn validate_manifest_paths(manifest: &Manifest) -> AppResult<()> {
+    let allowed_artifacts = ["history.jsonl", "logs.ndjson", "threads.json"]
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut artifact_paths = HashSet::new();
+    for artifact in &manifest.artifacts {
+        let relative = paths::checked_relative_path(&artifact.relpath)?;
+        let normalized = relative.to_string_lossy().replace('\\', "/");
+        if !allowed_artifacts.contains(normalized.as_str()) {
+            return Err(AppError::Path(format!(
+                "备份辅助文件清单包含不允许的路径: {}",
+                artifact.relpath
+            )));
+        }
+        if !artifact_paths.insert(normalized) {
+            return Err(AppError::Path(format!(
+                "备份辅助文件清单包含重复路径: {}",
+                artifact.relpath
+            )));
+        }
+    }
+    if manifest.version >= 4 {
+        let provider = manifest.provider.as_deref().unwrap_or_else(|| {
+            manifest
+                .sessions
+                .first()
+                .map(|session| manifest_session_provider(manifest, session))
+                .unwrap_or(PROVIDER_CODEX)
+        });
+        let expected = if provider == PROVIDER_CLAUDE {
+            ["history.jsonl"].into_iter().collect::<HashSet<_>>()
+        } else {
+            ["history.jsonl", "logs.ndjson", "threads.json"]
+                .into_iter()
+                .collect::<HashSet<_>>()
+        };
+        let actual = artifact_paths
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        if actual != expected {
+            return Err(AppError::Other(format!(
+                "备份 v{} 的辅助文件清单不完整: provider={provider}",
+                manifest.version
+            )));
+        }
+    }
+
+    for session in &manifest.sessions {
+        let mut artifact_paths = HashSet::new();
+        for artifact in &session.sidecar_files {
+            let relative = paths::checked_relative_path(&artifact.relpath)?;
+            if !artifact_paths.insert(relative) {
+                return Err(AppError::Path(format!(
+                    "sidecar manifest 包含重复路径: {}",
+                    artifact.relpath
+                )));
+            }
+        }
+        if session.sidecar_relpath.is_none() && !session.sidecar_files.is_empty() {
+            return Err(AppError::Path(format!(
+                "会话未声明 sidecar 目录却包含 sidecar 文件清单: {}",
+                session.id
+            )));
+        }
+        let provider = manifest_session_provider(manifest, session);
+        match provider {
+            PROVIDER_CODEX => {
+                validate_codex_rollout_relpath(&session.rollout_relpath, &session.id)?;
+                if session.sidecar_relpath.is_some() {
+                    return Err(AppError::Path(format!(
+                        "Codex 备份不应声明 Claude sidecar: {}",
+                        session.id
+                    )));
+                }
+                if let Some(path) = session.source_relpath.as_deref() {
+                    paths::checked_relative_path(path)?;
+                }
+            }
+            PROVIDER_CLAUDE => {
+                let source = session.source_relpath.as_deref().ok_or_else(|| {
+                    AppError::Path(format!("Claude 备份缺少 source_relpath: {}", session.id))
+                })?;
+                let source = validate_claude_source_relpath(source, &session.id)?;
+                let rollout = paths::checked_relative_path(&session.rollout_relpath)?;
+                if rollout != PathBuf::from(PROVIDER_CLAUDE).join(&source) {
+                    return Err(AppError::Path(format!(
+                        "Claude 备份文件路径与目标路径不对应: {}",
+                        session.id
+                    )));
+                }
+                if let Some(sidecar) = session.sidecar_relpath.as_deref() {
+                    let sidecar = paths::checked_relative_path(sidecar)?;
+                    let legacy = PathBuf::from("sidecars").join(paths::sanitize_slug(&session.id));
+                    let normalized_source = source.to_string_lossy().replace('\\', "/");
+                    let exact = PathBuf::from("sidecars")
+                        .join(exact_artifact_name(&session.id, &normalized_source));
+                    if sidecar != legacy && sidecar != exact {
+                        return Err(AppError::Path(format!(
+                            "Claude sidecar 路径与会话 ID 不对应: {}",
+                            session.id
+                        )));
+                    }
+                }
+            }
+            other => {
+                return Err(AppError::Other(format!("备份包含未知 provider: {other}")));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn verify_rollout_identity(source: &Path, expected_id: &str, provider: &str) -> AppResult<()> {
+    if provider == PROVIDER_CODEX {
+        let brief = crate::repair::read_rollout_brief(source.parent().unwrap_or(source), source)?
+            .ok_or_else(|| {
+            AppError::Other(format!(
+                "备份 Codex rollout 缺少 session_meta: {}",
+                source.to_string_lossy()
+            ))
+        })?;
+        if brief.id != expected_id {
+            return Err(AppError::Other(format!(
+                "备份 Codex rollout 内部 ID 不匹配: 期望 {}，实际 {}",
+                expected_id, brief.id
+            )));
+        }
+        return Ok(());
+    }
+
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    if stem.starts_with("agent-") {
+        if stem == expected_id {
+            return Ok(());
+        }
+        return Err(AppError::Other(format!(
+            "备份 Claude 子代理文件名与 ID 不匹配: {}",
+            expected_id
+        )));
+    }
+    let file = File::open(source)?;
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(&line).map_err(|error| {
+            AppError::Other(format!(
+                "备份 Claude JSONL 损坏 {}: {error}",
+                source.to_string_lossy()
+            ))
+        })?;
+        if let Some(id) = value.get("sessionId").and_then(serde_json::Value::as_str) {
+            if id == expected_id {
+                return Ok(());
+            }
+            return Err(AppError::Other(format!(
+                "备份 Claude rollout 内部 ID 不匹配: 期望 {}，实际 {}",
+                expected_id, id
+            )));
+        }
+    }
+    Err(AppError::Other(format!(
+        "备份 Claude rollout 缺少 sessionId: {}",
+        source.to_string_lossy()
+    )))
+}
+
+fn validate_optional_backup_file(backup: &Path, name: &str, required: bool) -> AppResult<()> {
+    let path = backup.join(name);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {
+            path_safety::validate_descendant(
+                backup,
+                &path,
+                EntryKind::File,
+                false,
+                &format!("备份 {name}"),
+            )?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !required => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(AppError::NotFound(format!("备份缺少必需文件: {name}")))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_backup_payload(
+    backup: &Path,
+    manifest: &Manifest,
+    rollout_presence: RolloutPresence,
+) -> AppResult<()> {
+    if manifest.version >= 4 {
+        for artifact in &manifest.artifacts {
+            let relative = paths::checked_relative_path(&artifact.relpath)?;
+            let path = backup.join(relative);
+            path_safety::validate_descendant(
+                backup,
+                &path,
+                EntryKind::File,
+                false,
+                "备份辅助文件",
+            )?;
+            let metadata = fs::symlink_metadata(&path)?;
+            let actual_sha = sha256_file(&path)?;
+            if metadata.len() != artifact.bytes || actual_sha != artifact.sha256 {
+                return Err(AppError::Other(format!(
+                    "备份辅助文件大小或 sha256 校验失败: {}",
+                    artifact.relpath
+                )));
+            }
+        }
+    }
+    let has_codex = manifest
+        .sessions
+        .iter()
+        .any(|session| manifest_session_provider(manifest, session) == PROVIDER_CODEX);
+    validate_optional_backup_file(backup, "threads.json", has_codex)?;
+    validate_optional_backup_file(
+        backup,
+        "logs.ndjson",
+        manifest
+            .sessions
+            .iter()
+            .any(|session| session.logs_count > 0),
+    )?;
+    validate_optional_backup_file(
+        backup,
+        "history.jsonl",
+        manifest
+            .sessions
+            .iter()
+            .any(|session| session.history_rows > 0),
+    )?;
+
+    for session in &manifest.sessions {
+        let provider = manifest_session_provider(manifest, session);
+        let source = backup.join(paths::checked_relative_path(&session.rollout_relpath)?);
+        let source_exists = path_safety::validate_descendant(
+            backup,
+            &source,
+            EntryKind::File,
+            rollout_presence == RolloutPresence::AllowMissing,
+            "备份会话文件",
+        )?;
+        if source_exists {
+            verify_rollout_identity(&source, &session.id, provider)?;
+        }
+        if let Some(sidecar) = session.sidecar_relpath.as_deref() {
+            let sidecar = backup.join(paths::checked_relative_path(sidecar)?);
+            path_safety::validate_tree(backup, &sidecar, "Claude 备份 sidecar")?;
+            if manifest.version >= 3 {
+                let actual = collect_manifest_artifacts(&sidecar)?;
+                if actual.len() != session.sidecar_files.len()
+                    || actual
+                        .iter()
+                        .zip(&session.sidecar_files)
+                        .any(|(left, right)| {
+                            left.relpath != right.relpath
+                                || left.bytes != right.bytes
+                                || left.sha256 != right.sha256
+                        })
+                {
+                    return Err(AppError::Other(format!(
+                        "Claude sidecar 文件清单或 sha256 校验失败: {}",
+                        session.id
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn load_backup_manifest(path: &Path) -> AppResult<Manifest> {
     let manifest_path = path.join("manifest.json");
-    let raw = fs::read_to_string(&manifest_path)?;
-    let manifest: Manifest = serde_json::from_str(&raw)?;
+    let metadata = fs::symlink_metadata(&manifest_path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(AppError::Path(format!(
+            "备份 manifest 必须是普通文件且不能是符号链接: {}",
+            manifest_path.to_string_lossy()
+        )));
+    }
+    let manifest: Manifest = serde_json::from_str(&fs::read_to_string(&manifest_path)?)?;
+    validate_manifest_paths(&manifest)?;
+    Ok(manifest)
+}
+
+fn validated_backup_path(backup_dir: &Path, backup_path: &Path) -> AppResult<PathBuf> {
+    let root_metadata = fs::symlink_metadata(backup_dir)?;
+    if path_safety::metadata_is_link_or_reparse(&root_metadata) || !root_metadata.is_dir() {
+        return Err(AppError::Path(format!(
+            "备份根目录必须是普通目录且不能是链接或 junction: {}",
+            backup_dir.to_string_lossy()
+        )));
+    }
+    let target_metadata = fs::symlink_metadata(backup_path)?;
+    if path_safety::metadata_is_link_or_reparse(&target_metadata) || !target_metadata.is_dir() {
+        return Err(AppError::Path(format!(
+            "备份目标必须是普通目录且不能是符号链接: {}",
+            backup_path.to_string_lossy()
+        )));
+    }
+    let root = backup_dir.canonicalize()?;
+    let target = backup_path.canonicalize()?;
+    if target == root || target.parent() != Some(root.as_path()) {
+        return Err(AppError::Path(format!(
+            "备份目标必须是备份根目录的直接子目录: {}",
+            backup_path.to_string_lossy()
+        )));
+    }
+    load_backup_manifest(&target)?;
+    Ok(target)
+}
+
+fn summarize_backup(path: &Path) -> AppResult<BackupSummary> {
+    let manifest = load_backup_manifest(path)?;
     let total_bytes: u64 = manifest.sessions.iter().map(|s| s.bytes_rollout).sum();
     let name = path
         .file_name()
@@ -477,12 +1163,31 @@ fn write_backup_history<'a>(
     history_index: &HashMap<String, Vec<String>>,
 ) -> AppResult<u32> {
     let mut lines = Vec::new();
+    let mut seen = HashSet::new();
     for id in ids {
+        if !seen.insert(id) {
+            continue;
+        }
         if let Some(rows) = history_index.get(id) {
             lines.extend(rows.iter().cloned());
         }
     }
-    crate::history::write_lines(&backup_dir.join("history.jsonl"), &lines)
+    let path = backup_dir.join("history.jsonl");
+    let written = crate::history::write_lines(&path, &lines)?;
+    if !path.exists() {
+        let file = File::create(&path)?;
+        file.sync_all()?;
+    }
+    Ok(written)
+}
+
+fn append_backup_history_if_present(destination: &Path, backup: &Path, id: &str) -> AppResult<u32> {
+    let source = backup.join("history.jsonl");
+    match fs::symlink_metadata(&source) {
+        Ok(_) => crate::history::append_from_file(destination, &source, id),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -495,7 +1200,9 @@ pub fn list_backups(backup_dir: String, provider: Option<String>) -> AppResult<V
     for entry in fs::read_dir(&root)? {
         let e = entry?;
         let p = e.path();
-        if !p.is_dir() {
+        let file_type = e.file_type()?;
+        let metadata = fs::symlink_metadata(&p)?;
+        if !file_type.is_dir() || path_safety::metadata_is_link_or_reparse(&metadata) {
             continue;
         }
         let name = p
@@ -506,15 +1213,14 @@ pub fn list_backups(backup_dir: String, provider: Option<String>) -> AppResult<V
             continue;
         }
         if p.join("manifest.json").is_file() {
-            if let Ok(s) = summarize_backup(&p) {
-                if let Some(provider) = provider.as_deref() {
-                    let backup_provider = backup_provider(&s.provider);
-                    if backup_provider != provider {
-                        continue;
-                    }
+            let s = summarize_backup(&p)?;
+            if let Some(provider) = provider.as_deref() {
+                let backup_provider = backup_provider(&s.provider);
+                if backup_provider != provider {
+                    continue;
                 }
-                out.push(s);
             }
+            out.push(s);
         }
     }
     out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -522,30 +1228,31 @@ pub fn list_backups(backup_dir: String, provider: Option<String>) -> AppResult<V
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
-pub fn open_backup(backup_path: String) -> AppResult<BackupDetail> {
-    let p = PathBuf::from(&backup_path);
+pub fn open_backup(backup_dir: String, backup_path: String) -> AppResult<BackupDetail> {
+    let p = validated_backup_path(Path::new(&backup_dir), Path::new(&backup_path))?;
     let summary = summarize_backup(&p)?;
-    let raw = fs::read_to_string(p.join("manifest.json"))?;
-    let manifest: Manifest = serde_json::from_str(&raw)?;
+    let manifest = load_backup_manifest(&p)?;
+    validate_backup_payload(&p, &manifest, RolloutPresence::AllowMissing)?;
     Ok(BackupDetail { summary, manifest })
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
-pub fn delete_backup(backup_path: String) -> AppResult<()> {
-    let p = PathBuf::from(&backup_path);
-    if p.is_dir() {
-        fs::remove_dir_all(&p)?;
-    }
+pub fn delete_backup(backup_dir: String, backup_path: String) -> AppResult<()> {
+    let p = validated_backup_path(Path::new(&backup_dir), Path::new(&backup_path))?;
+    let root = Path::new(&backup_dir).canonicalize()?;
+    path_safety::remove_path(&root, &p, EntryKind::Directory, "备份目录")?;
     Ok(())
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
-pub fn verify_backup(backup_path: String) -> AppResult<VerifyReport> {
-    let p = PathBuf::from(&backup_path);
-    let raw = fs::read_to_string(p.join("manifest.json"))?;
-    let manifest: Manifest = serde_json::from_str(&raw)?;
+pub fn verify_backup(backup_dir: String, backup_path: String) -> AppResult<VerifyReport> {
+    let p = validated_backup_path(Path::new(&backup_dir), Path::new(&backup_path))?;
+    let manifest = load_backup_manifest(&p)?;
+    validate_backup_payload(&p, &manifest, RolloutPresence::AllowMissing)?;
     let mut items = Vec::new();
-    let mut all_ok = true;
+    // v1-v3 没有覆盖 threads/logs/history 的哈希，不能把“rollout 校验通过”误报成
+    // “整个备份完整性通过”。旧备份仍可逐项查看和还原，但整体状态保持未通过。
+    let mut all_ok = manifest.version >= 4;
     for s in &manifest.sessions {
         let rel = paths::checked_relative_path(&s.rollout_relpath)?;
         let file = p.join(&rel);
@@ -592,27 +1299,62 @@ pub fn verify_backup(backup_path: String) -> AppResult<VerifyReport> {
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn restore_session(
     provider: Option<String>,
+    backup_dir: String,
     backup_path: String,
     codex_dir: String,
     claude_dir: Option<String>,
     id: String,
+    backup_rollout_relpath: Option<String>,
     overwrite: bool,
 ) -> AppResult<RestoreResult> {
-    let backup = PathBuf::from(&backup_path);
+    let backup = validated_backup_path(Path::new(&backup_dir), Path::new(&backup_path))?;
     let codex = PathBuf::from(&codex_dir);
     let claude = PathBuf::from(
         claude_dir.unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
     );
-    let raw = fs::read_to_string(backup.join("manifest.json"))?;
-    let manifest: Manifest = serde_json::from_str(&raw)?;
-    let target = manifest
+    let manifest = load_backup_manifest(&backup)?;
+    validate_backup_payload(&backup, &manifest, RolloutPresence::Required)?;
+    let matches = manifest
         .sessions
         .iter()
-        .find(|s| s.id == id)
-        .ok_or_else(|| AppError::NotFound(format!("manifest 中未找到 id: {}", id)))?;
-    let provider = provider
-        .as_deref()
-        .unwrap_or_else(|| manifest_session_provider(&manifest, target));
+        .filter(|session| session.id == id)
+        .collect::<Vec<_>>();
+    let target = if let Some(requested) = backup_rollout_relpath.as_deref() {
+        let requested = paths::checked_relative_path(requested)?;
+        matches
+            .into_iter()
+            .find(|session| {
+                paths::checked_relative_path(&session.rollout_relpath)
+                    .map(|relative| relative == requested)
+                    .unwrap_or(false)
+            })
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "manifest 中未找到精确备份会话: id={id} rollout_relpath={}",
+                    requested.to_string_lossy()
+                ))
+            })?
+    } else {
+        match matches.as_slice() {
+            [target] => *target,
+            [] => return Err(AppError::NotFound(format!("manifest 中未找到 id: {id}"))),
+            duplicates => {
+                return Err(AppError::Other(format!(
+                "manifest 中存在 {} 个同 ID 会话，还原必须提供精确 backup_rollout_relpath: {id}",
+                duplicates.len()
+            )))
+            }
+        }
+    };
+    let manifest_provider = manifest_session_provider(&manifest, target);
+    if let Some(requested) = provider.as_deref() {
+        if requested != manifest_provider {
+            return Err(AppError::Other(format!(
+                "备份 provider 为 {manifest_provider}，当前页面却请求按 {requested} 还原，已拒绝"
+            )));
+        }
+    }
+    let provider = provider.as_deref().unwrap_or(manifest_provider);
     if provider == PROVIDER_CLAUDE {
         restore_one_claude(&backup, &claude, target, overwrite)
     } else {
@@ -623,18 +1365,30 @@ pub fn restore_session(
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn restore_all(
     provider: Option<String>,
+    backup_dir: String,
     backup_path: String,
     codex_dir: String,
     claude_dir: Option<String>,
     overwrite: bool,
 ) -> AppResult<Vec<RestoreResult>> {
-    let backup = PathBuf::from(&backup_path);
+    let backup = validated_backup_path(Path::new(&backup_dir), Path::new(&backup_path))?;
     let codex = PathBuf::from(&codex_dir);
     let claude = PathBuf::from(
         claude_dir.unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
     );
-    let raw = fs::read_to_string(backup.join("manifest.json"))?;
-    let manifest: Manifest = serde_json::from_str(&raw)?;
+    let manifest = load_backup_manifest(&backup)?;
+    validate_backup_payload(&backup, &manifest, RolloutPresence::Required)?;
+    if let Some(requested) = provider.as_deref() {
+        for session in &manifest.sessions {
+            let actual = manifest_session_provider(&manifest, session);
+            if actual != requested {
+                return Err(AppError::Other(format!(
+                    "备份会话 {} 的 provider 为 {actual}，当前页面请求按 {requested} 还原，已拒绝",
+                    session.id
+                )));
+            }
+        }
+    }
     let mut out = Vec::new();
     for s in &manifest.sessions {
         let session_provider = provider
@@ -673,6 +1427,47 @@ fn manifest_session_provider<'a>(manifest: &'a Manifest, session: &'a ManifestSe
         .unwrap_or(PROVIDER_CODEX)
 }
 
+fn read_backup_log_rows(
+    backup: &Path,
+    target: &ManifestSession,
+) -> AppResult<Vec<serde_json::Map<String, serde_json::Value>>> {
+    let path = backup.join("logs.ndjson");
+    if !path.is_file() {
+        if target.logs_count == 0 {
+            return Ok(Vec::new());
+        }
+        return Err(AppError::NotFound(format!(
+            "备份缺少 logs.ndjson，会话 {} 声明有 {} 行日志",
+            target.id, target.logs_count
+        )));
+    }
+    let mut out = Vec::new();
+    for (line_no, line) in BufReader::new(File::open(path)?).lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(&line).map_err(|error| {
+            AppError::Other(format!("logs.ndjson 第 {} 行损坏: {error}", line_no + 1))
+        })?;
+        let object = value.as_object().ok_or_else(|| {
+            AppError::Other(format!("logs.ndjson 第 {} 行不是 JSON 对象", line_no + 1))
+        })?;
+        if object.get("thread_id").and_then(serde_json::Value::as_str) == Some(target.id.as_str()) {
+            out.push(object.clone());
+        }
+    }
+    if out.len() as u32 != target.logs_count {
+        return Err(AppError::Other(format!(
+            "logs.ndjson 会话 {} 行数与 manifest 不一致: expected={} actual={}",
+            target.id,
+            target.logs_count,
+            out.len()
+        )));
+    }
+    Ok(out)
+}
+
 fn restore_one_claude(
     backup: &Path,
     claude: &Path,
@@ -694,42 +1489,396 @@ fn restore_one_claude(
         .source_relpath
         .as_deref()
         .unwrap_or(&target.rollout_relpath);
-    let target_rel = paths::checked_relative_path(source_rel)?;
+    let target_rel = validate_claude_source_relpath(source_rel, &target.id)?;
     let backup_rel = paths::checked_relative_path(&target.rollout_relpath)?;
     let src = backup.join(&backup_rel);
     let dest = paths::claude_projects_dir(claude).join(&target_rel);
+    let sidecar_dest = crate::claude_sessions::sidecar_path_for(&dest)
+        .ok_or_else(|| AppError::Path("Claude 会话路径无法计算 sidecar".into()))?;
 
-    if dest.exists() && !overwrite {
+    fs::create_dir_all(claude)?;
+    path_safety::validate_descendant(claude, &dest, EntryKind::File, true, "Claude 会话还原目标")?;
+    path_safety::validate_descendant(
+        claude,
+        &sidecar_dest,
+        EntryKind::FileOrDirectory,
+        true,
+        "Claude sidecar 还原目标",
+    )?;
+    verify_restore_source(backup, &src, target, PROVIDER_CLAUDE)?;
+
+    if (dest.exists() || sidecar_dest.exists()) && !overwrite {
         result.conflict = true;
         return Ok(result);
     }
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::copy(&src, &dest)?;
+    let sidecar_src = target
+        .sidecar_relpath
+        .as_deref()
+        .map(paths::checked_relative_path)
+        .transpose()?
+        .map(|relative| backup.join(relative));
+    crate::bundle::replace_claude_snapshot_verified(
+        &src,
+        &dest,
+        None,
+        sidecar_src.as_deref(),
+        Some(&target.sha256_rollout),
+    )?;
     result.rollout_copied = true;
-
-    if let Some(sidecar_rel) = target.sidecar_relpath.as_deref() {
-        let sidecar_src = backup.join(paths::checked_relative_path(sidecar_rel)?);
-        if sidecar_src.exists() {
-            if let Some(sidecar_dest) = crate::claude_sessions::sidecar_path_for(&dest) {
-                if sidecar_dest.exists() && overwrite {
-                    remove_path_recursive(&sidecar_dest)?;
-                }
-                if !sidecar_dest.exists() {
-                    copy_path_recursive(&sidecar_src, &sidecar_dest)?;
-                }
-            }
+    match append_backup_history_if_present(&paths::history_path(claude), backup, &target.id) {
+        Ok(appended) => result.history_appended = appended,
+        Err(error) => {
+            result.error = Some(format!(
+                "Claude transcript/sidecar 已还原，但 history 追加失败: {error}"
+            ));
+            return Ok(result);
         }
     }
-    result.history_appended = crate::history::append_from_file(
-        &paths::history_path(claude),
-        &backup.join("history.jsonl"),
-        &target.id,
-    )?;
 
     result.ok = true;
     Ok(result)
+}
+
+struct RestoreFileSnapshot {
+    label: &'static str,
+    path: PathBuf,
+    snapshot_path: Option<PathBuf>,
+    original_fingerprint: Option<atomic_file::FileFingerprint>,
+    mutation_started: bool,
+    expected_after: Option<atomic_file::FileFingerprint>,
+}
+
+struct RestoreFileSnapshots {
+    root: PathBuf,
+    files: Vec<RestoreFileSnapshot>,
+}
+
+impl RestoreFileSnapshots {
+    fn capture(paths: &[(&'static str, &Path)]) -> AppResult<Self> {
+        let root = loop {
+            let sequence = RESTORE_SNAPSHOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let candidate = std::env::temp_dir().join(format!(
+                "ccsm-restore-snapshot-{}-{sequence}",
+                std::process::id()
+            ));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let mut files = Vec::with_capacity(paths.len());
+        for (index, (label, path)) in paths.iter().enumerate() {
+            let capture = (|| -> AppResult<RestoreFileSnapshot> {
+                match fs::symlink_metadata(path) {
+                    Ok(metadata) => {
+                        if path_safety::metadata_is_link_or_reparse(&metadata)
+                            || !metadata.is_file()
+                        {
+                            return Err(AppError::Path(format!(
+                                "{label} 不是普通文件，拒绝创建还原快照: {}",
+                                path.to_string_lossy()
+                            )));
+                        }
+                        let before = atomic_file::fingerprint(path)?;
+                        let snapshot_path = root.join(format!("{index}.snapshot"));
+                        fs::copy(path, &snapshot_path)?;
+                        File::open(&snapshot_path)?.sync_all()?;
+                        let snapshot_fingerprint = atomic_file::fingerprint(&snapshot_path)?;
+                        let after = atomic_file::fingerprint(path)?;
+                        if before != after || before != snapshot_fingerprint {
+                            return Err(AppError::Other(format!(
+                                "{label} 在创建还原快照期间发生变化: {}",
+                                path.to_string_lossy()
+                            )));
+                        }
+                        Ok(RestoreFileSnapshot {
+                            label,
+                            path: path.to_path_buf(),
+                            snapshot_path: Some(snapshot_path),
+                            original_fingerprint: Some(before),
+                            mutation_started: false,
+                            expected_after: None,
+                        })
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Ok(RestoreFileSnapshot {
+                            label,
+                            path: path.to_path_buf(),
+                            snapshot_path: None,
+                            original_fingerprint: None,
+                            mutation_started: false,
+                            expected_after: None,
+                        })
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            })();
+            match capture {
+                Ok(snapshot) => files.push(snapshot),
+                Err(error) => {
+                    return match fs::remove_dir_all(&root) {
+                        Ok(()) => Err(error),
+                        Err(cleanup_error) => Err(AppError::Other(format!(
+                            "{error}；清理未完成还原快照失败 {}: {cleanup_error}",
+                            root.to_string_lossy()
+                        ))),
+                    };
+                }
+            }
+        }
+        Ok(Self { root, files })
+    }
+
+    fn start(&mut self, label: &'static str) -> AppResult<()> {
+        let snapshot = self
+            .files
+            .iter_mut()
+            .find(|snapshot| snapshot.label == label)
+            .ok_or_else(|| AppError::Other(format!("缺少 {label} 的还原快照")))?;
+        snapshot.mutation_started = true;
+        Ok(())
+    }
+
+    fn finish(&mut self, label: &'static str) -> AppResult<()> {
+        let snapshot = self
+            .files
+            .iter_mut()
+            .find(|snapshot| snapshot.label == label)
+            .ok_or_else(|| AppError::Other(format!("缺少 {label} 的还原快照")))?;
+        snapshot.expected_after = Some(atomic_file::fingerprint(&snapshot.path)?);
+        Ok(())
+    }
+
+    fn compensate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for snapshot in self
+            .files
+            .iter()
+            .rev()
+            .filter(|snapshot| snapshot.mutation_started)
+        {
+            if let Err(error) = restore_file_snapshot(snapshot) {
+                errors.push(format!("补偿 {} 失败: {error}", snapshot.label));
+            }
+        }
+        errors
+    }
+
+    fn cleanup(&self) -> AppResult<()> {
+        fs::remove_dir_all(&self.root).map_err(|error| {
+            AppError::Other(format!(
+                "清理还原快照失败 {}: {error}",
+                self.root.to_string_lossy()
+            ))
+        })
+    }
+}
+
+fn current_regular_fingerprint(
+    path: &Path,
+    label: &str,
+) -> AppResult<Option<atomic_file::FileFingerprint>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if path_safety::metadata_is_link_or_reparse(&metadata) || !metadata.is_file() {
+                return Err(AppError::Path(format!(
+                    "{label} 在补偿前不再是普通文件: {}",
+                    path.to_string_lossy()
+                )));
+            }
+            Ok(Some(atomic_file::fingerprint(path)?))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn restore_file_snapshot(snapshot: &RestoreFileSnapshot) -> AppResult<()> {
+    let current = current_regular_fingerprint(&snapshot.path, snapshot.label)?;
+    if current == snapshot.original_fingerprint {
+        return Ok(());
+    }
+    if let Some(expected_after) = snapshot.expected_after.as_ref() {
+        if current.as_ref() != Some(expected_after) {
+            return Err(AppError::Other(format!(
+                "文件在还原失败后又发生变化，拒绝覆盖并发数据: {}",
+                snapshot.path.to_string_lossy()
+            )));
+        }
+    }
+
+    match (
+        snapshot.original_fingerprint.as_ref(),
+        snapshot.snapshot_path.as_deref(),
+        current.as_ref(),
+    ) {
+        (Some(_), Some(snapshot_path), Some(current)) => {
+            atomic_file::replace_with_writer_if_unchanged(&snapshot.path, current, |destination| {
+                let mut source = File::open(snapshot_path)?;
+                std::io::copy(&mut source, destination)?;
+                Ok(())
+            })
+        }
+        (Some(_), Some(snapshot_path), None) => {
+            if let Some(parent) = snapshot.path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            atomic_file::create_with_writer_if_absent(&snapshot.path, |destination| {
+                let mut source = File::open(snapshot_path)?;
+                std::io::copy(&mut source, destination)?;
+                Ok(())
+            })
+        }
+        (None, None, Some(_)) => {
+            fs::remove_file(&snapshot.path)?;
+            Ok(())
+        }
+        (None, None, None) => Ok(()),
+        _ => Err(AppError::Other(format!(
+            "{} 的还原快照结构不完整",
+            snapshot.label
+        ))),
+    }
+}
+
+fn restore_failure_message(
+    primary: impl std::fmt::Display,
+    rollback_error: Option<rusqlite::Error>,
+    compensation_errors: Vec<String>,
+    cleanup_error: Option<AppError>,
+) -> String {
+    let final_state_uncertain = rollback_error.is_some() || !compensation_errors.is_empty();
+    let mut details = vec![primary.to_string()];
+    if let Some(error) = rollback_error {
+        details.push(format!("回滚 SQLite 事务失败: {error}"));
+    }
+    details.extend(compensation_errors);
+    if let Some(error) = cleanup_error {
+        details.push(error.to_string());
+    }
+    if final_state_uncertain {
+        details.push("部分回滚或补偿失败，最终状态不确定，请检查上述文件与数据库".into());
+    }
+    details.join("；")
+}
+
+fn insert_restore_thread(
+    transaction: &rusqlite::Transaction<'_>,
+    codex: &Path,
+    target_rel: &Path,
+    row: &serde_json::Value,
+) -> AppResult<()> {
+    let columns_sql =
+        "id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+                sandbox_policy, approval_mode, tokens_used, has_user_event, archived, archived_at,
+                git_sha, git_branch, git_origin_url, cli_version, first_user_message,
+                agent_nickname, agent_role, memory_mode, model, reasoning_effort, agent_path,
+                created_at_ms, updated_at_ms";
+    let columns = columns_sql.split(',').map(str::trim).collect::<Vec<_>>();
+    let placeholders = (0..columns.len())
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("INSERT OR REPLACE INTO threads ({columns_sql}) VALUES ({placeholders})");
+    let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(columns.len());
+    for name in &columns {
+        if *name == "rollout_path" {
+            values.push(Box::new(
+                codex.join(target_rel).to_string_lossy().into_owned(),
+            ));
+            continue;
+        }
+        let value = row.get(*name).unwrap_or(&serde_json::Value::Null);
+        let parameter: Box<dyn rusqlite::ToSql> = match value {
+            serde_json::Value::Null => Box::new(Option::<String>::None),
+            serde_json::Value::Bool(value) => Box::new(if *value { 1i64 } else { 0i64 }),
+            serde_json::Value::Number(number) => {
+                if let Some(value) = number.as_i64() {
+                    Box::new(value)
+                } else if let Some(value) = number.as_f64() {
+                    Box::new(value)
+                } else {
+                    Box::new(number.to_string())
+                }
+            }
+            serde_json::Value::String(value) => Box::new(value.clone()),
+            other => Box::new(other.to_string()),
+        };
+        values.push(parameter);
+    }
+    let parameters = values
+        .iter()
+        .map(|value| value.as_ref())
+        .collect::<Vec<_>>();
+    let affected = transaction.execute(&sql, parameters.as_slice())?;
+    if affected != 1 {
+        return Err(AppError::Other(format!(
+            "threads 还原写入行数异常: expected=1 actual={affected}"
+        )));
+    }
+    Ok(())
+}
+
+fn insert_restore_logs(
+    transaction: &rusqlite::Transaction<'_>,
+    thread_id: &str,
+    rows: &[serde_json::Map<String, serde_json::Value>],
+    overwrite: bool,
+) -> AppResult<u32> {
+    if overwrite {
+        transaction.execute(
+            "DELETE FROM restore_logs.logs WHERE thread_id = ?",
+            [thread_id],
+        )?;
+    }
+    let mut inserted = 0u32;
+    for object in rows {
+        let keys = object.keys().cloned().collect::<Vec<_>>();
+        let placeholders = (0..keys.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+        let quoted_keys = keys
+            .iter()
+            .map(|key| format!("\"{}\"", key.replace('"', "\"\"")))
+            .collect::<Vec<_>>();
+        let sql = format!(
+            "INSERT INTO restore_logs.logs ({}) VALUES ({placeholders})",
+            quoted_keys.join(",")
+        );
+        let mut parameters: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(keys.len());
+        for key in &keys {
+            let value = &object[key];
+            let parameter: Box<dyn rusqlite::ToSql> = match value {
+                serde_json::Value::Null => Box::new(Option::<String>::None),
+                serde_json::Value::Bool(value) => Box::new(if *value { 1i64 } else { 0i64 }),
+                serde_json::Value::Number(number) => {
+                    if let Some(value) = number.as_i64() {
+                        Box::new(value)
+                    } else if let Some(value) = number.as_f64() {
+                        Box::new(value)
+                    } else {
+                        Box::new(number.to_string())
+                    }
+                }
+                serde_json::Value::String(value) => Box::new(value.clone()),
+                other => Box::new(other.to_string()),
+            };
+            parameters.push(parameter);
+        }
+        let bound = parameters
+            .iter()
+            .map(|value| value.as_ref())
+            .collect::<Vec<_>>();
+        let affected = transaction.execute(&sql, bound.as_slice())?;
+        if affected != 1 {
+            return Err(AppError::Other(format!(
+                "logs 还原写入行数异常: session={thread_id} expected=1 actual={affected}"
+            )));
+        }
+        inserted = inserted
+            .checked_add(1)
+            .ok_or_else(|| AppError::Other("logs 还原行数溢出".into()))?;
+    }
+    Ok(inserted)
 }
 
 fn restore_one(
@@ -748,173 +1897,226 @@ fn restore_one(
         conflict: false,
         error: None,
     };
-    let target_rel = paths::checked_relative_path(&target.rollout_relpath)?;
+    let target_rel = validate_codex_rollout_relpath(&target.rollout_relpath, &target.id)?;
+    let src = backup.join(&target_rel);
+    let dest = codex.join(&target_rel);
+
+    path_safety::validate_descendant(
+        codex,
+        &dest,
+        EntryKind::File,
+        true,
+        "Codex rollout 还原目标",
+    )?;
+    verify_restore_source(backup, &src, target, PROVIDER_CODEX)?;
 
     // 1) 冲突检测
-    let state = state_db::open(codex)?;
-    let exists: bool = state
-        .query_row("SELECT 1 FROM threads WHERE id = ?", [&target.id], |_| {
+    let mut state = state_db::open(codex)?;
+    let thread_exists =
+        match state.query_row("SELECT 1 FROM threads WHERE id = ?", [&target.id], |_| {
             Ok(true)
-        })
-        .unwrap_or(false);
-    if exists && !overwrite {
+        }) {
+            Ok(exists) => exists,
+            Err(rusqlite::Error::QueryReturnedNoRows) => false,
+            Err(error) => return Err(error.into()),
+        };
+    if (thread_exists || dest.exists()) && !overwrite {
         result.conflict = true;
         return Ok(result);
     }
 
-    // 2) 读 threads.json 找对应行
+    // 2) 在改动任何本地状态前，完整解析 threads/logs 并校验目标表结构。
     let threads_raw = fs::read_to_string(backup.join("threads.json"))?;
     let threads: Vec<serde_json::Value> = serde_json::from_str(&threads_raw)?;
-    let row = threads
+    let matching_threads = threads
         .iter()
-        .find(|v| v.get("id").and_then(|x| x.as_str()) == Some(target.id.as_str()))
-        .ok_or_else(|| AppError::NotFound(format!("threads.json 中缺 id: {}", target.id)))?;
-
-    // 3) 拷 rollout 回去
-    let src = backup.join(&target_rel);
-    let dest = codex.join(&target_rel);
-    if let Some(p) = dest.parent() {
-        fs::create_dir_all(p)?;
-    }
-    fs::copy(&src, &dest)?;
-    result.rollout_copied = true;
-
-    // 4) INSERT OR REPLACE threads
-    let cols_sql = "id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
-                    sandbox_policy, approval_mode, tokens_used, has_user_event, archived, archived_at,
-                    git_sha, git_branch, git_origin_url, cli_version, first_user_message,
-                    agent_nickname, agent_role, memory_mode, model, reasoning_effort, agent_path,
-                    created_at_ms, updated_at_ms";
-    let cols: Vec<&str> = cols_sql.split(',').map(|s| s.trim()).collect();
-    let placeholders = (0..cols.len()).map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql = format!(
-        "INSERT OR REPLACE INTO threads ({}) VALUES ({})",
-        cols_sql, placeholders
-    );
-    let mut stmt = state.prepare(&sql)?;
-
-    let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(cols.len());
-    for name in &cols {
-        let v = row.get(*name).unwrap_or(&serde_json::Value::Null);
-        let boxed: Box<dyn rusqlite::ToSql> = match v {
-            serde_json::Value::Null => Box::new(Option::<String>::None),
-            serde_json::Value::Bool(b) => Box::new(if *b { 1i64 } else { 0i64 }),
-            serde_json::Value::Number(n) => {
-                if let Some(i) = n.as_i64() {
-                    Box::new(i)
-                } else if let Some(f) = n.as_f64() {
-                    Box::new(f)
-                } else {
-                    Box::new(n.to_string())
-                }
+        .filter(|value| {
+            value.get("id").and_then(|value| value.as_str()) == Some(target.id.as_str())
+        })
+        .collect::<Vec<_>>();
+    let row = match matching_threads.as_slice() {
+        [row] => *row,
+        [] => {
+            return Err(AppError::NotFound(format!(
+                "threads.json 中缺 id: {}",
+                target.id
+            )))
+        }
+        duplicates => {
+            return Err(AppError::Other(format!(
+                "threads.json 中 id={} 存在 {} 行，拒绝不确定还原",
+                target.id,
+                duplicates.len()
+            )))
+        }
+    };
+    let backup_log_rows = read_backup_log_rows(backup, target)?;
+    let logs_path = codex.join("logs_2.sqlite");
+    let logs_exist = match fs::symlink_metadata(&logs_path) {
+        Ok(metadata) => {
+            if path_safety::metadata_is_link_or_reparse(&metadata) || !metadata.is_file() {
+                return Err(AppError::Path(format!(
+                    "Codex logs 数据库不是普通文件: {}",
+                    logs_path.to_string_lossy()
+                )));
             }
-            serde_json::Value::String(s) => {
-                if *name == "rollout_path" {
-                    let resolved = codex.join(&target_rel);
-                    Box::new(resolved.to_string_lossy().into_owned())
-                } else {
-                    Box::new(s.clone())
-                }
-            }
-            other => Box::new(other.to_string()),
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    let restore_logs = !backup_log_rows.is_empty() || (overwrite && logs_exist);
+    let allowed_log_columns = if restore_logs {
+        let logs_connection = logs_db::open(codex)?;
+        drop(logs_connection);
+        let logs_path_string = logs_path.to_string_lossy().into_owned();
+        state.execute("ATTACH DATABASE ?1 AS restore_logs", [&logs_path_string])?;
+        let columns = {
+            let mut statement = state.prepare("PRAGMA restore_logs.table_info(logs)")?;
+            let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+            rows.collect::<Result<HashSet<_>, _>>()?
         };
-        values.push(boxed);
-    }
-    let params: Vec<&dyn rusqlite::ToSql> = values.iter().map(|b| b.as_ref()).collect();
-    stmt.execute(params.as_slice())?;
-    result.threads_inserted = true;
-
-    // 5) 还原 logs
-    let logs_path = backup.join("logs.ndjson");
-    if logs_path.is_file() {
-        let logs = logs_db::open(codex)?;
-        let file = File::open(&logs_path)?;
-        let reader = BufReader::new(file);
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let v: serde_json::Value = match serde_json::from_str(&line) {
-                Ok(x) => x,
-                Err(_) => continue,
-            };
-            let tid = v.get("thread_id").and_then(|x| x.as_str()).unwrap_or("");
-            if tid != target.id {
-                continue;
-            }
-            // 通用插入：用 obj keys
-            if let Some(obj) = v.as_object() {
-                let keys: Vec<String> = obj.keys().cloned().collect();
-                let placeholders = (0..keys.len()).map(|_| "?").collect::<Vec<_>>().join(",");
-                let sql = format!(
-                    "INSERT OR IGNORE INTO logs ({}) VALUES ({})",
-                    keys.join(","),
-                    placeholders
-                );
-                let mut stmt = logs.prepare(&sql)?;
-                let mut boxed: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-                for k in &keys {
-                    let val = &obj[k];
-                    let b: Box<dyn rusqlite::ToSql> = match val {
-                        serde_json::Value::Null => Box::new(Option::<String>::None),
-                        serde_json::Value::Bool(b) => Box::new(if *b { 1i64 } else { 0i64 }),
-                        serde_json::Value::Number(n) => {
-                            if let Some(i) = n.as_i64() {
-                                Box::new(i)
-                            } else if let Some(f) = n.as_f64() {
-                                Box::new(f)
-                            } else {
-                                Box::new(n.to_string())
-                            }
-                        }
-                        serde_json::Value::String(s) => Box::new(s.clone()),
-                        other => Box::new(other.to_string()),
-                    };
-                    boxed.push(b);
-                }
-                let p: Vec<&dyn rusqlite::ToSql> = boxed.iter().map(|b| b.as_ref()).collect();
-                if stmt.execute(p.as_slice()).is_ok() {
-                    result.logs_inserted += 1;
-                }
-            }
+        if !columns.contains("thread_id") {
+            return Err(AppError::Other("logs 表缺少还原所需 thread_id 列".into()));
+        }
+        columns
+    } else {
+        HashSet::new()
+    };
+    for object in &backup_log_rows {
+        if object.get("thread_id").and_then(serde_json::Value::as_str) != Some(target.id.as_str()) {
+            return Err(AppError::Other(format!(
+                "logs.ndjson 含 thread_id 不匹配的待还原行: expected={}",
+                target.id
+            )));
+        }
+        if let Some(unknown) = object
+            .keys()
+            .find(|key| !allowed_log_columns.contains(*key))
+        {
+            return Err(AppError::Other(format!(
+                "logs.ndjson 包含 logs 表不存在的列: {unknown}"
+            )));
         }
     }
-    result.history_appended = crate::history::append_from_file(
-        &paths::history_path(codex),
-        &backup.join("history.jsonl"),
-        &target.id,
-    )?;
 
-    // 6) 更新 session_index.jsonl（append 一行，若已存在则跳过）
-    let index_path = codex.join("session_index.jsonl");
-    let mut already = false;
-    if index_path.exists() {
-        let raw = fs::read_to_string(&index_path)?;
-        for line in raw.lines() {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                if v.get("id").and_then(|x| x.as_str()) == Some(target.id.as_str()) {
-                    already = true;
-                    break;
-                }
-            }
+    // 3) threads 与 logs 先在同一 SQLite 事务中实际执行所有约束，但暂不提交。
+    let transaction = state.transaction()?;
+    let database_stage = (|| -> AppResult<()> {
+        insert_restore_thread(&transaction, codex, &target_rel, row)?;
+        result.threads_inserted = true;
+        if restore_logs {
+            result.logs_inserted =
+                insert_restore_logs(&transaction, &target.id, &backup_log_rows, overwrite)?;
         }
+        Ok(())
+    })();
+    if let Err(error) = database_stage {
+        let rollback_error = transaction.rollback().err();
+        if rollback_error.is_none() {
+            result.threads_inserted = false;
+            result.logs_inserted = 0;
+        }
+        result.error = Some(restore_failure_message(
+            format!("Codex 数据库还原约束失败，事务已回滚: {error}"),
+            rollback_error,
+            Vec::new(),
+            None,
+        ));
+        return Ok(result);
     }
-    if !already {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&index_path)?;
-        let entry = serde_json::json!({
-            "id": target.id,
-            "rollout_path": codex.join(&target_rel).to_string_lossy(),
-            "updated_at": target.updated_at,
-        });
-        writeln!(f, "{}", entry)?;
+
+    // 4) 为所有即将改写的文件创建一致快照。后续任一步失败均按变更后指纹补偿。
+    let history_path = paths::history_path(codex);
+    let index_path = paths::session_index_path(codex);
+    let mut snapshots = match RestoreFileSnapshots::capture(&[
+        ("rollout", &dest),
+        ("history", &history_path),
+        ("session index", &index_path),
+    ]) {
+        Ok(snapshots) => snapshots,
+        Err(error) => {
+            let rollback_error = transaction.rollback().err();
+            if rollback_error.is_none() {
+                result.threads_inserted = false;
+                result.logs_inserted = 0;
+            }
+            result.error = Some(restore_failure_message(
+                format!("创建 Codex 还原补偿快照失败: {error}"),
+                rollback_error,
+                Vec::new(),
+                None,
+            ));
+            return Ok(result);
+        }
+    };
+
+    let file_stage = (|| -> AppResult<()> {
+        snapshots.start("rollout")?;
+        copy_restore_file_atomically(
+            codex,
+            &src,
+            &dest,
+            &target.sha256_rollout,
+            "Codex rollout 还原目标",
+        )?;
+        result.rollout_copied = true;
+        snapshots.finish("rollout")?;
+
+        snapshots.start("history")?;
+        result.history_appended =
+            append_backup_history_if_present(&history_path, backup, &target.id)?;
+        if result.history_appended > 0 {
+            snapshots.finish("history")?;
+        }
+
+        snapshots.start("session index")?;
+        crate::repair::append_index_line(codex, &target.id, &target.title, &dest)?;
+        snapshots.finish("session index")?;
+        Ok(())
+    })();
+    if let Err(error) = file_stage {
+        let rollback_error = transaction.rollback().err();
+        let compensation_errors = snapshots.compensate();
+        let cleanup_error = snapshots.cleanup().err();
+        if rollback_error.is_none() {
+            result.threads_inserted = false;
+            result.logs_inserted = 0;
+        }
+        if compensation_errors.is_empty() {
+            result.rollout_copied = false;
+            result.history_appended = 0;
+        }
+        result.error = Some(restore_failure_message(
+            format!("Codex 文件还原未完成，已执行补偿: {error}"),
+            rollback_error,
+            compensation_errors,
+            cleanup_error,
+        ));
+        return Ok(result);
+    }
+
+    // 5) 文件全部落盘后一次提交 threads 与附加的 logs 数据库。
+    if let Err(error) = transaction.commit() {
+        let compensation_errors = snapshots.compensate();
+        let cleanup_error = snapshots.cleanup().err();
+        if compensation_errors.is_empty() {
+            result.rollout_copied = false;
+            result.history_appended = 0;
+        }
+        result.error = Some(restore_failure_message(
+            format!("提交 Codex 数据库还原事务失败，数据库最终状态可能不确定，已补偿文件: {error}"),
+            None,
+            compensation_errors,
+            cleanup_error,
+        ));
+        return Ok(result);
     }
 
     result.ok = true;
-    let _ = already;
+    if let Err(error) = snapshots.cleanup() {
+        result.error = Some(format!("Codex 会话已完整还原，但 {error}"));
+    }
     Ok(result)
 }
 
@@ -932,10 +2134,20 @@ fn copy_path_recursive(from: &Path, to: &Path) -> AppResult<()> {
             from.to_string_lossy()
         )));
     }
-    for entry in walkdir::WalkDir::new(from)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-    {
+    for entry in walkdir::WalkDir::new(from).follow_links(false) {
+        let entry = entry.map_err(|error| {
+            AppError::Other(format!(
+                "遍历待复制路径失败 {}: {error}",
+                from.to_string_lossy()
+            ))
+        })?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if path_safety::metadata_is_link_or_reparse(&metadata) {
+            return Err(AppError::Path(format!(
+                "待复制路径包含符号链接或 junction，已拒绝: {}",
+                entry.path().to_string_lossy()
+            )));
+        }
         let rel = entry.path().strip_prefix(from).map_err(|e| {
             AppError::Path(format!(
                 "无法计算相对路径 {}: {}",
@@ -954,16 +2166,12 @@ fn copy_path_recursive(from: &Path, to: &Path) -> AppResult<()> {
                 fs::create_dir_all(parent)?;
             }
             fs::copy(entry.path(), &dest)?;
+        } else {
+            return Err(AppError::Path(format!(
+                "待复制路径包含不支持的文件类型: {}",
+                entry.path().to_string_lossy()
+            )));
         }
-    }
-    Ok(())
-}
-
-fn remove_path_recursive(path: &Path) -> AppResult<()> {
-    if path.is_dir() {
-        fs::remove_dir_all(path)?;
-    } else if path.is_file() {
-        fs::remove_file(path)?;
     }
     Ok(())
 }
@@ -984,6 +2192,40 @@ mod tests {
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap()
         ))
+    }
+
+    fn create_directory_link(target: &Path, link: &Path) -> AppResult<()> {
+        #[cfg(windows)]
+        {
+            match std::os::windows::fs::symlink_dir(target, link) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.raw_os_error() == Some(1314) => {
+                    let output = std::process::Command::new("pwsh")
+                        .args([
+                            "-NoProfile",
+                            "-NonInteractive",
+                            "-Command",
+                            "$ErrorActionPreference = 'Stop'; New-Item -ItemType Junction -Path $env:CC_TEST_LINK -Target $env:CC_TEST_TARGET | Out-Null",
+                        ])
+                        .env("CC_TEST_LINK", link)
+                        .env("CC_TEST_TARGET", target)
+                        .output()?;
+                    if output.status.success() {
+                        return Ok(());
+                    }
+                    return Err(AppError::Other(format!(
+                        "无法创建 junction 测试夹具: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    )));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)?;
+            Ok(())
+        }
     }
 
     fn write_claude_session(claude: &Path, id: &str) -> AppResult<()> {
@@ -1018,6 +2260,15 @@ mod tests {
         let restore_claude = root.join("restore-claude");
         let backup_dir = root.join("backups");
         write_claude_session(&source_claude, "claude-backup-1")?;
+        let source_sidecar = source_claude
+            .join("projects")
+            .join("sample-project")
+            .join("claude-backup-1");
+        fs::create_dir_all(source_sidecar.join("subagents"))?;
+        fs::write(
+            source_sidecar.join("subagents").join("agent.jsonl"),
+            "sidecar-content",
+        )?;
 
         let summary = create_backup(
             Some(PROVIDER_CLAUDE.to_string()),
@@ -1025,13 +2276,16 @@ mod tests {
             Some(source_claude.to_string_lossy().into_owned()),
             backup_dir.to_string_lossy().into_owned(),
             vec!["claude-backup-1".to_string()],
+            None,
             Some("claude-backup".to_string()),
             Some("test".to_string()),
         )?;
         assert_eq!(summary.provider.as_deref(), Some(PROVIDER_CLAUDE));
         let backup_path = summary.path.clone();
-        let detail = open_backup(backup_path.clone())?;
+        let backup_root = backup_dir.to_string_lossy().into_owned();
+        let detail = open_backup(backup_root.clone(), backup_path.clone())?;
         assert_eq!(detail.manifest.sessions[0].history_rows, 2);
+        assert_eq!(detail.manifest.sessions[0].sidecar_files.len(), 1);
         let backup_history = fs::read_to_string(PathBuf::from(&backup_path).join("history.jsonl"))?;
         assert!(backup_history.contains("keep one"));
         assert!(backup_history.contains("keep two"));
@@ -1039,10 +2293,12 @@ mod tests {
 
         let restored = restore_session(
             Some(PROVIDER_CLAUDE.to_string()),
-            backup_path,
+            backup_root,
+            backup_path.clone(),
             String::new(),
             Some(restore_claude.to_string_lossy().into_owned()),
             "claude-backup-1".to_string(),
+            None,
             false,
         )?;
 
@@ -1052,10 +2308,598 @@ mod tests {
             .join("sample-project")
             .join("claude-backup-1.jsonl")
             .is_file());
+        assert_eq!(
+            fs::read_to_string(
+                paths::claude_projects_dir(&restore_claude)
+                    .join("sample-project")
+                    .join("claude-backup-1")
+                    .join("subagents")
+                    .join("agent.jsonl")
+            )?,
+            "sidecar-content"
+        );
         let restored_history = fs::read_to_string(restore_claude.join("history.jsonl"))?;
         assert!(restored_history.contains("keep one"));
         assert!(restored_history.contains("keep two"));
         assert!(!restored_history.contains("ignore"));
+
+        let backup_sidecar = PathBuf::from(&summary.path)
+            .join("sidecars")
+            .join("claude-backup-1")
+            .join("subagents")
+            .join("agent.jsonl");
+        fs::write(&backup_sidecar, "corrupted")?;
+        let error = verify_backup(backup_dir.to_string_lossy().into_owned(), summary.path)
+            .expect_err("sidecar corruption must fail backup verification");
+        assert!(error.to_string().contains("sidecar"));
+        fs::write(&backup_sidecar, "sidecar-content")?;
+        fs::write(
+            PathBuf::from(&backup_path).join("history.jsonl"),
+            "tampered\n",
+        )?;
+        let error = verify_backup(backup_dir.to_string_lossy().into_owned(), backup_path)
+            .expect_err("support-file corruption must fail backup verification");
+        assert!(error.to_string().contains("辅助文件"));
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn claude_backup_uses_exact_rollout_path_for_duplicate_ids() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-claude-backup-duplicate-id-test");
+        let claude = root.join("claude");
+        let backup_dir = root.join("backups");
+        let id = "duplicate-claude-id";
+        let first = claude
+            .join("projects")
+            .join("project-a")
+            .join(format!("{id}.jsonl"));
+        let second = claude
+            .join("projects")
+            .join("project-b")
+            .join(format!("{id}.jsonl"));
+        fs::create_dir_all(first.parent().unwrap_or(&claude))?;
+        fs::create_dir_all(second.parent().unwrap_or(&claude))?;
+        fs::write(
+            &first,
+            format!(
+                "{{\"sessionId\":\"{id}\",\"cwd\":\"F:\\\\a\",\"timestamp\":\"2026-07-10T00:00:00Z\",\"marker\":\"first\"}}\n"
+            ),
+        )?;
+        fs::write(
+            &second,
+            format!(
+                "{{\"sessionId\":\"{id}\",\"cwd\":\"F:\\\\b\",\"timestamp\":\"2026-07-10T00:00:01Z\",\"marker\":\"second\"}}\n"
+            ),
+        )?;
+
+        let summary = create_backup(
+            Some(PROVIDER_CLAUDE.to_string()),
+            String::new(),
+            Some(claude.to_string_lossy().into_owned()),
+            backup_dir.to_string_lossy().into_owned(),
+            vec![id.to_string()],
+            Some(vec![BundleExportTarget {
+                id: id.to_string(),
+                rollout_path: Some(second.to_string_lossy().into_owned()),
+            }]),
+            Some("exact-duplicate".to_string()),
+            None,
+        )?;
+        let manifest = load_backup_manifest(Path::new(&summary.path))?;
+        assert_eq!(manifest.sessions.len(), 1);
+        assert_eq!(
+            manifest.sessions[0].source_relpath.as_deref(),
+            Some("project-b/duplicate-claude-id.jsonl")
+        );
+        let copied = PathBuf::from(&summary.path).join(&manifest.sessions[0].rollout_relpath);
+        assert!(fs::read_to_string(copied)?.contains("\"marker\":\"second\""));
+
+        let ambiguous = create_backup(
+            Some(PROVIDER_CLAUDE.to_string()),
+            String::new(),
+            Some(claude.to_string_lossy().into_owned()),
+            backup_dir.to_string_lossy().into_owned(),
+            vec![id.to_string()],
+            None,
+            Some("ambiguous-duplicate".to_string()),
+            None,
+        )
+        .expect_err("an id-only request must not choose one duplicate arbitrarily");
+        assert!(ambiguous.to_string().contains("必须提供精确 rollout_path"));
+
+        let both = create_backup(
+            Some(PROVIDER_CLAUDE.to_string()),
+            String::new(),
+            Some(claude.to_string_lossy().into_owned()),
+            backup_dir.to_string_lossy().into_owned(),
+            vec![id.to_string(), id.to_string()],
+            Some(vec![
+                BundleExportTarget {
+                    id: id.to_string(),
+                    rollout_path: Some(first.to_string_lossy().into_owned()),
+                },
+                BundleExportTarget {
+                    id: id.to_string(),
+                    rollout_path: Some(second.to_string_lossy().into_owned()),
+                },
+            ]),
+            Some("both-duplicates".to_string()),
+            None,
+        )?;
+        let both_manifest = load_backup_manifest(Path::new(&both.path))?;
+        assert_eq!(both_manifest.sessions.len(), 2);
+        let restore_claude = root.join("restore-claude");
+        let ambiguous_restore = restore_session(
+            Some(PROVIDER_CLAUDE.to_string()),
+            backup_dir.to_string_lossy().into_owned(),
+            both.path.clone(),
+            String::new(),
+            Some(restore_claude.to_string_lossy().into_owned()),
+            id.to_string(),
+            None,
+            false,
+        )
+        .expect_err("an id-only restore must not choose one duplicate arbitrarily");
+        assert!(ambiguous_restore
+            .to_string()
+            .contains("必须提供精确 backup_rollout_relpath"));
+
+        let second_manifest = both_manifest
+            .sessions
+            .iter()
+            .find(|session| {
+                session.source_relpath.as_deref() == Some("project-b/duplicate-claude-id.jsonl")
+            })
+            .expect("second duplicate manifest entry");
+        let restored = restore_session(
+            Some(PROVIDER_CLAUDE.to_string()),
+            backup_dir.to_string_lossy().into_owned(),
+            both.path,
+            String::new(),
+            Some(restore_claude.to_string_lossy().into_owned()),
+            id.to_string(),
+            Some(second_manifest.rollout_relpath.clone()),
+            false,
+        )?;
+        assert!(restored.ok);
+        assert!(fs::read_to_string(
+            restore_claude
+                .join("projects")
+                .join("project-b")
+                .join(format!("{id}.jsonl"))
+        )?
+        .contains("\"marker\":\"second\""));
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn codex_restore_without_overwrite_preserves_orphan_rollout() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-codex-orphan-restore-test");
+        let backup = root.join("backup");
+        let codex = root.join("codex");
+        let relative = PathBuf::from("sessions/2026/07/10/rollout-orphan.jsonl");
+        let source = backup.join(&relative);
+        let destination = codex.join(&relative);
+        fs::create_dir_all(source.parent().unwrap_or(&backup))?;
+        fs::create_dir_all(destination.parent().unwrap_or(&codex))?;
+        let source_line = serde_json::json!({
+            "timestamp": "2026-07-10T00:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "orphan",
+                "model_provider": "openai",
+                "cwd": "F:\\work\\sample"
+            }
+        });
+        fs::write(
+            &source,
+            format!("{}\n", serde_json::to_string(&source_line)?),
+        )?;
+        fs::write(&destination, "newer local copy\n")?;
+
+        let state = rusqlite::Connection::open(codex.join("state_5.sqlite"))?;
+        state.execute("CREATE TABLE threads (id TEXT PRIMARY KEY)", [])?;
+        drop(state);
+
+        let target = ManifestSession {
+            provider: Some(PROVIDER_CODEX.to_string()),
+            id: "orphan".to_string(),
+            rollout_relpath: relative.to_string_lossy().replace('\\', "/"),
+            source_relpath: None,
+            sidecar_relpath: None,
+            sidecar_files: Vec::new(),
+            title: "orphan".to_string(),
+            cwd: String::new(),
+            created_at: 0,
+            updated_at: 0,
+            tokens_used: 0,
+            model: None,
+            bytes_rollout: fs::metadata(&source)?.len(),
+            logs_count: 0,
+            history_rows: 0,
+            sha256_rollout: sha256_file(&source)?,
+        };
+
+        let restored = restore_one(&backup, &codex, &target, false)?;
+        assert!(restored.conflict);
+        assert!(!restored.ok);
+        assert!(!restored.rollout_copied);
+        assert_eq!(fs::read_to_string(&destination)?, "newer local copy\n");
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn codex_restore_log_constraint_failure_preserves_all_existing_state() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-codex-restore-rollback-test");
+        let backup = root.join("backup");
+        let codex = root.join("codex");
+        let id = "restore-rollback";
+        let relative = PathBuf::from(format!("sessions/2026/07/10/rollout-{id}.jsonl"));
+        let source = backup.join(&relative);
+        let destination = codex.join(&relative);
+        fs::create_dir_all(source.parent().unwrap_or(&backup))?;
+        fs::create_dir_all(destination.parent().unwrap_or(&codex))?;
+        let source_line = serde_json::json!({
+            "timestamp": "2026-07-10T00:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": id,
+                "model_provider": "openai",
+                "cwd": "F:\\work\\restored"
+            }
+        });
+        fs::write(
+            &source,
+            format!("{}\n", serde_json::to_string(&source_line)?),
+        )?;
+        fs::write(&destination, "old rollout must remain\n")?;
+
+        let thread_columns = "
+            id TEXT PRIMARY KEY, rollout_path TEXT, created_at INTEGER, updated_at INTEGER,
+            source TEXT, model_provider TEXT, cwd TEXT, title TEXT, sandbox_policy TEXT,
+            approval_mode TEXT, tokens_used INTEGER, has_user_event INTEGER, archived INTEGER,
+            archived_at INTEGER, git_sha TEXT, git_branch TEXT, git_origin_url TEXT,
+            cli_version TEXT, first_user_message TEXT, agent_nickname TEXT, agent_role TEXT,
+            memory_mode TEXT, model TEXT, reasoning_effort TEXT, agent_path TEXT,
+            created_at_ms INTEGER, updated_at_ms INTEGER";
+        let state = rusqlite::Connection::open(codex.join("state_5.sqlite"))?;
+        state.execute(&format!("CREATE TABLE threads ({thread_columns})"), [])?;
+        state.execute(
+            "INSERT INTO threads (id, rollout_path, title) VALUES (?1, ?2, 'old thread')",
+            rusqlite::params![id, destination.to_string_lossy().into_owned()],
+        )?;
+        drop(state);
+
+        let logs = rusqlite::Connection::open(codex.join("logs_2.sqlite"))?;
+        logs.execute(
+            "CREATE TABLE logs (id INTEGER PRIMARY KEY, thread_id TEXT NOT NULL, message TEXT)",
+            [],
+        )?;
+        logs.execute(
+            "INSERT INTO logs (id, thread_id, message) VALUES (1, ?1, 'old log')",
+            [id],
+        )?;
+        drop(logs);
+
+        fs::create_dir_all(&backup)?;
+        fs::write(
+            backup.join("threads.json"),
+            serde_json::to_vec_pretty(&vec![serde_json::json!({
+                "id": id,
+                "rollout_path": source.to_string_lossy(),
+                "title": "new thread",
+                "cwd": "F:\\work\\restored"
+            })])?,
+        )?;
+        let duplicate_logs = [
+            serde_json::json!({"id": 2, "thread_id": id, "message": "first"}),
+            serde_json::json!({"id": 2, "thread_id": id, "message": "duplicate"}),
+        ];
+        let logs_ndjson = duplicate_logs
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()?
+            .join("\n");
+        fs::write(backup.join("logs.ndjson"), format!("{logs_ndjson}\n"))?;
+        fs::write(
+            backup.join("history.jsonl"),
+            format!("{{\"session_id\":\"{id}\",\"text\":\"new history\"}}\n"),
+        )?;
+        let history_path = paths::history_path(&codex);
+        let index_path = paths::session_index_path(&codex);
+        fs::write(&history_path, "old history must remain\n")?;
+        fs::write(&index_path, "old index must remain\n")?;
+
+        let rollout_before = fs::read(&destination)?;
+        let history_before = fs::read(&history_path)?;
+        let index_before = fs::read(&index_path)?;
+        let target = ManifestSession {
+            provider: Some(PROVIDER_CODEX.to_string()),
+            id: id.to_string(),
+            rollout_relpath: relative.to_string_lossy().replace('\\', "/"),
+            source_relpath: None,
+            sidecar_relpath: None,
+            sidecar_files: Vec::new(),
+            title: "new thread".to_string(),
+            cwd: "F:\\work\\restored".to_string(),
+            created_at: 0,
+            updated_at: 0,
+            tokens_used: 0,
+            model: None,
+            bytes_rollout: fs::metadata(&source)?.len(),
+            logs_count: 2,
+            history_rows: 1,
+            sha256_rollout: sha256_file(&source)?,
+        };
+
+        let restored = restore_one(&backup, &codex, &target, true)?;
+        assert!(!restored.ok);
+        assert!(!restored.threads_inserted);
+        assert_eq!(restored.logs_inserted, 0);
+        assert!(!restored.rollout_copied);
+        let error = restored.error.as_deref().unwrap_or_default();
+        assert!(error.contains("数据库还原约束失败"));
+        assert!(error.contains("UNIQUE") || error.contains("constraint"));
+        assert_eq!(fs::read(&destination)?, rollout_before);
+        assert_eq!(fs::read(&history_path)?, history_before);
+        assert_eq!(fs::read(&index_path)?, index_before);
+
+        let state = state_db::open(&codex)?;
+        let old_title: String =
+            state.query_row("SELECT title FROM threads WHERE id = ?", [id], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(old_title, "old thread");
+        drop(state);
+        let logs = logs_db::open(&codex)?;
+        let rows = logs
+            .prepare("SELECT id, message FROM logs WHERE thread_id = ? ORDER BY id")?
+            .query_map([id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(rows, vec![(1, "old log".to_string())]);
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn atomic_restore_copy_rejects_unverified_source_bytes() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-restore-copy-sha-test");
+        let codex = root.join("codex");
+        let source = root.join("source.jsonl");
+        let destination = codex.join("sessions").join("target.jsonl");
+        fs::create_dir_all(destination.parent().unwrap_or(&codex))?;
+        fs::write(&source, b"unverified source\n")?;
+        fs::write(&destination, b"local data\n")?;
+
+        let error = copy_restore_file_atomically(
+            &codex,
+            &source,
+            &destination,
+            &hex::encode(Sha256::digest(b"different expected bytes\n")),
+            "测试还原目标",
+        )
+        .expect_err("a source whose streamed hash differs must not be committed");
+
+        assert!(error.to_string().contains("还原期间发生变化"));
+        assert_eq!(fs::read(&destination)?, b"local data\n");
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn restore_rejects_manifest_targeting_codex_core_file() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-backup-core-path-test");
+        let backup_root = root.join("backups");
+        let backup = backup_root.join("malicious");
+        let codex = root.join("codex");
+        fs::create_dir_all(&backup)?;
+        fs::create_dir_all(&codex)?;
+        fs::write(backup.join("config.toml"), "attacker-controlled")?;
+        fs::write(codex.join("config.toml"), "trusted-config")?;
+        let manifest = Manifest {
+            version: 2,
+            provider: Some(PROVIDER_CODEX.to_string()),
+            created_at: "2026-07-10T00:00:00Z".to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            codex_dir: codex.to_string_lossy().into_owned(),
+            claude_dir: None,
+            note: None,
+            artifacts: Vec::new(),
+            sessions: vec![ManifestSession {
+                provider: Some(PROVIDER_CODEX.to_string()),
+                id: "malicious".to_string(),
+                rollout_relpath: "config.toml".to_string(),
+                source_relpath: None,
+                sidecar_relpath: None,
+                sidecar_files: Vec::new(),
+                title: String::new(),
+                cwd: String::new(),
+                created_at: 0,
+                updated_at: 0,
+                tokens_used: 0,
+                model: None,
+                bytes_rollout: fs::metadata(backup.join("config.toml"))?.len(),
+                logs_count: 0,
+                history_rows: 0,
+                sha256_rollout: sha256_file(&backup.join("config.toml"))?,
+            }],
+        };
+        fs::write(
+            backup.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest)?,
+        )?;
+
+        let error = restore_session(
+            Some(PROVIDER_CODEX.to_string()),
+            backup_root.to_string_lossy().into_owned(),
+            backup.to_string_lossy().into_owned(),
+            codex.to_string_lossy().into_owned(),
+            None,
+            "malicious".to_string(),
+            None,
+            true,
+        )
+        .expect_err("core paths must never be accepted as rollout destinations");
+
+        assert!(error.to_string().contains("sessions"));
+        assert_eq!(
+            fs::read_to_string(codex.join("config.toml"))?,
+            "trusted-config"
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn missing_rollout_is_visible_but_restore_remains_strict() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-backup-missing-rollout-test");
+        let backup_root = root.join("backups");
+        let backup = backup_root.join("missing-rollout");
+        let codex = root.join("codex");
+        fs::create_dir_all(&backup)?;
+        fs::write(backup.join("threads.json"), "[]")?;
+
+        let manifest = Manifest {
+            version: 3,
+            provider: Some(PROVIDER_CODEX.to_string()),
+            created_at: "2026-07-10T00:00:00Z".to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            codex_dir: String::new(),
+            claude_dir: None,
+            note: None,
+            artifacts: Vec::new(),
+            sessions: vec![ManifestSession {
+                provider: Some(PROVIDER_CODEX.to_string()),
+                id: "missing".to_string(),
+                rollout_relpath: "sessions/2026/07/10/rollout-missing.jsonl".to_string(),
+                source_relpath: None,
+                sidecar_relpath: None,
+                sidecar_files: Vec::new(),
+                title: "missing rollout".to_string(),
+                cwd: String::new(),
+                created_at: 0,
+                updated_at: 0,
+                tokens_used: 0,
+                model: None,
+                bytes_rollout: 0,
+                logs_count: 0,
+                history_rows: 0,
+                sha256_rollout: "not-present".to_string(),
+            }],
+        };
+        fs::write(
+            backup.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest)?,
+        )?;
+
+        let backup_root_string = backup_root.to_string_lossy().into_owned();
+        let backup_string = backup.to_string_lossy().into_owned();
+        let detail = open_backup(backup_root_string.clone(), backup_string.clone())?;
+        assert_eq!(detail.manifest.sessions.len(), 1);
+
+        let report = verify_backup(backup_root_string.clone(), backup_string.clone())?;
+        assert!(!report.all_ok);
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(report.items[0].id, "missing");
+        assert!(report.items[0].missing);
+        assert!(!report.items[0].ok);
+
+        let error = restore_session(
+            Some(PROVIDER_CODEX.to_string()),
+            backup_root_string,
+            backup_string,
+            codex.to_string_lossy().into_owned(),
+            None,
+            "missing".to_string(),
+            None,
+            true,
+        )
+        .expect_err("restore must reject a backup whose rollout is missing");
+        assert!(error.to_string().contains("不存在"));
+        assert!(!codex.exists());
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn open_backup_rejects_rollout_beneath_linked_directory() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-backup-linked-payload-test");
+        let backup_root = root.join("backups");
+        let backup = backup_root.join("linked-payload");
+        let external_sessions = root.join("external-sessions");
+        fs::create_dir_all(&backup)?;
+        fs::create_dir_all(&external_sessions)?;
+        let source = external_sessions.join("rollout-linked.jsonl");
+        let line = serde_json::json!({
+            "timestamp": "2026-07-10T00:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "linked",
+                "model_provider": "openai",
+                "cwd": "F:\\work\\sample"
+            }
+        });
+        fs::write(&source, format!("{}\n", serde_json::to_string(&line)?))?;
+        create_directory_link(&external_sessions, &backup.join("sessions"))?;
+        fs::write(backup.join("threads.json"), "[]")?;
+        let manifest = Manifest {
+            version: 3,
+            provider: Some(PROVIDER_CODEX.to_string()),
+            created_at: "2026-07-10T00:00:00Z".to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            codex_dir: String::new(),
+            claude_dir: None,
+            note: None,
+            artifacts: Vec::new(),
+            sessions: vec![ManifestSession {
+                provider: Some(PROVIDER_CODEX.to_string()),
+                id: "linked".to_string(),
+                rollout_relpath: "sessions/rollout-linked.jsonl".to_string(),
+                source_relpath: None,
+                sidecar_relpath: None,
+                sidecar_files: Vec::new(),
+                title: String::new(),
+                cwd: String::new(),
+                created_at: 0,
+                updated_at: 0,
+                tokens_used: 0,
+                model: None,
+                bytes_rollout: fs::metadata(&source)?.len(),
+                logs_count: 0,
+                history_rows: 0,
+                sha256_rollout: sha256_file(&source)?,
+            }],
+        };
+        fs::write(
+            backup.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest)?,
+        )?;
+
+        let error = open_backup(
+            backup_root.to_string_lossy().into_owned(),
+            backup.to_string_lossy().into_owned(),
+        )
+        .expect_err("backup payload links must be rejected");
+        assert!(error.to_string().contains("junction") || error.to_string().contains("链接"));
+
+        let error = verify_backup(
+            backup_root.to_string_lossy().into_owned(),
+            backup.to_string_lossy().into_owned(),
+        )
+        .expect_err("backup verification must reject payload links");
+        assert!(error.to_string().contains("junction") || error.to_string().contains("链接"));
+
+        fs::remove_dir(backup.join("sessions"))?;
+        assert!(source.is_file(), "external payload must remain untouched");
         fs::remove_dir_all(root).ok();
         Ok(())
     }

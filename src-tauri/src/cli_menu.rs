@@ -2,8 +2,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::{self, Write};
 
 use cc_session_manager_lib::models::{
-    BackupSummary, BundleListItem, ExportReport, ImportMode, PreviewEvent, ProjectGroup,
-    SessionSummary, SwitchStrategy,
+    BackupSummary, BundleExportTarget, BundleListItem, DeleteTarget, ExportReport, ImportMode,
+    PreviewEvent, ProjectGroup, SessionSummary, SwitchStrategy,
 };
 use cc_session_manager_lib::{
     backup, bundle, family, paths, repair, rollout, sessions, settings, stats,
@@ -16,6 +16,13 @@ const PAGE_SIZE: usize = 15;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Flow {
     Back,
+    Main,
+    Exit,
+}
+
+enum SessionActionResult {
+    Back,
+    Refresh,
     Main,
     Exit,
 }
@@ -174,8 +181,9 @@ fn sessions_menu(ctx: &mut MenuContext, provider: &str) -> MenuResult<Flow> {
                 let sessions = load_sessions(ctx, provider, true, SessionScope::All)?;
                 match find_session(&sessions, &id) {
                     Ok(session) => match session_action_menu(ctx, provider, session)? {
-                        Flow::Back => {}
-                        other => return Ok(other),
+                        SessionActionResult::Back | SessionActionResult::Refresh => {}
+                        SessionActionResult::Main => return Ok(Flow::Main),
+                        SessionActionResult::Exit => return Ok(Flow::Exit),
                     },
                     Err(err) => {
                         println!("{err}");
@@ -246,6 +254,31 @@ fn projects_menu(ctx: &mut MenuContext, provider: &str) -> MenuResult<Flow> {
     }
 }
 
+fn session_selection_key(session: &SessionSummary) -> String {
+    format!("{}\0{}", session.id, session.rollout_path)
+}
+
+fn refresh_browsed_sessions(
+    ctx: &MenuContext,
+    provider: &str,
+    current: &[SessionSummary],
+) -> MenuResult<Vec<SessionSummary>> {
+    let refreshed = sessions::list_sessions(
+        Some(provider.to_string()),
+        ctx.codex_dir.clone(),
+        Some(ctx.claude_dir.clone()),
+    )
+    .map_err(to_string)?;
+    let mut refreshed_by_key = refreshed
+        .into_iter()
+        .map(|session| (session_selection_key(&session), session))
+        .collect::<HashMap<_, _>>();
+    Ok(current
+        .iter()
+        .filter_map(|session| refreshed_by_key.remove(&session_selection_key(session)))
+        .collect())
+}
+
 fn browse_sessions(
     ctx: &mut MenuContext,
     provider: &str,
@@ -258,13 +291,17 @@ fn browse_sessions(
     }
 
     let mut page = 0usize;
-    let mut selected_ids = BTreeSet::<String>::new();
+    let mut selected_keys = BTreeSet::<String>::new();
     loop {
         if sessions.is_empty() {
             println!("当前列表已没有会话。");
             return pause();
         }
-        selected_ids.retain(|id| sessions.iter().any(|session| session.id == *id));
+        let available_keys = sessions
+            .iter()
+            .map(session_selection_key)
+            .collect::<BTreeSet<_>>();
+        selected_keys.retain(|key| available_keys.contains(key));
         let total_pages = sessions.len().div_ceil(PAGE_SIZE);
         if page >= total_pages {
             page = total_pages.saturating_sub(1);
@@ -278,11 +315,11 @@ fn browse_sessions(
                     "范围",
                     &format!("{}-{} / {}", start + 1, end, sessions.len()),
                 ),
-                ("已选", &selected_ids.len().to_string()),
+                ("已选", &selected_keys.len().to_string()),
             ],
         );
         for (offset, session) in sessions[start..end].iter().enumerate() {
-            let selected = if selected_ids.contains(&session.id) {
+            let selected = if selected_keys.contains(&session_selection_key(session)) {
                 "*"
             } else {
                 " "
@@ -320,29 +357,26 @@ fn browse_sessions(
             "s" | "S" => {
                 let indexes = prompt_page_indexes(end - start, "选择当前页序号")?;
                 for index in indexes {
-                    selected_ids.insert(sessions[start + index].id.clone());
+                    selected_keys.insert(session_selection_key(&sessions[start + index]));
                 }
             }
             "u" | "U" => {
                 let indexes = prompt_page_indexes(end - start, "取消选择当前页序号")?;
                 for index in indexes {
-                    selected_ids.remove(&sessions[start + index].id);
+                    selected_keys.remove(&session_selection_key(&sessions[start + index]));
                 }
             }
             "c" | "C" => {
-                selected_ids.clear();
+                selected_keys.clear();
             }
             "d" | "D" => {
                 let selected = sessions
                     .iter()
-                    .filter(|session| selected_ids.contains(&session.id))
+                    .filter(|session| selected_keys.contains(&session_selection_key(session)))
                     .cloned()
                     .collect::<Vec<_>>();
-                let deleted = delete_selected_sessions(ctx, provider, &selected)?;
-                if !deleted.is_empty() {
-                    let deleted_ids = deleted.into_iter().collect::<BTreeSet<_>>();
-                    selected_ids.retain(|id| !deleted_ids.contains(id));
-                    sessions.retain(|session| !deleted_ids.contains(&session.id));
+                if delete_selected_sessions(ctx, provider, &selected)? {
+                    sessions = refresh_browsed_sessions(ctx, provider, &sessions)?;
                 }
             }
             "b" | "B" => return Ok(Flow::Back),
@@ -352,8 +386,12 @@ fn browse_sessions(
                 Some(index) => {
                     let session = sessions[start + index].clone();
                     match session_action_menu(ctx, provider, session)? {
-                        Flow::Back => {}
-                        other => return Ok(other),
+                        SessionActionResult::Back => {}
+                        SessionActionResult::Refresh => {
+                            sessions = refresh_browsed_sessions(ctx, provider, &sessions)?;
+                        }
+                        SessionActionResult::Main => return Ok(Flow::Main),
+                        SessionActionResult::Exit => return Ok(Flow::Exit),
                     }
                 }
                 None => {
@@ -412,7 +450,7 @@ fn session_action_menu(
     ctx: &mut MenuContext,
     provider: &str,
     session: SessionSummary,
-) -> MenuResult<Flow> {
+) -> MenuResult<SessionActionResult> {
     loop {
         print_header(
             "会话操作",
@@ -447,11 +485,11 @@ fn session_action_menu(
             "6" => toggle_archived(ctx, provider, &session)?,
             "7" => {
                 delete_session(ctx, provider, &session)?;
-                return Ok(Flow::Back);
+                return Ok(SessionActionResult::Refresh);
             }
-            "8" => return Ok(Flow::Back),
-            "9" => return Ok(Flow::Main),
-            "0" => return Ok(Flow::Exit),
+            "8" => return Ok(SessionActionResult::Back),
+            "9" => return Ok(SessionActionResult::Main),
+            "0" => return Ok(SessionActionResult::Exit),
             _ => {
                 println!("无效选择。");
                 pause()?;
@@ -675,6 +713,10 @@ fn create_backup_for_session(
         Some(ctx.claude_dir.clone()),
         backup_dir,
         vec![session.id.clone()],
+        Some(vec![BundleExportTarget {
+            id: session.id.clone(),
+            rollout_path: Some(session.rollout_path.clone()),
+        }]),
         name,
         note,
     )
@@ -696,6 +738,10 @@ fn export_bundle_for_session(
         Some(ctx.claude_dir.clone()),
         out_dir,
         vec![session.id.clone()],
+        Some(vec![BundleExportTarget {
+            id: session.id.clone(),
+            rollout_path: Some(session.rollout_path.clone()),
+        }]),
         None,
         None,
     )
@@ -716,11 +762,12 @@ fn toggle_archived(ctx: &MenuContext, provider: &str, session: &SessionSummary) 
         println!("已取消。");
         return pause().map(|_| ());
     }
-    sessions::set_archived(
+    sessions::set_archived_with_lock(
         Some("codex".to_string()),
         ctx.codex_dir.clone(),
         session.id.clone(),
         target,
+        &ctx.family_lock,
     )
     .map_err(to_string)?;
     println!("已完成: {label}");
@@ -730,16 +777,31 @@ fn toggle_archived(ctx: &MenuContext, provider: &str, session: &SessionSummary) 
 
 fn delete_session(ctx: &MenuContext, provider: &str, session: &SessionSummary) -> MenuResult<()> {
     println!("将删除会话及相关索引记录: {}", session.id);
+    if provider == "codex" {
+        println!(
+            "若该会话属于 provider/历史分支组，将删除整个会话组。单分支删除请使用家族分支菜单。"
+        );
+    } else {
+        println!("将删除当前选中的 Claude 会话文件及其同名 sidecar。");
+        println!(
+            "若这是最后一个同 ID 副本，还会清理 history.jsonl、tasks/<id> 与 file-history/<id>；否则保留这些共享数据。"
+        );
+    }
     if !confirm_yes("这是破坏性操作。请输入 yes 确认删除。")? {
         println!("已取消。");
         pause()?;
         return Ok(());
     }
-    let result = sessions::delete_session(
+    let result = sessions::delete_session_with_lock(
         Some(provider.to_string()),
         ctx.codex_dir.clone(),
         Some(ctx.claude_dir.clone()),
         session.id.clone(),
+        Some(DeleteTarget {
+            id: session.id.clone(),
+            rollout_path: Some(session.rollout_path.clone()),
+        }),
+        &ctx.family_lock,
     )
     .map_err(to_string)?;
     println!("ok={}", result.ok);
@@ -754,11 +816,11 @@ fn delete_selected_sessions(
     ctx: &MenuContext,
     provider: &str,
     selected: &[SessionSummary],
-) -> MenuResult<Vec<String>> {
+) -> MenuResult<bool> {
     if selected.is_empty() {
         println!("尚未选择会话。");
         pause()?;
-        return Ok(Vec::new());
+        return Ok(false);
     }
 
     let total_tokens = selected
@@ -775,6 +837,14 @@ fn delete_selected_sessions(
         total_tokens,
         total_bytes
     );
+    if provider == "codex" {
+        println!("所选 Codex 会话若属于分支组，将连同组内全部 provider/历史分支一起删除。");
+    } else {
+        println!("每条 Claude 会话将按当前选中的文件路径删除，并清理其同名 sidecar。");
+        println!(
+            "仅当同 ID 的最后一个副本被删除时，才会清理 history.jsonl、tasks/<id> 与 file-history/<id>。"
+        );
+    }
     for session in selected.iter().take(10) {
         println!(
             "  {}  {:>10} token  {}",
@@ -790,18 +860,27 @@ fn delete_selected_sessions(
     if !confirm_yes("这是破坏性操作。请输入 yes 确认删除已选会话。")? {
         println!("已取消。");
         pause()?;
-        return Ok(Vec::new());
+        return Ok(false);
     }
 
     let ids = selected
         .iter()
         .map(|session| session.id.clone())
         .collect::<Vec<_>>();
-    let results = sessions::delete_sessions(
+    let targets = selected
+        .iter()
+        .map(|session| DeleteTarget {
+            id: session.id.clone(),
+            rollout_path: Some(session.rollout_path.clone()),
+        })
+        .collect::<Vec<_>>();
+    let results = sessions::delete_sessions_with_lock(
         Some(provider.to_string()),
         ctx.codex_dir.clone(),
         Some(ctx.claude_dir.clone()),
         ids,
+        Some(targets),
+        &ctx.family_lock,
     )
     .map_err(to_string)?;
 
@@ -823,7 +902,7 @@ fn delete_selected_sessions(
         );
     }
     pause()?;
-    Ok(deleted)
+    Ok(true)
 }
 
 fn stats_menu(ctx: &mut MenuContext) -> MenuResult<Flow> {
@@ -1057,6 +1136,7 @@ fn backup_create_by_id(ctx: &MenuContext) -> MenuResult<()> {
         Some(ctx.claude_dir.clone()),
         backup_dir,
         ids,
+        None,
         name,
         note,
     )
@@ -1077,7 +1157,8 @@ fn backup_list() -> MenuResult<()> {
 
 fn backup_open() -> MenuResult<()> {
     let path = prompt_required("备份路径: ")?;
-    let detail = backup::open_backup(path).map_err(to_string)?;
+    let root = explicit_backup_root(&path)?;
+    let detail = backup::open_backup(root, path).map_err(to_string)?;
     print_backup_summary(&detail.summary);
     println!("sessions:");
     for session in detail.manifest.sessions {
@@ -1094,7 +1175,8 @@ fn backup_open() -> MenuResult<()> {
 
 fn backup_verify() -> MenuResult<()> {
     let path = prompt_required("备份路径: ")?;
-    let report = backup::verify_backup(path).map_err(to_string)?;
+    let root = explicit_backup_root(&path)?;
+    let report = backup::verify_backup(root, path).map_err(to_string)?;
     println!("all_ok={}", report.all_ok);
     for item in report.items {
         println!(
@@ -1113,12 +1195,15 @@ fn backup_restore_one(ctx: &MenuContext) -> MenuResult<()> {
     let path = prompt_required("备份路径: ")?;
     let id = prompt_required("session id: ")?;
     let overwrite = confirm_yes("如目标已存在，是否允许覆盖？输入 yes 才会覆盖。")?;
+    let backup_root = explicit_backup_root(&path)?;
     let result = backup::restore_session(
         Some(provider),
+        backup_root,
         path,
         ctx.codex_dir.clone(),
         Some(ctx.claude_dir.clone()),
         id,
+        None,
         overwrite,
     )
     .map_err(to_string)?;
@@ -1138,8 +1223,10 @@ fn backup_restore_all(ctx: &MenuContext) -> MenuResult<()> {
         return pause().map(|_| ());
     }
     let overwrite = confirm_yes("如目标已存在，是否允许覆盖？输入 yes 才会覆盖。")?;
+    let backup_root = explicit_backup_root(&path)?;
     let results = backup::restore_all(
         Some(provider),
+        backup_root,
         path,
         ctx.codex_dir.clone(),
         Some(ctx.claude_dir.clone()),
@@ -1162,10 +1249,19 @@ fn backup_delete() -> MenuResult<()> {
         println!("已取消。");
         return pause().map(|_| ());
     }
-    backup::delete_backup(path.clone()).map_err(to_string)?;
+    let root = explicit_backup_root(&path)?;
+    backup::delete_backup(root, path.clone()).map_err(to_string)?;
     println!("已删除: {path}");
     pause()?;
     Ok(())
+}
+
+fn explicit_backup_root(path: &str) -> MenuResult<String> {
+    std::path::Path::new(path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(|parent| parent.to_string_lossy().into_owned())
+        .ok_or_else(|| format!("备份路径缺少父目录: {path}"))
 }
 
 fn bundle_menu(ctx: &mut MenuContext) -> MenuResult<Flow> {
@@ -1205,12 +1301,14 @@ fn bundle_export(ctx: &MenuContext) -> MenuResult<()> {
     let provider = choose_concrete_provider()?;
     let out_dir = prompt_required("导出目录: ")?;
     let ids = prompt_ids()?;
+    let targets = resolve_bundle_export_targets(ctx, &provider, &ids)?;
     let reports = bundle::export_session_bundles(
         Some(provider),
         ctx.codex_dir.clone(),
         Some(ctx.claude_dir.clone()),
         out_dir,
         ids,
+        targets,
         None,
         None,
     )
@@ -1994,6 +2092,49 @@ fn prompt_ids() -> MenuResult<Vec<String>> {
     } else {
         Ok(ids)
     }
+}
+
+fn resolve_bundle_export_targets(
+    ctx: &MenuContext,
+    provider: &str,
+    ids: &[String],
+) -> MenuResult<Option<Vec<BundleExportTarget>>> {
+    if provider != "claude" {
+        return Ok(None);
+    }
+    let available = load_sessions(ctx, provider, true, SessionScope::All)?;
+    let mut targets = Vec::with_capacity(ids.len());
+    for id in ids {
+        let matches = available
+            .iter()
+            .filter(|session| session.id == *id)
+            .collect::<Vec<_>>();
+        let rollout_path = match matches.as_slice() {
+            [session] => Some(session.rollout_path.clone()),
+            [] => None,
+            duplicates => {
+                println!(
+                    "检测到 {} 个同 ID Claude 会话，请选择精确 transcript：",
+                    duplicates.len()
+                );
+                for (index, session) in duplicates.iter().enumerate() {
+                    println!("{}. {}", index + 1, session.rollout_path);
+                }
+                let selected = prompt_required("请输入序号: ")?
+                    .parse::<usize>()
+                    .map_err(|_| "序号必须是正整数。".to_string())?;
+                let session = duplicates
+                    .get(selected.saturating_sub(1))
+                    .ok_or_else(|| "序号超出范围。".to_string())?;
+                Some(session.rollout_path.clone())
+            }
+        };
+        targets.push(BundleExportTarget {
+            id: id.clone(),
+            rollout_path,
+        });
+    }
+    Ok(Some(targets))
 }
 
 fn print_header(title: &str, fields: &[(&str, &str)]) {

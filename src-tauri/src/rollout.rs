@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -309,22 +309,64 @@ fn preview_capacity_hint(limit: usize) -> usize {
 }
 
 pub fn read_rollout_token_total(path: &Path) -> AppResult<i64> {
-    let f = File::open(path)?;
-    let reader = BufReader::new(f);
-    let mut total = 0i64;
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
+    const REVERSE_SCAN_CHUNK_BYTES: usize = 64 * 1024;
+
+    let mut file = File::open(path)?;
+    let mut scan_end = file.metadata()?.len();
+    let mut line_end = scan_end;
+    let mut chunk = vec![0u8; REVERSE_SCAN_CHUNK_BYTES];
+
+    while scan_end > 0 {
+        let chunk_start = scan_end.saturating_sub(REVERSE_SCAN_CHUNK_BYTES as u64);
+        let chunk_len = usize::try_from(scan_end - chunk_start).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "rollout 扫描窗口过大")
+        })?;
+        file.seek(SeekFrom::Start(chunk_start))?;
+        file.read_exact(&mut chunk[..chunk_len])?;
+
+        for offset in (0..chunk_len).rev() {
+            if chunk[offset] != b'\n' {
+                continue;
+            }
+            let separator = chunk_start + offset as u64;
+            if let Some(total) = read_token_total_from_range(&mut file, separator + 1, line_end)? {
+                return Ok(total);
+            }
+            line_end = separator;
         }
-        let Ok(raw) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        if let Some(next) = token_total_from_value(&raw) {
-            total = next;
-        }
+        scan_end = chunk_start;
     }
-    Ok(total)
+
+    Ok(read_token_total_from_range(&mut file, 0, line_end)?.unwrap_or(0))
+}
+
+fn read_token_total_from_range(file: &mut File, start: u64, end: u64) -> AppResult<Option<i64>> {
+    if end <= start {
+        return Ok(None);
+    }
+    let line_len = usize::try_from(end - start).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "rollout 单行长度超出平台限制",
+        )
+    })?;
+    let mut bytes = vec![0u8; line_len];
+    file.seek(SeekFrom::Start(start))?;
+    file.read_exact(&mut bytes)?;
+    let line = std::str::from_utf8(&bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("rollout 行不是有效 UTF-8: {error}"),
+        )
+    })?;
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let Ok(raw) = serde_json::from_str::<Value>(trimmed) else {
+        return Ok(None);
+    };
+    Ok(token_total_from_value(&raw))
 }
 
 pub fn token_total_from_value(raw: &Value) -> Option<i64> {
@@ -462,6 +504,37 @@ mod tests {
         fs::remove_file(file).ok();
 
         assert_eq!(total, 3_456_789);
+        Ok(())
+    }
+
+    #[test]
+    fn latest_token_count_does_not_require_parsing_earlier_rollout_bytes() -> AppResult<()> {
+        let file = temp_file("cc-session-manager-rollout-token-tail-test");
+        {
+            let mut out = File::create(&file)?;
+            out.write_all(&vec![0xff; 2 * 1024 * 1024])?;
+            out.write_all(b"\n")?;
+            writeln!(
+                out,
+                "{}",
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "total_tokens": 7_654_321
+                            }
+                        }
+                    }
+                })
+            )?;
+        }
+
+        let total = read_rollout_token_total(&file)?;
+        fs::remove_file(file).ok();
+
+        assert_eq!(total, 7_654_321);
         Ok(())
     }
 

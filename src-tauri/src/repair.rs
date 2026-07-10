@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::atomic_file;
 use crate::error::{AppError, AppResult};
 use crate::family;
 use crate::models::{
@@ -34,50 +35,110 @@ const DEFAULT_MEMORY_MODE: &str = "enabled";
 use crate::paths;
 use crate::state_db;
 
+fn rewrite_lines_atomically(path: &Path, lines: &[String]) -> AppResult<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let expected = match fs::symlink_metadata(path) {
+        Ok(metadata)
+            if metadata.is_file()
+                && !crate::path_safety::metadata_is_link_or_reparse(&metadata) =>
+        {
+            Some(atomic_file::fingerprint(path)?)
+        }
+        Ok(_) => {
+            return Err(AppError::Path(format!(
+                "待重写路径不是普通文件或属于链接/junction: {}",
+                path.to_string_lossy()
+            )))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let writer = |file: &mut fs::File| -> AppResult<()> {
+        for line in lines {
+            writeln!(file, "{line}")?;
+        }
+        Ok(())
+    };
+    if let Some(expected) = expected.as_ref() {
+        atomic_file::replace_with_writer_if_unchanged(path, expected, writer)
+    } else {
+        atomic_file::create_with_writer_if_absent(path, writer)
+    }
+}
+
 // ========================= 读当前 provider =========================
 
 /// 给其他模块使用的导出版本（只返回 provider，不返回 exists）。
-/// 返回值会落到 Codex 默认值 `openai`，便于下游按照"生效 provider"比较。
-pub(crate) fn read_current_provider_export(codex_dir: &Path) -> Option<String> {
-    Some(effective_current_provider(codex_dir))
+/// 仅在配置缺失或有效配置省略字段时落到 Codex 默认值 `openai`；配置损坏必须上抛。
+pub(crate) fn read_current_provider_export(codex_dir: &Path) -> AppResult<String> {
+    effective_current_provider(codex_dir)
 }
 
 /// 显式读取 config.toml 顶层的 `model_provider`，仅当字段存在时才返回 Some。
-fn read_explicit_provider(codex_dir: &Path) -> (Option<String>, bool) {
+fn read_explicit_provider(codex_dir: &Path) -> AppResult<(Option<String>, bool)> {
     let p = paths::config_toml_path(codex_dir);
-    if !p.is_file() {
-        return (None, false);
-    }
-    let raw = match fs::read_to_string(&p) {
-        Ok(v) => v,
-        Err(_) => return (None, true),
-    };
-    // 严格 TOML：只取顶层 `model_provider`，避免 `[model_providers.xxx]` 子表误匹配。
-    match raw.parse::<toml::Value>() {
-        Ok(toml::Value::Table(tbl)) => {
-            let v = tbl
-                .get("model_provider")
-                .and_then(|v| v.as_str())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            (v, true)
+    let metadata = match fs::metadata(&p) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok((None, false)),
+        Err(err) => {
+            return Err(AppError::Other(format!(
+                "读取 Codex provider 配置元数据失败: {} ({err})",
+                p.to_string_lossy()
+            )))
         }
-        _ => (None, true),
+    };
+    if !metadata.is_file() {
+        return Err(AppError::Other(format!(
+            "Codex provider 配置路径不是文件: {}",
+            p.to_string_lossy()
+        )));
     }
+    let raw = fs::read_to_string(&p).map_err(|err| {
+        AppError::Other(format!(
+            "读取 Codex provider 配置失败: {} ({err})",
+            p.to_string_lossy()
+        ))
+    })?;
+    // 严格 TOML：只取顶层 `model_provider`，避免 `[model_providers.xxx]` 子表误匹配。
+    let table = raw.parse::<toml::Table>().map_err(|err| {
+        AppError::Other(format!(
+            "Codex config.toml 不是有效 TOML: {} ({err})",
+            p.to_string_lossy()
+        ))
+    })?;
+    let Some(value) = table.get("model_provider") else {
+        return Ok((None, true));
+    };
+    let provider = value.as_str().ok_or_else(|| {
+        AppError::Other(format!(
+            "Codex config.toml 的 model_provider 必须是非空字符串: {}",
+            p.to_string_lossy()
+        ))
+    })?;
+    let provider = provider.trim();
+    if provider.is_empty() {
+        return Err(AppError::Other(format!(
+            "Codex config.toml 的 model_provider 不能为空: {}",
+            p.to_string_lossy()
+        )));
+    }
+    Ok((Some(provider.to_string()), true))
 }
 
 /// 返回 Codex 实际生效的 provider：显式值优先，否则默认 `openai`。
-fn effective_current_provider(codex_dir: &Path) -> String {
-    read_explicit_provider(codex_dir)
+fn effective_current_provider(codex_dir: &Path) -> AppResult<String> {
+    Ok(read_explicit_provider(codex_dir)?
         .0
-        .unwrap_or_else(|| DEFAULT_PROVIDER.to_string())
+        .unwrap_or_else(|| DEFAULT_PROVIDER.to_string()))
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn get_provider_info(codex_dir: String) -> AppResult<ProviderInfo> {
     let p = PathBuf::from(&codex_dir);
     let cfg = paths::config_toml_path(&p);
-    let (explicit, exists) = read_explicit_provider(&p);
+    let (explicit, exists) = read_explicit_provider(&p)?;
     let is_explicit = explicit.is_some();
     let current = explicit.or_else(|| Some(DEFAULT_PROVIDER.to_string()));
     Ok(ProviderInfo {
@@ -191,7 +252,7 @@ fn collect_project_config_candidates(
     let mut projects: BTreeSet<PathBuf> = BTreeSet::new();
     let mut candidates: BTreeMap<PathBuf, ProjectConfigCandidate> = BTreeMap::new();
 
-    for rollout_path in family::scan_rollouts(codex) {
+    for rollout_path in family::scan_rollouts(codex)? {
         let Some(brief) = read_rollout_brief(codex, &rollout_path)? else {
             continue;
         };
@@ -541,6 +602,56 @@ pub(crate) struct RolloutBrief {
     pub(crate) created_at_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RolloutIdentity {
+    id: String,
+    model_provider: String,
+    source: Option<String>,
+}
+
+/// 读取 provider / 本地索引诊断所需的最小 rollout 身份信息。
+///
+/// Codex 的 `session_meta` 位于会话头部；找到首个带有效 id 的记录后立即返回，
+/// 避免只为核对 id/provider/source 而解析可能达到数百 MB 的后续对话内容。
+fn read_rollout_identity(path: &Path) -> AppResult<Option<RolloutIdentity>> {
+    let reader = BufReader::new(fs::File::open(path)?);
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        let Some(id) = payload
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        let model_provider = payload
+            .get("model_provider")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| DEFAULT_PROVIDER.to_string());
+        return Ok(Some(RolloutIdentity {
+            id: id.to_string(),
+            model_provider,
+            source: metadata_string_field(payload, "source"),
+        }));
+    }
+    Ok(None)
+}
+
 pub(crate) fn read_rollout_brief(codex_dir: &Path, path: &Path) -> AppResult<Option<RolloutBrief>> {
     let f = fs::File::open(path)?;
     let reader = BufReader::new(f);
@@ -573,7 +684,7 @@ pub(crate) fn read_rollout_brief(codex_dir: &Path, path: &Path) -> AppResult<Opt
                 if created_ms == 0 {
                     created_ms = ms;
                 }
-                last_ms = ms;
+                last_ms = last_ms.max(ms);
             }
         }
         let outer_type = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
@@ -768,7 +879,7 @@ pub fn diagnose_codex_state(codex_dir: String) -> AppResult<DiagnosticReport> {
 
     // 1) 扫 sessions/。这里的 rollout_count 只统计 active 会话，和官方 thread/list
     // archived=false 的默认语义保持一致。
-    let rollouts = family::scan_rollouts(&codex);
+    let rollouts = family::scan_rollouts(&codex)?;
     let mut rollout_ids: Vec<String> = Vec::new();
     for p in &rollouts {
         if let Ok(Some(b)) = read_rollout_brief(&codex, p) {
@@ -780,7 +891,7 @@ pub fn diagnose_codex_state(codex_dir: String) -> AppResult<DiagnosticReport> {
     let rollout_count = rollout_ids.len() as u32;
 
     // 2) archived_sessions/
-    let archived_rollouts = family::scan_archived_rollouts(&codex);
+    let archived_rollouts = family::scan_archived_rollouts(&codex)?;
     let mut archived_ids: Vec<String> = Vec::new();
     let archived_count = archived_rollouts.len() as u32;
     for p in &archived_rollouts {
@@ -852,7 +963,7 @@ pub fn diagnose_codex_state(codex_dir: String) -> AppResult<DiagnosticReport> {
 
     // 6) provider mismatch —— 与 batch_clone 共用实现。
     // config.toml 没显式写 model_provider 时 Codex 默认 "openai"，这里也按默认值比较。
-    let cur_provider = effective_current_provider(&codex);
+    let cur_provider = effective_current_provider(&codex)?;
     let mismatch = list_mismatched_session_ids(&codex, &cur_provider)?.len() as u32;
 
     Ok(DiagnosticReport {
@@ -879,7 +990,7 @@ pub fn diagnose_codex_state(codex_dir: String) -> AppResult<DiagnosticReport> {
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn repair_session_index(codex_dir: String, dry_run: bool) -> AppResult<IndexRepairReport> {
     let codex = PathBuf::from(&codex_dir);
-    let rollouts = family::scan_rollouts(&codex);
+    let rollouts = family::scan_rollouts(&codex)?;
     let mut written = 0u32;
     let mut salvaged = 0u32;
     let mut errors: Vec<String> = Vec::new();
@@ -930,15 +1041,11 @@ pub fn repair_session_index(codex_dir: String, dry_run: bool) -> AppResult<Index
 
     if !dry_run {
         let out_path = paths::session_index_path(&codex);
-        let tmp = out_path.with_extension("jsonl.tmp");
-        {
-            let mut f = fs::File::create(&tmp)?;
-            for e in &entries {
-                writeln!(f, "{}", serde_json::to_string(e)?)?;
-            }
-            f.sync_all().ok();
-        }
-        fs::rename(&tmp, &out_path)?;
+        let lines = entries
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()?;
+        rewrite_lines_atomically(&out_path, &lines)?;
     }
 
     Ok(IndexRepairReport {
@@ -965,7 +1072,7 @@ pub fn prune_orphan_entries(
     let codex = PathBuf::from(&codex_dir);
 
     // active rollout 用于 session_index；active + archived rollout 用于 threads。
-    let rollouts = family::scan_rollouts(&codex);
+    let rollouts = family::scan_rollouts(&codex)?;
     let mut rollout_ids: BTreeSet<String> = BTreeSet::new();
     for p in &rollouts {
         if let Ok(Some(b)) = read_rollout_brief(&codex, p) {
@@ -973,7 +1080,7 @@ pub fn prune_orphan_entries(
         }
     }
     let mut all_rollout_ids = rollout_ids.clone();
-    for p in family::scan_archived_rollouts(&codex) {
+    for p in family::scan_archived_rollouts(&codex)? {
         if let Ok(Some(b)) = read_rollout_brief(&codex, &p) {
             all_rollout_ids.insert(b.id);
         }
@@ -1007,15 +1114,7 @@ pub fn prune_orphan_entries(
                 }
             }
             if !dry_run && index_removed > 0 {
-                let tmp = index_path.with_extension("jsonl.tmp");
-                {
-                    let mut f = fs::File::create(&tmp)?;
-                    for l in &kept_lines {
-                        writeln!(f, "{}", l)?;
-                    }
-                    f.sync_all().ok();
-                }
-                fs::rename(&tmp, &index_path)?;
+                rewrite_lines_atomically(&index_path, &kept_lines)?;
             }
         }
     }
@@ -1113,15 +1212,7 @@ pub fn prune_claude_history_orphans(
         }
 
         if !dry_run && removed_rows > 0 {
-            let tmp = history_path.with_extension("jsonl.tmp");
-            {
-                let mut file = fs::File::create(&tmp)?;
-                for line in &kept_lines {
-                    writeln!(file, "{}", line)?;
-                }
-                file.sync_all().ok();
-            }
-            fs::rename(&tmp, &history_path)?;
+            rewrite_lines_atomically(&history_path, &kept_lines)?;
         }
     }
 
@@ -1556,6 +1647,14 @@ pub fn repair_claude_gui_visibility(
 /// 在 jsonl 末尾追加一行 `{"type":"custom-title","sessionId":...,"customTitle":...}`。
 fn append_custom_title(path: &Path, session_id: &str, title: &str) -> AppResult<()> {
     use std::io::{Read, Seek, SeekFrom};
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() || crate::path_safety::metadata_is_link_or_reparse(&metadata) {
+        return Err(AppError::Path(format!(
+            "Claude 会话路径不是普通文件或属于链接/junction: {}",
+            path.to_string_lossy()
+        )));
+    }
+    let expected = atomic_file::fingerprint(path)?;
     let needs_newline = {
         let mut file = fs::File::open(path)?;
         let size = file.metadata()?.len();
@@ -1573,14 +1672,16 @@ fn append_custom_title(path: &Path, session_id: &str, title: &str) -> AppResult<
         "sessionId": session_id,
         "customTitle": title,
     });
-    let mut file = fs::OpenOptions::new().append(true).open(path)?;
-    if needs_newline {
-        file.write_all(b"\n")?;
-    }
-    file.write_all(record.to_string().as_bytes())?;
-    file.write_all(b"\n")?;
-    file.sync_all().ok();
-    Ok(())
+    atomic_file::replace_with_writer_if_unchanged(path, &expected, |target| {
+        let mut source = fs::File::open(path)?;
+        std::io::copy(&mut source, target)?;
+        if needs_newline {
+            target.write_all(b"\n")?;
+        }
+        target.write_all(record.to_string().as_bytes())?;
+        target.write_all(b"\n")?;
+        Ok(())
+    })
 }
 
 fn salvage_id_from_filename(p: &Path) -> Option<String> {
@@ -1635,8 +1736,8 @@ const THREADS_COLS: &[&str] = &[
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn rebuild_threads_table(codex_dir: String, dry_run: bool) -> AppResult<ThreadsRebuildReport> {
     let codex = PathBuf::from(&codex_dir);
-    let active_rollouts = family::scan_rollouts(&codex);
-    let archived_rollouts = family::scan_archived_rollouts(&codex);
+    let active_rollouts = family::scan_rollouts(&codex)?;
+    let archived_rollouts = family::scan_archived_rollouts(&codex)?;
     let mut scanned = 0u32;
     let mut upserted = 0u32;
     let mut skipped = 0u32;
@@ -1900,28 +2001,39 @@ fn mark_thread_archived(
 /// - `active-workspace-roots`（Codex App 侧栏当前显示的项目筛选集）
 /// - `project-order`（侧栏项目展示顺序）
 ///
-/// 三者缺一，官方 App 在"按项目分组"模式下都可能漏显新会话。文件不存在或非 JSON 对象时静默返回。
+/// 三者缺一，官方 App 在"按项目分组"模式下都可能漏显新会话。文件不存在时无需处理；
+/// 已存在但不可读或损坏时必须显式报错，避免把“已同步”误报给用户。
 fn ensure_workspace_root_registered(codex: &Path, cwd: &str) -> AppResult<()> {
     let cwd = cwd.trim();
     if cwd.is_empty() {
         return Ok(());
     }
     let path = paths::codex_global_state_json_path(codex);
-    if !path.is_file() {
-        return Ok(());
+    match fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(AppError::Path(format!(
+                "Codex 全局状态路径不是文件: {}",
+                path.to_string_lossy()
+            )))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
     }
-    let raw = match fs::read_to_string(&path) {
-        Ok(v) => v,
-        Err(_) => return Ok(()),
-    };
-    let mut root: Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => return Ok(()),
-    };
-    let obj = match root.as_object_mut() {
-        Some(o) => o,
-        None => return Ok(()),
-    };
+    let expected = atomic_file::fingerprint(&path)?;
+    let raw = fs::read_to_string(&path)?;
+    let mut root: Value = serde_json::from_str(&raw).map_err(|error| {
+        AppError::Other(format!(
+            "Codex 全局状态 JSON 损坏 {}: {error}",
+            path.to_string_lossy()
+        ))
+    })?;
+    let obj = root.as_object_mut().ok_or_else(|| {
+        AppError::Other(format!(
+            "Codex 全局状态必须是 JSON 对象: {}",
+            path.to_string_lossy()
+        ))
+    })?;
 
     let mut changed = false;
     // electron-saved-workspace-roots：若已有条目是 cwd 的前缀，则视为已覆盖。
@@ -1944,13 +2056,11 @@ fn ensure_workspace_root_registered(codex: &Path, cwd: &str) -> AppResult<()> {
         return Ok(());
     }
 
-    let tmp = path.with_extension("json.tmp");
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(serde_json::to_string(&root)?.as_bytes())?;
-        f.sync_all().ok();
-    }
-    fs::rename(&tmp, &path)?;
+    let serialized = serde_json::to_vec(&root)?;
+    atomic_file::replace_with_writer_if_unchanged(&path, &expected, |file| {
+        file.write_all(&serialized)?;
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -2017,33 +2127,42 @@ fn remove_index_line(codex: &Path, id: &str) -> AppResult<()> {
     if !path.is_file() {
         return Ok(());
     }
+    let expected = atomic_file::fingerprint(&path)?;
     let content = fs::read_to_string(&path)?;
-    let tmp = path.with_extension("jsonl.tmp");
-    {
-        let mut out = fs::File::create(&tmp)?;
-        for line in content.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let keep = match serde_json::from_str::<Value>(line) {
-                Ok(v) => {
-                    v.get("id").and_then(|x| x.as_str()) != Some(id)
-                        && v.get("session_id").and_then(|x| x.as_str()) != Some(id)
-                }
-                Err(_) => true,
-            };
-            if keep {
-                writeln!(out, "{}", line)?;
-            }
+    let mut kept = Vec::new();
+    let mut removed = false;
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
         }
-        out.sync_all().ok();
+        let keep = match serde_json::from_str::<Value>(line) {
+            Ok(v) => {
+                v.get("id").and_then(|x| x.as_str()) != Some(id)
+                    && v.get("session_id").and_then(|x| x.as_str()) != Some(id)
+            }
+            Err(_) => true,
+        };
+        if keep {
+            kept.push(line);
+        } else {
+            removed = true;
+        }
     }
-    fs::rename(&tmp, path)?;
+    if !removed {
+        return Ok(());
+    }
+    atomic_file::replace_with_writer_if_unchanged(&path, &expected, |file| {
+        for line in kept {
+            writeln!(file, "{line}")?;
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 
 #[derive(Debug, Clone)]
 struct ThreadRepairState {
+    rollout_path: Option<String>,
     model_provider: Option<String>,
     source: Option<String>,
     archived: bool,
@@ -2055,15 +2174,17 @@ fn read_thread_state_map(codex: &Path) -> AppResult<BTreeMap<String, ThreadRepai
         return Ok(out);
     }
     let conn = state_db::open_ro(codex)?;
-    let mut stmt =
-        conn.prepare("SELECT id, model_provider, source, COALESCE(archived,0) FROM threads")?;
+    let mut stmt = conn.prepare(
+        "SELECT id, rollout_path, model_provider, source, COALESCE(archived,0) FROM threads",
+    )?;
     let rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
             ThreadRepairState {
-                model_provider: r.get::<_, Option<String>>(1)?,
-                source: r.get::<_, Option<String>>(2)?,
-                archived: r.get::<_, i64>(3)? != 0,
+                rollout_path: r.get::<_, Option<String>>(1)?,
+                model_provider: r.get::<_, Option<String>>(2)?,
+                source: r.get::<_, Option<String>>(3)?,
+                archived: r.get::<_, i64>(4)? != 0,
             },
         ))
     })?;
@@ -2074,19 +2195,129 @@ fn read_thread_state_map(codex: &Path) -> AppResult<BTreeMap<String, ThreadRepai
     Ok(out)
 }
 
-fn thread_state_matches_active_provider(
+pub(crate) fn read_session_index_ids(codex: &Path) -> AppResult<BTreeSet<String>> {
+    let path = paths::session_index_path(codex);
+    let mut ids = BTreeSet::new();
+    if !path.is_file() {
+        return Ok(ids);
+    }
+    for (line_no, line) in BufReader::new(fs::File::open(&path)?).lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(&line).map_err(|error| {
+            AppError::Other(format!(
+                "session_index.jsonl 第 {} 行损坏: {error}",
+                line_no + 1
+            ))
+        })?;
+        let id = value
+            .get("id")
+            .or_else(|| value.get("session_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                AppError::Other(format!(
+                    "session_index.jsonl 第 {} 行缺少有效 id",
+                    line_no + 1
+                ))
+            })?;
+        ids.insert(id.to_string());
+    }
+    Ok(ids)
+}
+
+fn rollout_is_usable_provider_session(
+    codex: &Path,
     states: &BTreeMap<String, ThreadRepairState>,
+    index_ids: &BTreeSet<String>,
     id: &str,
+    expected_provider: &str,
+    rollout: &Path,
+) -> AppResult<bool> {
+    let Some(state) = states.get(id) else {
+        return Ok(false);
+    };
+    rollout_record_is_usable_provider(
+        codex,
+        id,
+        expected_provider,
+        rollout,
+        state.rollout_path.as_deref(),
+        state.model_provider.as_deref(),
+        state.source.as_deref(),
+        state.archived,
+        index_ids.contains(id),
+    )
+}
+
+fn family_branch_is_usable_provider(
+    codex: &Path,
+    states: &BTreeMap<String, ThreadRepairState>,
+    index_ids: &BTreeSet<String>,
+    branch: &FamilyBranch,
+    expected_provider: &str,
+) -> AppResult<bool> {
+    let relative = paths::checked_relative_path(&branch.rollout_relpath)?;
+    if !relative.starts_with("sessions") {
+        return Ok(false);
+    }
+    rollout_is_usable_provider_session(
+        codex,
+        states,
+        index_ids,
+        &branch.id,
+        expected_provider,
+        &codex.join(relative),
+    )
+}
+
+pub(crate) fn thread_fields_match_usable_provider(
+    provider: Option<&str>,
+    source: Option<&str>,
+    archived: bool,
     expected: &str,
 ) -> bool {
-    matches!(
-        states.get(id),
-        Some(state)
-            if state.model_provider.as_deref() == Some(expected)
-                && (is_desktop_visible_source(state.source.as_deref())
-                    || is_subagent_source(state.source.as_deref()))
-                && !state.archived
-    )
+    provider == Some(expected) && is_desktop_visible_source(source) && !archived
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rollout_record_is_usable_provider(
+    codex: &Path,
+    id: &str,
+    expected_provider: &str,
+    rollout: &Path,
+    recorded_rollout_path: Option<&str>,
+    recorded_provider: Option<&str>,
+    recorded_source: Option<&str>,
+    archived: bool,
+    indexed: bool,
+) -> AppResult<bool> {
+    if !thread_fields_match_usable_provider(
+        recorded_provider,
+        recorded_source,
+        archived,
+        expected_provider,
+    ) || !indexed
+        || !rollout.is_file()
+    {
+        return Ok(false);
+    }
+    let Some(recorded_rollout_path) = recorded_rollout_path else {
+        return Ok(false);
+    };
+    let recorded_path = PathBuf::from(paths::strip_verbatim(
+        &paths::host_path_string_from_codex_record(codex, recorded_rollout_path),
+    ));
+    if !recorded_path.is_file() || recorded_path.canonicalize()? != rollout.canonicalize()? {
+        return Ok(false);
+    }
+    let Some(identity) = read_rollout_identity(rollout)? else {
+        return Ok(false);
+    };
+    Ok(identity.id == id && identity.model_provider == expected_provider)
 }
 
 fn thread_state_is_subagent(states: &BTreeMap<String, ThreadRepairState>, id: &str) -> bool {
@@ -2197,6 +2428,37 @@ fn validate_rollout_filename(path: &Path) -> AppResult<()> {
     Ok(())
 }
 
+fn rewrite_session_meta_identity(
+    line: &str,
+    session_id: &str,
+    provider: &str,
+    timestamp_override: Option<&str>,
+) -> AppResult<Option<String>> {
+    let Ok(mut value) = serde_json::from_str::<Value>(line) else {
+        return Ok(None);
+    };
+    if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return Ok(None);
+    }
+
+    if let Some(timestamp) = timestamp_override {
+        value["timestamp"] = Value::String(timestamp.to_string());
+    }
+    let payload = value
+        .get_mut("payload")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| AppError::Other("session_meta 缺少有效 payload".into()))?;
+    payload.insert("id".into(), Value::String(session_id.into()));
+    payload.insert("model_provider".into(), Value::String(provider.into()));
+    if let Some(timestamp) = timestamp_override {
+        payload.insert("timestamp".into(), Value::String(timestamp.to_string()));
+    }
+    // 血统信息由 family store 维护，不向 Codex 原生元数据注入私有字段。
+    payload.remove("clone_timestamp");
+    payload.remove("cloned_from");
+    Ok(Some(serde_json::to_string(&value)?))
+}
+
 /// 深拷 rollout 到新 id + 新 provider；返回新文件绝对路径。
 fn write_cloned_rollout(
     src_abs: &Path,
@@ -2208,47 +2470,426 @@ fn write_cloned_rollout(
     if let Some(parent) = dest_abs.parent() {
         fs::create_dir_all(parent)?;
     }
-    let src = fs::File::open(src_abs)?;
-    let reader = BufReader::new(src);
-    let tmp = dest_abs.with_extension("jsonl.tmp");
-    {
-        let mut out = fs::File::create(&tmp)?;
-        let mut meta_rewritten = false;
+    let source_fingerprint = atomic_file::fingerprint(src_abs)?;
+    atomic_file::create_with_writer_if_absent(dest_abs, |out| {
+        let reader = BufReader::new(fs::File::open(src_abs)?);
+        let clone_timestamp = chrono::Utc::now().to_rfc3339();
+        let mut found_session_meta = false;
         for line in reader.lines() {
             let line = line?;
             if line.trim().is_empty() {
                 continue;
             }
-            if !meta_rewritten {
-                if let Ok(mut v) = serde_json::from_str::<Value>(&line) {
-                    if v.get("type").and_then(|x| x.as_str()) == Some("session_meta") {
-                        let now_iso = chrono::Utc::now().to_rfc3339();
-                        // 顶层 timestamp 与 payload.timestamp 都对齐到克隆时间，
-                        // 与 codex recorder 行为一致；避免与文件名时间戳错位。
-                        v["timestamp"] = Value::String(now_iso.clone());
-                        if let Some(payload) = v.get_mut("payload").and_then(|p| p.as_object_mut())
-                        {
-                            payload.insert("id".into(), Value::String(new_id.into()));
-                            payload.insert("timestamp".into(), Value::String(now_iso));
-                            payload.insert(
-                                "model_provider".into(),
-                                Value::String(new_provider.into()),
-                            );
-                            // 不再向 SessionMeta 注入非标字段，血统信息由 family.json 维护。
-                            payload.remove("clone_timestamp");
-                            payload.remove("cloned_from");
-                        }
-                        writeln!(out, "{}", serde_json::to_string(&v)?)?;
-                        meta_rewritten = true;
-                        continue;
-                    }
-                }
+            let timestamp_override = (!found_session_meta).then_some(clone_timestamp.as_str());
+            if let Some(rewritten) =
+                rewrite_session_meta_identity(&line, new_id, new_provider, timestamp_override)?
+            {
+                writeln!(out, "{rewritten}")?;
+                found_session_meta = true;
+                continue;
             }
             writeln!(out, "{}", line)?;
         }
-        out.sync_all().ok();
+        if !found_session_meta {
+            return Err(AppError::Other(format!(
+                "源 rollout 缺少有效 session_meta，拒绝创建 provider 分支: {}",
+                src_abs.to_string_lossy()
+            )));
+        }
+        if atomic_file::fingerprint(src_abs)? != source_fingerprint {
+            return Err(AppError::Other(format!(
+                "源 rollout 在克隆期间发生变化，已取消 provider 分支创建: {}",
+                src_abs.to_string_lossy()
+            )));
+        }
+        Ok(())
+    })?;
+    let post_commit = atomic_file::fingerprint(src_abs);
+    if !matches!(post_commit.as_ref(), Ok(current) if current == &source_fingerprint) {
+        let source_detail = post_commit
+            .err()
+            .map(|error| format!(": {error}"))
+            .unwrap_or_default();
+        return match fs::remove_file(dest_abs) {
+            Ok(()) => Err(AppError::Other(format!(
+                "源 rollout 在克隆提交时发生变化，已移除未登记分支{}: {}",
+                source_detail,
+                src_abs.to_string_lossy()
+            ))),
+            Err(error) => Err(AppError::Other(format!(
+                "源 rollout 在克隆提交时发生变化{}，且未登记分支清理失败 {}: {error}",
+                source_detail,
+                dest_abs.to_string_lossy()
+            ))),
+        };
     }
-    fs::rename(&tmp, dest_abs)?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct FileMutationSnapshot {
+    path: PathBuf,
+    contents: Option<Vec<u8>>,
+    fingerprint: Option<atomic_file::FileFingerprint>,
+}
+
+impl FileMutationSnapshot {
+    fn capture(path: &Path) -> AppResult<Self> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && !crate::path_safety::metadata_is_link_or_reparse(&metadata) =>
+            {
+                Ok(Self {
+                    path: path.to_path_buf(),
+                    contents: Some(fs::read(path)?),
+                    fingerprint: Some(atomic_file::fingerprint(path)?),
+                })
+            }
+            Ok(_) => Err(AppError::Path(format!(
+                "待修改路径不是普通文件: {}",
+                path.to_string_lossy()
+            ))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self {
+                path: path.to_path_buf(),
+                contents: None,
+                fingerprint: None,
+            }),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn into_compensation(self) -> AppResult<Option<MutationCompensation>> {
+        match fs::symlink_metadata(&self.path) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && !crate::path_safety::metadata_is_link_or_reparse(&metadata) =>
+            {
+                let current = atomic_file::fingerprint(&self.path)?;
+                if self.fingerprint.as_ref() == Some(&current) {
+                    Ok(None)
+                } else {
+                    Ok(Some(MutationCompensation::RestoreFile {
+                        path: self.path,
+                        contents: self.contents,
+                        expected_current: current,
+                    }))
+                }
+            }
+            Ok(_) => Err(AppError::Path(format!(
+                "修改后的路径不是普通文件: {}",
+                self.path.to_string_lossy()
+            ))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if self.contents.is_none() {
+                    Ok(None)
+                } else {
+                    Err(AppError::Other(format!(
+                        "修改后的文件意外消失，无法登记补偿: {}",
+                        self.path.to_string_lossy()
+                    )))
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum MutationCompensation {
+    RestoreFile {
+        path: PathBuf,
+        contents: Option<Vec<u8>>,
+        expected_current: atomic_file::FileFingerprint,
+    },
+    UndoMove {
+        original: PathBuf,
+        current: PathBuf,
+        expected_current: atomic_file::FileFingerprint,
+    },
+}
+
+impl MutationCompensation {
+    fn apply(self) -> AppResult<()> {
+        match self {
+            Self::RestoreFile {
+                path,
+                contents,
+                expected_current,
+            } => {
+                let metadata = fs::symlink_metadata(&path)?;
+                if !metadata.is_file() || crate::path_safety::metadata_is_link_or_reparse(&metadata)
+                {
+                    return Err(AppError::Path(format!(
+                        "补偿目标不是普通文件或属于链接/junction: {}",
+                        path.to_string_lossy()
+                    )));
+                }
+                let current = atomic_file::fingerprint(&path)?;
+                if current != expected_current {
+                    return Err(AppError::Other(format!(
+                        "补偿前文件已再次变化，拒绝覆盖: {}",
+                        path.to_string_lossy()
+                    )));
+                }
+                if let Some(contents) = contents {
+                    atomic_file::replace_with_writer_if_unchanged(
+                        &path,
+                        &expected_current,
+                        |file| {
+                            file.write_all(&contents)?;
+                            Ok(())
+                        },
+                    )?;
+                } else {
+                    fs::remove_file(&path)?;
+                }
+                Ok(())
+            }
+            Self::UndoMove {
+                original,
+                current,
+                expected_current,
+            } => {
+                if original.try_exists()? {
+                    return Err(AppError::Other(format!(
+                        "补偿移动的原位置已被占用: {}",
+                        original.to_string_lossy()
+                    )));
+                }
+                let metadata = fs::symlink_metadata(&current)?;
+                if !metadata.is_file() || crate::path_safety::metadata_is_link_or_reparse(&metadata)
+                {
+                    return Err(AppError::Path(format!(
+                        "补偿移动源不是普通文件或属于链接/junction: {}",
+                        current.to_string_lossy()
+                    )));
+                }
+                let current_fingerprint = atomic_file::fingerprint(&current)?;
+                if current_fingerprint != expected_current {
+                    return Err(AppError::Other(format!(
+                        "补偿移动前文件已再次变化，拒绝移动: {}",
+                        current.to_string_lossy()
+                    )));
+                }
+                if let Some(parent) = original.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::rename(&current, &original)?;
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct MutationJournal {
+    compensations: Vec<MutationCompensation>,
+}
+
+impl MutationJournal {
+    fn mutate_file<T>(
+        &mut self,
+        path: &Path,
+        mutation: impl FnOnce() -> AppResult<T>,
+    ) -> AppResult<T> {
+        let snapshot = FileMutationSnapshot::capture(path)?;
+        let value = mutation()?;
+        if let Some(compensation) = snapshot.into_compensation()? {
+            self.compensations.push(compensation);
+        }
+        Ok(value)
+    }
+
+    fn move_file(&mut self, original: &Path, current: &Path) -> AppResult<()> {
+        fs::rename(original, current)?;
+        match atomic_file::fingerprint(current) {
+            Ok(expected_current) => {
+                self.compensations.push(MutationCompensation::UndoMove {
+                    original: original.to_path_buf(),
+                    current: current.to_path_buf(),
+                    expected_current,
+                });
+                Ok(())
+            }
+            Err(error) => match fs::rename(current, original) {
+                Ok(()) => Err(error),
+                Err(restore_error) => Err(AppError::Other(format!(
+                    "移动后读取文件指纹失败: {error}; 立即移回原位置也失败 {} -> {}: {restore_error}",
+                    current.to_string_lossy(),
+                    original.to_string_lossy()
+                ))),
+            },
+        }
+    }
+
+    fn compensate(self, primary_error: AppError) -> AppError {
+        let mut compensation_errors = Vec::new();
+        for compensation in self.compensations.into_iter().rev() {
+            if let Err(error) = compensation.apply() {
+                compensation_errors.push(error.to_string());
+            }
+        }
+        if compensation_errors.is_empty() {
+            primary_error
+        } else {
+            AppError::Other(format!(
+                "{primary_error}; 补偿失败: {}",
+                compensation_errors.join(" | ")
+            ))
+        }
+    }
+}
+
+fn rollback_transaction_with_compensation(
+    transaction: rusqlite::Transaction<'_>,
+    journal: MutationJournal,
+    primary_error: AppError,
+) -> AppError {
+    let primary_error = match transaction.rollback() {
+        Ok(()) => primary_error,
+        Err(error) => AppError::Other(format!("{primary_error}; SQLite 事务回滚失败: {error}")),
+    };
+    journal.compensate(primary_error)
+}
+
+fn commit_transaction_with_compensation(
+    transaction: rusqlite::Transaction<'_>,
+    journal: MutationJournal,
+) -> AppResult<()> {
+    match transaction.execute_batch("COMMIT") {
+        Ok(()) => {
+            drop(transaction);
+            Ok(())
+        }
+        Err(commit_error) => {
+            let primary_error = AppError::Other(format!("提交 SQLite 事务失败: {commit_error}"));
+            Err(rollback_transaction_with_compensation(
+                transaction,
+                journal,
+                primary_error,
+            ))
+        }
+    }
+}
+
+fn require_unchanged_snapshot(
+    path: &Path,
+    expected: &atomic_file::FileFingerprint,
+    label: &str,
+) -> AppResult<()> {
+    let current = atomic_file::fingerprint(path)?;
+    if &current == expected {
+        Ok(())
+    } else {
+        Err(AppError::Other(format!(
+            "{label}在操作期间发生变化，已取消提交: {}",
+            path.to_string_lossy()
+        )))
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+enum RepairTestFaultAction {
+    Error,
+    Append(PathBuf),
+    CreateAndError(PathBuf),
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct RepairTestFault {
+    stage: &'static str,
+    action: RepairTestFaultAction,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static REPAIR_TEST_FAULT: std::cell::RefCell<Option<RepairTestFault>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct RepairTestFaultGuard;
+
+#[cfg(test)]
+impl RepairTestFaultGuard {
+    fn error(stage: &'static str) -> Self {
+        REPAIR_TEST_FAULT.with(|fault| {
+            *fault.borrow_mut() = Some(RepairTestFault {
+                stage,
+                action: RepairTestFaultAction::Error,
+            });
+        });
+        Self
+    }
+
+    fn append(stage: &'static str, path: PathBuf) -> Self {
+        REPAIR_TEST_FAULT.with(|fault| {
+            *fault.borrow_mut() = Some(RepairTestFault {
+                stage,
+                action: RepairTestFaultAction::Append(path),
+            });
+        });
+        Self
+    }
+
+    fn create_and_error(stage: &'static str, path: PathBuf) -> Self {
+        REPAIR_TEST_FAULT.with(|fault| {
+            *fault.borrow_mut() = Some(RepairTestFault {
+                stage,
+                action: RepairTestFaultAction::CreateAndError(path),
+            });
+        });
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for RepairTestFaultGuard {
+    fn drop(&mut self) {
+        REPAIR_TEST_FAULT.with(|fault| *fault.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn inject_repair_fault(stage: &'static str) -> AppResult<()> {
+    let fault = REPAIR_TEST_FAULT.with(|fault| {
+        let mut fault = fault.borrow_mut();
+        if fault.as_ref().is_some_and(|fault| fault.stage == stage) {
+            fault.take()
+        } else {
+            None
+        }
+    });
+    let Some(fault) = fault else {
+        return Ok(());
+    };
+    match fault.action {
+        RepairTestFaultAction::Error => {
+            Err(AppError::Other(format!("测试故障注入: {}", fault.stage)))
+        }
+        RepairTestFaultAction::Append(path) => {
+            let mut file = fs::OpenOptions::new().append(true).open(&path)?;
+            writeln!(
+                file,
+                "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"test_append\"}}}}"
+            )?;
+            file.flush()?;
+            Ok(())
+        }
+        RepairTestFaultAction::CreateAndError(path) => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&path, "test compensation conflict")?;
+            Err(AppError::Other(format!("测试故障注入: {}", fault.stage)))
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn inject_repair_fault(_stage: &'static str) -> AppResult<()> {
     Ok(())
 }
 
@@ -2438,9 +3079,7 @@ fn write_forked_rollout_prefix(
     if let Some(parent) = dest_abs.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = dest_abs.with_extension("jsonl.tmp");
-    {
-        let mut out = fs::File::create(&tmp)?;
+    atomic_file::create_with_writer_if_absent(dest_abs, |out| {
         for (idx, item) in prefix.lines.iter().enumerate() {
             if idx == 0 {
                 let mut value = item.value.clone();
@@ -2462,9 +3101,8 @@ fn write_forked_rollout_prefix(
                 writeln!(out, "{}", item.raw_line)?;
             }
         }
-        out.sync_all().ok();
-    }
-    fs::rename(&tmp, dest_abs)?;
+        Ok(())
+    })?;
     Ok(prefix.lines.len() as u64)
 }
 
@@ -2712,7 +3350,17 @@ fn clone_session_for_provider_locked(
     dry_run: bool,
 ) -> AppResult<CloneReport> {
     let codex = PathBuf::from(&codex_dir);
-    let provider = target_provider.unwrap_or_else(|| effective_current_provider(&codex));
+    let configured_provider = effective_current_provider(&codex)?;
+    let provider = match target_provider {
+        Some(provider) => {
+            let provider = provider.trim();
+            if provider.is_empty() {
+                return Err(AppError::Other("目标 provider 不能为空".into()));
+            }
+            provider.to_string()
+        }
+        None => configured_provider,
+    };
 
     let mut report = CloneReport {
         source_id: session_id.clone(),
@@ -2727,7 +3375,7 @@ fn clone_session_for_provider_locked(
     // 加载 family store
     let mut store = family::load(&codex)?;
     // 从 sessions/ 找到 session_id 对应文件
-    let rollouts = family::scan_rollouts(&codex);
+    let rollouts = family::scan_rollouts(&codex)?;
     let mut src_brief: Option<RolloutBrief> = None;
     for p in &rollouts {
         let Some(b) = read_rollout_brief(&codex, p)? else {
@@ -2747,6 +3395,7 @@ fn clone_session_for_provider_locked(
     };
 
     // 注册/定位家族
+    let family_was_registered = store.index.contains_key(&session_id);
     let family_id = family::ensure_family_for(
         &mut store,
         &session_id,
@@ -2760,20 +3409,83 @@ fn clone_session_for_provider_locked(
         let f = store.families.get(&family_id).cloned();
         f.and_then(|f| f.chain.into_iter().find(|b| b.id == f.active_id))
     };
+    if let Some(active) = active_branch.as_ref() {
+        if active.id != session_id {
+            return Err(AppError::Other(format!(
+                "provider 切换只能操作 family 当前 active 分支：当前 active={}，请求会话={}",
+                active.id, session_id
+            )));
+        }
+    }
     if let Some(b) = active_branch.as_ref() {
         if b.provider == provider {
-            if !dry_run {
+            if dry_run {
+                report.skipped_reason = Some("dry_run: 将复核并修复本地索引可见性".into());
+            } else {
                 ensure_state_db_exists(&codex)?;
                 let state = state_db::open(&codex)?;
                 sync_thread_from_rollout(&codex, &state, &src_brief.path)?;
+                append_index_line(
+                    &codex,
+                    &src_brief.id,
+                    &src_brief.first_user_message,
+                    &src_brief.path,
+                )?;
                 if let Some(cwd) = src_brief.cwd.as_deref() {
-                    let _ = ensure_workspace_root_registered(&codex, cwd);
+                    ensure_workspace_root_registered(&codex, cwd)?;
                 }
+                if !family_was_registered {
+                    family::save(&codex, &store)?;
+                }
+                let states = read_thread_state_map(&codex)?;
+                let index_ids = read_session_index_ids(&codex)?;
+                if !rollout_is_usable_provider_session(
+                    &codex,
+                    &states,
+                    &index_ids,
+                    &src_brief.id,
+                    &provider,
+                    &src_brief.path,
+                )? {
+                    return Err(AppError::Other(format!(
+                        "会话 {} 的可见性修复后复核仍未通过",
+                        src_brief.id
+                    )));
+                }
+                report.skipped_reason = Some("已修复并复核本地索引可见性".into());
             }
-            report.skipped_reason = Some("已修复本地索引可见性".into());
             report.ok = true;
             return Ok(report);
         }
+    }
+
+    let thread_states = read_thread_state_map(&codex)?;
+    let index_ids = read_session_index_ids(&codex)?;
+    let mut existing_usable_target = None;
+    if let Some(family) = store.families.get(&family_id) {
+        for branch in &family.chain {
+            if branch.provider == provider
+                && family_branch_is_usable_provider(
+                    &codex,
+                    &thread_states,
+                    &index_ids,
+                    branch,
+                    &provider,
+                )?
+            {
+                existing_usable_target = Some(branch);
+                break;
+            }
+        }
+    }
+    if let Some(branch) = existing_usable_target {
+        report.new_id = Some(branch.id.clone());
+        report.skipped_reason = Some("目标 provider 已有可用分支".into());
+        report.ok = true;
+        if !dry_run && !family_was_registered {
+            family::save(&codex, &store)?;
+        }
+        return Ok(report);
     }
 
     match strategy {
@@ -2786,22 +3498,58 @@ fn clone_session_for_provider_locked(
             }
             ensure_state_db_exists(&codex)?;
             let state = state_db::open(&codex)?;
-            rewrite_provider_inplace(&src_brief.path, &provider)?;
-            sync_thread_from_rollout(&codex, &state, &src_brief.path)?;
-            if let Some(cwd) = src_brief.cwd.as_deref() {
-                let _ = ensure_workspace_root_registered(&codex, cwd);
+            let transaction = rusqlite::Transaction::new_unchecked(
+                &state,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let mut journal = MutationJournal::default();
+            let operation = (|| -> AppResult<()> {
+                if let Some(cwd) = src_brief.cwd.as_deref() {
+                    let global_state = paths::codex_global_state_json_path(&codex);
+                    journal.mutate_file(&global_state, || {
+                        ensure_workspace_root_registered(&codex, cwd)
+                    })?;
+                }
+                journal.mutate_file(&src_brief.path, || {
+                    rewrite_provider_inplace(&src_brief.path, &provider)
+                })?;
+                inject_repair_fault("follow_after_rollout")?;
+                sync_thread_from_rollout(&codex, &transaction, &src_brief.path)?;
+                inject_repair_fault("follow_after_thread")?;
+                let index_path = paths::session_index_path(&codex);
+                journal.mutate_file(&index_path, || {
+                    append_index_line(
+                        &codex,
+                        &src_brief.id,
+                        &src_brief.first_user_message,
+                        &src_brief.path,
+                    )
+                })?;
+                inject_repair_fault("follow_after_index")?;
+
+                // 家族记录：更新当前 active 分支的 provider
+                if let Some(f) = store.families.get_mut(&family_id) {
+                    if let Some(b) = f.chain.iter_mut().find(|b| b.id == f.active_id) {
+                        b.provider = provider.clone();
+                    }
+                    f.updated_at = chrono::Utc::now().to_rfc3339();
+                }
+                let family_path = paths::family_store_path(&codex);
+                journal.mutate_file(&family_path, || family::save(&codex, &store))?;
+                inject_repair_fault("follow_after_family_save")?;
+                Ok(())
+            })();
+            if let Err(error) = operation {
+                return Err(rollback_transaction_with_compensation(
+                    transaction,
+                    journal,
+                    error,
+                ));
             }
+            commit_transaction_with_compensation(transaction, journal)?;
             report.new_id = Some(src_brief.id.clone());
             report.new_rollout_path = Some(src_brief.path.to_string_lossy().into_owned());
             report.ok = true;
-            // 家族记录：更新当前 active 分支的 provider
-            if let Some(f) = store.families.get_mut(&family_id) {
-                if let Some(b) = f.chain.iter_mut().find(|b| b.id == f.active_id) {
-                    b.provider = provider.clone();
-                }
-                f.updated_at = chrono::Utc::now().to_rfc3339();
-            }
-            family::save(&codex, &store)?;
             Ok(report)
         }
         SwitchStrategy::Scatter | SwitchStrategy::Continuous => {
@@ -2846,79 +3594,137 @@ fn clone_session_for_provider_locked(
             ensure_state_db_exists(&codex)?;
             let state = state_db::open(&codex)?;
 
-            // 1) 写新文件
-            write_cloned_rollout(
-                &source_rollout,
-                &new_abs,
-                &new_id,
-                &provider,
-                active_branch
-                    .as_ref()
-                    .map(|b| b.id.as_str())
-                    .unwrap_or(&session_id),
-            )?;
-            sync_thread_from_rollout(&codex, &state, &new_abs)?;
-            if let Some(cwd) = src_brief.cwd.as_deref() {
-                let _ = ensure_workspace_root_registered(&codex, cwd);
-            }
-
-            // 2) 连续模式下归档旧 active（用 active_branch.id）
-            if matches!(strategy, SwitchStrategy::Continuous) {
-                if let Some(b) = active_branch.as_ref() {
-                    let old_rel = paths::checked_relative_path(&b.rollout_relpath)?;
-                    let old_abs = codex.join(&old_rel);
-                    if !old_abs.is_file() {
-                        return Err(AppError::NotFound(format!(
-                            "旧 active rollout 不存在，不能归档: {}",
-                            old_abs.to_string_lossy()
-                        )));
-                    }
-                    family::archive_with_integrity(&mut store, &codex, &family_id, &b.id)?;
-                    require_thread_row(&state, &b.id)?;
-                    let archived_dir = paths::archived_sessions_dir(&codex);
-                    fs::create_dir_all(&archived_dir)?;
-                    let dest = archived_dir.join(old_abs.file_name().unwrap_or_default());
-                    fs::rename(&old_abs, &dest)?;
-                    mark_thread_archived(&state, &b.id, &dest)?;
-                    remove_index_line(&codex, &b.id)?;
+            let continuous_archive = if matches!(strategy, SwitchStrategy::Continuous) {
+                let branch = active_branch.as_ref().ok_or_else(|| {
+                    AppError::Other("continuous 模式缺少 active family 分支".into())
+                })?;
+                let old_rel = paths::checked_relative_path(&branch.rollout_relpath)?;
+                let old_abs = codex.join(old_rel);
+                if !old_abs.is_file() {
+                    return Err(AppError::NotFound(format!(
+                        "旧 active rollout 不存在，不能归档: {}",
+                        old_abs.to_string_lossy()
+                    )));
                 }
-            }
-
-            // 3) 追加新分支为 active（Scatter 模式也用同样的结构，只是不归档）
-            let cloned_from_id = active_branch
-                .as_ref()
-                .map(|b| b.id.clone())
-                .unwrap_or_else(|| session_id.clone());
-            let new_branch = FamilyBranch {
-                id: new_id.clone(),
-                provider: provider.clone(),
-                created_at: chrono::Utc::now().to_rfc3339(),
-                status: BranchStatus::Active,
-                rollout_relpath: new_rel.to_string_lossy().into_owned(),
-                sha256: None,
-                line_count: None,
-                note: Some(format!("cloned_from:{}", cloned_from_id)),
-            };
-            if matches!(strategy, SwitchStrategy::Scatter) {
-                if let Some(f) = store.families.get_mut(&family_id) {
-                    for b in f.chain.iter_mut() {
-                        if matches!(b.status, BranchStatus::Active) {
-                            b.status = BranchStatus::Archived;
-                        }
-                    }
-                    f.chain.push(new_branch);
-                    f.active_id = new_id.clone();
-                    f.updated_at = chrono::Utc::now().to_rfc3339();
+                require_thread_row(&state, &branch.id)?;
+                family::compute_integrity(&old_abs)?;
+                let archived_dir = paths::archived_sessions_dir(&codex);
+                let destination = archived_dir.join(old_abs.file_name().ok_or_else(|| {
+                    AppError::Path(format!("rollout 缺少文件名: {}", old_abs.to_string_lossy()))
+                })?);
+                if destination.exists() {
+                    return Err(AppError::Other(format!(
+                        "归档目标已存在，拒绝覆盖: {}",
+                        destination.to_string_lossy()
+                    )));
                 }
-                store.index.insert(new_id.clone(), family_id.clone());
+                Some((branch.id.clone(), old_abs, destination))
             } else {
-                family::append_branch(&mut store, &family_id, new_branch)?;
+                None
+            };
+            let source_snapshot = atomic_file::fingerprint(&source_rollout)?;
+            let transaction = rusqlite::Transaction::new_unchecked(
+                &state,
+                rusqlite::TransactionBehavior::Immediate,
+            )?;
+            let mut journal = MutationJournal::default();
+            let operation = (|| -> AppResult<()> {
+                if let Some(cwd) = src_brief.cwd.as_deref() {
+                    let global_state = paths::codex_global_state_json_path(&codex);
+                    journal.mutate_file(&global_state, || {
+                        ensure_workspace_root_registered(&codex, cwd)
+                    })?;
+                }
+
+                // 1) 基于固定源快照写新文件并登记新 threads 行。
+                journal.mutate_file(&new_abs, || {
+                    write_cloned_rollout(
+                        &source_rollout,
+                        &new_abs,
+                        &new_id,
+                        &provider,
+                        active_branch
+                            .as_ref()
+                            .map(|b| b.id.as_str())
+                            .unwrap_or(&session_id),
+                    )
+                })?;
+                inject_repair_fault("clone_after_new_rollout")?;
+                require_unchanged_snapshot(&source_rollout, &source_snapshot, "克隆源 rollout ")?;
+                sync_thread_from_rollout(&codex, &transaction, &new_abs)?;
+                inject_repair_fault("clone_after_thread")?;
+
+                // 2) Continuous 在移动旧 active 前再次绑定克隆时的同一源快照。
+                if let Some((branch_id, old_abs, destination)) = continuous_archive.as_ref() {
+                    require_unchanged_snapshot(old_abs, &source_snapshot, "旧 active rollout ")?;
+                    family::archive_with_integrity(&mut store, &codex, &family_id, branch_id)?;
+                    require_unchanged_snapshot(old_abs, &source_snapshot, "旧 active rollout ")?;
+                    if let Some(parent) = destination.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    journal.move_file(old_abs, destination)?;
+                    require_unchanged_snapshot(
+                        destination,
+                        &source_snapshot,
+                        "已归档旧 active rollout ",
+                    )?;
+                    inject_repair_fault("clone_after_old_archive")?;
+                    mark_thread_archived(&transaction, branch_id, destination)?;
+                    let index_path = paths::session_index_path(&codex);
+                    journal.mutate_file(&index_path, || remove_index_line(&codex, branch_id))?;
+                }
+
+                // 3) 追加新分支为 active（Scatter 不移动旧文件，但 family active 同步切换）。
+                let cloned_from_id = active_branch
+                    .as_ref()
+                    .map(|b| b.id.clone())
+                    .unwrap_or_else(|| session_id.clone());
+                let new_branch = FamilyBranch {
+                    id: new_id.clone(),
+                    provider: provider.clone(),
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                    status: BranchStatus::Active,
+                    rollout_relpath: new_rel.to_string_lossy().into_owned(),
+                    sha256: None,
+                    line_count: None,
+                    note: Some(format!("cloned_from:{}", cloned_from_id)),
+                };
+                if matches!(strategy, SwitchStrategy::Scatter) {
+                    if let Some(f) = store.families.get_mut(&family_id) {
+                        for b in f.chain.iter_mut() {
+                            if matches!(b.status, BranchStatus::Active) {
+                                b.status = BranchStatus::Archived;
+                            }
+                        }
+                        f.chain.push(new_branch);
+                        f.active_id = new_id.clone();
+                        f.updated_at = chrono::Utc::now().to_rfc3339();
+                    }
+                    store.index.insert(new_id.clone(), family_id.clone());
+                } else {
+                    family::append_branch(&mut store, &family_id, new_branch)?;
+                }
+
+                // 4) 索引和 family 都完成后才提交 SQLite 事务。
+                let index_path = paths::session_index_path(&codex);
+                journal.mutate_file(&index_path, || {
+                    append_index_line(&codex, &new_id, &src_brief.first_user_message, &new_abs)
+                })?;
+                inject_repair_fault("clone_after_index")?;
+
+                let family_path = paths::family_store_path(&codex);
+                journal.mutate_file(&family_path, || family::save(&codex, &store))?;
+                inject_repair_fault("clone_after_family_save")?;
+                Ok(())
+            })();
+            if let Err(error) = operation {
+                return Err(rollback_transaction_with_compensation(
+                    transaction,
+                    journal,
+                    error,
+                ));
             }
-
-            // 4) 更新 session_index.jsonl（追加一行）
-            append_index_line(&codex, &new_id, &src_brief.first_user_message, &new_abs)?;
-
-            family::save(&codex, &store)?;
+            commit_transaction_with_compensation(transaction, journal)?;
 
             report.new_id = Some(new_id);
             report.new_rollout_path = Some(new_abs.to_string_lossy().into_owned());
@@ -2929,35 +3735,40 @@ fn clone_session_for_provider_locked(
 }
 
 fn rewrite_provider_inplace(path: &Path, new_provider: &str) -> AppResult<()> {
+    let expected = atomic_file::fingerprint(path)?;
     let raw = fs::read_to_string(path)?;
     let mut rewritten = false;
-    let tmp = path.with_extension("jsonl.tmp");
-    {
-        let mut f = fs::File::create(&tmp)?;
-        for line in raw.lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if !rewritten {
-                if let Ok(mut v) = serde_json::from_str::<Value>(line) {
-                    if v.get("type").and_then(|x| x.as_str()) == Some("session_meta") {
-                        if let Some(payload) = v.get_mut("payload").and_then(|p| p.as_object_mut())
-                        {
-                            payload.insert(
-                                "model_provider".into(),
-                                Value::String(new_provider.into()),
-                            );
-                        }
-                        writeln!(f, "{}", serde_json::to_string(&v)?)?;
-                        rewritten = true;
-                        continue;
+    let mut output = Vec::new();
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if !rewritten {
+            if let Ok(mut v) = serde_json::from_str::<Value>(line) {
+                if v.get("type").and_then(|x| x.as_str()) == Some("session_meta") {
+                    if let Some(payload) = v.get_mut("payload").and_then(|p| p.as_object_mut()) {
+                        payload.insert("model_provider".into(), Value::String(new_provider.into()));
                     }
+                    output.push(serde_json::to_string(&v)?);
+                    rewritten = true;
+                    continue;
                 }
             }
-            writeln!(f, "{}", line)?;
         }
+        output.push(line.to_string());
     }
-    fs::rename(&tmp, path)?;
+    if !rewritten {
+        return Err(AppError::InvalidCodexDir(format!(
+            "rollout 缺少 session_meta，无法改写 provider: {}",
+            path.to_string_lossy()
+        )));
+    }
+    atomic_file::replace_with_writer_if_unchanged(path, &expected, |file| {
+        for line in output {
+            writeln!(file, "{line}")?;
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -2977,6 +3788,11 @@ pub(crate) fn append_index_line(
     });
     let entry_line = serde_json::to_string(&entry)?;
 
+    let expected = if index_path.is_file() {
+        Some(atomic_file::fingerprint(&index_path)?)
+    } else {
+        None
+    };
     let mut lines: Vec<String> = Vec::new();
     let mut replaced = false;
     if index_path.is_file() {
@@ -3004,15 +3820,17 @@ pub(crate) fn append_index_line(
         lines.push(entry_line);
     }
 
-    let tmp = index_path.with_extension("jsonl.tmp");
-    {
-        let mut f = fs::File::create(&tmp)?;
+    let write_index = |file: &mut fs::File| -> AppResult<()> {
         for line in &lines {
-            writeln!(f, "{}", line)?;
+            writeln!(file, "{line}")?;
         }
-        f.sync_all().ok();
+        Ok(())
+    };
+    if let Some(expected) = expected.as_ref() {
+        atomic_file::replace_with_writer_if_unchanged(&index_path, expected, write_index)?;
+    } else {
+        atomic_file::create_with_writer_if_absent(&index_path, write_index)?;
     }
-    fs::rename(&tmp, &index_path)?;
     Ok(())
 }
 
@@ -3027,21 +3845,52 @@ fn list_mismatched_session_ids(codex: &Path, target_provider: &str) -> AppResult
     let mut family_managed_ids: BTreeSet<String> = BTreeSet::new();
     let mut out: Vec<String> = Vec::new();
     let thread_states = read_thread_state_map(codex)?;
+    let index_ids = read_session_index_ids(codex)?;
 
     let store = family::load(codex)?;
     family_managed_ids.extend(store.index.keys().cloned());
     for f in store.families.values() {
         family_managed_ids.extend(f.chain.iter().map(|b| b.id.clone()));
         if let Some(active) = f.chain.iter().find(|b| b.id == f.active_id) {
+            if !matches!(active.status, BranchStatus::Active) {
+                continue;
+            }
+            // 手工归档的 family head 仍保持逻辑 Active 角色，但不应被 provider
+            // 批量同步重新复制成一条可见会话。
+            if thread_states
+                .get(&active.id)
+                .is_some_and(|state| state.archived)
+            {
+                continue;
+            }
             if thread_state_is_subagent(&thread_states, &active.id) {
                 continue;
             }
-            let has_target_branch = f.chain.iter().any(|b| b.provider == target_provider);
+            let mut has_target_branch = false;
+            for branch in &f.chain {
+                if branch.provider == target_provider
+                    && family_branch_is_usable_provider(
+                        codex,
+                        &thread_states,
+                        &index_ids,
+                        branch,
+                        target_provider,
+                    )?
+                {
+                    has_target_branch = true;
+                    break;
+                }
+            }
             if active.provider != target_provider && has_target_branch {
                 continue;
             }
-            let state_drift =
-                !thread_state_matches_active_provider(&thread_states, &active.id, &active.provider);
+            let state_drift = !family_branch_is_usable_provider(
+                codex,
+                &thread_states,
+                &index_ids,
+                active,
+                &active.provider,
+            )?;
             if (active.provider != target_provider || state_drift) && seen.insert(active.id.clone())
             {
                 out.push(active.id.clone());
@@ -3049,23 +3898,54 @@ fn list_mismatched_session_ids(codex: &Path, target_provider: &str) -> AppResult
         }
     }
 
-    for p in family::scan_rollouts(codex) {
-        let Some(b) = read_rollout_brief(codex, &p)? else {
+    for p in family::scan_rollouts(codex)? {
+        let Some(identity) = read_rollout_identity(&p)? else {
             continue;
         };
-        if family_managed_ids.contains(&b.id) {
+        if family_managed_ids.contains(&identity.id) {
             continue;
         }
-        if is_subagent_source(b.source.as_deref()) {
+        if is_subagent_source(identity.source.as_deref()) {
             continue;
         }
-        let provider = b.model_provider.as_deref().unwrap_or(DEFAULT_PROVIDER);
-        let state_drift = !thread_state_matches_active_provider(&thread_states, &b.id, provider);
-        if (provider != target_provider || state_drift) && seen.insert(b.id.clone()) {
-            out.push(b.id);
+        let provider = identity.model_provider.as_str();
+        let state_drift = !rollout_is_usable_provider_session(
+            codex,
+            &thread_states,
+            &index_ids,
+            &identity.id,
+            provider,
+            &p,
+        )?;
+        if (provider != target_provider || state_drift) && seen.insert(identity.id.clone()) {
+            out.push(identity.id);
         }
     }
     Ok(out)
+}
+
+/// 返回当前 provider 实际会被批量同步处理的会话 ID。
+///
+/// 该计划与 `batch_clone_for_current_provider_with_lock` 复用同一套扫描逻辑，
+/// 因此也包含尚未登记进 family store 的历史 rollout。
+pub fn get_provider_sync_plan_with_lock(
+    codex_dir: String,
+    lock: &family::FamilyLock,
+) -> AppResult<Vec<String>> {
+    family::with_lock(lock, |_g| {
+        let codex = PathBuf::from(codex_dir);
+        let current_provider = effective_current_provider(&codex)?;
+        list_mismatched_session_ids(&codex, &current_provider)
+    })
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub fn get_provider_sync_plan(
+    codex_dir: String,
+    lock: tauri::State<'_, family::FamilyLock>,
+) -> AppResult<Vec<String>> {
+    get_provider_sync_plan_with_lock(codex_dir, lock.inner())
 }
 
 /// 对所有 active 分支 provider ≠ 当前 provider 的家族批量克隆。
@@ -3077,7 +3957,7 @@ pub fn batch_clone_for_current_provider_with_lock(
 ) -> AppResult<Vec<CloneReport>> {
     family::with_lock(lock, |_g| {
         let codex = PathBuf::from(&codex_dir);
-        let cur = effective_current_provider(&codex);
+        let cur = effective_current_provider(&codex)?;
 
         let targets = list_mismatched_session_ids(&codex, &cur)?;
 
@@ -3154,62 +4034,165 @@ fn rollback_family_active_locked(
         .get(&family_id)
         .cloned()
         .ok_or_else(|| AppError::NotFound(format!("family: {}", family_id)))?;
-    // 当前 active 归档
-    if let Some(cur_active) = family.chain.iter().find(|b| b.id == family.active_id) {
-        let cur_rel = paths::checked_relative_path(&cur_active.rollout_relpath)?;
-        let abs = codex.join(&cur_rel);
-        if !abs.is_file() {
-            return Err(AppError::NotFound(format!(
-                "当前 active rollout 不存在，不能归档: {}",
-                abs.to_string_lossy()
-            )));
-        }
-        family::archive_with_integrity(&mut store, &codex, &family_id, &cur_active.id)?;
-        require_thread_row(&state, &cur_active.id)?;
-        let archived_dir = paths::archived_sessions_dir(&codex);
-        fs::create_dir_all(&archived_dir)?;
-        let dest = archived_dir.join(abs.file_name().unwrap_or_default());
-        fs::rename(&abs, &dest)?;
-        mark_thread_archived(&state, &cur_active.id, &dest)?;
-        remove_index_line(&codex, &cur_active.id)?;
+    if family.active_id == target_branch_id {
+        return Err(AppError::Other("目标分支已经是当前 active".into()));
     }
-    // 目标分支从归档恢复
-    if let Some(target) = family.chain.iter().find(|b| b.id == target_branch_id) {
-        let target_rel = paths::checked_relative_path(&target.rollout_relpath)?;
-        let expected_abs = codex.join(&target_rel);
-        if !expected_abs.is_file() {
-            let archived = paths::archived_sessions_dir(&codex)
-                .join(target_rel.file_name().unwrap_or_default());
-            if archived.is_file() {
-                if let Some(parent) = expected_abs.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::rename(&archived, &expected_abs)?;
-            } else {
-                return Err(AppError::NotFound(format!(
-                    "目标分支 rollout 丢失: {}",
-                    expected_abs.to_string_lossy()
-                )));
-            }
-        }
-        sync_thread_from_rollout(&codex, &state, &expected_abs)?;
-        let brief = read_rollout_brief(&codex, &expected_abs)?;
-        let thread_name = brief
-            .as_ref()
-            .map(|b| b.first_user_message.clone())
-            .unwrap_or_default();
-        append_index_line(&codex, &target_branch_id, &thread_name, &expected_abs)?;
-        if let Some(cwd) = brief.as_ref().and_then(|b| b.cwd.as_deref()) {
-            let _ = ensure_workspace_root_registered(&codex, cwd);
-        }
-    } else {
+
+    // 先完成所有可预见条件的预检，再开始移动当前 active，避免目标异常造成半完成状态。
+    let cur_active = family
+        .chain
+        .iter()
+        .find(|b| b.id == family.active_id)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(format!("active branch: {}", family.active_id)))?;
+    let target = family
+        .chain
+        .iter()
+        .find(|b| b.id == target_branch_id)
+        .cloned()
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "branch not in family {}: {}",
+                family_id, target_branch_id
+            ))
+        })?;
+
+    let cur_rel = paths::checked_relative_path(&cur_active.rollout_relpath)?;
+    let cur_abs = codex.join(&cur_rel);
+    if !cur_abs.is_file() {
         return Err(AppError::NotFound(format!(
-            "branch not in family {}: {}",
-            family_id, target_branch_id
+            "当前 active rollout 不存在，不能归档: {}",
+            cur_abs.to_string_lossy()
         )));
     }
-    family::set_active(&mut store, &family_id, &target_branch_id)?;
-    family::save(&codex, &store)?;
+    require_thread_row(&state, &cur_active.id)?;
+    let archived_dir = paths::archived_sessions_dir(&codex);
+    let cur_archived_abs = archived_dir.join(cur_abs.file_name().unwrap_or_default());
+    if cur_archived_abs.exists() {
+        return Err(AppError::Other(format!(
+            "当前 active 的归档目标已存在，取消切换: {}",
+            cur_archived_abs.to_string_lossy()
+        )));
+    }
+
+    let target_rel = paths::checked_relative_path(&target.rollout_relpath)?;
+    let expected_abs = codex.join(&target_rel);
+    let archived_target_abs = archived_dir.join(target_rel.file_name().unwrap_or_default());
+    let target_already_active = expected_abs.is_file();
+    if target_already_active && archived_target_abs.exists() {
+        return Err(AppError::Other(format!(
+            "目标分支同时存在 active 与 archived 副本，取消切换: {} / {}",
+            expected_abs.to_string_lossy(),
+            archived_target_abs.to_string_lossy()
+        )));
+    }
+    if !target_already_active && expected_abs.exists() {
+        return Err(AppError::Other(format!(
+            "目标分支恢复路径已被非文件条目占用: {}",
+            expected_abs.to_string_lossy()
+        )));
+    }
+    let target_source_abs = if target_already_active {
+        expected_abs.clone()
+    } else if archived_target_abs.is_file() {
+        archived_target_abs.clone()
+    } else {
+        return Err(AppError::NotFound(format!(
+            "目标分支 rollout 丢失: {}",
+            expected_abs.to_string_lossy()
+        )));
+    };
+    let target_brief = read_rollout_brief(&codex, &target_source_abs)?.ok_or_else(|| {
+        AppError::Other(format!(
+            "目标分支 rollout 缺少有效 session_meta.id: {}",
+            target_source_abs.to_string_lossy()
+        ))
+    })?;
+    if target_brief.id != target_branch_id {
+        return Err(AppError::Other(format!(
+            "目标分支 rollout id 不匹配：期望 {}，实际 {}",
+            target_branch_id, target_brief.id
+        )));
+    }
+    let current_lines = read_rollout_lines(&cur_abs)?;
+    let target_lines = read_rollout_lines(&target_source_abs)?;
+    let (relation, _, appendable_to_target) = compare_rollout_lines(&current_lines, &target_lines);
+    if relation == "active_ahead" {
+        return Err(AppError::Other(format!(
+            "目标分支落后当前 active {appendable_to_target} 行；请先把当前分支增量同步到目标分支，再设为当前"
+        )));
+    }
+    let current_snapshot = atomic_file::fingerprint(&cur_abs)?;
+    let target_snapshot = atomic_file::fingerprint(&target_source_abs)?;
+    let transaction =
+        rusqlite::Transaction::new_unchecked(&state, rusqlite::TransactionBehavior::Immediate)?;
+    let mut journal = MutationJournal::default();
+    let operation = (|| -> AppResult<()> {
+        if let Some(cwd) = target_brief.cwd.as_deref() {
+            let global_state = paths::codex_global_state_json_path(&codex);
+            journal.mutate_file(&global_state, || {
+                ensure_workspace_root_registered(&codex, cwd)
+            })?;
+        }
+
+        // 当前 active 归档，并在同一 SQLite 事务内更新 threads。
+        require_unchanged_snapshot(&cur_abs, &current_snapshot, "当前 active rollout ")?;
+        family::archive_with_integrity(&mut store, &codex, &family_id, &cur_active.id)?;
+        require_unchanged_snapshot(&cur_abs, &current_snapshot, "当前 active rollout ")?;
+        fs::create_dir_all(&archived_dir)?;
+        journal.move_file(&cur_abs, &cur_archived_abs)?;
+        require_unchanged_snapshot(
+            &cur_archived_abs,
+            &current_snapshot,
+            "已归档当前 active rollout ",
+        )?;
+        inject_repair_fault("rollback_after_current_archive")?;
+        mark_thread_archived(&transaction, &cur_active.id, &cur_archived_abs)?;
+        let index_path = paths::session_index_path(&codex);
+        journal.mutate_file(&index_path, || remove_index_line(&codex, &cur_active.id))?;
+
+        // 目标分支从归档恢复；Scatter 分支本就在 sessions/ 时无需移动。
+        if !target_already_active {
+            require_unchanged_snapshot(
+                &target_source_abs,
+                &target_snapshot,
+                "待恢复目标 rollout ",
+            )?;
+            if let Some(parent) = expected_abs.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            journal.move_file(&target_source_abs, &expected_abs)?;
+            require_unchanged_snapshot(&expected_abs, &target_snapshot, "已恢复目标 rollout ")?;
+        } else {
+            require_unchanged_snapshot(&expected_abs, &target_snapshot, "目标 rollout ")?;
+        }
+        inject_repair_fault("rollback_after_target_restore")?;
+        sync_thread_from_rollout(&codex, &transaction, &expected_abs)?;
+        let index_path = paths::session_index_path(&codex);
+        journal.mutate_file(&index_path, || {
+            append_index_line(
+                &codex,
+                &target_branch_id,
+                &target_brief.first_user_message,
+                &expected_abs,
+            )
+        })?;
+        inject_repair_fault("rollback_after_index")?;
+
+        family::set_active(&mut store, &family_id, &target_branch_id)?;
+        let family_path = paths::family_store_path(&codex);
+        journal.mutate_file(&family_path, || family::save(&codex, &store))?;
+        inject_repair_fault("rollback_after_family_save")?;
+        Ok(())
+    })();
+    if let Err(error) = operation {
+        return Err(rollback_transaction_with_compensation(
+            transaction,
+            journal,
+            error,
+        ));
+    }
+    commit_transaction_with_compensation(transaction, journal)?;
     Ok(())
 }
 
@@ -3261,32 +4244,13 @@ fn delete_family_branch_locked(
         )));
     }
 
-    // 1) 走 sessions::delete_one 把 threads / logs / rollout / session_index 一并清掉
-    let result = crate::sessions::delete_one_for_family(&codex, &branch_id)?;
-
-    // 2) 同时检查归档目录里是否有同名文件，一并删除
-    let archived_dir = paths::archived_sessions_dir(&codex);
-    if archived_dir.is_dir() {
-        if let Ok(entries) = fs::read_dir(&archived_dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                if name.contains(&branch_id) {
-                    let _ = fs::remove_file(&p);
-                }
-            }
-        }
+    // sessions 层按数据库、活动/归档 rollout、session_index 三处事实做完整清理与复核。
+    let outcome = crate::sessions::delete_codex_artifacts(&codex, &branch_id)?;
+    if outcome.structurally_removed {
+        family::remove_non_active_branch(&mut store, &family_id, &branch_id)?;
+        family::save(&codex, &store)?;
     }
-
-    // 3) 从 family.chain 移除并重保存
-    if let Some(f) = store.families.get_mut(&family_id) {
-        f.chain.retain(|b| b.id != branch_id);
-        f.updated_at = chrono::Utc::now().to_rfc3339();
-    }
-    store.index.remove(&branch_id);
-    family::save(&codex, &store)?;
-
-    Ok(result)
+    Ok(outcome.result)
 }
 
 /// 读取每个非 active 分支相对当前 active 分支的可同步状态。
@@ -3363,6 +4327,8 @@ fn get_family_branch_sync_states_locked(
                 Ok(branch_lines) => {
                     let (relation, to_active, to_branch) =
                         compare_rollout_lines(&active_lines, &branch_lines);
+                    let error = (relation == "diverged")
+                        .then(|| describe_rollout_divergence(&active_lines, &branch_lines));
                     BranchSyncState {
                         branch_id: branch.id.clone(),
                         relation,
@@ -3370,7 +4336,7 @@ fn get_family_branch_sync_states_locked(
                         branch_lines: Some(branch_lines.len() as u64),
                         appendable_lines_to_active: to_active,
                         appendable_lines_to_branch: to_branch,
-                        error: None,
+                        error,
                     }
                 }
                 Err(e) => BranchSyncState {
@@ -3502,7 +4468,9 @@ fn append_branch_extras_locked(
 
     let source_abs = resolve_branch_rollout(&codex, &source_branch)?;
     let target_abs = resolve_branch_rollout(&codex, &target_branch)?;
+    let target_archived = target_abs.starts_with(paths::archived_sessions_dir(&codex));
     let source_lines = read_rollout_lines(&source_abs)?;
+    let target_fingerprint = atomic_file::fingerprint(&target_abs)?;
     let target_lines = read_rollout_lines(&target_abs)?;
 
     validate_source_has_target_prefix(&source_lines, &target_lines)?;
@@ -3513,39 +4481,60 @@ fn append_branch_extras_locked(
     let target_body = comparable_body(&target_lines);
     let extras: Vec<String> = source_body[target_body.len()..]
         .iter()
-        .map(|s| (*s).clone())
-        .collect();
-    let appended = extras.len() as u32;
+        .map(|line| {
+            rewrite_session_meta_identity(line, &target_branch.id, &target_branch.provider, None)
+                .map(|rewritten| rewritten.unwrap_or_else(|| (*line).clone()))
+        })
+        .collect::<AppResult<_>>()?;
+    let appended = u32::try_from(extras.len())
+        .map_err(|_| AppError::Other("同步增量行数超过 u32 可表示范围".into()))?;
+    let final_line_count = usize::from(!target_lines.is_empty()) + target_body.len() + extras.len();
+    let final_line_count = u32::try_from(final_line_count)
+        .map_err(|_| AppError::Other("同步后总行数超过 u32 可表示范围".into()))?;
 
-    let tmp = target_abs.with_extension("jsonl.tmp");
-    {
-        let mut f = fs::File::create(&tmp)?;
+    ensure_state_db_exists(&codex)?;
+    let state = state_db::open(&codex)?;
+
+    atomic_file::replace_with_writer_if_unchanged(&target_abs, &target_fingerprint, |file| {
         // 保留目标的 session_meta（首行），后续 body 一律按过滤口径重写
         if let Some(first) = target_lines.first() {
-            writeln!(f, "{}", first)?;
+            writeln!(file, "{}", first)?;
         }
         for line in target_body.iter() {
-            writeln!(f, "{}", line)?;
+            if let Some(rewritten) = rewrite_session_meta_identity(
+                line,
+                &target_branch.id,
+                &target_branch.provider,
+                None,
+            )? {
+                writeln!(file, "{rewritten}")?;
+            } else {
+                writeln!(file, "{}", line)?;
+            }
         }
         for line in extras.iter() {
-            writeln!(f, "{}", line)?;
+            writeln!(file, "{}", line)?;
         }
-        f.sync_all().ok();
-    }
-    fs::rename(&tmp, &target_abs)?;
+        Ok(())
+    })?;
 
-    if target_branch.id == family.active_id {
-        ensure_state_db_exists(&codex)?;
-        let state = state_db::open(&codex)?;
-        sync_thread_from_rollout(&codex, &state, &target_abs)?;
-        let brief = read_rollout_brief(&codex, &target_abs)?;
-        let thread_name = brief
-            .as_ref()
-            .map(|b| b.first_user_message.clone())
-            .unwrap_or_default();
+    if !upsert_thread_from_rollout(&codex, &state, &target_abs, target_archived)? {
+        return Err(AppError::InvalidCodexDir(format!(
+            "同步后的 rollout 缺少有效 session_meta.id: {}",
+            target_abs.to_string_lossy()
+        )));
+    }
+    if !target_archived {
+        let brief = read_rollout_brief(&codex, &target_abs)?.ok_or_else(|| {
+            AppError::InvalidCodexDir(format!(
+                "同步后的 rollout 缺少有效 session_meta.id: {}",
+                target_abs.to_string_lossy()
+            ))
+        })?;
+        let thread_name = brief.first_user_message.clone();
         append_index_line(&codex, &target_branch.id, &thread_name, &target_abs)?;
-        if let Some(cwd) = brief.as_ref().and_then(|b| b.cwd.as_deref()) {
-            let _ = ensure_workspace_root_registered(&codex, cwd);
+        if let Some(cwd) = brief.cwd.as_deref() {
+            ensure_workspace_root_registered(&codex, cwd)?;
         }
     }
 
@@ -3569,7 +4558,7 @@ fn append_branch_extras_locked(
         source_id: source_branch_id,
         target_id: target_branch_id,
         appended_lines: appended,
-        total_lines: source_lines.len() as u32,
+        total_lines: final_line_count,
     })
 }
 
@@ -3640,6 +4629,19 @@ fn compare_rollout_lines(active_lines: &[String], branch_lines: &[String]) -> (S
     } else {
         ("diverged".into(), 0, 0)
     }
+}
+
+fn describe_rollout_divergence(active_lines: &[String], branch_lines: &[String]) -> String {
+    let active_body = comparable_body(active_lines);
+    let branch_body = comparable_body(branch_lines);
+    let common_lines = active_body
+        .iter()
+        .zip(branch_body.iter())
+        .take_while(|(active, branch)| active == branch)
+        .count();
+    format!(
+        "两份 rollout 在共同前缀 {common_lines} 行后均有不同记录，无法安全做前缀同步；模型切换本身不会创建会话分支"
+    )
 }
 
 fn validate_source_has_target_prefix(
@@ -3749,6 +4751,7 @@ mod tests {
         conn.execute(
             "CREATE TABLE threads (
                 id TEXT PRIMARY KEY,
+                rollout_path TEXT,
                 model_provider TEXT,
                 source TEXT,
                 archived INTEGER
@@ -3766,6 +4769,8 @@ mod tests {
             .map(|name| {
                 if *name == "id" {
                     "id TEXT PRIMARY KEY".to_string()
+                } else if *name == "archived" {
+                    "archived INTEGER".to_string()
                 } else {
                     format!("{name} TEXT")
                 }
@@ -3873,6 +4878,850 @@ mod tests {
         Ok(())
     }
 
+    fn prepare_provider_switch_fixture(codex: &Path, id: &str) -> AppResult<PathBuf> {
+        let source_rel = format!("sessions/2026/04/24/rollout-{id}.jsonl");
+        let source = codex.join(&source_rel);
+        write_sync_rollout(&source, id, "custom", &[])?;
+        create_full_state(codex)?;
+        {
+            let state = state_db::open(codex)?;
+            sync_thread_from_rollout(codex, &state, &source)?;
+        }
+        write_index_line(codex, id)?;
+        Ok(source)
+    }
+
+    fn write_sync_rollout(path: &Path, id: &str, provider: &str, body: &[String]) -> AppResult<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let meta = serde_json::json!({
+            "timestamp": "2026-04-24T00:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": id,
+                "model_provider": provider,
+                "cwd": "F:\\project\\example",
+                "source": DEFAULT_THREAD_SOURCE
+            }
+        })
+        .to_string();
+        let mut lines = vec![meta];
+        lines.extend(body.iter().cloned());
+        fs::write(path, format!("{}\n", lines.join("\n")))?;
+        Ok(())
+    }
+
+    fn save_two_branch_family(
+        codex: &Path,
+        source_id: &str,
+        source_provider: &str,
+        source_relpath: &str,
+        target_id: &str,
+        target_provider: &str,
+        target_relpath: &str,
+    ) -> AppResult<()> {
+        let family = Family {
+            family_id: source_id.to_string(),
+            root_id: source_id.to_string(),
+            title: "sync family".to_string(),
+            chain: vec![
+                FamilyBranch {
+                    id: source_id.to_string(),
+                    provider: source_provider.to_string(),
+                    created_at: "2026-04-24T00:00:00Z".to_string(),
+                    status: BranchStatus::Active,
+                    rollout_relpath: source_relpath.to_string(),
+                    sha256: None,
+                    line_count: None,
+                    note: None,
+                },
+                FamilyBranch {
+                    id: target_id.to_string(),
+                    provider: target_provider.to_string(),
+                    created_at: "2026-04-24T00:00:00Z".to_string(),
+                    status: BranchStatus::Archived,
+                    rollout_relpath: target_relpath.to_string(),
+                    sha256: None,
+                    line_count: None,
+                    note: None,
+                },
+            ],
+            active_id: source_id.to_string(),
+            updated_at: "2026-04-24T00:00:00Z".to_string(),
+        };
+        let mut families = BTreeMap::new();
+        families.insert(source_id.to_string(), family);
+        let mut index = BTreeMap::new();
+        index.insert(source_id.to_string(), source_id.to_string());
+        index.insert(target_id.to_string(), source_id.to_string());
+        family::save(
+            codex,
+            &FamilyStore {
+                version: 1,
+                families,
+                index,
+            },
+        )
+    }
+
+    struct RollbackFixture {
+        source_id: String,
+        target_id: String,
+        source_path: PathBuf,
+        source_archived_path: PathBuf,
+        target_active_path: PathBuf,
+        target_archived_path: PathBuf,
+    }
+
+    fn prepare_rollback_fixture(codex: &Path, suffix: &str) -> AppResult<RollbackFixture> {
+        let source_id = format!("rollback-source-{suffix}");
+        let target_id = format!("rollback-target-{suffix}");
+        let source_rel = format!("sessions/2026/04/24/rollout-{source_id}.jsonl");
+        let target_rel = format!("sessions/2026/04/24/rollout-{target_id}.jsonl");
+        let source_path = codex.join(&source_rel);
+        let target_active_path = codex.join(&target_rel);
+        let source_archived_path =
+            paths::archived_sessions_dir(codex).join(format!("rollout-{source_id}.jsonl"));
+        let target_archived_path =
+            paths::archived_sessions_dir(codex).join(format!("rollout-{target_id}.jsonl"));
+
+        write_sync_rollout(&source_path, &source_id, "custom", &[])?;
+        write_sync_rollout(&target_archived_path, &target_id, DEFAULT_PROVIDER, &[])?;
+        create_full_state(codex)?;
+        {
+            let state = state_db::open(codex)?;
+            sync_thread_from_rollout(codex, &state, &source_path)?;
+            assert!(upsert_thread_from_rollout(
+                codex,
+                &state,
+                &target_archived_path,
+                true,
+            )?);
+        }
+        write_index_line(codex, &source_id)?;
+        save_two_branch_family(
+            codex,
+            &source_id,
+            "custom",
+            &source_rel,
+            &target_id,
+            DEFAULT_PROVIDER,
+            &target_rel,
+        )?;
+        Ok(RollbackFixture {
+            source_id,
+            target_id,
+            source_path,
+            source_archived_path,
+            target_active_path,
+            target_archived_path,
+        })
+    }
+
+    fn read_thread_location(codex: &Path, id: &str) -> AppResult<(String, i64)> {
+        let state = state_db::open_ro(codex)?;
+        Ok(state.query_row(
+            "SELECT rollout_path, CAST(archived AS INTEGER) FROM threads WHERE id = ?",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?)
+    }
+
+    #[test]
+    fn provider_config_defaults_only_for_missing_or_valid_omission() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-provider-config-test");
+        fs::create_dir_all(&codex)?;
+
+        assert_eq!(effective_current_provider(&codex)?, DEFAULT_PROVIDER);
+
+        fs::write(paths::config_toml_path(&codex), "")?;
+        assert_eq!(effective_current_provider(&codex)?, DEFAULT_PROVIDER);
+
+        fs::write(
+            paths::config_toml_path(&codex),
+            "[model_providers.custom]\nname = \"Custom\"\n",
+        )?;
+        assert_eq!(effective_current_provider(&codex)?, DEFAULT_PROVIDER);
+
+        fs::write(
+            paths::config_toml_path(&codex),
+            "model_provider = \"  custom  \"\n",
+        )?;
+        assert_eq!(effective_current_provider(&codex)?, "custom");
+
+        for invalid in [
+            "model_provider = \"   \"\n",
+            "model_provider = 42\n",
+            "model_provider = [\n",
+        ] {
+            fs::write(paths::config_toml_path(&codex), invalid)?;
+            assert!(effective_current_provider(&codex).is_err(), "{invalid}");
+            assert!(get_provider_info(codex.to_string_lossy().into_owned()).is_err());
+            assert!(clone_session_for_provider_locked(
+                codex.to_string_lossy().into_owned(),
+                "any-session".to_string(),
+                Some("custom".to_string()),
+                SwitchStrategy::Scatter,
+                true,
+            )
+            .is_err());
+        }
+
+        fs::remove_file(paths::config_toml_path(&codex))?;
+        fs::create_dir(paths::config_toml_path(&codex))?;
+        assert!(effective_current_provider(&codex).is_err());
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn cloned_rollout_never_has_updated_at_before_created_at() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-clone-time-test");
+        let source = write_conversation_rollout(&codex, "clone-time-source")?;
+        let target = codex
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("10")
+            .join("rollout-clone-time-target.jsonl");
+
+        write_cloned_rollout(
+            &source,
+            &target,
+            "clone-time-target",
+            "custom",
+            "clone-time-source",
+        )?;
+        let brief = read_rollout_brief(&codex, &target)?.expect("cloned rollout brief");
+
+        assert!(brief.created_at_ms > 0);
+        assert!(brief.updated_at_ms >= brief.created_at_ms);
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn cloned_rollout_rewrites_every_session_meta_identity() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-clone-repeated-meta-test");
+        let source = codex.join("sessions/source.jsonl");
+        let target = codex.join("sessions/target.jsonl");
+        let repeated_meta = serde_json::json!({
+            "timestamp": "2026-04-24T01:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "source",
+                "timestamp": "2026-04-24T01:00:00Z",
+                "model_provider": DEFAULT_PROVIDER,
+                "cwd": "F:\\project\\example",
+                "source": DEFAULT_THREAD_SOURCE
+            }
+        })
+        .to_string();
+        write_sync_rollout(&source, "source", DEFAULT_PROVIDER, &[repeated_meta])?;
+
+        write_cloned_rollout(&source, &target, "target", "custom", "source")?;
+
+        let session_meta = read_rollout_lines(&target)?
+            .into_iter()
+            .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+            .filter(|value| value.get("type").and_then(Value::as_str) == Some("session_meta"))
+            .collect::<Vec<_>>();
+        assert_eq!(session_meta.len(), 2);
+        for value in &session_meta {
+            assert_eq!(value["payload"]["id"], "target");
+            assert_eq!(value["payload"]["model_provider"], "custom");
+        }
+        assert_eq!(
+            session_meta[1]["timestamp"],
+            Value::String("2026-04-24T01:00:00Z".into())
+        );
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn cloned_rollout_requires_session_meta_and_leaves_no_destination() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-clone-invalid-source-test");
+        let source = codex.join("sessions/source.jsonl");
+        let target = codex.join("sessions/target.jsonl");
+        fs::create_dir_all(source.parent().expect("source parent"))?;
+        fs::write(
+            &source,
+            "{\"type\":\"response_item\",\"payload\":{\"role\":\"user\"}}\n",
+        )?;
+
+        let error = write_cloned_rollout(&source, &target, "target", "custom", "source")
+            .expect_err("a clone without session_meta must be rejected");
+
+        assert!(error.to_string().contains("session_meta"));
+        assert!(!target.exists());
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn provider_switch_strategies_compensate_after_family_save_failure() -> AppResult<()> {
+        let cases = [
+            (SwitchStrategy::Follow, "follow_after_family_save", "follow"),
+            (
+                SwitchStrategy::Scatter,
+                "clone_after_family_save",
+                "scatter",
+            ),
+            (
+                SwitchStrategy::Continuous,
+                "clone_after_family_save",
+                "continuous",
+            ),
+        ];
+
+        for (strategy, fault_stage, label) in cases {
+            let codex = temp_codex_dir(&format!(
+                "cc-session-manager-provider-compensation-{label}-test"
+            ));
+            let session_id = format!("provider-compensation-{label}");
+            let source = prepare_provider_switch_fixture(&codex, &session_id)?;
+            let source_before = fs::read(&source)?;
+            let index_before = fs::read(paths::session_index_path(&codex))?;
+            assert!(!paths::family_store_path(&codex).exists());
+
+            let _fault = RepairTestFaultGuard::error(fault_stage);
+            let error = clone_session_for_provider_locked(
+                codex.to_string_lossy().into_owned(),
+                session_id.clone(),
+                Some(DEFAULT_PROVIDER.to_string()),
+                strategy,
+                false,
+            )
+            .expect_err("fault after family save must abort provider switch");
+            assert!(
+                error.to_string().contains("测试故障注入"),
+                "{label}: {error}"
+            );
+
+            assert_eq!(fs::read(&source)?, source_before, "{label}");
+            assert_eq!(
+                fs::read(paths::session_index_path(&codex))?,
+                index_before,
+                "{label}"
+            );
+            assert!(
+                !paths::family_store_path(&codex).exists(),
+                "{label}: family store must return to its originally absent state"
+            );
+            assert_eq!(family::scan_rollouts(&codex)?.len(), 1, "{label}");
+            let state = state_db::open_ro(&codex)?;
+            let (count, provider, archived): (i64, String, i64) = state.query_row(
+                "SELECT COUNT(*), MIN(model_provider), MIN(CAST(archived AS INTEGER)) FROM threads",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            assert_eq!(count, 1, "{label}");
+            assert_eq!(provider, "custom", "{label}");
+            assert_eq!(archived, 0, "{label}");
+
+            fs::remove_dir_all(&codex).ok();
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn provider_switch_strategies_commit_consistent_state_and_rollback() -> AppResult<()> {
+        for (strategy, label) in [
+            (SwitchStrategy::Follow, "follow"),
+            (SwitchStrategy::Scatter, "scatter"),
+            (SwitchStrategy::Continuous, "continuous"),
+        ] {
+            let codex = temp_codex_dir(&format!("cc-session-manager-provider-commit-{label}-test"));
+            let source_id = format!("provider-commit-{label}");
+            let source = prepare_provider_switch_fixture(&codex, &source_id)?;
+
+            let report = clone_session_for_provider_locked(
+                codex.to_string_lossy().into_owned(),
+                source_id.clone(),
+                Some(DEFAULT_PROVIDER.to_string()),
+                strategy,
+                false,
+            )?;
+            assert!(report.ok, "{label}: {:?}", report.error);
+            let active_id = report
+                .new_id
+                .clone()
+                .expect("successful provider target id");
+            let store = family::load(&codex)?;
+            let family_id = store.index.get(&source_id).expect("source family id");
+            let family = store.families.get(family_id).expect("source family");
+            assert_eq!(family.active_id, active_id, "{label}");
+            let index_ids = read_session_index_ids(&codex)?;
+
+            match label {
+                "follow" => {
+                    assert_eq!(active_id, source_id);
+                    assert_eq!(family.chain.len(), 1);
+                    assert_eq!(
+                        read_rollout_brief(&codex, &source)?.and_then(|brief| brief.model_provider),
+                        Some(DEFAULT_PROVIDER.to_string())
+                    );
+                    assert_eq!(read_thread_location(&codex, &source_id)?.1, 0);
+                    assert!(index_ids.contains(&source_id));
+                }
+                "scatter" => {
+                    assert_ne!(active_id, source_id);
+                    assert_eq!(family.chain.len(), 2);
+                    assert!(source.is_file());
+                    assert!(PathBuf::from(report.new_rollout_path.as_deref().unwrap()).is_file());
+                    assert_eq!(read_thread_location(&codex, &source_id)?.1, 0);
+                    assert_eq!(read_thread_location(&codex, &active_id)?.1, 0);
+                    assert!(index_ids.contains(&source_id));
+                    assert!(index_ids.contains(&active_id));
+                }
+                "continuous" => {
+                    assert_ne!(active_id, source_id);
+                    assert_eq!(family.chain.len(), 2);
+                    let archived_source = paths::archived_sessions_dir(&codex)
+                        .join(source.file_name().expect("source filename"));
+                    assert!(!source.exists());
+                    assert!(archived_source.is_file());
+                    assert!(PathBuf::from(report.new_rollout_path.as_deref().unwrap()).is_file());
+                    assert_eq!(read_thread_location(&codex, &source_id)?.1, 1);
+                    assert_eq!(read_thread_location(&codex, &active_id)?.1, 0);
+                    assert!(!index_ids.contains(&source_id));
+                    assert!(index_ids.contains(&active_id));
+
+                    rollback_family_active_locked(
+                        codex.to_string_lossy().into_owned(),
+                        family_id.clone(),
+                        source_id.clone(),
+                    )?;
+                    let restored_store = family::load(&codex)?;
+                    let restored_family = restored_store
+                        .families
+                        .get(family_id)
+                        .expect("restored family");
+                    assert_eq!(restored_family.active_id, source_id);
+                    assert!(source.is_file());
+                    let archived_new = paths::archived_sessions_dir(&codex).join(
+                        PathBuf::from(report.new_rollout_path.as_deref().unwrap())
+                            .file_name()
+                            .expect("new rollout filename"),
+                    );
+                    assert!(archived_new.is_file());
+                    assert_eq!(read_thread_location(&codex, &source_id)?.1, 0);
+                    assert_eq!(read_thread_location(&codex, &active_id)?.1, 1);
+                    let restored_index = read_session_index_ids(&codex)?;
+                    assert!(restored_index.contains(&source_id));
+                    assert!(!restored_index.contains(&active_id));
+                }
+                _ => unreachable!(),
+            }
+
+            fs::remove_dir_all(&codex).ok();
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn continuous_switch_rechecks_source_snapshot_before_archive() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-provider-source-race-test");
+        let session_id = "provider-source-race";
+        let source = prepare_provider_switch_fixture(&codex, session_id)?;
+        let index_before = fs::read(paths::session_index_path(&codex))?;
+
+        let _fault = RepairTestFaultGuard::append("clone_after_new_rollout", source.clone());
+        let error = clone_session_for_provider_locked(
+            codex.to_string_lossy().into_owned(),
+            session_id.to_string(),
+            Some(DEFAULT_PROVIDER.to_string()),
+            SwitchStrategy::Continuous,
+            false,
+        )
+        .expect_err("a changed source snapshot must abort before archive");
+
+        assert!(error.to_string().contains("发生变化"), "{error}");
+        assert!(source.is_file());
+        assert!(fs::read_to_string(&source)?.contains("test_append"));
+        assert_eq!(family::scan_rollouts(&codex)?.len(), 1);
+        assert_eq!(fs::read(paths::session_index_path(&codex))?, index_before);
+        assert!(!paths::family_store_path(&codex).exists());
+        let state = state_db::open_ro(&codex)?;
+        let count: i64 = state.query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))?;
+        assert_eq!(count, 1);
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn model_switch_on_one_side_is_ahead_not_diverged() {
+        let active = vec![
+            "active-meta".to_string(),
+            "shared-message".to_string(),
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "thread_settings_applied",
+                    "thread_settings": {"model": "gpt-next"}
+                }
+            })
+            .to_string(),
+            "new-turn".to_string(),
+        ];
+        let history = vec!["history-meta".to_string(), "shared-message".to_string()];
+
+        assert_eq!(
+            compare_rollout_lines(&active, &history),
+            ("active_ahead".to_string(), 0, 2)
+        );
+    }
+
+    #[test]
+    fn different_turns_after_model_switch_remain_diverged() {
+        let active = vec![
+            "active-meta".to_string(),
+            "shared-message".to_string(),
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "thread_settings_applied",
+                    "thread_settings": {"model": "gpt-next"}
+                }
+            })
+            .to_string(),
+            "active-user-turn".to_string(),
+        ];
+        let history = vec![
+            "history-meta".to_string(),
+            "shared-message".to_string(),
+            "history-user-turn".to_string(),
+        ];
+
+        assert_eq!(
+            compare_rollout_lines(&active, &history),
+            ("diverged".to_string(), 0, 0)
+        );
+        assert!(describe_rollout_divergence(&active, &history).contains("共同前缀 1 行"));
+    }
+
+    #[test]
+    fn sync_updates_non_active_main_target_and_reports_written_lines() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-sync-main-target-test");
+        let source_id = "sync-main-source";
+        let target_id = "sync-main-target";
+        let source_rel = "sessions/2026/04/24/rollout-sync-main-source.jsonl";
+        let target_rel = "sessions/2026/04/24/rollout-sync-main-target.jsonl";
+        let source_path = codex.join(source_rel);
+        let target_path = codex.join(target_rel);
+        let clone_trace = serde_json::json!({
+            "type": "event_msg",
+            "payload": {"type": "session_cloned"}
+        })
+        .to_string();
+        let common = serde_json::json!({
+            "timestamp": "2026-04-24T00:00:01Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "hello"}
+        })
+        .to_string();
+        let repeated_source_meta = serde_json::json!({
+            "timestamp": "2026-04-24T00:00:01.500Z",
+            "type": "session_meta",
+            "payload": {
+                "id": source_id,
+                "model_provider": "custom",
+                "cwd": "F:\\project\\example",
+                "source": DEFAULT_THREAD_SOURCE
+            }
+        })
+        .to_string();
+        let extra = serde_json::json!({
+            "timestamp": "2026-04-24T00:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {"total_tokens": 77}}
+            }
+        })
+        .to_string();
+        write_sync_rollout(
+            &source_path,
+            source_id,
+            "custom",
+            &[clone_trace, common.clone(), repeated_source_meta, extra],
+        )?;
+        write_sync_rollout(&target_path, target_id, DEFAULT_PROVIDER, &[common])?;
+        create_full_state(&codex)?;
+        {
+            let state = state_db::open(&codex)?;
+            sync_thread_from_rollout(&codex, &state, &source_path)?;
+            sync_thread_from_rollout(&codex, &state, &target_path)?;
+        }
+        save_two_branch_family(
+            &codex,
+            source_id,
+            "custom",
+            source_rel,
+            target_id,
+            DEFAULT_PROVIDER,
+            target_rel,
+        )?;
+
+        let report = append_branch_extras_locked(
+            codex.to_string_lossy().into_owned(),
+            source_id.to_string(),
+            source_id.to_string(),
+            target_id.to_string(),
+        )?;
+
+        assert_eq!(report.appended_lines, 2);
+        assert_eq!(report.total_lines, 4);
+        let target_lines = read_rollout_lines(&target_path)?;
+        assert_eq!(target_lines.len(), 4);
+        let appended_meta: Value = serde_json::from_str(&target_lines[2])?;
+        assert_eq!(appended_meta["payload"]["id"], target_id);
+        assert_eq!(appended_meta["payload"]["model_provider"], DEFAULT_PROVIDER);
+        let state = state_db::open_ro(&codex)?;
+        let (tokens, archived): (i64, i64) = state.query_row(
+            "SELECT CAST(tokens_used AS INTEGER), CAST(archived AS INTEGER) FROM threads WHERE id = ?",
+            [target_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(tokens, 77);
+        assert_eq!(archived, 0);
+        let index = fs::read_to_string(paths::session_index_path(&codex))?;
+        assert!(index.contains(target_id));
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn sync_updates_archived_target_without_adding_index_entry() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-sync-archived-target-test");
+        let source_id = "sync-archived-source";
+        let target_id = "sync-archived-target";
+        let source_rel = "sessions/2026/04/24/rollout-sync-archived-source.jsonl";
+        let target_rel = "sessions/2026/04/24/rollout-sync-archived-target.jsonl";
+        let source_path = codex.join(source_rel);
+        let target_path =
+            paths::archived_sessions_dir(&codex).join("rollout-sync-archived-target.jsonl");
+        let common = serde_json::json!({
+            "timestamp": "2026-04-24T00:00:01Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "hello"}
+        })
+        .to_string();
+        let extra = serde_json::json!({
+            "timestamp": "2026-04-24T00:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {"total_tokens": 88}}
+            }
+        })
+        .to_string();
+        write_sync_rollout(&source_path, source_id, "custom", &[common.clone(), extra])?;
+        write_sync_rollout(&target_path, target_id, DEFAULT_PROVIDER, &[common])?;
+        create_full_state(&codex)?;
+        {
+            let state = state_db::open(&codex)?;
+            sync_thread_from_rollout(&codex, &state, &source_path)?;
+            assert!(upsert_thread_from_rollout(
+                &codex,
+                &state,
+                &target_path,
+                true
+            )?);
+        }
+        save_two_branch_family(
+            &codex,
+            source_id,
+            "custom",
+            source_rel,
+            target_id,
+            DEFAULT_PROVIDER,
+            target_rel,
+        )?;
+
+        let report = append_branch_extras_locked(
+            codex.to_string_lossy().into_owned(),
+            source_id.to_string(),
+            source_id.to_string(),
+            target_id.to_string(),
+        )?;
+
+        assert_eq!(report.total_lines, 3);
+        let state = state_db::open_ro(&codex)?;
+        let (tokens, archived): (i64, i64) = state.query_row(
+            "SELECT CAST(tokens_used AS INTEGER), CAST(archived AS INTEGER) FROM threads WHERE id = ?",
+            [target_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(tokens, 88);
+        assert_eq!(archived, 1);
+        assert!(!paths::session_index_path(&codex).exists());
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_missing_target_has_no_side_effects() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-rollback-preflight-test");
+        let source_id = "rollback-source";
+        let target_id = "rollback-missing-target";
+        let source_rel = "sessions/2026/04/24/rollout-rollback-source.jsonl";
+        let target_rel = "sessions/2026/04/24/rollout-rollback-missing-target.jsonl";
+        let source_path = codex.join(source_rel);
+        write_sync_rollout(&source_path, source_id, "custom", &[])?;
+        create_full_state(&codex)?;
+        {
+            let state = state_db::open(&codex)?;
+            sync_thread_from_rollout(&codex, &state, &source_path)?;
+        }
+        write_index_line(&codex, source_id)?;
+        save_two_branch_family(
+            &codex,
+            source_id,
+            "custom",
+            source_rel,
+            target_id,
+            DEFAULT_PROVIDER,
+            target_rel,
+        )?;
+        let store_before = fs::read(paths::family_store_path(&codex))?;
+        let index_before = fs::read(paths::session_index_path(&codex))?;
+
+        let error = rollback_family_active_locked(
+            codex.to_string_lossy().into_owned(),
+            source_id.to_string(),
+            target_id.to_string(),
+        )
+        .expect_err("missing target must fail during preflight");
+
+        assert!(error.to_string().contains("目标分支 rollout 丢失"));
+        assert!(source_path.is_file());
+        assert!(!paths::archived_sessions_dir(&codex)
+            .join(source_path.file_name().unwrap())
+            .exists());
+        let state = state_db::open_ro(&codex)?;
+        let archived: i64 = state.query_row(
+            "SELECT CAST(archived AS INTEGER) FROM threads WHERE id = ?",
+            [source_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(archived, 0);
+        assert_eq!(fs::read(paths::family_store_path(&codex))?, store_before);
+        assert_eq!(fs::read(paths::session_index_path(&codex))?, index_before);
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_rejects_target_that_is_behind_active_without_side_effects() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-rollback-behind-test");
+        let fixture = prepare_rollback_fixture(&codex, "behind")?;
+        let extra = serde_json::json!({
+            "timestamp": "2026-04-24T00:00:01Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "new active turn"}
+        });
+        let mut source = fs::OpenOptions::new()
+            .append(true)
+            .open(&fixture.source_path)?;
+        writeln!(source, "{}", serde_json::to_string(&extra)?)?;
+        drop(source);
+        let family_before = fs::read(paths::family_store_path(&codex))?;
+        let index_before = fs::read(paths::session_index_path(&codex))?;
+        let target_before = fs::read(&fixture.target_archived_path)?;
+
+        let error = rollback_family_active_locked(
+            codex.to_string_lossy().into_owned(),
+            fixture.source_id.clone(),
+            fixture.target_id.clone(),
+        )
+        .expect_err("a behind target must be synchronized before switching");
+
+        assert!(error.to_string().contains("目标分支落后当前 active"));
+        assert!(fixture.source_path.is_file());
+        assert!(!fixture.source_archived_path.exists());
+        assert!(!fixture.target_active_path.exists());
+        assert_eq!(fs::read(&fixture.target_archived_path)?, target_before);
+        assert_eq!(fs::read(paths::family_store_path(&codex))?, family_before);
+        assert_eq!(fs::read(paths::session_index_path(&codex))?, index_before);
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_compensates_files_threads_index_and_family_after_late_failure() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-rollback-compensation-test");
+        let fixture = prepare_rollback_fixture(&codex, "compensation")?;
+        let family_before = fs::read(paths::family_store_path(&codex))?;
+        let index_before = fs::read(paths::session_index_path(&codex))?;
+        let source_before = fs::read(&fixture.source_path)?;
+        let target_before = fs::read(&fixture.target_archived_path)?;
+        let source_thread_before = read_thread_location(&codex, &fixture.source_id)?;
+        let target_thread_before = read_thread_location(&codex, &fixture.target_id)?;
+
+        let _fault = RepairTestFaultGuard::error("rollback_after_family_save");
+        let error = rollback_family_active_locked(
+            codex.to_string_lossy().into_owned(),
+            fixture.source_id.clone(),
+            fixture.target_id.clone(),
+        )
+        .expect_err("late rollback failure must trigger compensation");
+        assert!(error.to_string().contains("测试故障注入"), "{error}");
+        assert!(!error.to_string().contains("补偿失败"));
+
+        assert_eq!(fs::read(&fixture.source_path)?, source_before);
+        assert_eq!(fs::read(&fixture.target_archived_path)?, target_before);
+        assert!(!fixture.source_archived_path.exists());
+        assert!(!fixture.target_active_path.exists());
+        assert_eq!(fs::read(paths::family_store_path(&codex))?, family_before);
+        assert_eq!(fs::read(paths::session_index_path(&codex))?, index_before);
+        assert_eq!(
+            read_thread_location(&codex, &fixture.source_id)?,
+            source_thread_before
+        );
+        assert_eq!(
+            read_thread_location(&codex, &fixture.target_id)?,
+            target_thread_before
+        );
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_reports_compensation_failures_without_hiding_primary_error() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-rollback-compensation-error-test");
+        let fixture = prepare_rollback_fixture(&codex, "compensation-error")?;
+
+        let _fault = RepairTestFaultGuard::create_and_error(
+            "rollback_after_family_save",
+            fixture.source_path.clone(),
+        );
+        let error = rollback_family_active_locked(
+            codex.to_string_lossy().into_owned(),
+            fixture.source_id.clone(),
+            fixture.target_id.clone(),
+        )
+        .expect_err("an occupied original path must be reported as a compensation failure");
+        let message = error.to_string();
+        assert!(message.contains("测试故障注入"), "{message}");
+        assert!(message.contains("补偿失败"));
+        assert!(message.contains("原位置已被占用"));
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
     #[test]
     fn thread_rebuild_values_include_rollout_token_count() -> AppResult<()> {
         let codex = temp_codex_dir("cc-session-manager-repair-token-test");
@@ -3949,18 +5798,18 @@ mod tests {
         }));
 
         let state = state_db::open_ro(&codex)?;
-        let old_archived: String = state.query_row(
+        let old_archived: i64 = state.query_row(
             "SELECT archived FROM threads WHERE id = ?",
             [source_id],
             |row| row.get(0),
         )?;
-        let new_archived: String = state.query_row(
+        let new_archived: i64 = state.query_row(
             "SELECT archived FROM threads WHERE id = ?",
             [report.new_id.as_str()],
             |row| row.get(0),
         )?;
-        assert_eq!(old_archived, "1");
-        assert_eq!(new_archived, "0");
+        assert_eq!(old_archived, 1);
+        assert_eq!(new_archived, 0);
 
         fs::remove_dir_all(&codex).ok();
         Ok(())
@@ -4058,7 +5907,174 @@ mod tests {
         let targets = list_mismatched_session_ids(&codex, "openai")?;
         fs::remove_dir_all(&codex).ok();
 
-        assert_eq!(targets, vec!["legacy-session".to_string()]);
+        assert_eq!(
+            targets,
+            vec!["managed-source".to_string(), "legacy-session".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rollout_identity_stops_before_large_corrupt_tail() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-rollout-identity-tail-test");
+        let rollout_dir = codex.join("sessions/2026/04/22");
+        fs::create_dir_all(&rollout_dir)?;
+        let id = "lightweight-identity-session";
+        let provider = "anthropic";
+        let rollout = rollout_dir.join(format!("rollout-{id}.jsonl"));
+        let meta = serde_json::json!({
+            "timestamp": "2026-04-22T00:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": id,
+                "model_provider": provider,
+                "source": DEFAULT_THREAD_SOURCE
+            }
+        });
+        let mut bytes = format!("not-json\n{}\n", serde_json::to_string(&meta)?).into_bytes();
+        bytes.extend(vec![b'x'; 4 * 1024 * 1024]);
+        bytes.push(0xff);
+        fs::write(&rollout, bytes)?;
+
+        let identity = read_rollout_identity(&rollout)?.expect("valid session_meta identity");
+        assert_eq!(
+            identity,
+            RolloutIdentity {
+                id: id.to_string(),
+                model_provider: provider.to_string(),
+                source: Some(DEFAULT_THREAD_SOURCE.to_string()),
+            }
+        );
+        assert!(rollout_record_is_usable_provider(
+            &codex,
+            id,
+            provider,
+            &rollout,
+            Some(rollout.to_string_lossy().as_ref()),
+            Some(provider),
+            Some(DEFAULT_THREAD_SOURCE),
+            false,
+            true,
+        )?);
+        assert_eq!(
+            list_mismatched_session_ids(&codex, DEFAULT_PROVIDER)?,
+            vec![id.to_string()]
+        );
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn provider_sync_plan_includes_unregistered_rollouts() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-provider-sync-plan-test");
+        fs::create_dir_all(&codex)?;
+        fs::write(
+            paths::config_toml_path(&codex),
+            "model_provider = \"openai\"\n",
+        )?;
+        write_rollout(&codex, "unregistered-provider-session", "anthropic")?;
+
+        let lock = family::FamilyLock::default();
+        let plan = get_provider_sync_plan_with_lock(codex.to_string_lossy().into_owned(), &lock)?;
+        fs::remove_dir_all(&codex).ok();
+
+        assert_eq!(plan, vec!["unregistered-provider-session".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn mismatched_scan_skips_only_usable_target_branch() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-usable-provider-clone-test");
+        fs::create_dir_all(&codex)?;
+        let source_rollout = codex.join("sessions/2026/04/24/rollout-provider-source.jsonl");
+        let target_rollout = codex.join("sessions/2026/04/24/rollout-provider-target.jsonl");
+        write_sync_rollout(&source_rollout, "provider-source", "custom", &[])?;
+        write_sync_rollout(&target_rollout, "provider-target", DEFAULT_PROVIDER, &[])?;
+        fs::write(
+            paths::session_index_path(&codex),
+            "{\"id\":\"provider-source\"}\n{\"id\":\"provider-target\"}\n",
+        )?;
+        save_two_branch_family(
+            &codex,
+            "provider-source",
+            "custom",
+            "sessions/2026/04/24/rollout-provider-source.jsonl",
+            "provider-target",
+            DEFAULT_PROVIDER,
+            "sessions/2026/04/24/rollout-provider-target.jsonl",
+        )?;
+        let conn = create_minimal_state(&codex)?;
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path, model_provider, source, archived)
+             VALUES (?1, ?2, ?3, ?4, 0)",
+            (
+                "provider-source",
+                source_rollout.to_string_lossy(),
+                "custom",
+                DEFAULT_THREAD_SOURCE,
+            ),
+        )?;
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path, model_provider, source, archived)
+             VALUES (?1, ?2, ?3, ?4, 0)",
+            (
+                "provider-target",
+                target_rollout.to_string_lossy(),
+                DEFAULT_PROVIDER,
+                DEFAULT_THREAD_SOURCE,
+            ),
+        )?;
+
+        assert!(list_mismatched_session_ids(&codex, DEFAULT_PROVIDER)?.is_empty());
+
+        conn.execute(
+            "UPDATE threads SET archived = 1 WHERE id = ?",
+            ["provider-target"],
+        )?;
+        assert_eq!(
+            list_mismatched_session_ids(&codex, DEFAULT_PROVIDER)?,
+            vec!["provider-source".to_string()]
+        );
+
+        conn.execute(
+            "UPDATE threads SET archived = 0, source = 'cc-session-manager' WHERE id = ?",
+            ["provider-target"],
+        )?;
+        assert_eq!(
+            list_mismatched_session_ids(&codex, DEFAULT_PROVIDER)?,
+            vec!["provider-source".to_string()]
+        );
+
+        conn.execute(
+            "UPDATE threads SET archived = 1 WHERE id = ?",
+            ["provider-source"],
+        )?;
+        assert!(
+            list_mismatched_session_ids(&codex, DEFAULT_PROVIDER)?.is_empty(),
+            "手工归档的 active 分支不应被 provider 批量同步重新激活"
+        );
+        conn.execute(
+            "UPDATE threads SET archived = 0 WHERE id = ?",
+            ["provider-source"],
+        )?;
+
+        let mut store = family::load(&codex)?;
+        let managed = store
+            .families
+            .get_mut("provider-source")
+            .expect("provider family");
+        let active_id = managed.active_id.clone();
+        managed
+            .chain
+            .iter_mut()
+            .find(|branch| branch.id == active_id)
+            .expect("active branch")
+            .status = BranchStatus::Archived;
+        family::save(&codex, &store)?;
+        assert!(list_mismatched_session_ids(&codex, DEFAULT_PROVIDER)?.is_empty());
+
+        fs::remove_dir_all(&codex).ok();
         Ok(())
     }
 

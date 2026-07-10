@@ -180,23 +180,28 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             opt_string_arg(&args, "claudeDir")?,
             string_arg(&args, "query")?,
         )),
-        "set_archived" => to_result_value(sessions::set_archived(
+        "set_archived" => to_result_value(sessions::set_archived_with_lock(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "codexDir")?,
             string_arg(&args, "id")?,
             bool_arg(&args, "v")?,
+            &state.family_lock,
         )),
-        "delete_session" => to_result_value(sessions::delete_session(
+        "delete_session" => to_result_value(sessions::delete_session_with_lock(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "codexDir")?,
             opt_string_arg(&args, "claudeDir")?,
             string_arg(&args, "id")?,
+            opt_arg(&args, "target")?,
+            &state.family_lock,
         )),
-        "delete_sessions" => to_result_value(sessions::delete_sessions(
+        "delete_sessions" => to_result_value(sessions::delete_sessions_with_lock(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "codexDir")?,
             opt_string_arg(&args, "claudeDir")?,
             arg(&args, "ids")?,
+            opt_arg(&args, "targets")?,
+            &state.family_lock,
         )),
         "preview_session_head" => to_result_value(rollout::preview_session_head(
             opt_string_arg(&args, "provider")?,
@@ -271,6 +276,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             opt_string_arg(&args, "claudeDir")?,
             string_arg(&args, "backupDir")?,
             arg(&args, "ids")?,
+            opt_arg(&args, "targets")?,
             opt_string_arg(&args, "name")?,
             opt_string_arg(&args, "note")?,
         )),
@@ -278,24 +284,36 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "backupDir")?,
             opt_string_arg(&args, "provider")?,
         )),
-        "open_backup" => to_result_value(backup::open_backup(string_arg(&args, "backupPath")?)),
+        "open_backup" => to_result_value(backup::open_backup(
+            string_arg(&args, "backupDir")?,
+            string_arg(&args, "backupPath")?,
+        )),
         "restore_session" => to_result_value(backup::restore_session(
             opt_string_arg(&args, "provider")?,
+            string_arg(&args, "backupDir")?,
             string_arg(&args, "backupPath")?,
             string_arg(&args, "codexDir")?,
             opt_string_arg(&args, "claudeDir")?,
             string_arg(&args, "id")?,
+            opt_string_arg(&args, "backupRolloutRelpath")?,
             bool_arg(&args, "overwrite")?,
         )),
         "restore_all" => to_result_value(backup::restore_all(
             opt_string_arg(&args, "provider")?,
+            string_arg(&args, "backupDir")?,
             string_arg(&args, "backupPath")?,
             string_arg(&args, "codexDir")?,
             opt_string_arg(&args, "claudeDir")?,
             bool_arg(&args, "overwrite")?,
         )),
-        "delete_backup" => to_result_value(backup::delete_backup(string_arg(&args, "backupPath")?)),
-        "verify_backup" => to_result_value(backup::verify_backup(string_arg(&args, "backupPath")?)),
+        "delete_backup" => to_result_value(backup::delete_backup(
+            string_arg(&args, "backupDir")?,
+            string_arg(&args, "backupPath")?,
+        )),
+        "verify_backup" => to_result_value(backup::verify_backup(
+            string_arg(&args, "backupDir")?,
+            string_arg(&args, "backupPath")?,
+        )),
         "stats_kpi" => to_result_value(stats::stats_kpi(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "codexDir")?,
@@ -408,6 +426,10 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             usize_arg(&args, "eventIndex")?,
             &state.family_lock,
         )),
+        "get_provider_sync_plan" => to_result_value(repair::get_provider_sync_plan_with_lock(
+            string_arg(&args, "codexDir")?,
+            &state.family_lock,
+        )),
         "batch_clone_for_current_provider" => {
             to_result_value(repair::batch_clone_for_current_provider_with_lock(
                 string_arg(&args, "codexDir")?,
@@ -467,6 +489,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             opt_string_arg(&args, "claudeDir")?,
             string_arg(&args, "outDir")?,
             arg(&args, "ids")?,
+            opt_arg(&args, "targets")?,
             opt_string_arg(&args, "machineLabel")?,
             opt_string_arg(&args, "exportGroup")?,
         )),
@@ -737,6 +760,13 @@ fn arg<T: DeserializeOwned>(args: &Value, name: &str) -> AppResult<T> {
         return Err(AppError::Other(format!("缺少参数: {name}")));
     };
     serde_json::from_value(value.clone()).map_err(AppError::Serde)
+}
+
+fn opt_arg<T: DeserializeOwned>(args: &Value, name: &str) -> AppResult<Option<T>> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => serde_json::from_value(value.clone()).map_err(AppError::Serde),
+    }
 }
 
 fn enum_arg<T: DeserializeOwned>(args: &Value, name: &str) -> AppResult<T> {

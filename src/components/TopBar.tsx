@@ -1,5 +1,5 @@
 import { useLocation } from "react-router-dom";
-import { Archive, ArrowDown01, Clock, FolderKanban, RefreshCw, Trash2, X } from "lucide-react";
+import { Archive, ArrowDown10, Clock, FolderKanban, RefreshCw, Trash2, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { SearchInput } from "@/components/SearchInput";
@@ -14,6 +14,7 @@ type Props = {
   /** 次级展示，如"12 条"，会放在右侧刷新按钮前（不再置于标题下方）。 */
   stats?: string;
   onRefresh?: () => void;
+  refreshing?: boolean;
   onBulkBackup?: () => void;
   onBulkDelete?: () => void;
   showListTools?: boolean;
@@ -24,6 +25,7 @@ export function TopBar({
   title,
   stats,
   onRefresh,
+  refreshing = false,
   onBulkBackup,
   onBulkDelete,
   showListTools,
@@ -82,8 +84,8 @@ export function TopBar({
                   项目
                 </TabsTrigger>
                 <TabsTrigger value="size" className="gap-1.5 px-2.5 text-xs">
-                  <ArrowDown01 className="h-3.5 w-3.5" />
-                  大小
+                  <ArrowDown10 className="h-3.5 w-3.5" />
+                  大小降序
                 </TabsTrigger>
               </TabsList>
             </Tabs>
@@ -154,13 +156,14 @@ export function TopBar({
                   variant="ghost"
                   size="icon"
                   onClick={onRefresh}
+                  disabled={refreshing}
                   className="h-8 w-8 shrink-0 text-muted-foreground hover:text-foreground"
                   aria-label="刷新"
                 >
-                  <RefreshCw className="h-4 w-4" />
+                  <RefreshCw className={refreshing ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
                 </Button>
               </TooltipTrigger>
-              <TooltipContent>刷新</TooltipContent>
+              <TooltipContent>{refreshing ? "正在刷新…" : "刷新"}</TooltipContent>
             </Tooltip>
           )}
         </div>

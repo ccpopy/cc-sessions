@@ -618,9 +618,22 @@ function CodexRepairRoute() {
                                   dry_run: true,
                                 });
                                 const ok = r.filter((x) => x.ok).length;
-                                toast.success(
-                                  `预览：${ok}/${r.length} 将执行（策略：${strategy}）`,
-                                );
+                                const failed = r.filter((x) => !x.ok);
+                                if (r.length === 0) {
+                                  toast.info("预览：当前没有需要同步的会话");
+                                } else if (ok > 0) {
+                                  toast.success(`预览：${ok}/${r.length} 将执行（策略：${strategy}）`);
+                                }
+                                if (failed.length > 0) {
+                                  const detail = failed
+                                    .map((item) => item.error ?? `${item.source_id} 无法同步`)
+                                    .slice(0, 3)
+                                    .join("\n");
+                                  if (failed.length === r.length) {
+                                    throw new Error(detail || "没有会话可以同步");
+                                  }
+                                  toast.warning(`${failed.length} 条会话无法同步`, { description: detail });
+                                }
                               });
                             } else {
                               setConfirmBatch(true);
@@ -816,11 +829,23 @@ function CodexRepairRoute() {
                     dry_run: false,
                   });
                   const ok = r.filter((x) => x.ok).length;
-                  const fail = r.filter((x) => x.error).length;
-                  toast.success(
-                    `完成：${ok}/${r.length}${fail ? ` · ${fail} 个错误` : ""}`,
-                  );
+                  const failed = r.filter((x) => !x.ok);
                   await refresh();
+                  if (r.length === 0) {
+                    toast.info("当前没有需要同步的会话");
+                  } else if (ok > 0) {
+                    toast.success(`完成：${ok}/${r.length}`);
+                  }
+                  if (failed.length > 0) {
+                    const detail = failed
+                      .map((item) => item.error ?? `${item.source_id} 未处理`)
+                      .slice(0, 3)
+                      .join("\n");
+                    if (failed.length === r.length) {
+                      throw new Error(detail || "所有会话同步均失败");
+                    }
+                    toast.error(`${failed.length} 条会话同步失败`, { description: detail });
+                  }
                 })
               }
             >

@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
-import { Archive, Loader2, MessageSquare, Network, RotateCw } from "lucide-react";
+import { AlertTriangle, Archive, Loader2, MessageSquare, Network, RotateCw } from "lucide-react";
 import { TopBar } from "@/components/TopBar";
 import { SessionList } from "@/components/SessionList";
 import { PreviewDialog } from "@/components/PreviewDialog";
@@ -19,17 +19,24 @@ import { useSettings } from "@/stores/settings";
 import { useSelection } from "@/stores/selection";
 import { useView } from "@/stores/view";
 import { useHotkeys } from "@/hooks/useHotkeys";
-import { api, type FamilyOverlay, type SessionProvider, type SessionSummary } from "@/lib/api";
+import {
+  api,
+  type DeleteResult,
+  type FamilyOverlay,
+  type SessionProvider,
+  type SessionSummary,
+} from "@/lib/api";
 import { humanBytes, humanTokens } from "@/lib/format";
 import { basename } from "@/lib/cwd";
 import { isSubagentSession } from "@/lib/sessionSource";
+import { sessionIdentity } from "@/lib/sessionIdentity";
 
 export default function SessionsRoute({ provider = "codex" }: { provider?: SessionProvider }) {
   const navigate = useNavigate();
   const settings = useSettings((s) => s.settings);
   const query = useView((s) => s.query);
   const { sessions, loading, error, refresh } = useSessions(provider, query);
-  const backupIndex = useBackupIndex(provider);
+  const { index: backupIndex, error: backupIndexError } = useBackupIndex(provider);
   const selected = useSelection((s) => s.selected);
   const setSelection = useSelection((s) => s.set);
   const clearSelection = useSelection((s) => s.clear);
@@ -45,46 +52,124 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const [backupTargets, setBackupTargets] = useState<SessionSummary[]>([]);
   const [deleteTargets, setDeleteTargets] = useState<SessionSummary[]>([]);
   const [overlay, setOverlay] = useState<Map<string, FamilyOverlay>>(new Map());
+  const [providerSyncPlan, setProviderSyncPlan] = useState<string[]>([]);
   const [currentProvider, setCurrentProvider] = useState<string | null>(null);
+  const [maintenanceError, setMaintenanceError] = useState<string | null>(null);
   const [familySheetId, setFamilySheetId] = useState<string | null>(null);
   const [cloning, setCloning] = useState(false);
   const showHiddenRecords = useMemo(() => isExplicitHiddenRecordQuery(query), [query]);
   const isCodex = provider === "codex";
+  const overlayScope = JSON.stringify([provider, settings?.codex_dir ?? ""]);
+  const refreshScope = JSON.stringify([
+    provider,
+    settings?.codex_dir ?? "",
+    settings?.claude_dir ?? "",
+    query,
+  ]);
+  const overlayScopeRef = useRef(overlayScope);
+  const refreshScopeRef = useRef(refreshScope);
+  const overlayRequestSeq = useRef(0);
+  const refreshAllRequestSeq = useRef(0);
+  const overlayFlight = useRef<{
+    scope: string;
+    requestId: number;
+    promise: Promise<void>;
+  } | null>(null);
+  const refreshAllFlight = useRef<{
+    scope: string;
+    requestId: number;
+    promise: Promise<void>;
+  } | null>(null);
+  overlayScopeRef.current = overlayScope;
+  refreshScopeRef.current = refreshScope;
 
-  const refreshOverlay = useCallback(async () => {
-    if (!settings?.codex_dir || !isCodex) return;
-    try {
-      const [ov, info] = await Promise.all([
-        api.getSessionFamilyOverlay(settings.codex_dir),
-        api.getProviderInfo(settings.codex_dir),
-      ]);
-      setOverlay(new Map(ov.map((o) => [o.session_id, o])));
-      setCurrentProvider(info.current);
-    } catch (e) {
-      // overlay 读不到时（例如没 state_5.sqlite）静默
-      console.warn("overlay refresh failed", e);
-    }
-  }, [settings?.codex_dir, isCodex]);
+  useEffect(() => {
+    clearSelection();
+    setPreview(null);
+    setExportTarget(null);
+    setBackupTargets([]);
+    setDeleteTargets([]);
+    setFamilySheetId(null);
+  }, [provider, clearSelection]);
+
+  const refreshOverlay = useCallback((): Promise<void> => {
+    const codexDir = settings?.codex_dir;
+    if (!codexDir || !isCodex) return Promise.resolve();
+
+    const active = overlayFlight.current;
+    if (active?.scope === overlayScope) return active.promise;
+
+    const requestId = ++overlayRequestSeq.current;
+    const promise: Promise<void> = Promise.all([
+      api.getSessionFamilyOverlay(codexDir),
+      api.getProviderInfo(codexDir),
+      api.getProviderSyncPlan(codexDir),
+    ])
+      .then(([ov, info, syncPlan]) => {
+        if (overlayScopeRef.current !== overlayScope) return;
+        setOverlay(new Map(ov.map((o) => [o.session_id, o])));
+        setCurrentProvider(info.current);
+        setProviderSyncPlan(syncPlan);
+        setMaintenanceError(null);
+      })
+      .catch((error) => {
+        if (overlayScopeRef.current !== overlayScope) return;
+        setOverlay(new Map());
+        setCurrentProvider(null);
+        setProviderSyncPlan([]);
+        setMaintenanceError(String((error as Error)?.message ?? error));
+      })
+      .finally(() => {
+        const current = overlayFlight.current;
+        if (current?.scope === overlayScope && current.requestId === requestId) {
+          overlayFlight.current = null;
+        }
+      });
+    overlayFlight.current = { scope: overlayScope, requestId, promise };
+    return promise;
+  }, [isCodex, overlayScope, settings?.codex_dir]);
 
   useEffect(() => {
     void refreshOverlay();
-  }, [refreshOverlay, sessions.length]);
+  }, [refreshOverlay]);
 
-  const refreshAll = useCallback(async () => {
-    await refresh();
-    await refreshOverlay();
-  }, [refresh, refreshOverlay]);
+  const refreshAll = useCallback((): Promise<void> => {
+    const active = refreshAllFlight.current;
+    if (active?.scope === refreshScope) return active.promise;
 
-  const clonableCount = useMemo(() => {
-    let n = 0;
-    for (const o of overlay.values()) if (isProviderMaintenanceState(o.clone_state)) n++;
-    return n;
+    const requestId = ++refreshAllRequestSeq.current;
+    const promise: Promise<void> = Promise.resolve()
+      .then(async () => {
+        await refresh();
+        if (refreshScopeRef.current !== refreshScope) return;
+        await refreshOverlay();
+      })
+      .finally(() => {
+        const current = refreshAllFlight.current;
+        if (current?.scope === refreshScope && current.requestId === requestId) {
+          refreshAllFlight.current = null;
+        }
+      });
+    refreshAllFlight.current = { scope: refreshScope, requestId, promise };
+    return promise;
+  }, [refresh, refreshOverlay, refreshScope]);
+
+  const providerMaintenanceItems = useMemo(() => {
+    const items = new Map<string, FamilyOverlay>();
+    for (const item of overlay.values()) {
+      if (!isProviderMaintenanceState(item.clone_state)) continue;
+      if (item.family_id && !item.is_active_branch) continue;
+      const key = item.family_id ? `family:${item.family_id}` : `session:${item.session_id}`;
+      items.set(key, item);
+    }
+    return Array.from(items.values());
   }, [overlay]);
+  const clonableCount = providerSyncPlan.length;
 
   const providerMaintenanceLabel = useMemo(() => {
     let providerSync = 0;
     let indexRepair = 0;
-    for (const o of overlay.values()) {
+    for (const o of providerMaintenanceItems) {
       if (o.clone_state === "clonable") providerSync++;
       if (o.clone_state === "resync") indexRepair++;
     }
@@ -95,7 +180,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
       return "需要修复本地索引可见性";
     }
     return "需要同步到当前 provider";
-  }, [overlay]);
+  }, [providerMaintenanceItems]);
 
   const visibleSessions = useMemo(() => {
     const visible: SessionSummary[] = [];
@@ -110,15 +195,24 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
       if (isCodex && !showHiddenRecords && session.archived !== showArchivedSessions) {
         continue;
       }
-      if (isCodex && !showHiddenRecords && isHiddenFamilyBranch(session, sessionOverlay)) continue;
+      if (isCodex && !showHiddenRecords && isHiddenFamilyBranch(session, sessionOverlay)) {
+        continue;
+      }
       visible.push(session);
     }
     return visible;
-  }, [sessions, overlay, showHiddenRecords, isCodex, showSubagentSessions, showArchivedSessions]);
+  }, [
+    sessions,
+    overlay,
+    showHiddenRecords,
+    isCodex,
+    showSubagentSessions,
+    showArchivedSessions,
+  ]);
 
   useEffect(() => {
     if (selected.size === 0) return;
-    const visibleIds = new Set(visibleSessions.map((s) => s.id));
+    const visibleIds = new Set(visibleSessions.map(sessionIdentity));
     const next = Array.from(selected).filter((id) => visibleIds.has(id));
     if (next.length !== selected.size) setSelection(next);
   }, [selected, setSelection, visibleSessions]);
@@ -131,7 +225,6 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         const r = await api.cloneSessionForProvider({
           codex_dir: settings.codex_dir,
           session_id: s.id,
-          target_provider: currentProvider,
           strategy: "scatter",
           dry_run: false,
         });
@@ -165,9 +258,24 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         dry_run: false,
       });
       const ok = r.filter((x) => x.ok).length;
-      toast.success(`已处理 ${ok}/${r.length}`);
+      const failed = r.filter((x) => !x.ok);
       await refresh();
       await refreshOverlay();
+      if (r.length === 0) {
+        toast.info("当前没有需要同步的会话");
+      } else if (ok > 0) {
+        toast.success(`已处理 ${ok}/${r.length}`);
+      }
+      if (failed.length > 0) {
+        const description = failed
+          .map((item) => item.error ?? `${item.source_id} 未处理`)
+          .slice(0, 3)
+          .join("\n");
+        if (failed.length === r.length) {
+          throw new Error(description || "所有会话同步均失败");
+        }
+        toast.error(`${failed.length} 条会话同步失败`, { description });
+      }
     } catch (e) {
       toast.error(String((e as Error)?.message ?? e));
     } finally {
@@ -187,14 +295,13 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
       combo: "delete",
       handler: () => {
         if (selected.size === 0) return;
-        const ids = Array.from(selected);
-        setDeleteTargets(sessions.filter((s) => ids.includes(s.id)));
+        setDeleteTargets(sessions.filter((s) => selected.has(sessionIdentity(s))));
       },
     },
   ]);
 
   const selectedItems = useMemo(
-    () => visibleSessions.filter((s) => selected.has(s.id)),
+    () => visibleSessions.filter((s) => selected.has(sessionIdentity(s))),
     [visibleSessions, selected],
   );
 
@@ -254,6 +361,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         title={provider === "codex" ? "Codex 会话" : "Claude 会话"}
         stats={loading ? "加载中…" : `${visibleSessions.length} 条`}
         onRefresh={refreshAll}
+        refreshing={loading}
         onBulkBackup={onBulkBackup}
         onBulkDelete={onBulkDelete}
         showListTools
@@ -290,6 +398,22 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
           >
             清除过滤
           </button>
+        </div>
+      )}
+
+      {isCodex && maintenanceError && (
+        <div className="flex shrink-0 items-start gap-2 border-b border-amber-500/30 bg-amber-500/10 px-6 py-2 text-xs text-amber-800 dark:text-amber-300">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span className="min-w-0 break-words">
+            Provider 与分支状态读取失败，相关同步操作已停用：{maintenanceError}
+          </span>
+        </div>
+      )}
+
+      {backupIndexError && (
+        <div className="flex shrink-0 items-start gap-2 border-b border-amber-500/30 bg-amber-500/10 px-6 py-2 text-xs text-amber-800 dark:text-amber-300">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span className="min-w-0 break-words">部分备份索引读取失败：{backupIndexError}</span>
         </div>
       )}
 
@@ -425,46 +549,66 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             settings.codex_dir,
             ids,
             settings.claude_dir,
+            deleteTargets.map((session) => ({
+              id: session.id,
+              rollout_path: session.rollout_path,
+            })),
           );
           const okCount = r.filter((x) => x.ok).length;
           const failed = r.filter((x) => !x.ok);
+          const partiallyDeleted = failed.filter(deleteResultHasMutation);
           const rolloutMissing = r.filter((x) => x.ok && x.rollout_missing);
-          const rolloutFailed = r.filter((x) => x.ok && !x.rollout_deleted && !x.rollout_missing);
-          const cleanupFailed = r.filter((x) => x.ok && x.error);
+          const sharedPreserved = rolloutMissing.filter((x) => x.shared_data_preserved);
+          const missingCleaned = rolloutMissing.filter((x) => !x.shared_data_preserved);
+          clearSelection();
+          await refreshAll();
           if (okCount > 0) toast.success(`已删除 ${okCount}/${r.length}`);
-          if (rolloutMissing.length) {
-            toast.info(`${rolloutMissing.length} 条 rollout 文件原本不存在，数据库记录已删除`);
+          if (sharedPreserved.length) {
+            toast.info(
+              `${sharedPreserved.length} 个会话文件原本不存在，但同 ID 副本仍在，共享历史与附属数据已保留`,
+            );
           }
-          if (cleanupFailed.length) {
-            const title =
-              rolloutFailed.length === cleanupFailed.length
-                ? `${rolloutFailed.length} 条 rollout 文件删除失败，请手动处理`
-                : `${cleanupFailed.length} 条删除完成，但部分附属清理失败`;
-            toast.warning(title, {
-              description: cleanupFailed
-                .map((x) => x.error ?? x.id)
-                .slice(0, 3)
-                .join("\n"),
-            });
+          if (missingCleaned.length) {
+            toast.info(
+              provider === "codex"
+                ? `${missingCleaned.length} 条 rollout 文件原本不存在，数据库和索引残留已清理`
+                : `${missingCleaned.length} 个会话文件原本不存在，会话级历史与附属残留已清理`,
+            );
           }
           if (failed.length) {
-            const desc = failed
+            const details = failed
               .map((x) => x.error ?? x.id)
               .slice(0, 3)
               .join("\n");
+            const partialNotice = partiallyDeleted.length > 0
+              ? `${partiallyDeleted.length} 条已经删除了部分文件或索引；列表已按当前磁盘状态刷新。`
+              : "";
+            const desc = [partialNotice, details].filter(Boolean).join("\n");
             if (failed.length === r.length) {
-              throw new Error(desc || "没有会话被删除");
+              throw new Error(
+                ["没有会话被完整删除。", desc || "列表已刷新，未发现已完成的删除。"]
+                  .filter(Boolean)
+                  .join("\n"),
+              );
             }
-            toast.error(`${failed.length} 条会话删除失败`, { description: desc });
+            toast.error(`${failed.length} 条会话未删除干净`, { description: desc });
           }
-          clearSelection();
-          await refresh();
         }}
       >
-        <DeleteSummary targets={deleteTargets} provider={provider} />
+        <DeleteSummary targets={deleteTargets} provider={provider} overlay={overlay} />
       </DangerDialog>
     </>
   );
+}
+
+function deleteResultHasMutation(result: DeleteResult): boolean {
+  return result.rollout_deleted
+    || result.sidecar_deleted
+    || result.tasks_deleted
+    || result.file_history_deleted
+    || result.threads_rows_deleted > 0
+    || result.logs_rows_deleted > 0
+    || result.history_rows_deleted > 0;
 }
 
 /**
@@ -475,7 +619,10 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
  *   点击分支徽标可进入 FamilyHistorySheet 查看历史分支
  * - 没有 family_id（孤儿会话）：照常显示
  */
-function isHiddenFamilyBranch(_s: SessionSummary, overlay?: FamilyOverlay): boolean {
+function isHiddenFamilyBranch(
+  _s: SessionSummary,
+  overlay: FamilyOverlay | undefined,
+): boolean {
   if (!overlay?.family_id) return false;
   return !overlay.is_active_branch;
 }
@@ -492,28 +639,42 @@ function isProviderMaintenanceState(cloneState: string): boolean {
 function DeleteSummary({
   targets,
   provider,
+  overlay,
 }: {
   targets: SessionSummary[];
   provider: SessionProvider;
+  overlay: Map<string, FamilyOverlay>;
 }) {
-  const totalLogs = targets.reduce((a, b) => a + b.logs_count, 0);
   const totalBytes = targets.reduce((a, b) => a + b.rollout_bytes, 0);
   const totalTokens = targets.reduce((a, b) => a + b.tokens_used, 0);
+  const logicalGroups = new Map<string, number>();
+  for (const target of targets) {
+    const item = overlay.get(target.id);
+    const key = item?.family_id ? `family:${item.family_id}` : `session:${target.id}`;
+    logicalGroups.set(key, Math.max(logicalGroups.get(key) ?? 0, item?.branch_count ?? 1));
+  }
+  const totalBranches = Array.from(logicalGroups.values()).reduce((sum, count) => sum + count, 0);
+  const deletesFamily = provider === "codex" && Array.from(logicalGroups.values()).some((count) => count > 1);
   return (
     <div className="min-w-0 max-w-full space-y-2 wrap-anywhere">
       <div className="min-w-0 whitespace-normal">
-        {provider === "codex" ? (
+        {deletesFamily ? (
           <>
-            将删除 <b>{targets.length}</b> 条 threads 记录、
-            <b>{totalLogs}</b> 条日志、
-            <b>{targets.length}</b> 个 rollout 文件（共 <b>{humanBytes(totalBytes)}</b>，
-            <b>{humanTokens(totalTokens)}</b> token）。
+            将删除 <b>{logicalGroups.size}</b> 条逻辑会话及其全部 <b>{totalBranches}</b> 个
+            provider/历史分支。各分支的 threads、日志、rollout 和索引都会一并清理；若只想删除某个历史分支，请在“分支历史”面板操作。
+          </>
+        ) : provider === "codex" ? (
+          <>
+            将删除 <b>{targets.length}</b> 条所选逻辑会话对应的 threads、日志、rollout 与索引。
+            若其中会话属于 provider/历史分支组，后端会删除整个会话组的全部分支；只删除单个历史分支请进入“分支历史”面板。
           </>
         ) : (
           <>
             将删除 <b>{targets.length}</b> 个 jsonl 会话文件
             （共 <b>{humanBytes(totalBytes)}</b>，
-            <b>{humanTokens(totalTokens)}</b> token），同名 sidecar 目录会一并清理。
+            <b>{humanTokens(totalTokens)}</b> token）及同名 sidecar。删除最后一个同 ID 副本时，还会清理
+            history.jsonl 匹配行、tasks/&lt;id&gt; 与 file-history/&lt;id&gt;；仍有同 ID 副本时这些共享数据会保留。
+            项目 memory、.claude.json、session-env 和 shell-snapshots 不会被删除。
           </>
         )}
       </div>
@@ -521,7 +682,7 @@ function DeleteSummary({
       {targets.length > 1 && (
         <ul className="max-h-36 min-w-0 max-w-full space-y-0.5 overflow-y-auto overflow-x-hidden rounded-md border bg-muted/30 p-2 text-xs">
           {targets.slice(0, 5).map((t) => (
-            <li key={t.id} className="grid min-w-0 grid-cols-[max-content_minmax(0,1fr)] items-center gap-2">
+            <li key={sessionIdentity(t)} className="grid min-w-0 grid-cols-[max-content_minmax(0,1fr)] items-center gap-2">
               <code className="shrink-0 font-mono text-[10px]">{t.id.slice(0, 8)}</code>
               <span className="min-w-0 truncate" title={t.title || "(无标题)"}>
                 {t.title || "(无标题)"}

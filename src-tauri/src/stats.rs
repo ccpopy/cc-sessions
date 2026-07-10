@@ -58,6 +58,37 @@ fn filter_sessions(
         .collect()
 }
 
+fn filter_family_active_sessions(
+    sessions: Vec<SessionSummary>,
+    codex_dir: &str,
+) -> AppResult<Vec<SessionSummary>> {
+    if !sessions.iter().any(|session| session.provider == "codex") {
+        return Ok(sessions);
+    }
+    let store = crate::family::load(&PathBuf::from(codex_dir))?;
+    let mut out = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        if session.provider != "codex" {
+            out.push(session);
+            continue;
+        }
+        let Some(family_id) = store.index.get(&session.id) else {
+            out.push(session);
+            continue;
+        };
+        let family = store.families.get(family_id).ok_or_else(|| {
+            AppError::Other(format!(
+                "session_family 反向索引指向不存在的 family: session={} family={}",
+                session.id, family_id
+            ))
+        })?;
+        if family.active_id == session.id {
+            out.push(session);
+        }
+    }
+    Ok(out)
+}
+
 fn stat_sessions(
     provider: Option<String>,
     codex_dir: String,
@@ -69,6 +100,7 @@ fn stat_sessions(
 ) -> AppResult<Vec<SessionSummary>> {
     let provider = provider_or_codex(provider);
     let sessions = load_sessions(&provider, &codex_dir, claude_dir)?;
+    let sessions = filter_family_active_sessions(sessions, &codex_dir)?;
     Ok(filter_sessions(
         sessions,
         from_ts,
@@ -292,6 +324,8 @@ fn bucket_start(ts: i64, bucket: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{BranchStatus, Family, FamilyBranch, FamilyStore};
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
 
@@ -432,6 +466,92 @@ mod tests {
         assert!(models
             .iter()
             .any(|m| m.provider.as_deref() == Some("claude")));
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn stats_count_only_active_branch_of_scatter_family() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-stats-family-test");
+        let codex = root.join("codex");
+        create_codex_session(&codex)?;
+        let second_rollout = codex.join("sessions").join("rollout-codex-2.jsonl");
+        fs::write(&second_rollout, "{}\n")?;
+        let conn = rusqlite::Connection::open(codex.join("state_5.sqlite"))?;
+        conn.execute(
+            "INSERT INTO threads (
+                id, rollout_path, cwd, title, first_user_message, model, reasoning_effort,
+                tokens_used, created_at, updated_at, archived, git_branch, source,
+                agent_nickname, agent_role
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 17, 1770000000, 1770000600, 0, NULL, 'cli', NULL, NULL)",
+            (
+                "codex-2",
+                second_rollout.to_string_lossy().into_owned(),
+                "F:\\work\\codex-project",
+                "Codex clone",
+                "hello codex",
+                "gpt-5",
+            ),
+        )?;
+        drop(conn);
+
+        let family = Family {
+            family_id: "codex-1".to_string(),
+            root_id: "codex-1".to_string(),
+            title: "Codex title".to_string(),
+            chain: vec![
+                FamilyBranch {
+                    id: "codex-1".to_string(),
+                    provider: "custom".to_string(),
+                    created_at: "2026-02-06T00:00:00Z".to_string(),
+                    status: BranchStatus::Archived,
+                    rollout_relpath: "sessions/rollout-codex-1.jsonl".to_string(),
+                    sha256: None,
+                    line_count: None,
+                    note: None,
+                },
+                FamilyBranch {
+                    id: "codex-2".to_string(),
+                    provider: "openai".to_string(),
+                    created_at: "2026-02-06T00:00:00Z".to_string(),
+                    status: BranchStatus::Active,
+                    rollout_relpath: "sessions/rollout-codex-2.jsonl".to_string(),
+                    sha256: None,
+                    line_count: None,
+                    note: None,
+                },
+            ],
+            active_id: "codex-2".to_string(),
+            updated_at: "2026-02-06T00:10:00Z".to_string(),
+        };
+        let mut families = BTreeMap::new();
+        families.insert("codex-1".to_string(), family);
+        let mut index = BTreeMap::new();
+        index.insert("codex-1".to_string(), "codex-1".to_string());
+        index.insert("codex-2".to_string(), "codex-1".to_string());
+        crate::family::save(
+            &codex,
+            &FamilyStore {
+                version: 1,
+                families,
+                index,
+            },
+        )?;
+
+        for include_archived in [false, true] {
+            let kpi = stats_kpi(
+                Some("codex".to_string()),
+                codex.to_string_lossy().into_owned(),
+                None,
+                None,
+                None,
+                Vec::new(),
+                include_archived,
+            )?;
+            assert_eq!(kpi.sessions_total, 1);
+            assert_eq!(kpi.tokens_total, 17);
+        }
 
         fs::remove_dir_all(root).ok();
         Ok(())

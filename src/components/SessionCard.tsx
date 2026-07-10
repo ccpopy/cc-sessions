@@ -81,7 +81,8 @@ export const SessionCard = memo(function SessionCard({
   const syncAction = syncActionLabel(overlay?.clone_state, currentProvider);
   const isSubagent = isSubagentSession(s, overlay);
   const subagent = subagentLabel(s, isSubagent);
-  const canCopyResume = !(s.provider === "claude" && isSubagent);
+  const requiresActivation = Boolean(overlay?.family_id && !overlay.is_active_branch);
+  const canCopyResume = !(s.provider === "claude" && isSubagent) && !requiresActivation;
 
   return (
     <div
@@ -245,6 +246,17 @@ export const SessionCard = memo(function SessionCard({
               <Button variant="ghost" size="sm" onClick={() => onCopyResume(s)} className="h-8 gap-1.5 text-muted-foreground hover:text-foreground">
                 <Copy className="h-3.5 w-3.5" />
                 resume
+              </Button>
+            )}
+            {requiresActivation && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => onOpenFamily?.(s)}
+                className="h-8 gap-1.5 text-muted-foreground hover:text-foreground"
+              >
+                <GitBranch className="h-3.5 w-3.5" />
+                先设为当前
               </Button>
             )}
             <Button variant="ghost" size="sm" onClick={() => onRevealCwd(s)} className="h-8 gap-1.5 text-muted-foreground hover:text-foreground">

@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::atomic_file;
 use crate::error::{AppError, AppResult};
 use crate::models::{
     DeletePlan, DeletePlanLine, EditApplyReport, EditHistory, EditHistoryEntry, EditSnapshotInfo,
@@ -119,18 +120,28 @@ fn load_file(path: &Path) -> AppResult<LoadedFile> {
     })
 }
 
-fn write_lines(path: &Path, lines: &[String], trailing_newline: bool) -> AppResult<String> {
+fn write_lines(
+    path: &Path,
+    lines: &[String],
+    trailing_newline: bool,
+    expected_hash: &str,
+) -> AppResult<String> {
+    let current = fs::read(path)?;
+    if sha_hex(&current) != expected_hash {
+        return Err(AppError::Other(format!(
+            "会话文件在编辑期间发生变化，已拒绝覆盖: {}",
+            path.to_string_lossy()
+        )));
+    }
+    let expected = atomic_file::fingerprint(path)?;
     let mut body = lines.join("\n");
     if trailing_newline && !lines.is_empty() {
         body.push('\n');
     }
-    let tmp = path.with_extension("jsonl.edit-tmp");
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(body.as_bytes())?;
-        f.sync_all().ok();
-    }
-    fs::rename(&tmp, path)?;
+    atomic_file::replace_with_writer_if_unchanged(path, &expected, |file| {
+        file.write_all(body.as_bytes())?;
+        Ok(())
+    })?;
     Ok(sha_hex(body.as_bytes()))
 }
 
@@ -146,15 +157,22 @@ fn journal_path(dir: &Path) -> PathBuf {
     dir.join("journal.jsonl")
 }
 
-fn read_journal(dir: &Path) -> Vec<JournalEntry> {
-    let Ok(content) = fs::read_to_string(journal_path(dir)) else {
-        return Vec::new();
+fn read_journal(dir: &Path) -> AppResult<Vec<JournalEntry>> {
+    let content = match fs::read_to_string(journal_path(dir)) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
     };
-    content
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<JournalEntry>(l).ok())
-        .collect()
+    let mut entries = Vec::new();
+    for (line_no, line) in content.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        entries.push(serde_json::from_str::<JournalEntry>(line).map_err(|error| {
+            AppError::Other(format!("编辑 journal 第 {} 行损坏: {error}", line_no + 1))
+        })?);
+    }
+    Ok(entries)
 }
 
 fn append_journal(dir: &Path, entry: &JournalEntry) -> AppResult<()> {
@@ -164,7 +182,7 @@ fn append_journal(dir: &Path, entry: &JournalEntry) -> AppResult<()> {
         .append(true)
         .open(journal_path(dir))?;
     writeln!(f, "{}", serde_json::to_string(entry)?)?;
-    f.sync_all().ok();
+    f.sync_all()?;
     Ok(())
 }
 
@@ -987,7 +1005,7 @@ fn open_op_context(
         return Err(AppError::NotFound(path.to_string_lossy().into_owned()));
     }
     let dir = edit_dir(backup_dir, provider, session_id);
-    let journal = read_journal(&dir);
+    let journal = read_journal(&dir)?;
     let loaded = load_file(&path)?;
     Ok(OpContext {
         dir,
@@ -1008,7 +1026,12 @@ fn commit_op(
     new_lines: Vec<String>,
 ) -> AppResult<EditApplyReport> {
     let snapshot = ensure_snapshot(&ctx.dir, &ctx.path, &ctx.loaded.hash, &ctx.journal)?;
-    let after_hash = write_lines(&ctx.path, &new_lines, ctx.loaded.trailing_newline)?;
+    let after_hash = write_lines(
+        &ctx.path,
+        &new_lines,
+        ctx.loaded.trailing_newline,
+        &ctx.loaded.hash,
+    )?;
     let changed = changes
         .iter()
         .filter(|c| c.before.is_some() && c.after.is_some())
@@ -1229,7 +1252,12 @@ pub fn restore_snapshot(
     fs::copy(&ctx.path, ctx.dir.join(&pre_name))?;
 
     let snap_loaded = load_file(&snap_path)?;
-    let after_hash = write_lines(&ctx.path, &snap_loaded.lines, snap_loaded.trailing_newline)?;
+    let after_hash = write_lines(
+        &ctx.path,
+        &snap_loaded.lines,
+        snap_loaded.trailing_newline,
+        &ctx.loaded.hash,
+    )?;
     let description = format!("还原快照 {snapshot_name}（还原前状态已保存为 {pre_name}）");
     let entry = JournalEntry {
         op_id: new_op_id(ctx.journal.len()),
@@ -1266,25 +1294,22 @@ pub fn history(
     let provider = provider_normalized(provider)?;
     let path = PathBuf::from(paths::strip_verbatim(rollout_path));
     let dir = edit_dir(backup_dir, provider, session_id);
-    let journal = read_journal(&dir);
+    let journal = read_journal(&dir)?;
 
     let mut snapshots: Vec<EditSnapshotInfo> = Vec::new();
     if dir.is_dir() {
-        for entry in fs::read_dir(&dir)?.flatten() {
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
             if !name.ends_with(".jsonl") || name == "journal.jsonl" {
                 continue;
             }
-            let meta = entry.metadata().ok();
-            let created_at = meta
-                .as_ref()
-                .and_then(|m| m.modified().ok())
-                .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
-                .unwrap_or_default();
+            let meta = entry.metadata()?;
+            let created_at = chrono::DateTime::<chrono::Utc>::from(meta.modified()?).to_rfc3339();
             snapshots.push(EditSnapshotInfo {
                 name,
                 created_at,
-                bytes: meta.map(|m| m.len()).unwrap_or(0),
+                bytes: meta.len(),
             });
         }
     }

@@ -1,3 +1,4 @@
+pub mod atomic_file;
 pub mod backup;
 pub mod bundle;
 pub mod claude_sessions;
@@ -9,6 +10,7 @@ pub mod history;
 pub mod logs_db;
 pub mod markdown_export;
 pub mod models;
+pub mod path_safety;
 pub mod paths;
 pub mod repair;
 pub mod rollout;
@@ -91,6 +93,7 @@ pub fn run() {
             repair::repair_claude_gui_visibility,
             repair::clone_session_for_provider,
             repair::fork_session_at_event,
+            repair::get_provider_sync_plan,
             repair::batch_clone_for_current_provider,
             repair::rollback_family_active,
             repair::delete_family_branch,

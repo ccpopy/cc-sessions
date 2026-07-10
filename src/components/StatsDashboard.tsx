@@ -16,7 +16,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { CalendarDays, CalendarRange, Coins, FolderKanban, Gauge, MessageSquare, RefreshCw } from "lucide-react";
+import { AlertCircle, CalendarDays, CalendarRange, Coins, FolderKanban, Gauge, MessageSquare, RefreshCw } from "lucide-react";
 
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -71,9 +71,24 @@ export function StatsDashboard() {
   const [byModel, setByModel] = useState<ModelStat[]>([]);
   const [heat, setHeat] = useState<number[][]>([]);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!settings?.codex_dir) return;
+    if (!settings) return;
+    let cancelled = false;
+    setKpi(null);
+    setTs([]);
+    setByProject([]);
+    setByModel([]);
+    setHeat([]);
+    setError(null);
+
+    const requiredDir = provider === "claude" ? settings.claude_dir : settings.codex_dir;
+    if (!requiredDir) {
+      setLoading(false);
+      setError(provider === "claude" ? "尚未配置 Claude 目录" : "尚未配置 Codex 目录");
+      return;
+    }
     const [from, to] = rangeToTs(range);
     const common = {
       provider,
@@ -85,21 +100,30 @@ export function StatsDashboard() {
       include_archived: includeArchived,
     };
     setLoading(true);
-    Promise.all([
-      api.statsKpi(common),
-      api.statsTimeseries({ ...common, bucket }),
-      api.statsByProject({ ...common, limit: 10 }),
-      api.statsByModel(common),
-      api.statsHeatmap(common),
-    ])
-      .then(([k, t, p, m, h]) => {
+    void (async () => {
+      try {
+        const [k, t, p, m, h] = await Promise.all([
+          api.statsKpi(common),
+          api.statsTimeseries({ ...common, bucket }),
+          api.statsByProject({ ...common, limit: 10 }),
+          api.statsByModel(common),
+          api.statsHeatmap(common),
+        ]);
+        if (cancelled) return;
         setKpi(k);
         setTs(t);
         setByProject(p);
         setByModel(m);
         setHeat(h);
-      })
-      .finally(() => setLoading(false));
+      } catch (error) {
+        if (!cancelled) setError(String((error as Error)?.message ?? error));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [settings?.codex_dir, settings?.claude_dir, provider, range, bucket, includeArchived, tick]);
 
   return (
@@ -146,6 +170,16 @@ export function StatsDashboard() {
           刷新
         </Button>
       </div>
+
+      {error && (
+        <div
+          role="alert"
+          className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive"
+        >
+          <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+          <div className="min-w-0 whitespace-pre-wrap break-words">统计读取失败：{error}</div>
+        </div>
+      )}
 
       <KpiRow k={kpi} loading={loading} />
 

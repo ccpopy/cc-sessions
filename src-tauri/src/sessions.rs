@@ -1,13 +1,16 @@
-use std::collections::HashMap;
-use std::fs;
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use rusqlite::params;
 
+use crate::atomic_file;
 use crate::error::{AppError, AppResult};
+use crate::family;
 use crate::history;
 use crate::logs_db;
-use crate::models::{DeleteResult, ProjectGroup, SessionSummary};
+use crate::models::{DeleteResult, DeleteTarget, ProjectGroup, SessionSummary};
 use crate::paths;
 use crate::state_db;
 
@@ -132,7 +135,7 @@ pub fn list_sessions(
             let mut list = query_summaries(&p, "", &[])?;
             // 官方 Codex app 归档会把 rollout 移到 archived_sessions/；
             // threads 记录缺失或漂移时，从归档目录补扫，保证归档会话可见。
-            let extra = supplement_archived_summaries(&p, &list);
+            let extra = supplement_archived_summaries(&p, &list)?;
             if !extra.is_empty() {
                 list.extend(extra);
                 list.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
@@ -154,7 +157,7 @@ pub fn list_sessions(
 fn supplement_archived_summaries(
     codex_dir: &Path,
     existing: &[SessionSummary],
-) -> Vec<SessionSummary> {
+) -> AppResult<Vec<SessionSummary>> {
     let known_names: std::collections::HashSet<String> = existing
         .iter()
         .filter_map(|s| {
@@ -164,14 +167,14 @@ fn supplement_archived_summaries(
         })
         .collect();
     let mut out = Vec::new();
-    for p in crate::family::scan_archived_rollouts(codex_dir) {
+    for p in crate::family::scan_archived_rollouts(codex_dir)? {
         let Some(name) = p.file_name().map(|n| n.to_string_lossy().into_owned()) else {
             continue;
         };
         if known_names.contains(&name) {
             continue;
         }
-        let Ok(Some(brief)) = crate::repair::read_rollout_brief(codex_dir, &p) else {
+        let Some(brief) = crate::repair::read_rollout_brief(codex_dir, &p)? else {
             continue;
         };
         if existing.iter().any(|s| s.id == brief.id) {
@@ -199,12 +202,12 @@ fn supplement_archived_summaries(
             updated_at: brief.updated_at_ms / 1000,
             archived: true,
             git_branch: None,
-            rollout_bytes: fs::metadata(&p).map(|m| m.len()).unwrap_or(0),
+            rollout_bytes: fs::metadata(&p)?.len(),
             logs_count: 0,
             has_backup: false,
         });
     }
-    out
+    Ok(out)
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -320,27 +323,48 @@ pub fn session_is_subagent(session: &SessionSummary) -> bool {
 ///   `archived_at` 置时间、`rollout_path` 指向新位置，并从 session_index 移除；
 /// - 取消归档：rollout 按文件名日期移回 `sessions/YYYY/MM/DD/`，threads 行
 ///   复位，并补回 session_index 行。
-#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn set_archived_with_lock(
+    provider: Option<String>,
+    codex_dir: String,
+    id: String,
+    v: bool,
+    lock: &family::FamilyLock,
+) -> AppResult<()> {
+    if provider_or_codex(provider) != "codex" {
+        return Err(AppError::Other("Claude 会话不支持归档".into()));
+    }
+    family::with_lock(lock, |_guard| set_archived_codex_locked(codex_dir, id, v))
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
 pub fn set_archived(
     provider: Option<String>,
     codex_dir: String,
     id: String,
     v: bool,
+    lock: tauri::State<'_, family::FamilyLock>,
 ) -> AppResult<()> {
-    if provider_or_codex(provider) != "codex" {
-        return Err(AppError::Other("Claude 会话不支持归档".into()));
-    }
+    set_archived_with_lock(provider, codex_dir, id, v, lock.inner())
+}
+
+fn set_archived_codex_locked(codex_dir: String, id: String, v: bool) -> AppResult<()> {
     let codex = PathBuf::from(&codex_dir);
+    let mut family_store = family::load(&codex)?;
+    // Validate the bidirectional mapping before moving any file.
+    family::resolve_family_id_strict(&family_store, &id)?;
     let state = state_db::open(&codex)?;
 
     // 1) 定位当前 rollout 文件：优先 threads 记录，缺失/漂移时按文件名兜底
-    let db_path: Option<String> = state
-        .query_row(
-            "SELECT rollout_path FROM threads WHERE id = ?",
-            [&id],
-            |r| r.get(0),
-        )
-        .ok();
+    let db_path: Option<String> = match state.query_row(
+        "SELECT rollout_path FROM threads WHERE id = ?",
+        [&id],
+        |row| row.get(0),
+    ) {
+        Ok(path) => Some(path),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(error) => return Err(error.into()),
+    };
     let mut current: Option<PathBuf> = db_path
         .as_ref()
         .map(|raw| {
@@ -349,14 +373,22 @@ pub fn set_archived(
             ))
         })
         .filter(|p| p.is_file());
+    let mut discovered = rollout_files_by_id(&codex, &id)?;
+    if discovered.len() > 1 {
+        return Err(AppError::Other(format!(
+            "发现 {} 个同 ID Codex rollout，无法安全归档，请先修复重复文件: {id}",
+            discovered.len()
+        )));
+    }
     if current.is_none() {
-        current = find_rollout_file_by_id(&codex, &id);
+        current = discovered.pop();
     }
     let Some(current) = current else {
         return Err(AppError::NotFound(format!(
             "找不到会话 {id} 的 rollout 文件"
         )));
     };
+    validate_codex_rollout_path(&codex, &current, &id)?;
     let Some(file_name) = current.file_name().map(|n| n.to_os_string()) else {
         return Err(AppError::Other("rollout 路径缺少文件名".into()));
     };
@@ -405,7 +437,11 @@ pub fn set_archived(
         params![if v { 1 } else { 0 }, now, target_str, id],
     )?;
     if updated == 0 {
-        let _ = crate::repair::upsert_thread_from_rollout(&codex, &state, &target, v);
+        if !crate::repair::upsert_thread_from_rollout(&codex, &state, &target, v)? {
+            return Err(AppError::Other(format!(
+                "无法从 rollout 重建会话 {id} 的 threads 记录"
+            )));
+        }
     }
 
     // 4) session_index 维护：归档移除、取消归档补回（官方索引只含活跃会话）
@@ -423,6 +459,9 @@ pub fn set_archived(
             )
             .unwrap_or_default();
         crate::repair::append_index_line(&codex, &id, &thread_name, &target)?;
+    }
+    if family::update_manual_archive_metadata(&mut family_store, &codex, &id, v, &target)? {
+        family::save(&codex, &family_store)?;
     }
     Ok(())
 }
@@ -476,202 +515,781 @@ fn active_rollout_date(current: &Path, file_name: &str) -> (String, String, Stri
     )
 }
 
-/// 在 sessions/ 与 archived_sessions/ 中按文件名（内嵌会话 uuid）查找 rollout。
-fn find_rollout_file_by_id(codex_dir: &Path, id: &str) -> Option<PathBuf> {
+/// 在 sessions/ 与 archived_sessions/ 中按文件名末尾的会话 uuid 精确查找 rollout。
+fn rollout_files_by_id(codex_dir: &Path, id: &str) -> AppResult<Vec<PathBuf>> {
     if id.trim().is_empty() {
-        return None;
+        return Ok(Vec::new());
     }
-    crate::family::scan_archived_rollouts(codex_dir)
-        .into_iter()
-        .chain(crate::family::scan_rollouts(codex_dir))
-        .find(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.contains(id))
-        })
+    let expected_suffix = format!("-{id}.jsonl");
+    let mut matches = Vec::new();
+    for root in [
+        paths::archived_sessions_dir(codex_dir),
+        paths::sessions_dir(codex_dir),
+    ] {
+        let root_metadata = match fs::symlink_metadata(&root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !root_metadata.is_dir()
+            || crate::path_safety::metadata_is_link_or_reparse(&root_metadata)
+        {
+            return Err(AppError::Path(format!(
+                "Codex rollout 根路径不是普通目录或属于链接/junction: {}",
+                root.to_string_lossy()
+            )));
+        }
+        for entry in walkdir::WalkDir::new(&root).follow_links(false) {
+            let entry = entry.map_err(|error| {
+                AppError::Other(format!(
+                    "扫描 Codex rollout 失败 {}: {error}",
+                    root.to_string_lossy()
+                ))
+            })?;
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if crate::path_safety::metadata_is_link_or_reparse(&metadata) {
+                return Err(AppError::Path(format!(
+                    "Codex rollout 目录包含链接/junction，已拒绝扫描: {}",
+                    entry.path().to_string_lossy()
+                )));
+            }
+            if metadata.is_file()
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(&expected_suffix)
+            {
+                matches.push(entry.path().to_path_buf());
+            }
+        }
+    }
+    matches.sort();
+    matches.dedup();
+    Ok(matches)
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn delete_session_with_lock(
+    provider: Option<String>,
+    codex_dir: String,
+    claude_dir: Option<String>,
+    id: String,
+    target: Option<DeleteTarget>,
+    lock: &family::FamilyLock,
+) -> AppResult<DeleteResult> {
+    let target = match target {
+        Some(target) if target.id != id => {
+            return Err(AppError::Other(format!(
+                "删除目标 ID 与请求 ID 不一致: 请求 {id}，目标 {}",
+                target.id
+            )))
+        }
+        Some(target) => target,
+        None => DeleteTarget {
+            id,
+            rollout_path: None,
+        },
+    };
+    match provider_or_codex(provider).as_str() {
+        "codex" => family::with_lock(lock, |_guard| {
+            delete_codex_targets_locked(Path::new(&codex_dir), vec![target])?
+                .pop()
+                .ok_or_else(|| AppError::Other("Codex 删除未返回结果".to_string()))
+        }),
+        "claude" => {
+            let dir = claude_dir
+                .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned());
+            delete_claude_targets(Path::new(&dir), vec![target])?
+                .pop()
+                .ok_or_else(|| AppError::Other("Claude 删除未返回结果".to_string()))
+        }
+        other => Err(AppError::Other(format!("不支持的 provider: {other}"))),
+    }
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
 pub fn delete_session(
     provider: Option<String>,
     codex_dir: String,
     claude_dir: Option<String>,
     id: String,
+    target: Option<DeleteTarget>,
+    lock: tauri::State<'_, family::FamilyLock>,
 ) -> AppResult<DeleteResult> {
-    match provider_or_codex(provider).as_str() {
-        "codex" => {
-            let p = PathBuf::from(&codex_dir);
-            delete_one(&p, &id)
-        }
-        "claude" => {
-            let dir = claude_dir
-                .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned());
-            delete_one_claude(Path::new(&dir), &id)
-        }
-        other => Err(AppError::Other(format!("不支持的 provider: {other}"))),
-    }
+    delete_session_with_lock(provider, codex_dir, claude_dir, id, target, lock.inner())
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
-pub fn delete_sessions(
+pub fn delete_sessions_with_lock(
     provider: Option<String>,
     codex_dir: String,
     claude_dir: Option<String>,
     ids: Vec<String>,
+    targets: Option<Vec<DeleteTarget>>,
+    lock: &family::FamilyLock,
 ) -> AppResult<Vec<DeleteResult>> {
-    match provider_or_codex(provider).as_str() {
-        "codex" => {
-            let p = PathBuf::from(&codex_dir);
-            Ok(ids
-                .iter()
-                .map(|id| {
-                    delete_one(&p, id).unwrap_or_else(|e| DeleteResult {
-                        id: id.clone(),
-                        threads_rows_deleted: 0,
-                        logs_rows_deleted: 0,
-                        history_rows_deleted: 0,
-                        rollout_deleted: false,
-                        rollout_missing: false,
-                        ok: false,
-                        error: Some(e.to_string()),
-                    })
-                })
-                .collect())
+    let targets = match targets {
+        Some(targets) => {
+            if !ids.is_empty()
+                && (ids.len() != targets.len()
+                    || ids
+                        .iter()
+                        .zip(&targets)
+                        .any(|(id, target)| id != &target.id))
+            {
+                return Err(AppError::Other(
+                    "批量删除的 ids 与精确 targets 不一致，已拒绝执行".to_string(),
+                ));
+            }
+            targets
         }
+        None => ids
+            .into_iter()
+            .map(|id| DeleteTarget {
+                id,
+                rollout_path: None,
+            })
+            .collect(),
+    };
+    match provider_or_codex(provider).as_str() {
+        "codex" => family::with_lock(lock, |_guard| {
+            delete_codex_targets_locked(Path::new(&codex_dir), targets)
+        }),
         "claude" => {
             let dir = PathBuf::from(
                 claude_dir
                     .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
             );
-            Ok(ids
-                .iter()
-                .map(|id| {
-                    delete_one_claude(&dir, id).unwrap_or_else(|e| DeleteResult {
-                        id: id.clone(),
-                        threads_rows_deleted: 0,
-                        logs_rows_deleted: 0,
-                        history_rows_deleted: 0,
-                        rollout_deleted: false,
-                        rollout_missing: false,
-                        ok: false,
-                        error: Some(e.to_string()),
-                    })
-                })
-                .collect())
+            delete_claude_targets(&dir, targets)
         }
         other => Err(AppError::Other(format!("不支持的 provider: {other}"))),
     }
 }
 
-fn delete_one_claude(claude_dir: &Path, id: &str) -> AppResult<DeleteResult> {
-    let mut result = DeleteResult {
-        id: id.to_string(),
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub fn delete_sessions(
+    provider: Option<String>,
+    codex_dir: String,
+    claude_dir: Option<String>,
+    ids: Vec<String>,
+    targets: Option<Vec<DeleteTarget>>,
+    lock: tauri::State<'_, family::FamilyLock>,
+) -> AppResult<Vec<DeleteResult>> {
+    delete_sessions_with_lock(provider, codex_dir, claude_dir, ids, targets, lock.inner())
+}
+
+fn empty_delete_result(target: &DeleteTarget) -> DeleteResult {
+    DeleteResult {
+        id: target.id.clone(),
+        rollout_path: target.rollout_path.clone(),
         threads_rows_deleted: 0,
         logs_rows_deleted: 0,
         history_rows_deleted: 0,
         rollout_deleted: false,
         rollout_missing: false,
+        sidecar_deleted: false,
+        tasks_deleted: false,
+        file_history_deleted: false,
+        shared_data_preserved: false,
         ok: false,
         error: None,
-    };
+    }
+}
 
-    let projects = paths::claude_projects_dir(claude_dir);
-    if !projects.is_dir() {
-        result.rollout_missing = true;
-        append_error(&mut result, "claude projects 目录不存在".into());
-        return Ok(result);
+fn failed_delete_result(target: &DeleteTarget, error: String) -> DeleteResult {
+    let mut result = empty_delete_result(target);
+    result.error = Some(error);
+    result
+}
+
+fn validate_delete_id(id: &str) -> AppResult<()> {
+    let mut components = Path::new(id).components();
+    let is_single_normal_component = matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(value)), None) if value == id
+    );
+    if id.trim().is_empty()
+        || !is_single_normal_component
+        || id.contains(':')
+        || id.chars().any(char::is_control)
+    {
+        return Err(AppError::Path(format!(
+            "会话 ID 不能包含路径或非法字符: {id:?}"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum CodexDeletePlanKey {
+    Family(String),
+    Session(String),
+}
+
+fn delete_codex_targets_locked(
+    codex_dir: &Path,
+    targets: Vec<DeleteTarget>,
+) -> AppResult<Vec<DeleteResult>> {
+    let mut store = family::load(codex_dir)?;
+    // Resolve every target before the first destructive write. A broken family/index mapping
+    // must never leave a half-deleted logical conversation.
+    let plans = targets
+        .iter()
+        .map(|target| {
+            validate_delete_id(&target.id)
+                .and_then(|()| family::resolve_family_id_strict(&store, &target.id))
+                .map(|family_id| match family_id {
+                    Some(id) => CodexDeletePlanKey::Family(id),
+                    None => CodexDeletePlanKey::Session(target.id.clone()),
+                })
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Vec<_>>();
+
+    let mut executed = HashMap::<CodexDeletePlanKey, DeleteResult>::new();
+    let mut results = Vec::with_capacity(targets.len());
+    for (target, plan) in targets.iter().zip(plans) {
+        let key = match plan {
+            Ok(key) => key,
+            Err(error) => {
+                results.push(failed_delete_result(target, error));
+                continue;
+            }
+        };
+        if !executed.contains_key(&key) {
+            let result = match &key {
+                CodexDeletePlanKey::Family(family_id) => {
+                    delete_codex_family_locked(codex_dir, &mut store, family_id, &target.id)
+                        .unwrap_or_else(|error| failed_delete_result(target, error.to_string()))
+                }
+                CodexDeletePlanKey::Session(id) => delete_codex_artifacts(codex_dir, id)
+                    .map(|outcome| outcome.result)
+                    .unwrap_or_else(|error| failed_delete_result(target, error.to_string())),
+            };
+            executed.insert(key.clone(), result);
+        }
+        let mut result = executed
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| AppError::Other("Codex 删除计划未产生结果".to_string()))?;
+        result.id.clone_from(&target.id);
+        results.push(result);
+    }
+    Ok(results)
+}
+
+fn delete_codex_family_locked(
+    codex_dir: &Path,
+    store: &mut crate::models::FamilyStore,
+    family_id: &str,
+    requested_id: &str,
+) -> AppResult<DeleteResult> {
+    let snapshot = store
+        .families
+        .get(family_id)
+        .cloned()
+        .ok_or_else(|| AppError::NotFound(format!("family: {family_id}")))?;
+    let target = DeleteTarget {
+        id: requested_id.to_string(),
+        rollout_path: None,
+    };
+    let mut aggregate = empty_delete_result(&target);
+    // Confirm the family store is writable before deleting the first physical artifact. A later
+    // external sharing violation can still occur, but ordinary permission/read-only failures are
+    // surfaced before any branch is touched.
+    family::save(codex_dir, store)?;
+
+    // Historical branches first. If any core artifact survives, keep the active branch intact.
+    for branch in snapshot
+        .chain
+        .iter()
+        .filter(|branch| branch.id != snapshot.active_id)
+    {
+        let outcome = match delete_codex_artifacts(codex_dir, &branch.id) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                append_error(
+                    &mut aggregate,
+                    format!("分支 {} 删除失败: {error}", branch.id),
+                );
+                return Ok(aggregate);
+            }
+        };
+        merge_codex_delete_result(&mut aggregate, &branch.id, outcome.result);
+        if !outcome.structurally_removed {
+            if aggregate.error.is_none() {
+                append_error(
+                    &mut aggregate,
+                    format!("分支 {} 的核心记录未删除干净，已保留当前分支", branch.id),
+                );
+            }
+            aggregate.ok = false;
+            return Ok(aggregate);
+        }
+        let before_metadata = store.clone();
+        if let Err(error) = family::remove_non_active_branch(store, family_id, &branch.id)
+            .and_then(|_| family::save(codex_dir, store))
+        {
+            *store = before_metadata;
+            append_error(
+                &mut aggregate,
+                format!(
+                    "分支 {} 的文件已删除，但 family 元数据保存失败: {error}",
+                    branch.id
+                ),
+            );
+            return Ok(aggregate);
+        }
     }
 
-    let target_filename = format!("{id}.jsonl");
-    let mut jsonl_path: Option<PathBuf> = None;
-    find_jsonl_by_name(&projects, &target_filename, &mut jsonl_path);
-
-    if let Some(jsonl) = jsonl_path {
-        match fs::remove_file(&jsonl) {
-            Ok(_) => result.rollout_deleted = true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                result.rollout_missing = true;
-            }
-            Err(e) => {
-                append_error(&mut result, format!("rollout remove failed: {}", e));
-                return Ok(result);
-            }
+    let active_outcome = match delete_codex_artifacts(codex_dir, &snapshot.active_id) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            append_error(
+                &mut aggregate,
+                format!("当前分支 {} 删除失败: {error}", snapshot.active_id),
+            );
+            return Ok(aggregate);
         }
+    };
+    let active_removed = active_outcome.structurally_removed;
+    merge_codex_delete_result(&mut aggregate, &snapshot.active_id, active_outcome.result);
+    if active_removed {
+        let before_metadata = store.clone();
+        if let Err(error) =
+            family::remove_family(store, family_id).and_then(|_| family::save(codex_dir, store))
+        {
+            *store = before_metadata;
+            append_error(
+                &mut aggregate,
+                format!(
+                    "当前分支 {} 的文件已删除，但 family 元数据保存失败: {error}",
+                    snapshot.active_id
+                ),
+            );
+            return Ok(aggregate);
+        }
+    } else if aggregate.error.is_none() {
+        append_error(
+            &mut aggregate,
+            format!("当前分支 {} 的核心记录未删除干净", snapshot.active_id),
+        );
+    }
+    aggregate.ok = active_removed && aggregate.error.is_none();
+    Ok(aggregate)
+}
 
-        if let Some(stem) = jsonl.file_stem() {
-            let sidecar = jsonl.with_file_name(stem);
-            if sidecar.is_dir() {
-                if let Err(e) = fs::remove_dir_all(&sidecar) {
-                    append_error(&mut result, format!("sidecar remove failed: {}", e));
+fn merge_codex_delete_result(target: &mut DeleteResult, branch_id: &str, source: DeleteResult) {
+    if target.rollout_path.is_none() {
+        target.rollout_path = source.rollout_path.clone();
+    }
+    target.threads_rows_deleted = target
+        .threads_rows_deleted
+        .saturating_add(source.threads_rows_deleted);
+    target.logs_rows_deleted = target
+        .logs_rows_deleted
+        .saturating_add(source.logs_rows_deleted);
+    target.history_rows_deleted = target
+        .history_rows_deleted
+        .saturating_add(source.history_rows_deleted);
+    if source.rollout_deleted {
+        target.rollout_deleted = true;
+        target.rollout_missing = false;
+    } else if source.rollout_missing && !target.rollout_deleted {
+        target.rollout_missing = true;
+    }
+    if let Some(error) = source.error {
+        append_error(target, format!("分支 {branch_id}: {error}"));
+    }
+}
+
+fn delete_claude_targets(
+    claude_dir: &Path,
+    targets: Vec<DeleteTarget>,
+) -> AppResult<Vec<DeleteResult>> {
+    let mut results = Vec::with_capacity(targets.len());
+    let projects = paths::claude_projects_dir(claude_dir);
+    for target in &targets {
+        let mut result = empty_delete_result(target);
+        if let Err(error) = validate_delete_id(&target.id) {
+            append_error(&mut result, error.to_string());
+            results.push(result);
+            continue;
+        }
+        match resolve_claude_delete_target(&projects, target) {
+            Ok(Some(jsonl)) => {
+                result.rollout_path = Some(jsonl.to_string_lossy().into_owned());
+                match fs::remove_file(&jsonl) {
+                    Ok(()) => result.rollout_deleted = true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        result.rollout_missing = true;
+                    }
+                    Err(error) => {
+                        append_error(
+                            &mut result,
+                            format!(
+                                "Claude 会话文件删除失败 {}: {error}",
+                                jsonl.to_string_lossy()
+                            ),
+                        );
+                    }
+                }
+
+                if result.rollout_deleted || result.rollout_missing {
+                    cleanup_claude_sidecar(&projects, &jsonl, &mut result);
+                }
+            }
+            Ok(None) => {
+                result.rollout_missing = true;
+                if let Some(raw_path) = target.rollout_path.as_deref() {
+                    let jsonl = PathBuf::from(paths::strip_verbatim(raw_path));
+                    cleanup_claude_sidecar(&projects, &jsonl, &mut result);
+                }
+            }
+            Err(error) => append_error(&mut result, error.to_string()),
+        }
+        results.push(result);
+    }
+
+    // Deleting one imported duplicate must not erase history/tasks shared by another copy.
+    let remaining_ids = match scan_claude_session_ids(&projects) {
+        Ok(ids) => Some(ids),
+        Err(error) => {
+            for result in &mut results {
+                if result.rollout_deleted || result.rollout_missing {
+                    result.shared_data_preserved = true;
+                    append_error(
+                        result,
+                        format!("无法确认是否仍有同 ID 会话副本，已保留共享数据: {error}"),
+                    );
+                }
+            }
+            None
+        }
+    };
+
+    let mut history_ids = HashSet::new();
+    if let Some(remaining_ids) = remaining_ids {
+        for result in &mut results {
+            if !(result.rollout_deleted || result.rollout_missing) {
+                continue;
+            }
+            if remaining_ids.contains(&result.id) {
+                result.shared_data_preserved = true;
+                if result.rollout_missing && result.rollout_path.is_none() {
+                    append_error(
+                        result,
+                        "未按 ID 定位到待删文件，但扫描后该 ID 会话仍存在，已拒绝报告成功"
+                            .to_string(),
+                    );
+                }
+                continue;
+            }
+            match cleanup_claude_session_dir(
+                claude_dir,
+                &claude_dir.join("tasks").join(&result.id),
+                "tasks",
+            ) {
+                Ok(deleted) => result.tasks_deleted = deleted,
+                Err(error) => append_error(result, error.to_string()),
+            }
+            match cleanup_claude_session_dir(
+                claude_dir,
+                &claude_dir.join("file-history").join(&result.id),
+                "file-history",
+            ) {
+                Ok(deleted) => result.file_history_deleted = deleted,
+                Err(error) => append_error(result, error.to_string()),
+            }
+            history_ids.insert(result.id.clone());
+        }
+    }
+
+    if !history_ids.is_empty() {
+        let history_path = paths::history_path(claude_dir);
+        match history::filter_file_for_ids(&history_path, &history_ids) {
+            Ok(removed) => {
+                for result in &mut results {
+                    result.history_rows_deleted = removed.get(&result.id).copied().unwrap_or(0);
+                }
+            }
+            Err(error) => {
+                for result in &mut results {
+                    if history_ids.contains(&result.id) {
+                        append_error(result, format!("Claude history.jsonl 清理失败: {error}"));
+                    }
                 }
             }
         }
-
-        if let Some(parent) = jsonl.parent() {
-            let _ = fs::remove_dir(parent);
-        }
-    } else {
-        result.rollout_missing = true;
     }
 
-    let history_path = paths::history_path(claude_dir);
-    if history_path.exists() {
-        match history::filter_file(&history_path, id) {
-            Ok(rows) => result.history_rows_deleted = rows,
-            Err(e) => append_error(&mut result, format!("history filter failed: {}", e)),
-        }
+    for result in &mut results {
+        result.ok = result.error.is_none() && (result.rollout_deleted || result.rollout_missing);
     }
-
-    result.ok = result.rollout_deleted || result.history_rows_deleted > 0;
-    Ok(result)
+    Ok(results)
 }
 
-fn find_jsonl_by_name(dir: &Path, target: &str, found: &mut Option<PathBuf>) {
-    if found.is_some() {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(dir) else {
+fn cleanup_claude_sidecar(projects: &Path, jsonl: &Path, result: &mut DeleteResult) {
+    let Some(sidecar) = crate::claude_sessions::sidecar_path_for(jsonl) else {
         return;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            find_jsonl_by_name(&path, target, found);
-            if found.is_some() {
-                return;
-            }
-        } else if path.file_name().and_then(|n| n.to_str()) == Some(target) {
-            *found = Some(path);
-            return;
-        }
+    if !projects.exists() {
+        return;
+    }
+    match crate::path_safety::remove_path(
+        projects,
+        &sidecar,
+        crate::path_safety::EntryKind::Directory,
+        "Claude sidecar",
+    ) {
+        Ok(deleted) => result.sidecar_deleted = deleted,
+        Err(error) => append_error(result, error.to_string()),
     }
 }
 
-pub(crate) fn delete_one_for_family(codex_dir: &Path, id: &str) -> AppResult<DeleteResult> {
-    delete_one(codex_dir, id)
+#[cfg(test)]
+fn delete_one_claude(claude_dir: &Path, id: &str) -> AppResult<DeleteResult> {
+    delete_claude_targets(
+        claude_dir,
+        vec![DeleteTarget {
+            id: id.to_string(),
+            rollout_path: None,
+        }],
+    )?
+    .pop()
+    .ok_or_else(|| AppError::Other("Claude 删除未返回结果".to_string()))
 }
 
-fn delete_one(codex_dir: &Path, id: &str) -> AppResult<DeleteResult> {
+fn cleanup_claude_session_dir(root: &Path, path: &Path, label: &str) -> AppResult<bool> {
+    crate::path_safety::remove_path(
+        root,
+        path,
+        crate::path_safety::EntryKind::Directory,
+        &format!("Claude {label}"),
+    )
+}
+
+fn resolve_claude_delete_target(
+    projects: &Path,
+    target: &DeleteTarget,
+) -> AppResult<Option<PathBuf>> {
+    if let Some(raw_path) = target.rollout_path.as_deref() {
+        let path = PathBuf::from(paths::strip_verbatim(raw_path));
+        let exists = validate_claude_target_path(projects, &path, &target.id)?;
+        return Ok(exists.then_some(path));
+    }
+
+    if !projects.is_dir() {
+        return Ok(None);
+    }
+    let mut matches = Vec::new();
+    for entry in walkdir::WalkDir::new(projects).follow_links(false) {
+        let entry = entry.map_err(|error| {
+            AppError::Other(format!(
+                "扫描 Claude projects 失败 {}: {error}",
+                projects.to_string_lossy()
+            ))
+        })?;
+        if entry.file_type().is_file()
+            && entry.path().extension().and_then(|value| value.to_str()) == Some("jsonl")
+            && claude_session_identity(entry.path())?.as_deref() == Some(target.id.as_str())
+        {
+            validate_claude_target_path(projects, entry.path(), &target.id)?;
+            matches.push(entry.path().to_path_buf());
+        }
+    }
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.pop()),
+        count => Err(AppError::Other(format!(
+            "发现 {count} 个同 ID Claude 会话，必须提供精确 rollout_path: {}",
+            target.id
+        ))),
+    }
+}
+
+fn validate_claude_target_path(projects: &Path, path: &Path, id: &str) -> AppResult<bool> {
+    if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+        return Err(AppError::Path(format!(
+            "Claude 删除目标不是 jsonl: {}",
+            path.to_string_lossy()
+        )));
+    }
+
+    let exists = if projects.exists() {
+        crate::path_safety::validate_descendant(
+            projects,
+            path,
+            crate::path_safety::EntryKind::File,
+            true,
+            "Claude 删除目标",
+        )?
+    } else {
+        // A file can disappear between list and delete. Validate the absent target lexically so
+        // the remaining history/tasks can still be cleaned idempotently without accepting `..`.
+        let clean_root = PathBuf::from(paths::strip_verbatim(&projects.to_string_lossy()));
+        let clean_path = PathBuf::from(paths::strip_verbatim(&path.to_string_lossy()));
+        let relative = clean_path.strip_prefix(&clean_root).map_err(|_| {
+            AppError::Path(format!(
+                "Claude 删除目标不在 projects 目录内: {}",
+                path.to_string_lossy()
+            ))
+        })?;
+        paths::checked_relative_path(&relative.to_string_lossy())?;
+        if clean_path.file_stem().and_then(|value| value.to_str()) != Some(id) {
+            return Err(AppError::Path(format!(
+                "Claude 删除目标文件名与会话 ID 不匹配: {}",
+                path.to_string_lossy()
+            )));
+        }
+        false
+    };
+    if exists {
+        let identity = claude_session_identity(path)?;
+        if identity.as_deref() != Some(id) {
+            return Err(AppError::Other(format!(
+                "Claude 删除目标 ID 不匹配: 期望 {id}，文件识别为 {} ({})",
+                identity.as_deref().unwrap_or("未知"),
+                path.to_string_lossy()
+            )));
+        }
+    } else if path.file_stem().and_then(|value| value.to_str()) != Some(id) {
+        return Err(AppError::Path(format!(
+            "Claude 删除目标文件名与会话 ID 不匹配: {}",
+            path.to_string_lossy()
+        )));
+    }
+    Ok(exists)
+}
+
+fn scan_claude_session_ids(projects: &Path) -> AppResult<HashSet<String>> {
+    let mut ids = HashSet::new();
+    if !projects.exists() {
+        return Ok(ids);
+    }
+    if !projects.is_dir() {
+        return Err(AppError::Path(format!(
+            "Claude projects 路径不是目录: {}",
+            projects.to_string_lossy()
+        )));
+    }
+    for entry in walkdir::WalkDir::new(projects).follow_links(false) {
+        let entry = entry.map_err(|error| {
+            AppError::Other(format!(
+                "扫描 Claude projects 失败 {}: {error}",
+                projects.to_string_lossy()
+            ))
+        })?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if crate::path_safety::metadata_is_link_or_reparse(&metadata) {
+            return Err(AppError::Path(format!(
+                "Claude projects 内包含链接或 junction，无法安全确认剩余副本: {}",
+                entry.path().to_string_lossy()
+            )));
+        }
+        if !entry.file_type().is_file()
+            || entry.path().extension().and_then(|value| value.to_str()) != Some("jsonl")
+        {
+            continue;
+        }
+        if let Some(id) = claude_session_identity(entry.path())? {
+            ids.insert(id);
+        }
+    }
+    Ok(ids)
+}
+
+fn claude_session_identity(path: &Path) -> AppResult<Option<String>> {
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(str::to_string);
+    if stem
+        .as_deref()
+        .is_some_and(|value| value.starts_with("agent-"))
+    {
+        return Ok(stem);
+    }
+    let file = File::open(path)?;
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if let Some(id) = value
+            .get("sessionId")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(Some(id.to_string()));
+        }
+    }
+    Ok(stem)
+}
+
+pub(crate) struct CodexDeleteOutcome {
+    pub(crate) result: DeleteResult,
+    pub(crate) structurally_removed: bool,
+}
+
+pub(crate) fn delete_codex_artifacts(codex_dir: &Path, id: &str) -> AppResult<CodexDeleteOutcome> {
     let mut result = DeleteResult {
         id: id.to_string(),
+        rollout_path: None,
         threads_rows_deleted: 0,
         logs_rows_deleted: 0,
         history_rows_deleted: 0,
         rollout_deleted: false,
         rollout_missing: false,
+        sidecar_deleted: false,
+        tasks_deleted: false,
+        file_history_deleted: false,
+        shared_data_preserved: false,
         ok: false,
         error: None,
     };
 
-    // 1) 查出 rollout_path
+    // Preflight every fallible lookup that can be checked before the first write.
     let state = state_db::open(codex_dir)?;
-    let rollout_path: Option<String> = state
-        .query_row("SELECT rollout_path FROM threads WHERE id = ?", [id], |r| {
-            r.get(0)
-        })
-        .ok();
+    let rollout_path: Option<String> = match state.query_row(
+        "SELECT rollout_path FROM threads WHERE id = ?",
+        [id],
+        |row| row.get(0),
+    ) {
+        Ok(path) => Some(path),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let mut rollout_files = rollout_files_by_id(codex_dir, id)?;
+    if let Some(raw_path) = rollout_path.as_deref() {
+        let db_path = PathBuf::from(paths::strip_verbatim(
+            &paths::host_path_string_from_codex_record(codex_dir, raw_path),
+        ));
+        if db_path.is_file() {
+            validate_codex_rollout_path(codex_dir, &db_path, id)?;
+            rollout_files.push(db_path);
+        }
+    }
+    let mut canonical_files = Vec::with_capacity(rollout_files.len());
+    for path in rollout_files {
+        validate_codex_rollout_path(codex_dir, &path, id)?;
+        let canonical = path.canonicalize()?;
+        if !canonical_files.contains(&canonical) {
+            canonical_files.push(canonical);
+        }
+    }
+    let logs = if codex_dir.join("logs_2.sqlite").is_file() {
+        Some(logs_db::open(codex_dir)?)
+    } else {
+        None
+    };
 
-    // 2) 事务删 threads（外键级联 thread_dynamic_tools / stage1_outputs / thread_spawn_edges）
+    // 1) threads（外键级联 thread_dynamic_tools / stage1_outputs / thread_spawn_edges）
     let rows = {
         let tx = state.unchecked_transaction()?;
         let n = tx.execute("DELETE FROM threads WHERE id = ?", [id])?;
@@ -680,77 +1298,204 @@ fn delete_one(codex_dir: &Path, id: &str) -> AppResult<DeleteResult> {
     };
     result.threads_rows_deleted = rows as u32;
 
-    // 3) 事务删 logs。logs_2.sqlite 可能在新版本或精简环境中不存在；
-    // 这不应掩盖 threads 已删除的事实，但需要显式反馈给前端。
-    match logs_db::open(codex_dir) {
-        Ok(logs) => {
-            let logs_result: AppResult<usize> = (|| {
-                let tx = logs.unchecked_transaction()?;
-                let n = tx.execute("DELETE FROM logs WHERE thread_id = ?", [id])?;
-                tx.commit()?;
-                Ok(n)
-            })();
-            match logs_result {
-                Ok(rows_logs) => {
-                    result.logs_rows_deleted = rows_logs as u32;
-                }
-                Err(e) => append_error(&mut result, format!("logs delete failed: {}", e)),
-            }
+    // 2) logs_2.sqlite 在部分 Codex 版本中不存在；不存在就没有待清理记录。
+    if let Some(logs) = logs {
+        let logs_result: AppResult<usize> = (|| {
+            let tx = logs.unchecked_transaction()?;
+            let n = tx.execute("DELETE FROM logs WHERE thread_id = ?", [id])?;
+            tx.commit()?;
+            Ok(n)
+        })();
+        match logs_result {
+            Ok(rows_logs) => result.logs_rows_deleted = rows_logs as u32,
+            Err(error) => append_error(&mut result, format!("logs delete failed: {error}")),
         }
-        Err(e) => append_error(&mut result, format!("logs database unavailable: {}", e)),
     }
 
-    // 4) 直接删除 rollout 文件（失败不回滚）。threads 记录缺失或路径漂移时
-    //    按文件名兜底搜索（覆盖官方归档在 archived_sessions/ 的文件）。
-    let mut file_to_remove: Option<PathBuf> = rollout_path
-        .as_ref()
-        .map(|path| PathBuf::from(paths::strip_verbatim(path)));
-    if file_to_remove
-        .as_ref()
-        .map(|p| !p.is_file())
-        .unwrap_or(true)
-    {
-        if let Some(found) = find_rollout_file_by_id(codex_dir, id) {
-            file_to_remove = Some(found);
-        }
-    }
-    if let Some(cleaned) = file_to_remove {
-        match fs::remove_file(&cleaned) {
-            Ok(_) => {
-                result.rollout_deleted = true;
-                // 尝试清理空的 YYYY/MM/DD 目录
-                if let Some(parent) = cleaned.parent() {
-                    let _ = fs::remove_dir(parent);
-                    if let Some(month) = parent.parent() {
-                        let _ = fs::remove_dir(month);
-                        if let Some(year) = month.parent() {
-                            let _ = fs::remove_dir(year);
-                        }
-                    }
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                result.rollout_missing = true;
-            }
-            Err(e) => {
-                result.rollout_deleted = false;
-                append_error(&mut result, format!("rollout remove failed: {}", e));
-            }
-        }
-    } else {
+    // 3) 删除 sessions/ 与 archived_sessions/ 中全部同 ID rollout，避免漂移副本残留。
+    if canonical_files.is_empty() {
         result.rollout_missing = true;
-    }
-
-    // 5) 过滤 session_index.jsonl
-    let index_path = codex_dir.join("session_index.jsonl");
-    if index_path.exists() {
-        if let Err(e) = filter_index_file(&index_path, id) {
-            append_error(&mut result, format!("session_index filter failed: {}", e));
+    } else {
+        result.rollout_path = canonical_files
+            .first()
+            .map(|path| path.to_string_lossy().into_owned());
+        for rollout in canonical_files {
+            match fs::remove_file(&rollout) {
+                Ok(()) => {
+                    result.rollout_deleted = true;
+                    cleanup_empty_rollout_ancestors(codex_dir, &rollout, &mut result);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    result.rollout_missing = true;
+                }
+                Err(error) => append_error(
+                    &mut result,
+                    format!(
+                        "rollout remove failed {}: {error}",
+                        rollout.to_string_lossy()
+                    ),
+                ),
+            }
         }
     }
 
-    result.ok = result.threads_rows_deleted > 0 || result.rollout_deleted;
-    Ok(result)
+    // 4) session_index.jsonl
+    let index_path = paths::session_index_path(codex_dir);
+    if index_path.exists() {
+        if let Err(error) = filter_index_file(&index_path, id) {
+            append_error(&mut result, format!("session_index filter failed: {error}"));
+        }
+    }
+
+    // Verify the three core locations from disk/database truth before touching family metadata.
+    let threads_remaining: i64 =
+        state.query_row("SELECT COUNT(*) FROM threads WHERE id = ?", [id], |row| {
+            row.get(0)
+        })?;
+    let rollout_remaining = match rollout_files_by_id(codex_dir, id) {
+        Ok(paths) => !paths.is_empty(),
+        Err(error) => {
+            append_error(
+                &mut result,
+                format!("rollout deletion verification failed: {error}"),
+            );
+            true
+        }
+    };
+    let index_remaining = match index_contains_id(&index_path, id) {
+        Ok(remaining) => remaining,
+        Err(error) => {
+            append_error(
+                &mut result,
+                format!("session_index deletion verification failed: {error}"),
+            );
+            true
+        }
+    };
+    let structurally_removed = threads_remaining == 0 && !rollout_remaining && !index_remaining;
+    if !structurally_removed && result.error.is_none() {
+        append_error(
+            &mut result,
+            "Codex 会话仍有核心记录残留（threads、rollout 或 session_index）".to_string(),
+        );
+    }
+    result.ok = structurally_removed && result.error.is_none();
+    Ok(CodexDeleteOutcome {
+        result,
+        structurally_removed,
+    })
+}
+
+#[cfg(test)]
+fn delete_one(codex_dir: &Path, id: &str) -> AppResult<DeleteResult> {
+    Ok(delete_codex_artifacts(codex_dir, id)?.result)
+}
+
+fn validate_codex_rollout_path(codex_dir: &Path, path: &Path, id: &str) -> AppResult<()> {
+    let expected_suffix = format!("-{id}.jsonl");
+    if !path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(&expected_suffix))
+    {
+        return Err(AppError::Path(format!(
+            "Codex rollout 路径与会话 ID 不匹配，拒绝删除: {}",
+            path.to_string_lossy()
+        )));
+    }
+    for root in [
+        paths::sessions_dir(codex_dir),
+        paths::archived_sessions_dir(codex_dir),
+    ] {
+        let root_metadata = match fs::symlink_metadata(&root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !root_metadata.is_dir()
+            || crate::path_safety::metadata_is_link_or_reparse(&root_metadata)
+        {
+            return Err(AppError::Path(format!(
+                "Codex rollout 根路径不是普通目录或属于链接/junction: {}",
+                root.to_string_lossy()
+            )));
+        }
+
+        let clean_root = PathBuf::from(paths::strip_verbatim(&root.to_string_lossy()));
+        let clean_path = PathBuf::from(paths::strip_verbatim(&path.to_string_lossy()));
+        if clean_path.strip_prefix(&clean_root).is_ok() {
+            crate::path_safety::validate_descendant(
+                &root,
+                path,
+                crate::path_safety::EntryKind::File,
+                false,
+                "Codex rollout 删除目标",
+            )?;
+            let meta = family::read_session_meta(path)?;
+            let actual_id = meta
+                .get("payload")
+                .and_then(|payload| payload.get("id"))
+                .and_then(serde_json::Value::as_str);
+            if actual_id == Some(id) {
+                return Ok(());
+            }
+            return Err(AppError::Other(format!(
+                "Codex rollout 内容 ID 不匹配，期望 {id}，实际为 {}: {}",
+                actual_id.unwrap_or("未知"),
+                path.to_string_lossy()
+            )));
+        }
+    }
+    Err(AppError::Path(format!(
+        "Codex rollout 不在 sessions 或 archived_sessions 内，拒绝删除: {}",
+        path.to_string_lossy()
+    )))
+}
+
+fn cleanup_empty_rollout_ancestors(codex_dir: &Path, rollout: &Path, result: &mut DeleteResult) {
+    let sessions_root = paths::sessions_dir(codex_dir);
+    let mut current = rollout.parent();
+    while let Some(dir) = current {
+        if dir == sessions_root || !dir.starts_with(&sessions_root) {
+            break;
+        }
+        match fs::remove_dir(dir) {
+            Ok(()) => current = dir.parent(),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
+                ) =>
+            {
+                break;
+            }
+            Err(error) => {
+                append_error(
+                    result,
+                    format!("清理空 rollout 目录失败 {}: {error}", dir.to_string_lossy()),
+                );
+                break;
+            }
+        }
+    }
+}
+
+fn index_contains_id(path: &Path, id: &str) -> AppResult<bool> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+    for line in BufReader::new(File::open(path)?).lines() {
+        let line = line?;
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if value.get("id").and_then(serde_json::Value::as_str) == Some(id)
+            || value.get("session_id").and_then(serde_json::Value::as_str) == Some(id)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn append_error(result: &mut DeleteResult, msg: String) {
@@ -761,36 +1506,47 @@ fn append_error(result: &mut DeleteResult, msg: String) {
 }
 
 fn filter_index_file(path: &Path, id: &str) -> AppResult<()> {
+    let expected = atomic_file::fingerprint(path)?;
     let content = fs::read_to_string(path)?;
-    let tmp = path.with_extension("jsonl.tmp");
-    {
-        use std::io::Write;
-        let mut f = fs::File::create(&tmp)?;
-        for line in content.lines() {
-            if line.is_empty() {
-                continue;
+    let mut kept = Vec::new();
+    let mut removed = false;
+    for line in content.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let keep = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(v) => {
+                v.get("id").and_then(|x| x.as_str()) != Some(id)
+                    && v.get("session_id").and_then(|x| x.as_str()) != Some(id)
             }
-            let keep = match serde_json::from_str::<serde_json::Value>(line) {
-                Ok(v) => {
-                    v.get("id").and_then(|x| x.as_str()) != Some(id)
-                        && v.get("session_id").and_then(|x| x.as_str()) != Some(id)
-                }
-                Err(_) => true,
-            };
-            if keep {
-                writeln!(f, "{}", line)?;
-            }
+            Err(_) => true,
+        };
+        if keep {
+            kept.push(line);
+        } else {
+            removed = true;
         }
     }
-    fs::rename(&tmp, path).map_err(AppError::Io)?;
+    if !removed {
+        return Ok(());
+    }
+    atomic_file::replace_with_writer_if_unchanged(path, &expected, |file| {
+        use std::io::Write;
+        for line in kept {
+            writeln!(file, "{line}")?;
+        }
+        Ok(())
+    })?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::models::{BranchStatus, Family, FamilyBranch, FamilyStore};
     use std::io::Write;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -799,6 +1555,28 @@ mod tests {
             .expect("system clock before unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("cc-sessions-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    #[cfg(windows)]
+    fn create_windows_junction(target: &Path, link: &Path) -> AppResult<()> {
+        let output = std::process::Command::new("pwsh")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$ErrorActionPreference = 'Stop'; New-Item -ItemType Junction -Path $env:CC_TEST_LINK -Target $env:CC_TEST_TARGET | Out-Null",
+            ])
+            .env("CC_TEST_LINK", link)
+            .env("CC_TEST_TARGET", target)
+            .output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(AppError::Other(format!(
+                "无法创建 junction 测试夹具: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )))
+        }
     }
 
     fn create_codex_threads_table(codex: &Path) -> AppResult<rusqlite::Connection> {
@@ -826,6 +1604,24 @@ mod tests {
             [],
         )?;
         Ok(conn)
+    }
+
+    fn write_claude_session(path: &Path, id: &str) -> AppResult<()> {
+        fs::create_dir_all(path.parent().expect("claude session parent"))?;
+        fs::write(
+            path,
+            format!(
+                "{{\"sessionId\":\"{id}\",\"cwd\":\"F:\\\\work\\\\sample\",\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"hello\"}}}}\n"
+            ),
+        )?;
+        Ok(())
+    }
+
+    fn claude_target(id: &str, path: Option<&Path>) -> crate::models::DeleteTarget {
+        crate::models::DeleteTarget {
+            id: id.to_string(),
+            rollout_path: path.map(|path| path.to_string_lossy().into_owned()),
+        }
     }
 
     #[test]
@@ -959,6 +1755,396 @@ mod tests {
         fs::remove_dir_all(claude).expect("cleanup temp dir");
     }
 
+    #[test]
+    fn delete_claude_session_removes_only_session_scoped_artifacts() -> AppResult<()> {
+        let claude = temp_dir("claude-delete-session-artifacts");
+        let project = claude.join("projects").join("sample-project");
+        let id = "11111111-2222-4333-8444-555555555555";
+        let session = project.join(format!("{id}.jsonl"));
+        write_claude_session(&session, id)?;
+
+        let sidecar = project.join(id);
+        fs::create_dir_all(sidecar.join("subagents"))?;
+        fs::write(sidecar.join("subagents").join("agent-one.jsonl"), "{}\n")?;
+        fs::create_dir_all(claude.join("tasks").join(id))?;
+        fs::write(claude.join("tasks").join(id).join("1.json"), "{}\n")?;
+        fs::create_dir_all(claude.join("file-history").join(id))?;
+        fs::write(
+            claude.join("file-history").join(id).join("snapshot@v1"),
+            "original",
+        )?;
+
+        let memory = project.join("memory");
+        fs::create_dir_all(&memory)?;
+        fs::write(memory.join("MEMORY.md"), "keep")?;
+        fs::create_dir_all(claude.join("session-env").join(id))?;
+        fs::write(claude.join("session-env").join(id).join("env"), "keep")?;
+        fs::create_dir_all(claude.join("shell-snapshots"))?;
+        fs::write(claude.join("shell-snapshots").join("snapshot.sh"), "keep")?;
+        fs::write(
+            claude.join("history.jsonl"),
+            format!("{{\"sessionId\":\"{id}\",\"display\":\"delete\"}}\n"),
+        )?;
+
+        let result = delete_claude_targets(&claude, vec![claude_target(id, Some(&session))])?
+            .pop()
+            .expect("one delete result");
+
+        assert!(result.ok, "{:?}", result.error);
+        assert!(result.rollout_deleted);
+        assert!(result.sidecar_deleted);
+        assert!(result.tasks_deleted);
+        assert!(result.file_history_deleted);
+        assert_eq!(result.history_rows_deleted, 1);
+        assert!(!session.exists());
+        assert!(!sidecar.exists());
+        assert!(!claude.join("tasks").join(id).exists());
+        assert!(!claude.join("file-history").join(id).exists());
+        assert!(memory.is_dir(), "project memory must not be deleted");
+        assert!(claude.join("session-env").join(id).is_dir());
+        assert!(claude.join("shell-snapshots").join("snapshot.sh").is_file());
+
+        fs::remove_dir_all(claude).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn delete_claude_exact_path_preserves_shared_data_until_last_copy() -> AppResult<()> {
+        let claude = temp_dir("claude-delete-duplicate-id");
+        let id = "22222222-3333-4444-8555-666666666666";
+        let first = claude
+            .join("projects")
+            .join("first-project")
+            .join(format!("{id}.jsonl"));
+        let second = claude
+            .join("projects")
+            .join("second-project")
+            .join(format!("{id}.jsonl"));
+        write_claude_session(&first, id)?;
+        write_claude_session(&second, id)?;
+        fs::create_dir_all(claude.join("tasks").join(id))?;
+        fs::create_dir_all(claude.join("file-history").join(id))?;
+        fs::write(
+            claude.join("history.jsonl"),
+            format!("{{\"sessionId\":\"{id}\",\"display\":\"keep until last\"}}\n"),
+        )?;
+
+        let first_result = delete_session_with_lock(
+            Some("claude".to_string()),
+            String::new(),
+            Some(claude.to_string_lossy().into_owned()),
+            id.to_string(),
+            Some(claude_target(id, Some(&second))),
+            &family::FamilyLock::default(),
+        )?;
+        assert!(first_result.ok, "{:?}", first_result.error);
+        assert!(first.is_file(), "the unselected copy must remain");
+        assert!(!second.exists(), "the exact selected copy must be deleted");
+        assert!(first_result.shared_data_preserved);
+        assert_eq!(first_result.history_rows_deleted, 0);
+        assert!(claude.join("tasks").join(id).is_dir());
+        assert!(claude.join("file-history").join(id).is_dir());
+        assert!(fs::read_to_string(claude.join("history.jsonl"))?.contains(id));
+
+        let last_result = delete_claude_targets(&claude, vec![claude_target(id, Some(&first))])?
+            .pop()
+            .expect("last delete result");
+        assert!(last_result.ok, "{:?}", last_result.error);
+        assert!(!last_result.shared_data_preserved);
+        assert_eq!(last_result.history_rows_deleted, 1);
+        assert!(!claude.join("tasks").join(id).exists());
+        assert!(!claude.join("file-history").join(id).exists());
+
+        fs::remove_dir_all(claude).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn delete_session_rejects_mismatched_explicit_target_id() -> AppResult<()> {
+        let claude = temp_dir("claude-delete-mismatched-target");
+        let requested_id = "23232323-3434-4545-8565-676767676767";
+        let target_id = "24242424-3535-4646-8575-686868686868";
+        let target = claude
+            .join("projects")
+            .join("target-project")
+            .join(format!("{target_id}.jsonl"));
+        write_claude_session(&target, target_id)?;
+
+        let error = delete_session_with_lock(
+            Some("claude".to_string()),
+            String::new(),
+            Some(claude.to_string_lossy().into_owned()),
+            requested_id.to_string(),
+            Some(claude_target(target_id, Some(&target))),
+            &family::FamilyLock::default(),
+        )
+        .expect_err("mismatched target id must be rejected");
+
+        assert!(error.to_string().contains("不一致"));
+        assert!(target.is_file(), "rejected target must remain untouched");
+        fs::remove_dir_all(claude).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn delete_claude_batch_cleans_history_without_projects_directory() -> AppResult<()> {
+        let claude = temp_dir("claude-delete-no-projects");
+        fs::create_dir_all(&claude)?;
+        let first = "33333333-4444-4555-8666-777777777777";
+        let second = "44444444-5555-4666-8777-888888888888";
+        fs::write(
+            claude.join("history.jsonl"),
+            format!(
+                "{{\"sessionId\":\"{first}\",\"display\":\"one\"}}\n\
+                 {{\"sessionId\":\"{second}\",\"display\":\"two\"}}\n\
+                 {{\"sessionId\":\"{first}\",\"display\":\"three\"}}\n\
+                 {{\"sessionId\":\"other\",\"display\":\"keep\"}}\n"
+            ),
+        )?;
+        fs::create_dir_all(claude.join("tasks").join(first))?;
+        fs::create_dir_all(claude.join("file-history").join(second))?;
+        let missing_first = claude
+            .join("projects")
+            .join("gone-project")
+            .join(format!("{first}.jsonl"));
+        let missing_second = claude
+            .join("projects")
+            .join("gone-project")
+            .join(format!("{second}.jsonl"));
+
+        let results = delete_claude_targets(
+            &claude,
+            vec![
+                claude_target(first, Some(&missing_first)),
+                claude_target(second, Some(&missing_second)),
+            ],
+        )?;
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| result.ok));
+        assert_eq!(results[0].history_rows_deleted, 2);
+        assert_eq!(results[1].history_rows_deleted, 1);
+        assert!(results.iter().all(|result| result.rollout_missing));
+        let history = fs::read_to_string(claude.join("history.jsonl"))?;
+        assert!(!history.contains(first));
+        assert!(!history.contains(second));
+        assert!(history.contains("other"));
+        assert!(!claude.join("tasks").join(first).exists());
+        assert!(!claude.join("file-history").join(second).exists());
+
+        fs::remove_dir_all(claude).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn delete_claude_partial_cleanup_is_not_success() -> AppResult<()> {
+        let claude = temp_dir("claude-delete-partial");
+        let id = "55555555-6666-4777-8888-999999999999";
+        let session = claude
+            .join("projects")
+            .join("sample-project")
+            .join(format!("{id}.jsonl"));
+        write_claude_session(&session, id)?;
+        fs::create_dir_all(claude.join("tasks"))?;
+        fs::write(claude.join("tasks").join(id), "not a directory")?;
+
+        let result = delete_claude_targets(&claude, vec![claude_target(id, Some(&session))])?
+            .pop()
+            .expect("one delete result");
+
+        assert!(result.rollout_deleted);
+        assert!(
+            !result.ok,
+            "partial cleanup must not be reported as success"
+        );
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("tasks"));
+
+        fs::remove_dir_all(claude).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn delete_claude_rejects_rollout_outside_projects() -> AppResult<()> {
+        let claude = temp_dir("claude-delete-outside-projects");
+        let id = "66666666-7777-4888-8999-000000000000";
+        let outside = claude.join("outside").join(format!("{id}.jsonl"));
+        write_claude_session(&outside, id)?;
+        fs::create_dir_all(claude.join("projects"))?;
+
+        let result = delete_claude_targets(&claude, vec![claude_target(id, Some(&outside))])?
+            .pop()
+            .expect("one delete result");
+
+        assert!(!result.ok);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("projects"));
+        assert!(
+            outside.is_file(),
+            "an out-of-root target must not be deleted"
+        );
+
+        fs::remove_dir_all(claude).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn delete_claude_rejects_jsonl_directory_target() -> AppResult<()> {
+        let claude = temp_dir("claude-delete-jsonl-directory");
+        let id = "77777777-8888-4999-8000-111111111111";
+        let project = claude.join("projects").join("sample-project");
+        let invalid_rollout = project.join(format!("{id}.jsonl"));
+        let sidecar = project.join(id);
+        fs::create_dir_all(&invalid_rollout)?;
+        fs::create_dir_all(&sidecar)?;
+        fs::write(sidecar.join("sentinel"), "keep")?;
+
+        let result =
+            delete_claude_targets(&claude, vec![claude_target(id, Some(&invalid_rollout))])?
+                .pop()
+                .expect("one delete result");
+
+        assert!(!result.ok);
+        assert!(invalid_rollout.is_dir());
+        assert_eq!(fs::read_to_string(sidecar.join("sentinel"))?, "keep");
+        fs::remove_dir_all(claude).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn delete_claude_rejects_linked_parent_for_missing_rollout() -> AppResult<()> {
+        let root = temp_dir("claude-delete-linked-parent");
+        let claude = root.join("claude");
+        let projects = claude.join("projects");
+        let victim = root.join("victim");
+        let id = "88888888-9999-4000-8111-222222222222";
+        fs::create_dir_all(&projects)?;
+        fs::create_dir_all(victim.join(id))?;
+        fs::write(victim.join(id).join("sentinel"), "keep")?;
+        let link = projects.join("linked-project");
+
+        #[cfg(windows)]
+        if let Err(error) = std::os::windows::fs::symlink_dir(&victim, &link) {
+            if error.raw_os_error() == Some(1314) {
+                let output = std::process::Command::new("pwsh")
+                    .args([
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        "$ErrorActionPreference = 'Stop'; New-Item -ItemType Junction -Path $env:CC_TEST_LINK -Target $env:CC_TEST_TARGET | Out-Null",
+                    ])
+                    .env("CC_TEST_LINK", &link)
+                    .env("CC_TEST_TARGET", &victim)
+                    .output()?;
+                if !output.status.success() {
+                    return Err(AppError::Other(format!(
+                        "无法创建 junction 测试夹具: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    )));
+                }
+            } else {
+                return Err(error.into());
+            }
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&victim, &link)?;
+
+        let missing = link.join(format!("{id}.jsonl"));
+        let result = delete_claude_targets(&claude, vec![claude_target(id, Some(&missing))])?
+            .pop()
+            .expect("one delete result");
+
+        assert!(!result.ok);
+        assert_eq!(
+            fs::read_to_string(victim.join(id).join("sentinel"))?,
+            "keep"
+        );
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn delete_rejects_session_id_path_traversal() {
+        for invalid in ["", ".", "..", "../outside", "..\\outside", "id:stream"] {
+            assert!(validate_delete_id(invalid).is_err(), "accepted {invalid:?}");
+        }
+        assert!(validate_delete_id("agent-019d-safe_session").is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn delete_codex_rejects_rollout_root_junctions_without_touching_external_files() -> AppResult<()>
+    {
+        for root_name in ["sessions", "archived_sessions"] {
+            let root = temp_dir(&format!("codex-delete-{root_name}-junction"));
+            let codex = root.join("codex");
+            let victim = root.join("external-rollouts");
+            let id = format!("019d-{root_name}-junction-7000-8000-000000000001");
+            let rollout = victim.join(format!("rollout-2026-07-10T10-00-00-{id}.jsonl"));
+            fs::create_dir_all(&victim)?;
+            write_test_rollout(&rollout, &id, "external sentinel");
+            let expected = fs::read(&rollout)?;
+
+            drop(create_codex_threads_table(&codex)?);
+            let junction = codex.join(root_name);
+            if root_name == "sessions" {
+                fs::remove_dir(&junction)?;
+            }
+            create_windows_junction(&victim, &junction)?;
+
+            let error = match delete_codex_artifacts(&codex, &id) {
+                Ok(_) => panic!("rollout root junction must abort deletion"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("junction") || error.to_string().contains("链接"),
+                "unexpected error: {error}"
+            );
+            assert_eq!(fs::read(&rollout)?, expected);
+
+            fs::remove_dir(&junction)?;
+            fs::remove_dir_all(root).ok();
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn delete_codex_rejects_nested_junction_without_touching_external_files() -> AppResult<()> {
+        let root = temp_dir("codex-delete-nested-junction");
+        let codex = root.join("codex");
+        let victim = root.join("external-rollouts");
+        let id = "019d-nested-junction-7000-8000-000000000001";
+        let rollout = victim.join(format!("rollout-2026-07-10T10-00-00-{id}.jsonl"));
+        fs::create_dir_all(&victim)?;
+        write_test_rollout(&rollout, id, "external sentinel");
+        let expected = fs::read(&rollout)?;
+
+        drop(create_codex_threads_table(&codex)?);
+        let junction = codex.join("sessions").join("linked-day");
+        create_windows_junction(&victim, &junction)?;
+
+        let error = match delete_codex_artifacts(&codex, id) {
+            Ok(_) => panic!("nested rollout junction must abort deletion"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("junction") || error.to_string().contains("链接"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(fs::read(&rollout)?, expected);
+
+        fs::remove_dir(&junction)?;
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
     const ARCHIVE_TEST_ID: &str = "019dtest-1111-7000-8000-000000000001";
 
     fn write_test_rollout(path: &Path, id: &str, msg: &str) {
@@ -1021,17 +2207,136 @@ mod tests {
         active
     }
 
+    #[derive(Clone, Copy)]
+    struct FamilyBranchFixture<'a> {
+        id: &'a str,
+        archived: bool,
+    }
+
+    fn codex_family_fixture(
+        codex: &Path,
+        family_id: &str,
+        active_id: &str,
+        branches: &[FamilyBranchFixture<'_>],
+    ) -> AppResult<BTreeMap<String, PathBuf>> {
+        let conn = create_codex_threads_table(codex)?;
+        let mut paths_by_id = BTreeMap::new();
+        let mut chain = Vec::with_capacity(branches.len());
+        let mut index = BTreeMap::new();
+        let mut index_lines = String::new();
+
+        for branch in branches {
+            let file_name = format!("rollout-2026-05-10T10-00-00-{}.jsonl", branch.id);
+            let rollout = if branch.archived {
+                paths::archived_sessions_dir(codex).join(file_name)
+            } else {
+                paths::sessions_dir(codex)
+                    .join("2026")
+                    .join("05")
+                    .join("10")
+                    .join(file_name)
+            };
+            write_test_rollout(&rollout, branch.id, &format!("message for {}", branch.id));
+            conn.execute(
+                "INSERT INTO threads (
+                    id, rollout_path, cwd, title, first_user_message, model, reasoning_effort,
+                    tokens_used, created_at, updated_at, archived, archived_at, git_branch, source,
+                    agent_nickname, agent_role
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 0, 1770000000, 1770000300, ?7, ?8, NULL, NULL, NULL, NULL)",
+                params![
+                    branch.id,
+                    rollout.to_string_lossy().into_owned(),
+                    "F:\\w",
+                    format!("title for {}", branch.id),
+                    format!("message for {}", branch.id),
+                    "gpt-5",
+                    if branch.archived { 1 } else { 0 },
+                    if branch.archived { Some(1770000400_i64) } else { None },
+                ],
+            )?;
+
+            let (sha256, line_count) = if branch.archived {
+                let (sha256, line_count) = family::compute_integrity(&rollout)?;
+                (Some(sha256), Some(line_count))
+            } else {
+                (None, None)
+            };
+            let status = if branch.id == active_id {
+                BranchStatus::Active
+            } else {
+                BranchStatus::Archived
+            };
+            let relpath = rollout
+                .strip_prefix(codex)
+                .expect("fixture rollout belongs to codex dir")
+                .to_string_lossy()
+                .replace('\\', "/");
+            chain.push(FamilyBranch {
+                id: branch.id.to_string(),
+                provider: if branch.id == active_id {
+                    "custom".to_string()
+                } else {
+                    "openai".to_string()
+                },
+                created_at: "2026-05-10T10:00:00Z".to_string(),
+                status,
+                rollout_relpath: relpath,
+                sha256,
+                line_count,
+                note: None,
+            });
+            index.insert(branch.id.to_string(), family_id.to_string());
+            if !branch.archived {
+                index_lines.push_str(&format!(
+                    "{{\"id\":\"{}\",\"thread_name\":\"title for {}\",\"updated_at\":\"2026-05-10T10:00:00Z\"}}\n",
+                    branch.id, branch.id
+                ));
+            }
+            paths_by_id.insert(branch.id.to_string(), rollout);
+        }
+        drop(conn);
+
+        let root_id = branches
+            .first()
+            .map(|branch| branch.id)
+            .ok_or_else(|| AppError::Other("family fixture requires a branch".to_string()))?;
+        let mut families = BTreeMap::new();
+        families.insert(
+            family_id.to_string(),
+            Family {
+                family_id: family_id.to_string(),
+                root_id: root_id.to_string(),
+                title: "family fixture".to_string(),
+                chain,
+                active_id: active_id.to_string(),
+                updated_at: "2026-05-10T10:00:00Z".to_string(),
+            },
+        );
+        family::save(
+            codex,
+            &FamilyStore {
+                version: 1,
+                families,
+                index,
+            },
+        )?;
+        fs::write(paths::session_index_path(codex), index_lines)?;
+        Ok(paths_by_id)
+    }
+
     #[test]
     fn archive_moves_rollout_updates_threads_and_index() -> AppResult<()> {
         let codex = temp_dir("codex-archive");
         let active = archive_fixture(&codex);
         let codex_str = codex.to_string_lossy().into_owned();
+        let family_lock = family::FamilyLock::default();
 
-        set_archived(
+        set_archived_with_lock(
             Some("codex".into()),
             codex_str.clone(),
             ARCHIVE_TEST_ID.into(),
             true,
+            &family_lock,
         )?;
 
         let archived_path = codex
@@ -1056,11 +2361,12 @@ mod tests {
         drop(conn);
 
         // 取消归档：搬回原日期目录、复位 threads、补回索引
-        set_archived(
+        set_archived_with_lock(
             Some("codex".into()),
             codex_str,
             ARCHIVE_TEST_ID.into(),
             false,
+            &family_lock,
         )?;
         assert!(
             active.is_file(),
@@ -1080,6 +2386,304 @@ mod tests {
         assert!(index.contains(ARCHIVE_TEST_ID), "取消归档应补回索引行");
 
         fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn main_list_delete_removes_single_branch_family_and_all_metadata() -> AppResult<()> {
+        let codex = temp_dir("codex-delete-single-family");
+        let family_id = "family-single";
+        let active_id = "019d-family-single-active";
+        let paths_by_id = codex_family_fixture(
+            &codex,
+            family_id,
+            active_id,
+            &[FamilyBranchFixture {
+                id: active_id,
+                archived: false,
+            }],
+        )?;
+        let lock = family::FamilyLock::default();
+
+        let results = delete_sessions_with_lock(
+            Some("codex".to_string()),
+            codex.to_string_lossy().into_owned(),
+            None,
+            vec![active_id.to_string()],
+            None,
+            &lock,
+        )?;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, active_id);
+        assert!(results[0].ok, "{:?}", results[0].error);
+        assert_eq!(results[0].threads_rows_deleted, 1);
+        assert!(results[0].rollout_deleted);
+        assert!(!paths_by_id[active_id].exists());
+        let store = family::load(&codex)?;
+        assert!(!store.families.contains_key(family_id));
+        assert!(!store.index.contains_key(active_id));
+        let conn = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let remaining: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM threads WHERE id = ?",
+            [active_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(remaining, 0);
+        assert!(!fs::read_to_string(paths::session_index_path(&codex))?.contains(active_id));
+
+        drop(conn);
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn main_list_delete_removes_all_continuous_family_branches_without_promotion() -> AppResult<()>
+    {
+        let codex = temp_dir("codex-delete-continuous-family");
+        let family_id = "family-continuous";
+        let archived_id = "019d-family-continuous-archived";
+        let active_id = "019d-family-continuous-active";
+        let paths_by_id = codex_family_fixture(
+            &codex,
+            family_id,
+            active_id,
+            &[
+                FamilyBranchFixture {
+                    id: archived_id,
+                    archived: true,
+                },
+                FamilyBranchFixture {
+                    id: active_id,
+                    archived: false,
+                },
+            ],
+        )?;
+        let lock = family::FamilyLock::default();
+
+        let results = delete_sessions_with_lock(
+            Some("codex".to_string()),
+            codex.to_string_lossy().into_owned(),
+            None,
+            vec![active_id.to_string()],
+            None,
+            &lock,
+        )?;
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].ok, "{:?}", results[0].error);
+        assert_eq!(results[0].threads_rows_deleted, 2);
+        assert!(results[0].rollout_deleted);
+        assert!(paths_by_id.values().all(|path| !path.exists()));
+        let store = family::load(&codex)?;
+        assert!(
+            store.families.is_empty(),
+            "family must not promote a branch"
+        );
+        assert!(store.index.is_empty());
+        let conn = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let remaining: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM threads WHERE id IN (?1, ?2)",
+            params![archived_id, active_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(remaining, 0);
+
+        drop(conn);
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn batch_delete_same_family_keeps_input_order_and_executes_physical_delete_once(
+    ) -> AppResult<()> {
+        let codex = temp_dir("codex-delete-family-batch-dedup");
+        let family_id = "family-batch";
+        let archived_id = "019d-family-batch-archived";
+        let active_id = "019d-family-batch-active";
+        let paths_by_id = codex_family_fixture(
+            &codex,
+            family_id,
+            active_id,
+            &[
+                FamilyBranchFixture {
+                    id: archived_id,
+                    archived: true,
+                },
+                FamilyBranchFixture {
+                    id: active_id,
+                    archived: false,
+                },
+            ],
+        )?;
+        let lock = family::FamilyLock::default();
+
+        let results = delete_sessions_with_lock(
+            Some("codex".to_string()),
+            codex.to_string_lossy().into_owned(),
+            None,
+            vec![archived_id.to_string(), active_id.to_string()],
+            None,
+            &lock,
+        )?;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, archived_id);
+        assert_eq!(results[1].id, active_id);
+        assert!(results.iter().all(|result| result.ok));
+        assert_eq!(results[0].threads_rows_deleted, 2);
+        assert_eq!(
+            results[1].threads_rows_deleted, 2,
+            "the second result must reuse the one physical family deletion"
+        );
+        assert!(paths_by_id.values().all(|path| !path.exists()));
+        let store = family::load(&codex)?;
+        assert!(!store.families.contains_key(family_id));
+        assert!(store
+            .index
+            .values()
+            .all(|indexed_family| indexed_family != family_id));
+
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn conflicting_family_mapping_causes_zero_destructive_changes() -> AppResult<()> {
+        let codex = temp_dir("codex-delete-family-conflict");
+        let family_id = "family-conflict";
+        let active_id = "019d-family-conflict-active";
+        let paths_by_id = codex_family_fixture(
+            &codex,
+            family_id,
+            active_id,
+            &[FamilyBranchFixture {
+                id: active_id,
+                archived: false,
+            }],
+        )?;
+        let mut broken_store = family::load(&codex)?;
+        broken_store.index.remove(active_id);
+        fs::write(
+            paths::family_store_path(&codex),
+            serde_json::to_vec_pretty(&broken_store)?,
+        )?;
+        let family_before = fs::read(paths::family_store_path(&codex))?;
+        let index_before = fs::read(paths::session_index_path(&codex))?;
+        let rollout_before = fs::read(&paths_by_id[active_id])?;
+        let lock = family::FamilyLock::default();
+
+        let results = delete_sessions_with_lock(
+            Some("codex".to_string()),
+            codex.to_string_lossy().into_owned(),
+            None,
+            vec![active_id.to_string()],
+            None,
+            &lock,
+        )?;
+
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].ok);
+        assert!(results[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("index"));
+        assert_eq!(fs::read(paths::family_store_path(&codex))?, family_before);
+        assert_eq!(fs::read(paths::session_index_path(&codex))?, index_before);
+        assert_eq!(fs::read(&paths_by_id[active_id])?, rollout_before);
+        let conn = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let remaining: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM threads WHERE id = ?",
+            [active_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(remaining, 1);
+
+        drop(conn);
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn archive_roundtrip_preserves_family_role_and_refreshes_integrity() -> AppResult<()> {
+        let codex = temp_dir("codex-archive-family-roundtrip");
+        let family_id = "family-archive-roundtrip";
+        let active_id = "019d-family-archive-roundtrip-active";
+        let paths_by_id = codex_family_fixture(
+            &codex,
+            family_id,
+            active_id,
+            &[FamilyBranchFixture {
+                id: active_id,
+                archived: false,
+            }],
+        )?;
+        let original_relpath = paths_by_id[active_id]
+            .strip_prefix(&codex)
+            .expect("fixture rollout belongs to codex dir")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let lock = family::FamilyLock::default();
+
+        set_archived_with_lock(
+            Some("codex".to_string()),
+            codex.to_string_lossy().into_owned(),
+            active_id.to_string(),
+            true,
+            &lock,
+        )?;
+
+        let archived_path = paths::archived_sessions_dir(&codex).join(
+            paths_by_id[active_id]
+                .file_name()
+                .expect("fixture rollout file name"),
+        );
+        let expected_integrity = family::compute_integrity(&archived_path)?;
+        let archived_store = family::load(&codex)?;
+        let archived_family = archived_store
+            .families
+            .get(family_id)
+            .expect("family remains after manual archive");
+        let archived_branch = archived_family
+            .chain
+            .iter()
+            .find(|branch| branch.id == active_id)
+            .expect("active branch remains in family");
+        assert_eq!(archived_family.active_id, active_id);
+        assert!(matches!(archived_branch.status, BranchStatus::Active));
+        assert_eq!(archived_branch.rollout_relpath, original_relpath);
+        assert_eq!(
+            archived_branch.sha256.as_deref(),
+            Some(expected_integrity.0.as_str())
+        );
+        assert_eq!(archived_branch.line_count, Some(expected_integrity.1));
+
+        set_archived_with_lock(
+            Some("codex".to_string()),
+            codex.to_string_lossy().into_owned(),
+            active_id.to_string(),
+            false,
+            &lock,
+        )?;
+
+        let restored_store = family::load(&codex)?;
+        let restored_family = restored_store
+            .families
+            .get(family_id)
+            .expect("family remains after unarchive");
+        let restored_branch = restored_family
+            .chain
+            .iter()
+            .find(|branch| branch.id == active_id)
+            .expect("active branch remains in family");
+        assert_eq!(restored_family.active_id, active_id);
+        assert!(matches!(restored_branch.status, BranchStatus::Active));
+        assert_eq!(restored_branch.rollout_relpath, original_relpath);
+        assert_eq!(restored_branch.sha256, None);
+        assert_eq!(restored_branch.line_count, None);
+
+        fs::remove_dir_all(codex).ok();
         Ok(())
     }
 

@@ -12,6 +12,7 @@ import { bucketLabel, dayBucket } from "@/lib/format";
 import { useSelection } from "@/stores/selection";
 import { useView } from "@/stores/view";
 import { cn } from "@/lib/utils";
+import { sessionIdentity } from "@/lib/sessionIdentity";
 
 type Handlers = {
   onPreview: (s: SessionSummary) => void;
@@ -48,7 +49,7 @@ export function SessionList({ sessions, backupIndex, overlay, currentProvider, .
     () =>
       filtered.map((s) => ({
         ...s,
-        has_backup: backupIndex ? !!backupIndex[s.id]?.length : s.has_backup,
+        has_backup: backupIndex ? !!backupIndex[sessionIdentity(s)]?.length : s.has_backup,
       })),
     [filtered, backupIndex],
   );
@@ -157,10 +158,10 @@ function TimeView({
             <div className="mt-3 min-w-0 space-y-3">
               {g.items.map((s) => (
                 <SessionCard
-                  key={s.id}
+                  key={sessionIdentity(s)}
                   s={s}
-                  selected={selected.has(s.id)}
-                  onToggleSelect={toggle}
+                  selected={selected.has(sessionIdentity(s))}
+                  onToggleSelect={() => toggle(sessionIdentity(s))}
                   query={query}
                   overlay={overlay?.get(s.id)}
                   currentProvider={currentProvider}
@@ -239,7 +240,7 @@ function SizeView({
   const toggle = useSelection((s) => s.toggle);
 
   const sorted = useMemo(
-    () => [...sessions].sort(compareSessionSizeAsc),
+    () => [...sessions].sort(compareSessionSizeDesc),
     [sessions],
   );
 
@@ -247,10 +248,10 @@ function SizeView({
     <div className="min-w-0 max-w-full space-y-3 overflow-hidden px-6 py-5">
       {sorted.map((s) => (
         <SessionCard
-          key={s.id}
+          key={sessionIdentity(s)}
           s={s}
-          selected={selected.has(s.id)}
-          onToggleSelect={toggle}
+          selected={selected.has(sessionIdentity(s))}
+          onToggleSelect={() => toggle(sessionIdentity(s))}
           query={query}
           overlay={overlay?.get(s.id)}
           currentProvider={currentProvider}
@@ -261,10 +262,10 @@ function SizeView({
   );
 }
 
-function compareSessionSizeAsc(a: SessionSummary, b: SessionSummary): number {
-  const tokenDelta = a.tokens_used - b.tokens_used;
+function compareSessionSizeDesc(a: SessionSummary, b: SessionSummary): number {
+  const tokenDelta = b.tokens_used - a.tokens_used;
   if (tokenDelta !== 0) return tokenDelta;
-  const bytesDelta = a.rollout_bytes - b.rollout_bytes;
+  const bytesDelta = b.rollout_bytes - a.rollout_bytes;
   if (bytesDelta !== 0) return bytesDelta;
   const updatedDelta = b.updated_at - a.updated_at;
   if (updatedDelta !== 0) return updatedDelta;

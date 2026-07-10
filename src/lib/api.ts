@@ -131,13 +131,23 @@ export type SessionMetaBrief = {
 
 export type DeleteResult = {
   id: string;
+  rollout_path: string | null;
   threads_rows_deleted: number;
   logs_rows_deleted: number;
   history_rows_deleted: number;
   rollout_deleted: boolean;
   rollout_missing: boolean;
+  sidecar_deleted: boolean;
+  tasks_deleted: boolean;
+  file_history_deleted: boolean;
+  shared_data_preserved: boolean;
   ok: boolean;
   error: string | null;
+};
+
+export type DeleteTarget = {
+  id: string;
+  rollout_path?: string;
 };
 
 export type DeletePlanLine = {
@@ -200,6 +210,11 @@ export type ManifestSession = {
   rollout_relpath: string;
   source_relpath: string | null;
   sidecar_relpath: string | null;
+  sidecar_files?: Array<{
+    relpath: string;
+    bytes: number;
+    sha256: string;
+  }>;
   title: string;
   cwd: string;
   created_at: number;
@@ -220,6 +235,11 @@ export type Manifest = {
   codex_dir: string;
   claude_dir: string | null;
   note: string | null;
+  artifacts?: Array<{
+    relpath: string;
+    bytes: number;
+    sha256: string;
+  }>;
   sessions: ManifestSession[];
 };
 
@@ -526,6 +546,16 @@ export type BundleManifest = {
   sha256_rollout: string;
   rollout_line_count: number;
   has_history: boolean;
+  artifacts?: Array<{
+    relpath: string;
+    bytes: number;
+    sha256: string;
+  }>;
+};
+
+export type BundleExportTarget = {
+  id: string;
+  rollout_path?: string;
 };
 
 export type BundleListItem = {
@@ -635,13 +665,22 @@ export const api = {
     codexDir: string,
     id: string,
     claudeDir?: string,
-  ) => invokeCommand<DeleteResult>("delete_session", { provider, codexDir, claudeDir, id }),
+    target?: DeleteTarget,
+  ) => invokeCommand<DeleteResult>("delete_session", { provider, codexDir, claudeDir, id, target }),
   deleteSessions: (
     provider: SessionProvider,
     codexDir: string,
     ids: string[],
     claudeDir?: string,
-  ) => invokeCommand<DeleteResult[]>("delete_sessions", { provider, codexDir, claudeDir, ids }),
+    targets?: DeleteTarget[],
+  ) =>
+    invokeCommand<DeleteResult[]>("delete_sessions", {
+      provider,
+      codexDir,
+      claudeDir,
+      ids,
+      targets,
+    }),
 
   previewHead: (provider: SessionProvider, rolloutPath: string, limit: number) =>
     invokeCommand<PreviewEvent[]>("preview_session_head", { provider, rolloutPath, limit }),
@@ -671,6 +710,7 @@ export const api = {
     claude_dir?: string;
     backup_dir: string;
     ids: string[];
+    targets?: BundleExportTarget[];
     name?: string;
     note?: string;
   }) =>
@@ -680,30 +720,37 @@ export const api = {
       claudeDir: p.claude_dir,
       backupDir: p.backup_dir,
       ids: p.ids,
+      targets: p.targets,
       name: p.name,
       note: p.note,
     }),
   listBackups: (backupDir: string, provider?: SessionProvider) =>
     invokeCommand<BackupSummary[]>("list_backups", { backupDir, provider }),
-  openBackup: (backupPath: string) => invokeCommand<BackupDetail>("open_backup", { backupPath }),
+  openBackup: (backupDir: string, backupPath: string) =>
+    invokeCommand<BackupDetail>("open_backup", { backupDir, backupPath }),
   restoreSession: (p: {
     provider: SessionProvider;
+    backup_dir: string;
     backup_path: string;
     codex_dir: string;
     claude_dir?: string;
     id: string;
+    backup_rollout_relpath?: string;
     overwrite: boolean;
   }) =>
     invokeCommand<RestoreResult>("restore_session", {
       provider: p.provider,
+      backupDir: p.backup_dir,
       backupPath: p.backup_path,
       codexDir: p.codex_dir,
       claudeDir: p.claude_dir,
       id: p.id,
+      backupRolloutRelpath: p.backup_rollout_relpath,
       overwrite: p.overwrite,
     }),
   restoreAll: (p: {
     provider: SessionProvider;
+    backup_dir: string;
     backup_path: string;
     codex_dir: string;
     claude_dir?: string;
@@ -711,13 +758,16 @@ export const api = {
   }) =>
     invokeCommand<RestoreResult[]>("restore_all", {
       provider: p.provider,
+      backupDir: p.backup_dir,
       backupPath: p.backup_path,
       codexDir: p.codex_dir,
       claudeDir: p.claude_dir,
       overwrite: p.overwrite,
     }),
-  deleteBackup: (backupPath: string) => invokeCommand<void>("delete_backup", { backupPath }),
-  verifyBackup: (backupPath: string) => invokeCommand<VerifyReport>("verify_backup", { backupPath }),
+  deleteBackup: (backupDir: string, backupPath: string) =>
+    invokeCommand<void>("delete_backup", { backupDir, backupPath }),
+  verifyBackup: (backupDir: string, backupPath: string) =>
+    invokeCommand<VerifyReport>("verify_backup", { backupDir, backupPath }),
 
   statsKpi: (p: {
     provider: StatsProvider;
@@ -960,6 +1010,8 @@ export const api = {
       sessionId: p.session_id,
       backupDir: p.backup_dir,
     }),
+  getProviderSyncPlan: (codexDir: string) =>
+    invokeCommand<string[]>("get_provider_sync_plan", { codexDir }),
   batchCloneForCurrentProvider: (p: {
     codex_dir: string;
     strategy: SwitchStrategy;
@@ -1003,6 +1055,7 @@ export const api = {
     claude_dir?: string;
     out_dir: string;
     ids: string[];
+    targets?: BundleExportTarget[];
     machine_label?: string;
     export_group?: string;
   }) =>
@@ -1012,6 +1065,7 @@ export const api = {
       claudeDir: p.claude_dir,
       outDir: p.out_dir,
       ids: p.ids,
+      targets: p.targets,
       machineLabel: p.machine_label,
       exportGroup: p.export_group,
     }),

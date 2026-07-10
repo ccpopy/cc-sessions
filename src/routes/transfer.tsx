@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Archive,
   CheckCircle2,
@@ -16,6 +16,7 @@ import { toast } from "sonner";
 
 import { TopBar } from "@/components/TopBar";
 import { EmptyState } from "@/components/EmptyState";
+import { DangerDialog } from "@/components/DangerDialog";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -45,8 +46,10 @@ import {
   type ImportMode,
   type ProjectPathMapping,
   type SessionProvider,
+  type SessionSummary,
 } from "@/lib/api";
 import { copyText } from "@/lib/clipboard";
+import { sessionIdentity } from "@/lib/sessionIdentity";
 import { pickDirectoryPath, pickFilePath, saveFilePath } from "@/lib/dialog";
 import { humanBytes, humanTokens } from "@/lib/format";
 import { basename, dirname, joinPath } from "@/lib/cwd";
@@ -109,7 +112,7 @@ function ExportPanel({
   const [exportGroup, setExportGroup] = useState("default");
   const [activeOnly, setActiveOnly] = useState(true);
   const [sessionSearch, setSessionSearch] = useState("");
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [selectedSessionKeys, setSelectedSessionKeys] = useState<Set<string>>(new Set());
   const [running, setRunning] = useState(false);
   const [lastZipSource, setLastZipSource] = useState<string | null>(null);
 
@@ -121,11 +124,17 @@ function ExportPanel({
     }
   };
 
-  const toggle = (id: string) => {
-    setSelectedIds((prev) => {
+  useEffect(() => {
+    setSelectedSessionKeys(new Set());
+    setLastZipSource(null);
+  }, [provider]);
+
+  const toggle = (session: SessionSummary) => {
+    const key = sessionIdentity(session);
+    setSelectedSessionKeys((prev) => {
       const n = new Set(prev);
-      if (n.has(id)) n.delete(id);
-      else n.add(id);
+      if (n.has(key)) n.delete(key);
+      else n.add(key);
       return n;
     });
   };
@@ -156,21 +165,27 @@ function ExportPanel({
     });
   }, [sessions, sessionSearch]);
   const visibleSessions = useMemo(() => filteredSessions.slice(0, 500), [filteredSessions]);
-  const visibleSelectedCount = visibleSessions.filter((s) => selectedIds.has(s.id)).length;
+  const selectedSessions = useMemo(
+    () => sessions.filter((session) => selectedSessionKeys.has(sessionIdentity(session))),
+    [sessions, selectedSessionKeys],
+  );
+  const visibleSelectedCount = visibleSessions.filter((s) =>
+    selectedSessionKeys.has(sessionIdentity(s)),
+  ).length;
   const allSelected =
     visibleSessions.length > 0 &&
-    visibleSessions.every((s) => selectedIds.has(s.id));
+    visibleSessions.every((s) => selectedSessionKeys.has(sessionIdentity(s)));
   const someSelected =
-    !allSelected && visibleSessions.some((s) => selectedIds.has(s.id));
+    !allSelected && visibleSessions.some((s) => selectedSessionKeys.has(sessionIdentity(s)));
   const toggleAll = () => {
-    setSelectedIds((prev) => {
+    setSelectedSessionKeys((prev) => {
       if (allSelected) {
         const n = new Set(prev);
-        for (const s of visibleSessions) n.delete(s.id);
+        for (const s of visibleSessions) n.delete(sessionIdentity(s));
         return n;
       }
       const n = new Set(prev);
-      for (const s of visibleSessions) n.add(s.id);
+      for (const s of visibleSessions) n.add(sessionIdentity(s));
       return n;
     });
   };
@@ -183,13 +198,17 @@ function ExportPanel({
     }
   };
 
-  const exportIds = async (ids: string[]) => {
+  const exportSessions = async (selected: SessionSummary[]) => {
     const r = await api.exportSessionBundles({
       provider,
       codex_dir: codexDir,
       claude_dir: claudeDir,
       out_dir: outDir,
-      ids,
+      ids: selected.map((session) => session.id),
+      targets: selected.map((session) => ({
+        id: session.id,
+        rollout_path: session.rollout_path,
+      })),
       machine_label: machineLabel || undefined,
       export_group: exportGroup || undefined,
     });
@@ -199,12 +218,12 @@ function ExportPanel({
 
   const exportSelected = async () => {
     if (!outDir) return toast.error("请先选择导出目录");
-    if (selectedIds.size === 0) return toast.error("请先勾选要导出的会话");
+    if (selectedSessions.length === 0) return toast.error("请先勾选要导出的会话");
     setRunning(true);
     try {
-      const r = await exportIds(Array.from(selectedIds));
+      const r = await exportSessions(selectedSessions);
       const ok = r.filter((x) => x.ok).length;
-      toast.success(`已导出 ${ok}/${r.length} 条会话数据`);
+      notifyExportResult(r, `已导出 ${ok}/${r.length} 条会话数据`);
     } catch (e) {
       toast.error(String((e as Error)?.message ?? e));
     } finally {
@@ -226,7 +245,10 @@ function ExportPanel({
         active_only: activeOnly,
       });
       const ok = r.filter((x) => x.ok).length;
-      toast.success(`已导出 ${ok}/${r.length} 条会话数据${activeOnly ? "（仅包含活跃记录）" : ""}`);
+      notifyExportResult(
+        r,
+        `已导出 ${ok}/${r.length} 条会话数据${activeOnly ? "（仅包含活跃记录）" : ""}`,
+      );
       setLastZipSource(zipSourceFromReports(r));
     } catch (e) {
       toast.error(String((e as Error)?.message ?? e));
@@ -237,7 +259,7 @@ function ExportPanel({
 
   const packZip = async () => {
     if (!outDir) return toast.error("请先选择导出目录");
-    if (selectedIds.size === 0 && !lastZipSource) {
+    if (selectedSessions.length === 0 && !lastZipSource) {
       return toast.error("请先勾选要导出的会话，或先完成一次导出");
     }
     const zipPath = await saveFilePath({
@@ -249,8 +271,8 @@ function ExportPanel({
     setRunning(true);
     try {
       let zipSource = lastZipSource;
-      if (selectedIds.size > 0) {
-        const reports = await exportIds(Array.from(selectedIds));
+      if (selectedSessions.length > 0) {
+        const reports = await exportSessions(selectedSessions);
         zipSource = zipSourceFromReports(reports);
         const ok = reports.filter((x) => x.ok).length;
         if (!zipSource) {
@@ -340,11 +362,11 @@ function ExportPanel({
                 size="sm"
                 variant="outline"
                 onClick={exportSelected}
-                disabled={running || selectedIds.size === 0}
+                disabled={running || selectedSessions.length === 0}
                 className="gap-1.5"
               >
                 <Upload className="h-3.5 w-3.5" />
-                导出勾选（{selectedIds.size}）
+                导出勾选（{selectedSessions.length}）
               </Button>
               <Button
                 size="sm"
@@ -359,7 +381,7 @@ function ExportPanel({
                 size="sm"
                 variant="outline"
                 onClick={packZip}
-                disabled={running || (selectedIds.size === 0 && !lastZipSource)}
+                disabled={running || (selectedSessions.length === 0 && !lastZipSource)}
                 className="gap-1.5"
               >
                 <FileArchive className="h-3.5 w-3.5" />
@@ -430,16 +452,16 @@ function ExportPanel({
                     <ul className="divide-y text-xs">
                       {visibleSessions.map((s) => (
                         <li
-                          key={s.id}
+                          key={sessionIdentity(s)}
                           className={`grid grid-cols-[2rem_8rem_minmax(0,1fr)_9rem_5rem] items-center gap-2 px-3 py-2 ${
-                            selectedIds.has(s.id)
+                            selectedSessionKeys.has(sessionIdentity(s))
                               ? "bg-primary/5"
                               : "hover:bg-muted/30"
                           }`}
                         >
                           <Checkbox
-                            checked={selectedIds.has(s.id)}
-                            onCheckedChange={() => toggle(s.id)}
+                            checked={selectedSessionKeys.has(sessionIdentity(s))}
+                            onCheckedChange={() => toggle(s)}
                             aria-label="选择该会话"
                           />
                           <Tooltip>
@@ -492,6 +514,23 @@ function zipSourceFromReports(reports: ExportReport[]): string | null {
   return parentDirs.length === 1 ? parentDirs[0] : null;
 }
 
+function notifyExportResult(reports: ExportReport[], summary: string) {
+  const failed = reports.filter((report) => !report.ok);
+  const description = failed
+    .map((report) => `${report.session_id.slice(0, 8)}：${report.error ?? report.skipped_reason ?? "导出失败"}`)
+    .slice(0, 3)
+    .join("\n");
+  if (reports.length === 0 || failed.length === reports.length) {
+    toast.error(reports.length === 0 ? "没有找到可导出的会话" : summary, {
+      description: description || undefined,
+    });
+  } else if (failed.length > 0) {
+    toast.warning(summary, { description: description || undefined });
+  } else {
+    toast.success(summary);
+  }
+}
+
 // ========================= 导入 =========================
 
 function ImportPanel({
@@ -511,6 +550,16 @@ function ImportPanel({
   const [running, setRunning] = useState(false);
   const [scanLoading, setScanLoading] = useState(false);
   const [projectTargets, setProjectTargets] = useState<Record<string, string>>({});
+  const [confirmImport, setConfirmImport] = useState(false);
+  const [verifiedSource, setVerifiedSource] = useState<{
+    dir: string;
+    provider: SessionProvider;
+  } | null>(null);
+  const scanGeneration = useRef(0);
+  const latestSource = useRef(srcDir);
+  const latestProvider = useRef(provider);
+  latestSource.current = srcDir;
+  latestProvider.current = provider;
 
   const pickDir = async () => {
     const picked = await pickDirectoryPath();
@@ -530,7 +579,6 @@ function ImportPanel({
         const r = await api.unpackZipToTemp(picked);
         toast.success(`已读取 zip：${r.files} 文件 · ${humanBytes(r.bytes)}`);
         setSrcDir(r.path);
-        await rescan(r.path);
       } catch (e) {
         toast.error(String((e as Error)?.message ?? e));
       } finally {
@@ -541,18 +589,37 @@ function ImportPanel({
 
   const rescan = useCallback(
     async (dir: string) => {
-      if (!dir) return;
+      const generation = ++scanGeneration.current;
+      setItems([]);
+      setProjectTargets({});
+      setVerifiedSource(null);
+      if (!dir) {
+        setScanLoading(false);
+        return;
+      }
       setScanLoading(true);
       try {
         const r = await api.verifyBundlesCmd(dir, provider);
+        if (
+          generation !== scanGeneration.current ||
+          latestSource.current !== dir ||
+          latestProvider.current !== provider
+        ) {
+          return;
+        }
         setItems(r);
+        setVerifiedSource({ dir, provider });
       } catch (e) {
-        toast.error(String((e as Error)?.message ?? e));
+        if (generation === scanGeneration.current) {
+          toast.error(String((e as Error)?.message ?? e));
+        }
       } finally {
-        setScanLoading(false);
+        if (generation === scanGeneration.current) {
+          setScanLoading(false);
+        }
       }
     },
-    [],
+    [provider],
   );
 
   useEffect(() => {
@@ -605,17 +672,43 @@ function ImportPanel({
   };
 
   const runImport = async () => {
-    if (!srcDir) return toast.error("请先选择数据所在的目录或解压好的 zip 文件夹");
+    if (!srcDir) {
+      toast.error("请先选择数据所在的目录或解压好的 zip 文件夹");
+      return;
+    }
+    if (
+      scanLoading ||
+      verifiedSource?.dir !== srcDir ||
+      verifiedSource?.provider !== provider
+    ) {
+      toast.error("数据源尚未完成当前服务商的校验，请等待扫描完成");
+      return;
+    }
+    const sourceAtStart = srcDir;
+    const providerAtStart = provider;
+    const reviewedScan = JSON.stringify(items);
     setRunning(true);
     try {
+      const currentScan = await api.verifyBundlesCmd(sourceAtStart, providerAtStart);
+      if (
+        latestSource.current !== sourceAtStart ||
+        latestProvider.current !== providerAtStart
+      ) {
+        throw new Error("导入期间数据源或服务商已改变，已取消本次导入");
+      }
+      setItems(currentScan);
+      setVerifiedSource({ dir: sourceAtStart, provider: providerAtStart });
+      if (JSON.stringify(currentScan) !== reviewedScan) {
+        throw new Error("数据源内容在确认后发生变化，已刷新列表，请核对后重新导入");
+      }
       const projectMappings = buildProjectMappings();
       const r = await api.importSessionBundles({
-        provider,
-        src_dir: srcDir,
+        provider: providerAtStart,
+        src_dir: sourceAtStart,
         codex_dir: codexDir,
         claude_dir: claudeDir,
         mode,
-        make_visible: provider === "codex" ? makeVisible : false,
+        make_visible: providerAtStart === "codex" ? makeVisible : false,
         strict,
         project_mappings: projectMappings,
       });
@@ -623,10 +716,22 @@ function ImportPanel({
       const skipped = r.filter((x) => x.skipped_reason).length;
       const fail = r.filter((x) => x.error).length;
       const shaBad = r.filter((x) => x.sha_mismatch).length;
-      toast.success(
-        `导入完成：${ok}/${r.length}${skipped ? ` · ${skipped} 条跳过` : ""}${fail ? ` · ${fail} 条失败` : ""}${shaBad ? ` · ${shaBad} 条 sha 不一致` : ""}`,
-      );
-      await rescan(srcDir);
+      const summary = `导入完成：${ok}/${r.length}${skipped ? ` · ${skipped} 条跳过` : ""}${fail ? ` · ${fail} 条失败` : ""}${shaBad ? ` · ${shaBad} 条 sha 不一致` : ""}`;
+      const failedDetails = r
+        .filter((item) => !item.ok || item.error)
+        .map((item) => `${item.session_id.slice(0, 8)}：${item.error ?? "未完整导入"}`)
+        .slice(0, 3)
+        .join("\n");
+      if (r.length === 0 || ok === 0) {
+        toast.error(r.length === 0 ? "没有找到可导入的会话数据" : summary, {
+          description: failedDetails || undefined,
+        });
+      } else if (fail > 0 || shaBad > 0 || ok < r.length) {
+        toast.warning(summary, { description: failedDetails || undefined });
+      } else {
+        toast.success(summary);
+      }
+      await rescan(sourceAtStart);
     } catch (e) {
       toast.error(String((e as Error)?.message ?? e));
     } finally {
@@ -797,8 +902,20 @@ function ImportPanel({
               </Button>
               <Button
                 size="sm"
-                onClick={runImport}
-                disabled={running || items.length === 0}
+                onClick={() => {
+                  if (mode === "skip") {
+                    void runImport();
+                  } else {
+                    setConfirmImport(true);
+                  }
+                }}
+                disabled={
+                  running ||
+                  scanLoading ||
+                  items.length === 0 ||
+                  verifiedSource?.dir !== srcDir ||
+                  verifiedSource?.provider !== provider
+                }
                 className="gap-1.5"
               >
                 <Download className="h-3.5 w-3.5" />
@@ -923,6 +1040,25 @@ function ImportPanel({
           </CardContent>
         </Card>
       )}
+
+      <DangerDialog
+        open={confirmImport}
+        onOpenChange={setConfirmImport}
+        title={mode === "overwrite" ? "确认强制覆盖本地会话" : "确认按更新时间替换本地会话"}
+        confirmText={mode === "overwrite" ? "强制覆盖并导入" : "比较后导入"}
+        onConfirm={runImport}
+      >
+        <p>
+          将处理 <b>{items.length}</b> 条 {provider === "codex" ? "Codex" : "Claude"} 会话，
+          目标目录：<code>{provider === "codex" ? codexDir : claudeDir}</code>。
+        </p>
+        <p>
+          {mode === "overwrite"
+            ? "同 ID 的本地会话会被导入数据直接替换。"
+            : "只有 bundle 的会话更新时间明确晚于本地时才会替换；无法可靠比较时保留本地。"}
+        </p>
+        <p className="text-destructive">覆盖前不会自动创建备份，请确认重要会话已有可用备份。</p>
+      </DangerDialog>
     </div>
   );
 }

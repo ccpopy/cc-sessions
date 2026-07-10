@@ -12,6 +12,7 @@ import type { FamilyOverlay, SessionSummary } from "@/lib/api";
 import { useSelection } from "@/stores/selection";
 import { humanTokens, relativeTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
+import { sessionIdentity } from "@/lib/sessionIdentity";
 
 type Handlers = {
   onPreview: (s: SessionSummary) => void;
@@ -52,7 +53,7 @@ export function ProjectGroupView({
   const addMany = useSelection((s) => s.addMany);
   const removeMany = useSelection((s) => s.removeMany);
 
-  const ids = sessions.map((s) => s.id);
+  const ids = sessions.map(sessionIdentity);
   const allSelected = ids.every((id) => selected.has(id));
   const someSelected = !allSelected && ids.some((id) => selected.has(id));
 
@@ -109,10 +110,10 @@ export function ProjectGroupView({
         <div className="min-w-0 space-y-3 bg-muted/20 p-4">
           {sessions.map((s) => (
             <SessionCard
-              key={s.id}
+              key={sessionIdentity(s)}
               s={s}
-              selected={selected.has(s.id)}
-              onToggleSelect={toggle}
+              selected={selected.has(sessionIdentity(s))}
+              onToggleSelect={() => toggle(sessionIdentity(s))}
               query={query}
               showProject={false}
               overlay={overlay?.get(s.id)}

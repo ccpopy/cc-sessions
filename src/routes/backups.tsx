@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { Archive, ChevronRight, RotateCcw, ShieldCheck, Trash2 } from "lucide-react";
+import { AlertTriangle, Archive, ChevronRight, RotateCcw, ShieldCheck, Trash2 } from "lucide-react";
 import { TopBar } from "@/components/TopBar";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -17,7 +17,7 @@ import { toast } from "sonner";
 
 export default function BackupsRoute({ provider = "codex" }: { provider?: SessionProvider }) {
   const settings = useSettings((s) => s.settings);
-  const { backups, loading, refresh } = useBackups(provider);
+  const { backups, loading, error, refresh } = useBackups(provider);
   const [delTarget, setDelTarget] = useState<BackupSummary | null>(null);
   const [restoreTarget, setRestoreTarget] = useState<BackupSummary | null>(null);
 
@@ -43,6 +43,17 @@ export default function BackupsRoute({ provider = "codex" }: { provider?: Sessio
 
         {loading ? (
           <EmptyState title="加载中…" />
+        ) : error ? (
+          <EmptyState
+            icon={<AlertTriangle className="h-10 w-10" />}
+            title="读取备份失败"
+            description={error}
+            action={
+              <Button variant="outline" onClick={() => void refresh()}>
+                重试
+              </Button>
+            }
+          />
         ) : backups.length === 0 ? (
           <EmptyState
             icon={<Archive className="h-10 w-10" />}
@@ -124,8 +135,8 @@ export default function BackupsRoute({ provider = "codex" }: { provider?: Sessio
         title="删除备份"
         confirmText="删除备份"
         onConfirm={async () => {
-          if (!delTarget) return;
-          await api.deleteBackup(delTarget.path);
+          if (!delTarget || !settings) return;
+          await api.deleteBackup(settings.backup_dir, delTarget.path);
           toast.success("备份已删除");
           await refresh();
         }}
@@ -143,6 +154,7 @@ export default function BackupsRoute({ provider = "codex" }: { provider?: Sessio
           if (!restoreTarget || !settings) return;
           const r = await api.restoreAll({
             provider,
+            backup_dir: settings.backup_dir,
             backup_path: restoreTarget.path,
             codex_dir: settings.codex_dir,
             claude_dir: settings.claude_dir,
@@ -150,7 +162,24 @@ export default function BackupsRoute({ provider = "codex" }: { provider?: Sessio
           });
           const ok = r.filter((x) => x.ok).length;
           const conflict = r.filter((x) => x.conflict).length;
-          toast.success(`已还原 ${ok}/${r.length}${conflict ? `（${conflict} 条跳过冲突）` : ""}`);
+          const failed = r.filter((x) => !x.ok && !x.conflict);
+          const summary = `已还原 ${ok}/${r.length}${conflict ? `（${conflict} 条跳过冲突）` : ""}`;
+          const description = failed
+            .map((item) => `${item.id.slice(0, 8)}：${item.error ?? "还原未完成"}`)
+            .slice(0, 3)
+            .join("\n");
+          if (failed.length === r.length) {
+            throw new Error(description || "所有会话都还原失败");
+          }
+          if (failed.length > 0) {
+            toast.warning(`${summary}，${failed.length} 条失败`, {
+              description: description || undefined,
+            });
+          } else if (ok === 0 && conflict > 0) {
+            toast.info(`未写入会话：${conflict} 条均因本地已存在而跳过`);
+          } else {
+            toast.success(summary);
+          }
         }}
       >
         将把备份中的所有会话回写至 {providerLabel} 目录。已存在的 session id 会自动跳过（不覆盖）；

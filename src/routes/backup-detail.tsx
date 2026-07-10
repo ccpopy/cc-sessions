@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate, useParams } from "react-router-dom";
 import { ArrowLeft, Copy, Eye, RotateCcw, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
@@ -27,14 +27,34 @@ import { useSettings } from "@/stores/settings";
 import { humanBytes, humanTokens, relativeTime } from "@/lib/format";
 import { basename } from "@/lib/cwd";
 
+type RequestScope = {
+  backupDir: string;
+  backupPath: string;
+  reloadKey: number;
+};
+
+type LoadState = RequestScope & {
+  detail: BackupDetail | null;
+  loading: boolean;
+  error: string | null;
+};
+
+type VerifyResult = Record<string, "ok" | "fail" | "missing">;
+
+type VerificationState = RequestScope & {
+  result: VerifyResult;
+};
+
 export default function BackupDetailRoute({ provider = "codex" }: { provider?: SessionProvider }) {
   const { name } = useParams();
   const loc = useLocation();
   const nav = useNavigate();
   const settings = useSettings((s) => s.settings);
-  const [detail, setDetail] = useState<BackupDetail | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [verifyResult, setVerifyResult] = useState<Record<string, "ok" | "fail" | "missing"> | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
+  const [loadState, setLoadState] = useState<LoadState | null>(null);
+  const [verification, setVerification] = useState<VerificationState | null>(null);
+  const loadGeneration = useRef(0);
+  const verifyGeneration = useRef(0);
   const [preview, setPreview] = useState<{ session: SessionSummary; rollout: string } | null>(null);
   const [restoreTarget, setRestoreTarget] = useState<ManifestSession | null>(null);
   const [overwrite, setOverwrite] = useState<"skip" | "overwrite">("skip");
@@ -46,23 +66,80 @@ export default function BackupDetailRoute({ provider = "codex" }: { provider?: S
     return joinPath(settings.backup_dir, name);
   }, [loc.state, name, settings?.backup_dir]);
 
+  const currentScope: RequestScope | null = backupPath && settings?.backup_dir
+    ? { backupDir: settings.backup_dir, backupPath, reloadKey }
+    : null;
+  const currentScopeRef = useRef<RequestScope | null>(currentScope);
+  currentScopeRef.current = currentScope;
+
+  const visibleLoadState = loadState && sameRequestScope(loadState, currentScope)
+    ? loadState
+    : null;
+  const detail = visibleLoadState?.detail ?? null;
+  const loading = currentScope !== null && (visibleLoadState?.loading ?? true);
+  const loadError = visibleLoadState?.error ?? null;
+  const verifyResult = verification && sameRequestScope(verification, currentScope)
+    ? verification.result
+    : null;
+
   useEffect(() => {
-    if (!backupPath) return;
-    setLoading(true);
-    api.openBackup(backupPath).then(setDetail).finally(() => setLoading(false));
-  }, [backupPath]);
+    const requestScope = currentScopeRef.current;
+    const generation = ++loadGeneration.current;
+    ++verifyGeneration.current;
+    setVerification(null);
+
+    if (!requestScope) {
+      setLoadState(null);
+      return;
+    }
+
+    setLoadState({ ...requestScope, detail: null, loading: true, error: null });
+    void api.openBackup(requestScope.backupDir, requestScope.backupPath)
+      .then((next) => {
+        if (!isCurrentRequest(loadGeneration, generation, currentScopeRef, requestScope)) return;
+        setLoadState({ ...requestScope, detail: next, loading: false, error: null });
+      })
+      .catch((error) => {
+        if (!isCurrentRequest(loadGeneration, generation, currentScopeRef, requestScope)) return;
+        setLoadState({
+          ...requestScope,
+          detail: null,
+          loading: false,
+          error: String((error as Error)?.message ?? error),
+        });
+      });
+
+    return () => {
+      if (loadGeneration.current === generation) ++loadGeneration.current;
+      ++verifyGeneration.current;
+    };
+  }, [backupPath, reloadKey, settings?.backup_dir]);
 
   const items = useMemo(() => detail?.manifest.sessions ?? [], [detail]);
 
   const onVerify = async () => {
-    if (!backupPath) return;
-    const r = await api.verifyBackup(backupPath);
-    const map: Record<string, "ok" | "fail" | "missing"> = {};
-    for (const it of r.items) {
-      map[it.id] = it.missing ? "missing" : it.ok ? "ok" : "fail";
+    const requestScope = currentScopeRef.current;
+    if (!requestScope) return;
+    const generation = ++verifyGeneration.current;
+    setVerification(null);
+
+    try {
+      const r = await api.verifyBackup(requestScope.backupDir, requestScope.backupPath);
+      if (!isCurrentRequest(verifyGeneration, generation, currentScopeRef, requestScope)) return;
+
+      const map: VerifyResult = {};
+      for (const [index, it] of r.items.entries()) {
+        const manifestItem = detail?.manifest.sessions[index];
+        if (!manifestItem) continue;
+        map[manifestSessionIdentity(manifestItem)] = it.missing ? "missing" : it.ok ? "ok" : "fail";
+      }
+      setVerification({ ...requestScope, result: map });
+      if (r.all_ok) toast.success("校验通过");
+      else toast.warning("存在损坏或缺失项，请查看标记");
+    } catch (error) {
+      if (!isCurrentRequest(verifyGeneration, generation, currentScopeRef, requestScope)) return;
+      toast.error("校验失败：" + String((error as Error)?.message ?? error));
     }
-    setVerifyResult(map);
-    toast.success(r.all_ok ? "校验通过" : "存在损坏项，请查看标记");
   };
 
   if (!backupPath) {
@@ -98,6 +175,16 @@ export default function BackupDetailRoute({ provider = "codex" }: { provider?: S
 
         {loading ? (
           <EmptyState title="加载中…" />
+        ) : loadError ? (
+          <EmptyState
+            title="读取备份详情失败"
+            description={loadError}
+            action={
+              <Button variant="outline" onClick={() => setReloadKey((value) => value + 1)}>
+                重试
+              </Button>
+            }
+          />
         ) : items.length === 0 ? (
           <EmptyState title="备份为空" />
         ) : (
@@ -105,10 +192,11 @@ export default function BackupDetailRoute({ provider = "codex" }: { provider?: S
             {items.map((s) => {
               const itemProvider = manifestSessionProvider(s, detail?.manifest.provider, provider);
               const sess = toSessionSummary(s, backupPath, itemProvider);
-              const v = verifyResult?.[s.id];
+              const identity = manifestSessionIdentity(s);
+              const v = verifyResult?.[identity];
               return (
                 <Card
-                  key={s.id}
+                  key={identity}
                   className="p-0 shadow-sm transition-all hover:shadow-md"
                 >
                   <CardContent className="flex items-center gap-4 p-4">
@@ -188,7 +276,10 @@ export default function BackupDetailRoute({ provider = "codex" }: { provider?: S
                         variant="outline"
                         size="sm"
                         className="gap-1.5"
-                        onClick={() => setRestoreTarget(s)}
+                        onClick={() => {
+                          setOverwrite("skip");
+                          setRestoreTarget(s);
+                        }}
                       >
                         <RotateCcw className="h-3.5 w-3.5" />
                         还原
@@ -212,7 +303,12 @@ export default function BackupDetailRoute({ provider = "codex" }: { provider?: S
 
       <DangerDialog
         open={!!restoreTarget}
-        onOpenChange={(v) => !v && setRestoreTarget(null)}
+        onOpenChange={(v) => {
+          if (!v) {
+            setRestoreTarget(null);
+            setOverwrite("skip");
+          }
+        }}
         title="还原会话"
         confirmText="还原"
         onConfirm={async () => {
@@ -220,18 +316,20 @@ export default function BackupDetailRoute({ provider = "codex" }: { provider?: S
           const itemProvider = manifestSessionProvider(restoreTarget, detail?.manifest.provider, provider);
           const r = await api.restoreSession({
             provider: itemProvider,
+            backup_dir: settings.backup_dir,
             backup_path: backupPath,
             codex_dir: settings.codex_dir,
             claude_dir: settings.claude_dir,
             id: restoreTarget.id,
+            backup_rollout_relpath: restoreTarget.rollout_relpath,
             overwrite: overwrite === "overwrite",
           });
           if (r.conflict) {
-            toast.warning("目标 id 已存在，已跳过。选择「覆盖」再试一次。");
+            throw new Error("目标会话或 rollout 文件已存在。若确认要替换本地数据，请选择「覆盖」后重试。");
           } else if (r.ok) {
             toast.success("已还原");
           } else {
-            toast.error("还原失败：" + (r.error ?? "未知错误"));
+            throw new Error(r.error ?? "还原未完整完成");
           }
         }}
       >
@@ -305,4 +403,26 @@ function manifestSessionProvider(
   routeProvider: SessionProvider,
 ): SessionProvider {
   return session.provider ?? manifestProvider ?? routeProvider;
+}
+
+function manifestSessionIdentity(session: ManifestSession): string {
+  return `${session.id}\0${session.rollout_relpath}`;
+}
+
+function sameRequestScope(left: RequestScope | null, right: RequestScope | null): boolean {
+  return left !== null
+    && right !== null
+    && left.backupDir === right.backupDir
+    && left.backupPath === right.backupPath
+    && left.reloadKey === right.reloadKey;
+}
+
+function isCurrentRequest(
+  generationRef: { current: number },
+  generation: number,
+  scopeRef: { current: RequestScope | null },
+  requestScope: RequestScope,
+): boolean {
+  return generationRef.current === generation
+    && sameRequestScope(scopeRef.current, requestScope);
 }

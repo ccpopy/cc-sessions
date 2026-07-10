@@ -83,14 +83,33 @@ pub struct ProjectGroup {
     pub total_tokens: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteTarget {
+    pub id: String,
+    #[serde(default)]
+    pub rollout_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BundleExportTarget {
+    pub id: String,
+    #[serde(default)]
+    pub rollout_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DeleteResult {
     pub id: String,
+    pub rollout_path: Option<String>,
     pub threads_rows_deleted: u32,
     pub logs_rows_deleted: u32,
     pub history_rows_deleted: u32,
     pub rollout_deleted: bool,
     pub rollout_missing: bool,
+    pub sidecar_deleted: bool,
+    pub tasks_deleted: bool,
+    pub file_history_deleted: bool,
+    pub shared_data_preserved: bool,
     pub ok: bool,
     pub error: Option<String>,
 }
@@ -139,6 +158,8 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_dir: Option<String>,
     pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ManifestArtifact>,
     pub sessions: Vec<ManifestSession>,
 }
 
@@ -152,6 +173,8 @@ pub struct ManifestSession {
     pub source_relpath: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidecar_relpath: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sidecar_files: Vec<ManifestArtifact>,
     pub title: String,
     pub cwd: String,
     pub created_at: i64,
@@ -163,6 +186,13 @@ pub struct ManifestSession {
     #[serde(default)]
     pub history_rows: u32,
     pub sha256_rollout: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestArtifact {
+    pub relpath: String,
+    pub bytes: u64,
+    pub sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -434,6 +464,8 @@ pub struct BundleManifest {
     pub sha256_rollout: String,
     pub rollout_line_count: u64,
     pub has_history: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ManifestArtifact>,
 }
 
 #[derive(Debug, Clone, Serialize)]

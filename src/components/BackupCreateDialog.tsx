@@ -17,6 +17,7 @@ import { api, type SessionProvider, type SessionSummary } from "@/lib/api";
 import { humanBytes } from "@/lib/format";
 import { useSettings } from "@/stores/settings";
 import { toast } from "sonner";
+import { sessionIdentityKey } from "@/lib/sessionIdentity";
 
 type Props = {
   open: boolean;
@@ -60,6 +61,7 @@ export function BackupCreateDialog({ open, onOpenChange, provider, sessions, onD
         claude_dir: settings.claude_dir,
         backup_dir: settings.backup_dir,
         ids: sessions.map((s) => s.id),
+        targets: sessions.map((s) => ({ id: s.id, rollout_path: s.rollout_path })),
         name,
         note: note.trim() || undefined,
       });
@@ -102,7 +104,7 @@ export function BackupCreateDialog({ open, onOpenChange, provider, sessions, onD
             </div>
             <ul className="max-h-40 min-w-0 space-y-1 overflow-auto text-xs">
               {sessions.slice(0, 10).map((s) => (
-                <li key={s.id} className="flex min-w-0 items-center gap-2">
+                <li key={sessionIdentityKey(s)} className="flex min-w-0 items-center gap-2">
                   <Badge variant="outline" className="h-4 shrink-0 px-1.5 font-mono text-[10px]">
                     {s.id.slice(0, 8)}
                   </Badge>

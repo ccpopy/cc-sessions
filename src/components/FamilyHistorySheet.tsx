@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   CheckCircle2,
   GitBranch,
@@ -62,12 +62,23 @@ export function FamilyHistorySheet({
   const [syncTarget, setSyncTarget] = useState<SyncTarget | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<FamilyBranch | null>(null);
   const [running, setRunning] = useState(false);
+  const requestSeq = useRef(0);
 
   const load = useCallback(async () => {
-    if (!sessionId || !codexDir) return;
+    const requestId = ++requestSeq.current;
+    setFamily(null);
+    setSyncStates({});
+    setRollbackTarget(null);
+    setSyncTarget(null);
+    setDeleteTarget(null);
+    if (!sessionId || !codexDir) {
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     try {
       const store = await api.getFamilyStore(codexDir);
+      if (requestSeq.current !== requestId) return;
       const fid = store.index[sessionId];
       if (!fid) {
         setFamily(null);
@@ -77,28 +88,57 @@ export function FamilyHistorySheet({
         setFamily(nextFamily);
         if (nextFamily) {
           const states = await api.getFamilyBranchSyncStates(codexDir, nextFamily.family_id);
+          if (requestSeq.current !== requestId) return;
           setSyncStates(Object.fromEntries(states.map((s) => [s.branch_id, s])));
         } else {
           setSyncStates({});
         }
       }
     } catch (e) {
-      toast.error(String((e as Error)?.message ?? e));
+      if (requestSeq.current === requestId) {
+        setFamily(null);
+        setSyncStates({});
+        toast.error(String((e as Error)?.message ?? e));
+      }
     } finally {
-      setLoading(false);
+      if (requestSeq.current === requestId) setLoading(false);
     }
   }, [sessionId, codexDir]);
 
   useEffect(() => {
-    if (open) void load();
+    if (open) {
+      void load();
+    } else {
+      requestSeq.current += 1;
+      setFamily(null);
+      setSyncStates({});
+      setRollbackTarget(null);
+      setSyncTarget(null);
+      setDeleteTarget(null);
+      setLoading(false);
+    }
   }, [open, load]);
 
   const doRollback = async () => {
     if (!family || !rollbackTarget) return;
     setRunning(true);
     try {
+      const syncState = syncStates[rollbackTarget.id];
+      let synchronizedLines = 0;
+      if (syncState?.relation === "active_ahead") {
+        const result = await api.syncActiveIntoBranch(
+          codexDir,
+          family.family_id,
+          rollbackTarget.id,
+        );
+        synchronizedLines = result.appended_lines;
+      }
       await api.rollbackFamilyActive(codexDir, family.family_id, rollbackTarget.id);
-      toast.success(`已切换到 ${rollbackTarget.provider} 分支`);
+      toast.success(
+        synchronizedLines > 0
+          ? `已同步 ${synchronizedLines} 行并切换到 ${rollbackTarget.provider} 分支`
+          : `已切换到 ${rollbackTarget.provider} 分支`,
+      );
       await load();
       onChanged?.();
       setRollbackTarget(null);
@@ -113,10 +153,13 @@ export function FamilyHistorySheet({
     if (!family || !deleteTarget) return;
     setRunning(true);
     try {
-      await api.deleteFamilyBranch(codexDir, family.family_id, deleteTarget.id);
-      toast.success(`已删除 ${deleteTarget.provider} 分支`);
+      const result = await api.deleteFamilyBranch(codexDir, family.family_id, deleteTarget.id);
       await load();
-      onChanged?.();
+      await onChanged?.();
+      if (!result.ok) {
+        throw new Error(result.error ?? `分支 ${deleteTarget.id} 未删除干净`);
+      }
+      toast.success(`已删除 ${deleteTarget.provider} 分支`);
       setDeleteTarget(null);
     } catch (e) {
       toast.error(String((e as Error)?.message ?? e));
@@ -360,10 +403,26 @@ export function FamilyHistorySheet({
             <AlertDialogHeader>
               <AlertDialogTitle>切换当前分支</AlertDialogTitle>
               <AlertDialogDescription className="break-words">
-                将当前分支（provider=
-                {family?.chain.find((x) => x.id === family.active_id)?.provider ?? "-"}
-                ）归档至 <code>archived_sessions/</code>
-                ，并从归档恢复 <b>{rollbackTarget?.provider}</b> 下的目标分支。
+                {rollbackTarget && syncStates[rollbackTarget.id]?.relation === "active_ahead" ? (
+                  <>
+                    目标分支落后当前分支 {syncStates[rollbackTarget.id].appendable_lines_to_branch} 行。
+                    确认后会先同步这些增量，再归档当前分支并恢复 <b>{rollbackTarget.provider}</b>
+                    分支，避免从旧基线继续对话造成真实分叉。
+                  </>
+                ) : (
+                  <>
+                    将当前分支（provider=
+                    {family?.chain.find((x) => x.id === family.active_id)?.provider ?? "-"}
+                    ）归档至 <code>archived_sessions/</code>
+                    ，并从归档恢复 <b>{rollbackTarget?.provider}</b> 下的目标分支。
+                  </>
+                )}
+                {rollbackTarget && syncStates[rollbackTarget.id]?.relation === "diverged" && (
+                  <>
+                    <br />
+                    两个分支都已有不同的新记录，无法自动合并；切换只会改变当前可见分支，不会消除“已分叉”状态。
+                  </>
+                )}
                 <br />
                 此操作不会删除任何文件，随时可再切回。
               </AlertDialogDescription>
@@ -371,7 +430,13 @@ export function FamilyHistorySheet({
             <AlertDialogFooter>
               <AlertDialogCancel>取消</AlertDialogCancel>
               <AlertDialogAction disabled={running} onClick={doRollback}>
-                {running ? "执行中…" : "确认切换"}
+                {running
+                  ? "执行中…"
+                  : rollbackTarget && syncStates[rollbackTarget.id]?.relation === "active_ahead"
+                    ? "同步并切换"
+                    : rollbackTarget && syncStates[rollbackTarget.id]?.relation === "diverged"
+                      ? "仍要切换"
+                      : "确认切换"}
               </AlertDialogAction>
             </AlertDialogFooter>
           </AlertDialogContent>
@@ -479,7 +544,11 @@ function BranchSyncBadge({ state }: { state: BranchSyncState }) {
       );
     case "diverged":
       return (
-        <Badge variant="outline" className="h-5 px-1.5 font-normal text-amber-600">
+        <Badge
+          variant="outline"
+          className="h-5 px-1.5 font-normal text-amber-600"
+          title={state.error ?? undefined}
+        >
           已分叉
         </Badge>
       );
