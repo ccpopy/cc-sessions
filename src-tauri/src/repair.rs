@@ -1702,7 +1702,7 @@ fn salvage_id_from_filename(p: &Path) -> Option<String> {
 
 // ========================= 重建 threads 表 =========================
 
-/// columns in threads（和 backup.rs 保持一致以便互操作）
+/// threads 表的基础列（旧版 Codex App 的 schema；新版新增列见 THREADS_OPTIONAL_COLS）
 const THREADS_COLS: &[&str] = &[
     "id",
     "rollout_path",
@@ -1733,6 +1733,41 @@ const THREADS_COLS: &[&str] = &[
     "updated_at_ms",
 ];
 
+/// 新版 Codex App（内置 codex-rs 0.144.x 起）通过迁移新增的 threads 列。
+/// 官方 App 的会话列表查询带 `preview <> ''` 谓词（对应库内 idx_threads_visible_*
+/// 部分索引），preview 为空的行在 App 中不可见，因此目标库存在这些列时必须写入；
+/// 旧版库没有这些列，写入前需按实际表结构过滤，避免 INSERT 报未知列错误。
+const THREADS_OPTIONAL_COLS: &[&str] = &["preview", "thread_source"];
+
+/// threads 表当前实际存在的列名（按建表顺序）。
+pub(crate) fn threads_table_columns(state: &rusqlite::Connection) -> AppResult<Vec<String>> {
+    let mut stmt = state.prepare("PRAGMA table_info(threads)")?;
+    let mut rows = stmt.query([])?;
+    let mut cols = Vec::new();
+    while let Some(row) = rows.next()? {
+        cols.push(row.get::<_, String>(1)?);
+    }
+    Ok(cols)
+}
+
+/// upsert 实际写入的列：已知列（固定 + 可选）与目标表结构的交集。
+fn effective_threads_cols(state: &rusqlite::Connection) -> AppResult<Vec<&'static str>> {
+    let existing: std::collections::HashSet<String> =
+        threads_table_columns(state)?.into_iter().collect();
+    let cols: Vec<&'static str> = THREADS_COLS
+        .iter()
+        .chain(THREADS_OPTIONAL_COLS.iter())
+        .copied()
+        .filter(|name| existing.contains(*name))
+        .collect();
+    if !cols.contains(&"id") || !cols.contains(&"rollout_path") {
+        return Err(AppError::InvalidCodexDir(
+            "threads 表缺少 id/rollout_path 列，无法同步会话".into(),
+        ));
+    }
+    Ok(cols)
+}
+
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn rebuild_threads_table(codex_dir: String, dry_run: bool) -> AppResult<ThreadsRebuildReport> {
     let codex = PathBuf::from(&codex_dir);
@@ -1751,6 +1786,7 @@ pub fn rebuild_threads_table(codex_dir: String, dry_run: bool) -> AppResult<Thre
     }
 
     let state = state_db::open(&codex)?;
+    let effective_cols = effective_threads_cols(&state)?;
 
     for (p, archived) in active_rollouts
         .iter()
@@ -1759,7 +1795,7 @@ pub fn rebuild_threads_table(codex_dir: String, dry_run: bool) -> AppResult<Thre
     {
         scanned += 1;
         if dry_run {
-            match thread_values_from_rollout(&codex, p, archived) {
+            match thread_values_from_rollout(&codex, p, archived, &effective_cols) {
                 Ok(Some(_)) => upserted += 1,
                 Ok(None) => skipped += 1,
                 Err(e) => {
@@ -1800,13 +1836,10 @@ fn ensure_state_db_exists(codex: &Path) -> AppResult<()> {
     )))
 }
 
-fn threads_upsert_sql() -> String {
-    let placeholders = (0..THREADS_COLS.len())
-        .map(|_| "?")
-        .collect::<Vec<_>>()
-        .join(",");
-    let cols_sql = THREADS_COLS.join(",");
-    let update_sql = THREADS_COLS
+fn threads_upsert_sql(cols: &[&str]) -> String {
+    let placeholders = (0..cols.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+    let cols_sql = cols.join(",");
+    let update_sql = cols
         .iter()
         .filter(|c| **c != "id")
         .map(|c| format!("{c}=excluded.{c}"))
@@ -1819,6 +1852,7 @@ fn thread_values_from_rollout(
     codex: &Path,
     rollout: &Path,
     archived: bool,
+    cols: &[&str],
 ) -> AppResult<Option<Vec<Value>>> {
     let brief = match read_rollout_brief(codex, rollout)? {
         Some(b) => b,
@@ -1853,8 +1887,7 @@ fn thread_values_from_rollout(
     };
 
     Ok(Some(
-        THREADS_COLS
-            .iter()
+        cols.iter()
             .map(|name| match *name {
                 "id" => Value::String(brief.id.clone()),
                 "rollout_path" => Value::String(brief.path.to_string_lossy().into_owned()),
@@ -1911,6 +1944,19 @@ fn thread_values_from_rollout(
                     .clone()
                     .map(Value::String)
                     .unwrap_or(Value::Null),
+                // 官方 App 列表要求 preview 非空才可见；与 App 约定一致取首条用户消息。
+                "preview" => Value::String(brief.first_user_message.clone()),
+                "thread_source" => {
+                    let source = desktop_visible_source(&payload);
+                    Value::String(
+                        if is_subagent_source(Some(source.as_str())) {
+                            "subagent"
+                        } else {
+                            "user"
+                        }
+                        .to_string(),
+                    )
+                }
                 _ => payload.get(*name).cloned().unwrap_or(Value::Null),
             })
             .collect(),
@@ -1944,11 +1990,12 @@ pub(crate) fn upsert_thread_from_rollout(
     rollout: &Path,
     archived: bool,
 ) -> AppResult<bool> {
-    let values = match thread_values_from_rollout(codex, rollout, archived)? {
+    let cols = effective_threads_cols(state)?;
+    let values = match thread_values_from_rollout(codex, rollout, archived, &cols)? {
         Some(values) => values,
         None => return Ok(false),
     };
-    let sql = threads_upsert_sql();
+    let sql = threads_upsert_sql(&cols);
     let mut stmt = state.prepare(&sql)?;
     let boxed = bind_thread_values(&values);
     let refs: Vec<&dyn rusqlite::ToSql> = boxed.iter().map(|b| b.as_ref()).collect();
@@ -5727,14 +5774,120 @@ mod tests {
         let codex = temp_codex_dir("cc-session-manager-repair-token-test");
         let rollout = write_token_rollout(&codex, "token-session")?;
 
-        let values = thread_values_from_rollout(&codex, &rollout, false)?.expect("thread values");
+        let cols: Vec<&str> = THREADS_COLS
+            .iter()
+            .chain(THREADS_OPTIONAL_COLS.iter())
+            .copied()
+            .collect();
+        let values =
+            thread_values_from_rollout(&codex, &rollout, false, &cols)?.expect("thread values");
         fs::remove_dir_all(&codex).ok();
 
-        let token_index = THREADS_COLS
+        let token_index = cols
             .iter()
             .position(|name| *name == "tokens_used")
             .expect("tokens_used column");
         assert_eq!(values[token_index], Value::from(2_468_000i64));
+        Ok(())
+    }
+
+    #[test]
+    fn upsert_thread_fills_preview_and_thread_source_when_columns_exist() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-preview-cols-test");
+        let rollout = write_conversation_rollout(&codex, "preview-session")?;
+        {
+            let conn = create_full_state(&codex)?;
+            conn.execute(
+                "ALTER TABLE threads ADD COLUMN preview TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+            conn.execute("ALTER TABLE threads ADD COLUMN thread_source TEXT", [])?;
+        }
+
+        let state = state_db::open(&codex)?;
+        assert!(upsert_thread_from_rollout(&codex, &state, &rollout, false)?);
+        let (preview, thread_source): (String, String) = state.query_row(
+            "SELECT preview, thread_source FROM threads WHERE id = ?",
+            ["preview-session"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(preview, "First request");
+        assert_eq!(thread_source, "user");
+
+        drop(state);
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn upsert_thread_marks_subagent_thread_source() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-subagent-source-test");
+        let rollout_dir = codex.join("sessions").join("2026").join("04").join("23");
+        fs::create_dir_all(&rollout_dir)?;
+        let rollout = rollout_dir.join("rollout-subagent-session.jsonl");
+        let lines = vec![
+            serde_json::json!({
+                "timestamp": "2026-04-23T00:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "subagent-session",
+                    "model_provider": DEFAULT_PROVIDER,
+                    "cwd": "F:\\project\\example",
+                    "source": {"subagent": {"other": "guardian"}}
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": "2026-04-23T00:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "Subagent request"
+                }
+            })
+            .to_string(),
+        ];
+        fs::write(&rollout, format!("{}\n", lines.join("\n")))?;
+        {
+            let conn = create_full_state(&codex)?;
+            conn.execute(
+                "ALTER TABLE threads ADD COLUMN preview TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+            conn.execute("ALTER TABLE threads ADD COLUMN thread_source TEXT", [])?;
+        }
+
+        let state = state_db::open(&codex)?;
+        assert!(upsert_thread_from_rollout(&codex, &state, &rollout, false)?);
+        let thread_source: String = state.query_row(
+            "SELECT thread_source FROM threads WHERE id = ?",
+            ["subagent-session"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(thread_source, "subagent");
+
+        drop(state);
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn upsert_thread_skips_optional_columns_on_legacy_schema() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-legacy-schema-test");
+        let rollout = write_conversation_rollout(&codex, "legacy-session")?;
+        create_full_state(&codex)?;
+
+        let state = state_db::open(&codex)?;
+        assert!(upsert_thread_from_rollout(&codex, &state, &rollout, false)?);
+        let title: String = state.query_row(
+            "SELECT title FROM threads WHERE id = ?",
+            ["legacy-session"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(title, "First request");
+
+        drop(state);
+        fs::remove_dir_all(&codex).ok();
         Ok(())
     }
 

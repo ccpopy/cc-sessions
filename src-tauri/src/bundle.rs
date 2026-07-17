@@ -2566,6 +2566,20 @@ fn upsert_threads_minimal(
             m.thread_name,
         ],
     )?;
+    // 新版 App 的会话列表要求 preview <> '' 才可见；旧版库没有这些列则跳过。
+    let table_cols = crate::repair::threads_table_columns(&conn)?;
+    if table_cols.iter().any(|name| name == "preview") {
+        conn.execute(
+            "UPDATE threads SET preview = ?2 WHERE id = ?1 AND preview = ''",
+            params![m.session_id, m.thread_name],
+        )?;
+    }
+    if table_cols.iter().any(|name| name == "thread_source") {
+        conn.execute(
+            "UPDATE threads SET thread_source = 'user' WHERE id = ?1 AND thread_source IS NULL",
+            params![m.session_id],
+        )?;
+    }
     Ok(())
 }
 

@@ -661,45 +661,16 @@ fn load_backup_thread(
     codex: &Path,
     id: &str,
 ) -> AppResult<BackupThread> {
-    let mut stmt = state.prepare(
-        "SELECT id, rollout_path, created_at, updated_at, source, model_provider,
-                cwd, title, sandbox_policy, approval_mode, COALESCE(tokens_used,0),
-                has_user_event, archived, archived_at, git_sha, git_branch, git_origin_url,
-                cli_version, first_user_message, agent_nickname, agent_role, memory_mode,
-                model, reasoning_effort, agent_path, created_at_ms, updated_at_ms
-         FROM threads WHERE id = ?",
-    )?;
+    // SELECT * 以捕获全部列（含新版 App 增加的 preview/thread_source 等），
+    // 还原时按目标表实际结构取交集写回。
+    let mut stmt = state.prepare("SELECT * FROM threads WHERE id = ?")?;
+    let cols: Vec<String> = stmt
+        .column_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
     let row_json = match stmt.query_row([id], |row| {
         let mut obj = serde_json::Map::new();
-        let cols = [
-            "id",
-            "rollout_path",
-            "created_at",
-            "updated_at",
-            "source",
-            "model_provider",
-            "cwd",
-            "title",
-            "sandbox_policy",
-            "approval_mode",
-            "tokens_used",
-            "has_user_event",
-            "archived",
-            "archived_at",
-            "git_sha",
-            "git_branch",
-            "git_origin_url",
-            "cli_version",
-            "first_user_message",
-            "agent_nickname",
-            "agent_role",
-            "memory_mode",
-            "model",
-            "reasoning_effort",
-            "agent_path",
-            "created_at_ms",
-            "updated_at_ms",
-        ];
         for (i, name) in cols.iter().enumerate() {
             let v = row.get_ref(i)?;
             let jv = match v {
@@ -711,7 +682,7 @@ fn load_backup_thread(
                 }
                 rusqlite::types::ValueRef::Blob(b) => serde_json::Value::String(hex::encode(b)),
             };
-            obj.insert((*name).to_string(), jv);
+            obj.insert(name.clone(), jv);
         }
         Ok(serde_json::Value::Object(obj))
     }) {
@@ -1769,29 +1740,62 @@ fn insert_restore_thread(
     target_rel: &Path,
     row: &serde_json::Value,
 ) -> AppResult<()> {
-    let columns_sql =
-        "id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
-                sandbox_policy, approval_mode, tokens_used, has_user_event, archived, archived_at,
-                git_sha, git_branch, git_origin_url, cli_version, first_user_message,
-                agent_nickname, agent_role, memory_mode, model, reasoning_effort, agent_path,
-                created_at_ms, updated_at_ms";
-    let columns = columns_sql.split(',').map(str::trim).collect::<Vec<_>>();
-    let placeholders = (0..columns.len())
-        .map(|_| "?")
-        .collect::<Vec<_>>()
-        .join(",");
-    let sql = format!("INSERT OR REPLACE INTO threads ({columns_sql}) VALUES ({placeholders})");
-    let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(columns.len());
-    for name in &columns {
-        if *name == "rollout_path" {
+    // 按目标表实际列还原：备份可能来自新/旧不同 schema，两个方向都取交集。
+    let table_cols = crate::repair::threads_table_columns(transaction)?;
+    if !table_cols.iter().any(|name| name == "id") {
+        return Err(AppError::Other(
+            "threads 表缺少 id 列，无法还原会话记录".into(),
+        ));
+    }
+    let mut columns: Vec<String> = Vec::with_capacity(table_cols.len());
+    let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(table_cols.len());
+    for name in &table_cols {
+        if name == "rollout_path" {
+            columns.push(name.clone());
             values.push(Box::new(
                 codex.join(target_rel).to_string_lossy().into_owned(),
             ));
             continue;
         }
-        let value = row.get(*name).unwrap_or(&serde_json::Value::Null);
-        let parameter: Box<dyn rusqlite::ToSql> = match value {
-            serde_json::Value::Null => Box::new(Option::<String>::None),
+        // 旧备份未捕获 preview/thread_source；目标库有列而备份缺值时按 App 规则补齐，
+        // 否则还原出的行会因 preview = '' 在官方 App 列表中不可见。
+        let value = match name.as_str() {
+            "preview" => match row.get(name.as_str()) {
+                Some(serde_json::Value::String(text)) if !text.is_empty() => {
+                    serde_json::Value::String(text.clone())
+                }
+                _ => row
+                    .get("first_user_message")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            },
+            "thread_source" => match row.get(name.as_str()) {
+                Some(serde_json::Value::String(text)) if !text.is_empty() => {
+                    serde_json::Value::String(text.clone())
+                }
+                _ => {
+                    let source = row.get("source").and_then(serde_json::Value::as_str);
+                    serde_json::Value::String(
+                        if crate::repair::is_subagent_source(source) {
+                            "subagent"
+                        } else {
+                            "user"
+                        }
+                        .to_string(),
+                    )
+                }
+            },
+            _ => row
+                .get(name.as_str())
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        };
+        // 备份未捕获或为 NULL 的列交给表默认值/触发器，避免对 NOT NULL 列写显式 NULL。
+        if value.is_null() {
+            continue;
+        }
+        columns.push(name.clone());
+        let parameter: Box<dyn rusqlite::ToSql> = match &value {
             serde_json::Value::Bool(value) => Box::new(if *value { 1i64 } else { 0i64 }),
             serde_json::Value::Number(number) => {
                 if let Some(value) = number.as_i64() {
@@ -1807,6 +1811,12 @@ fn insert_restore_thread(
         };
         values.push(parameter);
     }
+    let columns_sql = columns.join(", ");
+    let placeholders = (0..columns.len())
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("INSERT OR REPLACE INTO threads ({columns_sql}) VALUES ({placeholders})");
     let parameters = values
         .iter()
         .map(|value| value.as_ref())
