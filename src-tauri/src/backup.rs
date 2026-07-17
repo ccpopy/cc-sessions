@@ -175,7 +175,6 @@ fn copy_restore_file_atomically(
     }
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn create_backup(
     provider: Option<String>,
     codex_dir: String,
@@ -1161,7 +1160,6 @@ fn append_backup_history_if_present(destination: &Path, backup: &Path, id: &str)
     }
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn list_backups(backup_dir: String, provider: Option<String>) -> AppResult<Vec<BackupSummary>> {
     let root = PathBuf::from(&backup_dir);
     if !root.is_dir() {
@@ -1198,7 +1196,6 @@ pub fn list_backups(backup_dir: String, provider: Option<String>) -> AppResult<V
     Ok(out)
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn open_backup(backup_dir: String, backup_path: String) -> AppResult<BackupDetail> {
     let p = validated_backup_path(Path::new(&backup_dir), Path::new(&backup_path))?;
     let summary = summarize_backup(&p)?;
@@ -1207,7 +1204,6 @@ pub fn open_backup(backup_dir: String, backup_path: String) -> AppResult<BackupD
     Ok(BackupDetail { summary, manifest })
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn delete_backup(backup_dir: String, backup_path: String) -> AppResult<()> {
     let p = validated_backup_path(Path::new(&backup_dir), Path::new(&backup_path))?;
     let root = Path::new(&backup_dir).canonicalize()?;
@@ -1215,7 +1211,6 @@ pub fn delete_backup(backup_dir: String, backup_path: String) -> AppResult<()> {
     Ok(())
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn verify_backup(backup_dir: String, backup_path: String) -> AppResult<VerifyReport> {
     let p = validated_backup_path(Path::new(&backup_dir), Path::new(&backup_path))?;
     let manifest = load_backup_manifest(&p)?;
@@ -1267,7 +1262,6 @@ pub fn verify_backup(backup_dir: String, backup_path: String) -> AppResult<Verif
     Ok(VerifyReport { items, all_ok })
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn restore_session(
     provider: Option<String>,
     backup_dir: String,
@@ -1333,7 +1327,6 @@ pub fn restore_session(
     }
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn restore_all(
     provider: Option<String>,
     backup_dir: String,

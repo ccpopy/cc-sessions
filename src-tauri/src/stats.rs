@@ -110,7 +110,6 @@ fn stat_sessions(
     ))
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn stats_kpi(
     provider: Option<String>,
     codex_dir: String,
@@ -149,7 +148,6 @@ pub fn stats_kpi(
     })
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn stats_timeseries(
     provider: Option<String>,
     codex_dir: String,
@@ -186,7 +184,6 @@ pub fn stats_timeseries(
         .collect())
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn stats_by_project(
     provider: Option<String>,
     codex_dir: String,
@@ -229,7 +226,6 @@ pub fn stats_by_project(
     Ok(out)
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn stats_by_model(
     provider: Option<String>,
     codex_dir: String,
@@ -275,7 +271,6 @@ pub fn stats_by_model(
     Ok(out)
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn stats_heatmap(
     provider: Option<String>,
     codex_dir: String,

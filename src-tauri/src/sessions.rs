@@ -123,7 +123,6 @@ fn rollout_token_total(rollout_path: &str) -> i64 {
     crate::rollout::read_rollout_token_total(Path::new(&cleaned)).unwrap_or(0)
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn list_sessions(
     provider: Option<String>,
     codex_dir: String,
@@ -210,7 +209,6 @@ fn supplement_archived_summaries(
     Ok(out)
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn group_sessions_by_project(
     provider: Option<String>,
     codex_dir: String,
@@ -239,7 +237,6 @@ pub fn group_sessions_by_project(
     Ok(out)
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn search_sessions(
     provider: Option<String>,
     codex_dir: String,
@@ -334,18 +331,6 @@ pub fn set_archived_with_lock(
         return Err(AppError::Other("Claude 会话不支持归档".into()));
     }
     family::with_lock(lock, |_guard| set_archived_codex_locked(codex_dir, id, v))
-}
-
-#[cfg(feature = "desktop")]
-#[tauri::command]
-pub fn set_archived(
-    provider: Option<String>,
-    codex_dir: String,
-    id: String,
-    v: bool,
-    lock: tauri::State<'_, family::FamilyLock>,
-) -> AppResult<()> {
-    set_archived_with_lock(provider, codex_dir, id, v, lock.inner())
 }
 
 fn set_archived_codex_locked(codex_dir: String, id: String, v: bool) -> AppResult<()> {
@@ -606,19 +591,6 @@ pub fn delete_session_with_lock(
     }
 }
 
-#[cfg(feature = "desktop")]
-#[tauri::command]
-pub fn delete_session(
-    provider: Option<String>,
-    codex_dir: String,
-    claude_dir: Option<String>,
-    id: String,
-    target: Option<DeleteTarget>,
-    lock: tauri::State<'_, family::FamilyLock>,
-) -> AppResult<DeleteResult> {
-    delete_session_with_lock(provider, codex_dir, claude_dir, id, target, lock.inner())
-}
-
 pub fn delete_sessions_with_lock(
     provider: Option<String>,
     codex_dir: String,
@@ -663,19 +635,6 @@ pub fn delete_sessions_with_lock(
         }
         other => Err(AppError::Other(format!("不支持的 provider: {other}"))),
     }
-}
-
-#[cfg(feature = "desktop")]
-#[tauri::command]
-pub fn delete_sessions(
-    provider: Option<String>,
-    codex_dir: String,
-    claude_dir: Option<String>,
-    ids: Vec<String>,
-    targets: Option<Vec<DeleteTarget>>,
-    lock: tauri::State<'_, family::FamilyLock>,
-) -> AppResult<Vec<DeleteResult>> {
-    delete_sessions_with_lock(provider, codex_dir, claude_dir, ids, targets, lock.inner())
 }
 
 fn empty_delete_result(target: &DeleteTarget) -> DeleteResult {

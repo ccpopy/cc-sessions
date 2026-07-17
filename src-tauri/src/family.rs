@@ -839,15 +839,6 @@ pub fn get_family_store_with_lock(codex_dir: String, lock: &FamilyLock) -> AppRe
     })
 }
 
-#[cfg(feature = "desktop")]
-#[tauri::command]
-pub fn get_family_store(
-    codex_dir: String,
-    lock: tauri::State<'_, FamilyLock>,
-) -> AppResult<FamilyStore> {
-    get_family_store_with_lock(codex_dir, lock.inner())
-}
-
 pub fn verify_family_integrity_with_lock(
     codex_dir: String,
     lock: &FamilyLock,
@@ -856,15 +847,6 @@ pub fn verify_family_integrity_with_lock(
         let p = PathBuf::from(&codex_dir);
         verify_integrity(&p)
     })
-}
-
-#[cfg(feature = "desktop")]
-#[tauri::command]
-pub fn verify_family_integrity(
-    codex_dir: String,
-    lock: tauri::State<'_, FamilyLock>,
-) -> AppResult<FamilyIntegrityReport> {
-    verify_family_integrity_with_lock(codex_dir, lock.inner())
 }
 
 /// 把 threads 表 + family store + current provider 聚合成 per-session 覆盖信息，
@@ -1005,15 +987,6 @@ pub fn get_session_family_overlay_with_lock(
         });
     }
     Ok(out)
-}
-
-#[cfg(feature = "desktop")]
-#[tauri::command]
-pub fn get_session_family_overlay(
-    codex_dir: String,
-    lock: tauri::State<'_, FamilyLock>,
-) -> AppResult<Vec<FamilyOverlay>> {
-    get_session_family_overlay_with_lock(codex_dir, lock.inner())
 }
 
 fn compute_clone_state(

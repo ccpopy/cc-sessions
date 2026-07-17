@@ -35,6 +35,8 @@ type Props = {
   defaultOpen?: boolean;
   overlay?: Map<string, FamilyOverlay>;
   currentProvider?: string | null;
+  syncingSessionIds?: ReadonlySet<string>;
+  syncActionsDisabled?: boolean;
 };
 
 export function ProjectGroupView({
@@ -46,6 +48,8 @@ export function ProjectGroupView({
   defaultOpen = false,
   overlay,
   currentProvider,
+  syncingSessionIds,
+  syncActionsDisabled,
 }: Props) {
   const [open, setOpen] = useState(defaultOpen);
   const selected = useSelection((s) => s.selected);
@@ -118,6 +122,8 @@ export function ProjectGroupView({
               showProject={false}
               overlay={overlay?.get(s.id)}
               currentProvider={currentProvider}
+              syncing={syncingSessionIds?.has(s.id)}
+              syncDisabled={syncActionsDisabled}
               {...handlers}
             />
           ))}

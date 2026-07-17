@@ -56,6 +56,8 @@ type Props = {
   showProject?: boolean;
   overlay?: FamilyOverlay;
   currentProvider?: string | null;
+  syncing?: boolean;
+  syncDisabled?: boolean;
 };
 
 export const SessionCard = memo(function SessionCard({
@@ -75,10 +77,13 @@ export const SessionCard = memo(function SessionCard({
   showProject = true,
   overlay,
   currentProvider,
+  syncing = false,
+  syncDisabled = false,
 }: Props) {
   const displayTitle = sessionDisplayTitle(s.title, s.first_user_message);
   const displayFirstUserMessage = sessionDisplayPreview(s.first_user_message);
   const syncAction = syncActionLabel(overlay?.clone_state, currentProvider);
+  const syncBlocked = syncing || syncDisabled;
   const isSubagent = isSubagentSession(s, overlay);
   const subagent = subagentLabel(s, isSubagent);
   const isUsableCurrentProviderBranch =
@@ -199,14 +204,21 @@ export const SessionCard = memo(function SessionCard({
             {syncAction && (
               <Badge
                 variant="outline"
-                className="h-5 cursor-pointer gap-1 border-blue-500/40 px-1.5 font-normal text-blue-600 hover:bg-blue-500/10"
+                aria-disabled={syncBlocked}
+                className={cn(
+                  "h-5 gap-1 border-blue-500/40 px-1.5 font-normal text-blue-600",
+                  syncBlocked
+                    ? "cursor-not-allowed opacity-60"
+                    : "cursor-pointer hover:bg-blue-500/10",
+                )}
                 onClick={(e) => {
                   e.stopPropagation();
+                  if (syncBlocked) return;
                   onClone?.(s);
                 }}
               >
-                <RotateCw className="h-3 w-3" />
-                {syncAction}
+                <RotateCw className={cn("h-3 w-3", syncing && "animate-spin")} />
+                {syncing ? "同步中…" : syncAction}
               </Badge>
             )}
             {overlay?.clone_state === "has_clone" && (
@@ -316,9 +328,9 @@ export const SessionCard = memo(function SessionCard({
                   </DropdownMenuItem>
                 )}
                 {onClone && syncAction && (
-                  <DropdownMenuItem onClick={() => onClone(s)}>
-                    <RotateCw className="h-4 w-4" />
-                    {syncAction}
+                  <DropdownMenuItem disabled={syncBlocked} onClick={() => onClone(s)}>
+                    <RotateCw className={cn("h-4 w-4", syncing && "animate-spin")} />
+                    {syncing ? "同步中…" : syncAction}
                   </DropdownMenuItem>
                 )}
                 {onArchiveToggle && (

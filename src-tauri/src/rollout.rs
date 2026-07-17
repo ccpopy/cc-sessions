@@ -302,7 +302,6 @@ fn flatten_rich_content_item(item: &Value) -> Option<String> {
     }
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn preview_session_head(
     provider: Option<String>,
     rollout_path: String,
@@ -311,7 +310,6 @@ pub fn preview_session_head(
     preview_range_by_provider(provider, &rollout_path, 0, limit)
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn preview_session_range(
     provider: Option<String>,
     rollout_path: String,
@@ -464,7 +462,6 @@ fn nonnegative_i64(value: Option<&Value>) -> Option<i64> {
     None
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn preview_session_meta(
     provider: Option<String>,
     rollout_path: String,

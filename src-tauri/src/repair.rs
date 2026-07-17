@@ -134,7 +134,6 @@ fn effective_current_provider(codex_dir: &Path) -> AppResult<String> {
         .unwrap_or_else(|| DEFAULT_PROVIDER.to_string()))
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn get_provider_info(codex_dir: String) -> AppResult<ProviderInfo> {
     let p = PathBuf::from(&codex_dir);
     let cfg = paths::config_toml_path(&p);
@@ -164,7 +163,6 @@ struct ProjectConfigCandidate {
     session_ids: BTreeSet<String>,
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn diagnose_project_configs(codex_dir: String) -> AppResult<ProjectConfigReport> {
     let codex = PathBuf::from(&codex_dir);
     let (scanned_projects, candidates) = collect_project_config_candidates(&codex)?;
@@ -196,7 +194,6 @@ pub fn diagnose_project_configs(codex_dir: String) -> AppResult<ProjectConfigRep
     })
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn repair_project_configs(
     codex_dir: String,
     dry_run: bool,
@@ -873,7 +870,6 @@ fn desktop_visible_source(payload: &Value) -> String {
     DEFAULT_THREAD_SOURCE.to_string()
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn diagnose_codex_state(codex_dir: String) -> AppResult<DiagnosticReport> {
     let codex = PathBuf::from(&codex_dir);
 
@@ -987,7 +983,6 @@ pub fn diagnose_codex_state(codex_dir: String) -> AppResult<DiagnosticReport> {
 
 // ========================= 重建 session_index.jsonl =========================
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn repair_session_index(codex_dir: String, dry_run: bool) -> AppResult<IndexRepairReport> {
     let codex = PathBuf::from(&codex_dir);
     let rollouts = family::scan_rollouts(&codex)?;
@@ -1062,7 +1057,6 @@ pub fn repair_session_index(codex_dir: String, dry_run: bool) -> AppResult<Index
 // 与 `repair_session_index`/`rebuild_threads_table` 不同：此命令**只删除**
 // 指向已消失 rollout 的孤儿行（session_index.jsonl 里多出来的 id、threads
 // 表里多出来的 id），不会从 rollout 重建。适合只想"把残留清干净"的场景。
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn prune_orphan_entries(
     codex_dir: String,
     prune_index: bool,
@@ -1145,7 +1139,6 @@ pub fn prune_orphan_entries(
     })
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn diagnose_claude_history_orphans(claude_dir: String) -> AppResult<HistoryOrphanReport> {
     let (history_path, session_ids) = claude_history_context(claude_dir)?;
 
@@ -1186,7 +1179,6 @@ pub fn diagnose_claude_history_orphans(claude_dir: String) -> AppResult<HistoryO
     })
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn prune_claude_history_orphans(
     claude_dir: String,
     dry_run: bool,
@@ -1497,7 +1489,6 @@ fn first_line_is_sidechain(head: &str) -> bool {
     first.contains("\"isSidechain\":true") || first.contains("\"isSidechain\": true")
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn diagnose_claude_gui_visibility(claude_dir: String) -> AppResult<GuiVisibilityReport> {
     let claude = PathBuf::from(&claude_dir);
     let projects_root = paths::claude_projects_dir(&claude);
@@ -1598,7 +1589,6 @@ pub fn diagnose_claude_gui_visibility(claude_dir: String) -> AppResult<GuiVisibi
     })
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn repair_claude_gui_visibility(
     claude_dir: String,
     dry_run: bool,
@@ -1768,7 +1758,6 @@ fn effective_threads_cols(state: &rusqlite::Connection) -> AppResult<Vec<&'stati
     Ok(cols)
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn rebuild_threads_table(codex_dir: String, dry_run: bool) -> AppResult<ThreadsRebuildReport> {
     let codex = PathBuf::from(&codex_dir);
     let active_rollouts = family::scan_rollouts(&codex)?;
@@ -3211,24 +3200,6 @@ pub fn fork_session_at_event_with_lock(
     })
 }
 
-#[cfg(feature = "desktop")]
-#[tauri::command]
-pub fn fork_session_at_event(
-    codex_dir: String,
-    session_id: String,
-    rollout_path: String,
-    event_index: usize,
-    lock: tauri::State<'_, family::FamilyLock>,
-) -> AppResult<ForkSessionReport> {
-    fork_session_at_event_with_lock(
-        codex_dir,
-        session_id,
-        rollout_path,
-        event_index,
-        lock.inner(),
-    )
-}
-
 fn fork_session_at_event_locked(
     codex_dir: String,
     session_id: String,
@@ -3367,26 +3338,6 @@ pub fn clone_session_for_provider_with_lock(
     family::with_lock(lock, |_g| {
         clone_session_for_provider_locked(codex_dir, session_id, target_provider, strategy, dry_run)
     })
-}
-
-#[cfg(feature = "desktop")]
-#[tauri::command]
-pub fn clone_session_for_provider(
-    codex_dir: String,
-    session_id: String,
-    target_provider: Option<String>,
-    strategy: SwitchStrategy,
-    dry_run: bool,
-    lock: tauri::State<'_, family::FamilyLock>,
-) -> AppResult<CloneReport> {
-    clone_session_for_provider_with_lock(
-        codex_dir,
-        session_id,
-        target_provider,
-        strategy,
-        dry_run,
-        lock.inner(),
-    )
 }
 
 fn clone_session_for_provider_locked(
@@ -3986,15 +3937,6 @@ pub fn get_provider_sync_plan_with_lock(
     })
 }
 
-#[cfg(feature = "desktop")]
-#[tauri::command]
-pub fn get_provider_sync_plan(
-    codex_dir: String,
-    lock: tauri::State<'_, family::FamilyLock>,
-) -> AppResult<Vec<String>> {
-    get_provider_sync_plan_with_lock(codex_dir, lock.inner())
-}
-
 /// 对所有 active 分支 provider ≠ 当前 provider 的家族批量克隆。
 pub fn batch_clone_for_current_provider_with_lock(
     codex_dir: String,
@@ -4033,17 +3975,6 @@ pub fn batch_clone_for_current_provider_with_lock(
     })
 }
 
-#[cfg(feature = "desktop")]
-#[tauri::command]
-pub fn batch_clone_for_current_provider(
-    codex_dir: String,
-    strategy: SwitchStrategy,
-    dry_run: bool,
-    lock: tauri::State<'_, family::FamilyLock>,
-) -> AppResult<Vec<CloneReport>> {
-    batch_clone_for_current_provider_with_lock(codex_dir, strategy, dry_run, lock.inner())
-}
-
 /// 回滚：把家族的 active 切回某个历史分支（把当前 active 归档，目标分支从归档恢复）。
 pub fn rollback_family_active_with_lock(
     codex_dir: String,
@@ -4054,17 +3985,6 @@ pub fn rollback_family_active_with_lock(
     family::with_lock(lock, |_g| {
         rollback_family_active_locked(codex_dir, family_id, target_branch_id)
     })
-}
-
-#[cfg(feature = "desktop")]
-#[tauri::command]
-pub fn rollback_family_active(
-    codex_dir: String,
-    family_id: String,
-    target_branch_id: String,
-    lock: tauri::State<'_, family::FamilyLock>,
-) -> AppResult<()> {
-    rollback_family_active_with_lock(codex_dir, family_id, target_branch_id, lock.inner())
 }
 
 fn rollback_family_active_locked(
@@ -4256,17 +4176,6 @@ pub fn delete_family_branch_with_lock(
     })
 }
 
-#[cfg(feature = "desktop")]
-#[tauri::command]
-pub fn delete_family_branch(
-    codex_dir: String,
-    family_id: String,
-    branch_id: String,
-    lock: tauri::State<'_, family::FamilyLock>,
-) -> AppResult<crate::models::DeleteResult> {
-    delete_family_branch_with_lock(codex_dir, family_id, branch_id, lock.inner())
-}
-
 fn delete_family_branch_locked(
     codex_dir: String,
     family_id: String,
@@ -4310,16 +4219,6 @@ pub fn get_family_branch_sync_states_with_lock(
     family::with_lock(lock, |_g| {
         get_family_branch_sync_states_locked(codex_dir, family_id)
     })
-}
-
-#[cfg(feature = "desktop")]
-#[tauri::command]
-pub fn get_family_branch_sync_states(
-    codex_dir: String,
-    family_id: String,
-    lock: tauri::State<'_, family::FamilyLock>,
-) -> AppResult<Vec<BranchSyncState>> {
-    get_family_branch_sync_states_with_lock(codex_dir, family_id, lock.inner())
 }
 
 fn get_family_branch_sync_states_locked(
@@ -4416,17 +4315,6 @@ pub fn sync_branch_into_active_with_lock(
     })
 }
 
-#[cfg(feature = "desktop")]
-#[tauri::command]
-pub fn sync_branch_into_active(
-    codex_dir: String,
-    family_id: String,
-    source_branch_id: String,
-    lock: tauri::State<'_, family::FamilyLock>,
-) -> AppResult<SyncBranchReport> {
-    sync_branch_into_active_with_lock(codex_dir, family_id, source_branch_id, lock.inner())
-}
-
 fn sync_branch_into_active_locked(
     codex_dir: String,
     family_id: String,
@@ -4461,17 +4349,6 @@ pub fn sync_active_into_branch_with_lock(
         }
         append_branch_extras_locked(codex_dir, family_id, active_id, target_branch_id)
     })
-}
-
-#[cfg(feature = "desktop")]
-#[tauri::command]
-pub fn sync_active_into_branch(
-    codex_dir: String,
-    family_id: String,
-    target_branch_id: String,
-    lock: tauri::State<'_, family::FamilyLock>,
-) -> AppResult<BranchSyncReport> {
-    sync_active_into_branch_with_lock(codex_dir, family_id, target_branch_id, lock.inner())
 }
 
 fn active_branch_id(codex_dir: &str, family_id: &str) -> AppResult<String> {

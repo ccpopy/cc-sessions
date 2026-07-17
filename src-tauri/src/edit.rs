@@ -1362,7 +1362,6 @@ pub fn history(
 
 // ========================= 命令包装（带锁） =========================
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn plan_session_event_deletion(
     provider: String,
     rollout_path: String,
@@ -1392,28 +1391,6 @@ pub fn edit_session_event_text_with_lock(
     })
 }
 
-#[cfg(feature = "desktop")]
-#[tauri::command]
-pub fn edit_session_event_text(
-    provider: String,
-    rollout_path: String,
-    session_id: String,
-    backup_dir: String,
-    line_no: usize,
-    new_text: String,
-    lock: tauri::State<'_, crate::family::FamilyLock>,
-) -> AppResult<EditApplyReport> {
-    edit_session_event_text_with_lock(
-        provider,
-        rollout_path,
-        session_id,
-        backup_dir,
-        line_no,
-        new_text,
-        lock.inner(),
-    )
-}
-
 pub fn delete_session_events_with_lock(
     provider: String,
     rollout_path: String,
@@ -1433,26 +1410,6 @@ pub fn delete_session_events_with_lock(
     })
 }
 
-#[cfg(feature = "desktop")]
-#[tauri::command]
-pub fn delete_session_events(
-    provider: String,
-    rollout_path: String,
-    session_id: String,
-    backup_dir: String,
-    line_nos: Vec<usize>,
-    lock: tauri::State<'_, crate::family::FamilyLock>,
-) -> AppResult<EditApplyReport> {
-    delete_session_events_with_lock(
-        provider,
-        rollout_path,
-        session_id,
-        backup_dir,
-        line_nos,
-        lock.inner(),
-    )
-}
-
 pub fn undo_last_session_edit_with_lock(
     provider: String,
     rollout_path: String,
@@ -1463,18 +1420,6 @@ pub fn undo_last_session_edit_with_lock(
     crate::family::with_lock(lock, |_g| {
         undo_last(&provider, &rollout_path, &session_id, &backup_dir)
     })
-}
-
-#[cfg(feature = "desktop")]
-#[tauri::command]
-pub fn undo_last_session_edit(
-    provider: String,
-    rollout_path: String,
-    session_id: String,
-    backup_dir: String,
-    lock: tauri::State<'_, crate::family::FamilyLock>,
-) -> AppResult<EditApplyReport> {
-    undo_last_session_edit_with_lock(provider, rollout_path, session_id, backup_dir, lock.inner())
 }
 
 pub fn restore_session_edit_snapshot_with_lock(
@@ -1496,27 +1441,6 @@ pub fn restore_session_edit_snapshot_with_lock(
     })
 }
 
-#[cfg(feature = "desktop")]
-#[tauri::command]
-pub fn restore_session_edit_snapshot(
-    provider: String,
-    rollout_path: String,
-    session_id: String,
-    backup_dir: String,
-    snapshot_name: String,
-    lock: tauri::State<'_, crate::family::FamilyLock>,
-) -> AppResult<EditApplyReport> {
-    restore_session_edit_snapshot_with_lock(
-        provider,
-        rollout_path,
-        session_id,
-        backup_dir,
-        snapshot_name,
-        lock.inner(),
-    )
-}
-
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn session_edit_history(
     provider: String,
     rollout_path: String,

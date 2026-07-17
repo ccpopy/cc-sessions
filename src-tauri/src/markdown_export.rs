@@ -33,7 +33,6 @@ enum Segment {
     Skip,
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn export_session_markdown(
     provider: Option<String>,
     rollout_path: String,

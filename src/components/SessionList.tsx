@@ -31,11 +31,21 @@ type Props = Handlers & {
   backupIndex?: Record<string, string[]>;
   overlay?: Map<string, FamilyOverlay>;
   currentProvider?: string | null;
+  syncingSessionIds?: ReadonlySet<string>;
+  syncActionsDisabled?: boolean;
 };
 
 type BucketKey = "today" | "yesterday" | "week" | "month" | "earlier";
 
-export function SessionList({ sessions, backupIndex, overlay, currentProvider, ...h }: Props) {
+export function SessionList({
+  sessions,
+  backupIndex,
+  overlay,
+  currentProvider,
+  syncingSessionIds,
+  syncActionsDisabled,
+  ...h
+}: Props) {
   const view = useView((s) => s.view);
   const query = useView((s) => s.query);
   const prefillCwd = useView((s) => s.prefillCwd);
@@ -62,6 +72,8 @@ export function SessionList({ sessions, backupIndex, overlay, currentProvider, .
         query={query}
         overlay={overlay}
         currentProvider={currentProvider}
+        syncingSessionIds={syncingSessionIds}
+        syncActionsDisabled={syncActionsDisabled}
       />
     );
   }
@@ -74,6 +86,8 @@ export function SessionList({ sessions, backupIndex, overlay, currentProvider, .
         query={query}
         overlay={overlay}
         currentProvider={currentProvider}
+        syncingSessionIds={syncingSessionIds}
+        syncActionsDisabled={syncActionsDisabled}
       />
     );
   }
@@ -85,6 +99,8 @@ export function SessionList({ sessions, backupIndex, overlay, currentProvider, .
       query={query}
       overlay={overlay}
       currentProvider={currentProvider}
+      syncingSessionIds={syncingSessionIds}
+      syncActionsDisabled={syncActionsDisabled}
     />
   );
 }
@@ -95,12 +111,16 @@ function TimeView({
   query,
   overlay,
   currentProvider,
+  syncingSessionIds,
+  syncActionsDisabled,
 }: {
   sessions: SessionSummary[];
   handlers: Handlers;
   query: string;
   overlay?: Map<string, FamilyOverlay>;
   currentProvider?: string | null;
+  syncingSessionIds?: ReadonlySet<string>;
+  syncActionsDisabled?: boolean;
 }) {
   const selected = useSelection((s) => s.selected);
   const toggle = useSelection((s) => s.toggle);
@@ -165,6 +185,8 @@ function TimeView({
                   query={query}
                   overlay={overlay?.get(s.id)}
                   currentProvider={currentProvider}
+                  syncing={syncingSessionIds?.has(s.id)}
+                  syncDisabled={syncActionsDisabled}
                   {...handlers}
                 />
               ))}
@@ -182,12 +204,16 @@ function ProjectView({
   query,
   overlay,
   currentProvider,
+  syncingSessionIds,
+  syncActionsDisabled,
 }: {
   sessions: SessionSummary[];
   handlers: Handlers;
   query: string;
   overlay?: Map<string, FamilyOverlay>;
   currentProvider?: string | null;
+  syncingSessionIds?: ReadonlySet<string>;
+  syncActionsDisabled?: boolean;
 }) {
   const groups = useMemo(() => {
     const map = new Map<string, SessionSummary[]>();
@@ -217,6 +243,8 @@ function ProjectView({
           handlers={handlers}
           overlay={overlay}
           currentProvider={currentProvider}
+          syncingSessionIds={syncingSessionIds}
+          syncActionsDisabled={syncActionsDisabled}
         />
       ))}
     </div>
@@ -229,12 +257,16 @@ function SizeView({
   query,
   overlay,
   currentProvider,
+  syncingSessionIds,
+  syncActionsDisabled,
 }: {
   sessions: SessionSummary[];
   handlers: Handlers;
   query: string;
   overlay?: Map<string, FamilyOverlay>;
   currentProvider?: string | null;
+  syncingSessionIds?: ReadonlySet<string>;
+  syncActionsDisabled?: boolean;
 }) {
   const selected = useSelection((s) => s.selected);
   const toggle = useSelection((s) => s.toggle);
@@ -255,6 +287,8 @@ function SizeView({
           query={query}
           overlay={overlay?.get(s.id)}
           currentProvider={currentProvider}
+          syncing={syncingSessionIds?.has(s.id)}
+          syncDisabled={syncActionsDisabled}
           {...handlers}
         />
       ))}

@@ -18,7 +18,6 @@ pub struct PreviewImage {
     pub mime: String,
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn read_preview_image(path: String) -> AppResult<PreviewImage> {
     let raw = path.trim();
     reject_non_local_preview_path(raw)?;

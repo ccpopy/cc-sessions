@@ -45,6 +45,10 @@ import { basename } from "@/lib/cwd";
 import { isSubagentSession } from "@/lib/sessionSource";
 import { sessionIdentity } from "@/lib/sessionIdentity";
 import {
+  ProviderSyncRegistry,
+  type ProviderSyncSnapshot,
+} from "@/lib/providerSyncRegistry";
+import {
   selectNormalFamilySessions,
   sortSessionsByActivity,
 } from "@/lib/sessionVisibility";
@@ -89,7 +93,15 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const [currentProvider, setCurrentProvider] = useState<string | null>(null);
   const [maintenanceError, setMaintenanceError] = useState<string | null>(null);
   const [familySheetId, setFamilySheetId] = useState<string | null>(null);
-  const [cloning, setCloning] = useState(false);
+  const providerSyncRegistry = useRef(new ProviderSyncRegistry());
+  const [providerSyncState, setProviderSyncState] = useState<ProviderSyncSnapshot>(() =>
+    providerSyncRegistry.current.snapshot(),
+  );
+  const publishProviderSyncState = useCallback(() => {
+    setProviderSyncState(providerSyncRegistry.current.snapshot());
+  }, []);
+  const cloning =
+    providerSyncState.batchActive || providerSyncState.sessionIds.size > 0;
   const showHiddenRecords = useMemo(() => isExplicitHiddenRecordQuery(query), [query]);
   const isCodex = provider === "codex";
   const hasActiveVisibilityFilter = showSubagentSessions || (isCodex && showArchivedSessions);
@@ -280,7 +292,8 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const onCloneOne = useCallback(
     async (s: SessionSummary) => {
       if (!settings || !currentProvider) return;
-      setCloning(true);
+      if (!providerSyncRegistry.current.tryBeginSession(s.id)) return;
+      publishProviderSyncState();
       try {
         const r = await api.cloneSessionForProvider({
           codex_dir: settings.codex_dir,
@@ -302,15 +315,17 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
       } catch (e) {
         toast.error(String((e as Error)?.message ?? e));
       } finally {
-        setCloning(false);
+        providerSyncRegistry.current.finishSession(s.id);
+        publishProviderSyncState();
       }
     },
-    [settings, currentProvider, refresh, refreshOverlay],
+    [settings, currentProvider, publishProviderSyncState, refresh, refreshOverlay],
   );
 
   const onBatchClone = useCallback(async () => {
     if (!settings || !currentProvider || !isCodex) return;
-    setCloning(true);
+    if (!providerSyncRegistry.current.tryBeginBatch()) return;
+    publishProviderSyncState();
     try {
       const r = await api.batchCloneForCurrentProvider({
         codex_dir: settings.codex_dir,
@@ -339,9 +354,10 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     } catch (e) {
       toast.error(String((e as Error)?.message ?? e));
     } finally {
-      setCloning(false);
+      providerSyncRegistry.current.finishBatch();
+      publishProviderSyncState();
     }
-  }, [settings, currentProvider, isCodex, refresh, refreshOverlay]);
+  }, [settings, currentProvider, isCodex, publishProviderSyncState, refresh, refreshOverlay]);
 
   useHotkeys([
     {
@@ -577,6 +593,8 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             backupIndex={backupIndex}
             overlay={overlay}
             currentProvider={currentProvider}
+            syncingSessionIds={providerSyncState.sessionIds}
+            syncActionsDisabled={providerSyncState.batchActive}
             onPreview={setPreview}
             onCopyResume={onCopyResume}
             onRevealCwd={onReveal}

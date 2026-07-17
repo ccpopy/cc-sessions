@@ -429,7 +429,6 @@ fn rollout_source_from_state(
 
 // ========================= 导出 =========================
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn export_session_bundles(
     provider: Option<String>,
     codex_dir: String,
@@ -937,7 +936,6 @@ fn claude_bundle_dir_name(id: &str, source_rel: &str) -> String {
     )
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn export_all_bundles(
     provider: Option<String>,
     codex_dir: String,
@@ -1007,7 +1005,6 @@ pub fn export_all_bundles(
 
 // ========================= 列出 / 校验 =========================
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn list_bundles(src_dir: String, provider: Option<String>) -> AppResult<Vec<BundleListItem>> {
     let root = PathBuf::from(&src_dir);
     if !plain_directory_root_exists(&root, "Bundle 源目录")? {
@@ -1077,7 +1074,6 @@ pub fn list_bundles(src_dir: String, provider: Option<String>) -> AppResult<Vec<
     Ok(out)
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn verify_bundles(src_dir: String, provider: Option<String>) -> AppResult<Vec<BundleListItem>> {
     let mut items = list_bundles(src_dir, provider)?;
     for it in items.iter_mut() {
@@ -1132,7 +1128,6 @@ pub fn verify_bundles(src_dir: String, provider: Option<String>) -> AppResult<Ve
 
 // ========================= 导入 =========================
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn import_session_bundles(
     provider: Option<String>,
     src_dir: String,
@@ -4125,7 +4120,6 @@ mod tests {
 
 // ========================= zip 打包 =========================
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn pack_bundles_zip(src_dir: String, zip_path: String) -> AppResult<ZipReport> {
     let src = absolute_lexical_path(Path::new(&src_dir), "ZIP 打包源")?;
     validate_existing_directory_chain(&src, "ZIP 打包源父链")?;
@@ -5234,7 +5228,6 @@ fn cleanup_failed_zip_unpack(
     }
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn unpack_zip(zip_path: String, dst_dir: String) -> AppResult<ZipReport> {
     let destination = absolute_lexical_path(Path::new(&dst_dir), "ZIP 解包目标")?;
     let parent = destination.parent().ok_or_else(|| {
@@ -5306,7 +5299,6 @@ pub fn unpack_zip(zip_path: String, dst_dir: String) -> AppResult<ZipReport> {
     })
 }
 
-#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn unpack_zip_to_temp(zip_path: String) -> AppResult<ZipReport> {
     let dir = std::env::temp_dir().join(format!(
         "cc-session-manager-import-{}-{}",
