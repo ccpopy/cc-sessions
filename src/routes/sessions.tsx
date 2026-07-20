@@ -17,6 +17,7 @@ import { PreviewDialog } from "@/components/PreviewDialog";
 import { MarkdownExportDialog } from "@/components/MarkdownExportDialog";
 import { BackupCreateDialog } from "@/components/BackupCreateDialog";
 import { DangerDialog } from "@/components/DangerDialog";
+import { RenameSessionDialog } from "@/components/RenameSessionDialog";
 import { EmptyState } from "@/components/EmptyState";
 import { FamilyHistorySheet } from "@/components/FamilyHistorySheet";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -86,6 +87,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
 
   const [preview, setPreview] = useState<SessionSummary | null>(null);
   const [exportTarget, setExportTarget] = useState<SessionSummary | null>(null);
+  const [renameTarget, setRenameTarget] = useState<SessionSummary | null>(null);
   const [backupTargets, setBackupTargets] = useState<SessionSummary[]>([]);
   const [deleteTargets, setDeleteTargets] = useState<SessionSummary[]>([]);
   const [overlay, setOverlay] = useState<Map<string, FamilyOverlay>>(new Map());
@@ -604,6 +606,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             onClone={isCodex ? onCloneOne : undefined}
             onOpenFamily={isCodex ? (s) => setFamilySheetId(s.id) : undefined}
             onExportMarkdown={setExportTarget}
+            onRename={isCodex ? setRenameTarget : undefined}
           />
         )}
       </ScrollArea>
@@ -630,6 +633,28 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         open={!!exportTarget}
         onOpenChange={(v) => !v && setExportTarget(null)}
         session={exportTarget}
+      />
+
+      <RenameSessionDialog
+        open={!!renameTarget}
+        onOpenChange={(v) => !v && setRenameTarget(null)}
+        session={renameTarget}
+        onSubmit={async (title) => {
+          if (!settings || !renameTarget) return;
+          try {
+            const renamed = await api.renameSession(
+              provider,
+              settings.codex_dir,
+              renameTarget.id,
+              title,
+            );
+            toast.success(renamed > 1 ? `已重命名（同步 ${renamed} 个分支）` : "已重命名");
+            await refresh();
+          } catch (e: any) {
+            toast.error("重命名失败：" + String(e?.message ?? e));
+            throw e;
+          }
+        }}
       />
 
       <FamilyHistorySheet

@@ -735,6 +735,21 @@ pub async fn delete_sessions(
 }
 
 #[tauri::command]
+pub async fn rename_session(
+    provider: Option<String>,
+    codex_dir: String,
+    id: String,
+    title: String,
+    lock: SharedLock<'_>,
+) -> AppResult<u32> {
+    let lock = lock.inner().clone();
+    run_blocking(move || {
+        crate::sessions::rename_session_with_lock(provider, codex_dir, id, title, &lock)
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn stats_kpi(
     provider: Option<String>,
     codex_dir: String,

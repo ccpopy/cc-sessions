@@ -24,6 +24,7 @@ type Handlers = {
   onClone?: (s: SessionSummary) => void;
   onOpenFamily?: (s: SessionSummary) => void;
   onExportMarkdown?: (s: SessionSummary) => void;
+  onRename?: (s: SessionSummary) => void;
 };
 
 type Props = Handlers & {

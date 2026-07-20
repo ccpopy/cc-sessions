@@ -1831,7 +1831,14 @@ fn threads_upsert_sql(cols: &[&str]) -> String {
     let update_sql = cols
         .iter()
         .filter(|c| **c != "id")
-        .map(|c| format!("{c}=excluded.{c}"))
+        .map(|c| match *c {
+            // 官方 App 的“重命名”只落在 threads.title（rollout 里没有这份数据）。
+            // 行已存在时不得用 rollout 派生标题覆盖非空标题，否则自定义会话名会丢失。
+            "title" => "title=CASE WHEN TRIM(COALESCE(threads.title,''))='' \
+                 THEN excluded.title ELSE threads.title END"
+                .to_string(),
+            _ => format!("{c}=excluded.{c}"),
+        })
         .collect::<Vec<_>>()
         .join(",");
     format!("INSERT INTO threads ({cols_sql}) VALUES ({placeholders}) ON CONFLICT(id) DO UPDATE SET {update_sql}")
@@ -2004,6 +2011,24 @@ fn sync_thread_from_rollout(
         "rollout 缺少有效 session_meta.id，无法同步 threads: {}",
         rollout.to_string_lossy()
     )))
+}
+
+/// 把源会话的 threads.title 带到克隆/fork 出的新分支。
+///
+/// 官方 App 的自定义会话名只存在 threads.title；新 id 的行由 rollout 派生，
+/// 不带过来的话切换 provider 后侧栏名称会退回“首条消息”。源行标题为空时不动。
+fn carry_thread_title(
+    state: &rusqlite::Connection,
+    source_id: &str,
+    new_id: &str,
+) -> AppResult<()> {
+    state.execute(
+        "UPDATE threads SET title = (SELECT title FROM threads WHERE id = ?1)
+         WHERE id = ?2
+           AND EXISTS (SELECT 1 FROM threads WHERE id = ?1 AND TRIM(COALESCE(title,'')) <> '')",
+        rusqlite::params![source_id, new_id],
+    )?;
+    Ok(())
 }
 
 fn require_thread_row(state: &rusqlite::Connection, id: &str) -> AppResult<()> {
@@ -3277,6 +3302,7 @@ fn fork_session_at_event_locked(
     let included_lines = write_forked_rollout_prefix(&prefix, &new_abs, &new_id, &provider)?;
     sync_thread_from_rollout(&codex, &state, &new_abs)?;
     sync_thread_from_rollout(&codex, &state, &source_abs)?;
+    carry_thread_title(&state, &active_branch.id, &new_id)?;
 
     family::archive_with_integrity(&mut store, &codex, &family_id, &active_branch.id)?;
     let archived_dir = paths::archived_sessions_dir(&codex);
@@ -3650,6 +3676,14 @@ fn clone_session_for_provider_locked(
                 inject_repair_fault("clone_after_new_rollout")?;
                 require_unchanged_snapshot(&source_rollout, &source_snapshot, "克隆源 rollout ")?;
                 sync_thread_from_rollout(&codex, &transaction, &new_abs)?;
+                carry_thread_title(
+                    &transaction,
+                    active_branch
+                        .as_ref()
+                        .map(|b| b.id.as_str())
+                        .unwrap_or(&session_id),
+                    &new_id,
+                )?;
                 inject_repair_fault("clone_after_thread")?;
 
                 // 2) Continuous 在移动旧 active 前再次绑定克隆时的同一源快照。
@@ -5764,6 +5798,81 @@ mod tests {
         assert_eq!(title, "First request");
 
         drop(state);
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn upsert_thread_preserves_existing_custom_title() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-preserve-title-test");
+        let rollout = write_conversation_rollout(&codex, "renamed-session")?;
+        create_full_state(&codex)?;
+
+        let state = state_db::open(&codex)?;
+        assert!(upsert_thread_from_rollout(&codex, &state, &rollout, false)?);
+        state.execute(
+            "UPDATE threads SET title = '自定义标题' WHERE id = 'renamed-session'",
+            [],
+        )?;
+
+        // 再次同步（模拟 provider follow / 分支内容同步 / 重建 threads 表）
+        assert!(upsert_thread_from_rollout(&codex, &state, &rollout, false)?);
+        let title: String = state.query_row(
+            "SELECT title FROM threads WHERE id = ?",
+            ["renamed-session"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            title, "自定义标题",
+            "非空自定义标题不得被 rollout 派生标题覆盖"
+        );
+
+        // 空标题仍应被派生标题补齐
+        state.execute(
+            "UPDATE threads SET title = '   ' WHERE id = 'renamed-session'",
+            [],
+        )?;
+        assert!(upsert_thread_from_rollout(&codex, &state, &rollout, false)?);
+        let title: String = state.query_row(
+            "SELECT title FROM threads WHERE id = ?",
+            ["renamed-session"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(title, "First request");
+
+        drop(state);
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn carry_thread_title_copies_only_non_empty_source_title() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-carry-title-test");
+        let conn = create_full_state(&codex)?;
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path, title) VALUES
+             ('src-named', 'a.jsonl', '自定义标题'),
+             ('src-unnamed', 'b.jsonl', ''),
+             ('new-1', 'c.jsonl', 'First request'),
+             ('new-2', 'd.jsonl', 'First request')",
+            [],
+        )?;
+
+        carry_thread_title(&conn, "src-named", "new-1")?;
+        carry_thread_title(&conn, "src-unnamed", "new-2")?;
+
+        let title1: String =
+            conn.query_row("SELECT title FROM threads WHERE id = 'new-1'", [], |r| {
+                r.get(0)
+            })?;
+        let title2: String =
+            conn.query_row("SELECT title FROM threads WHERE id = 'new-2'", [], |r| {
+                r.get(0)
+            })?;
+        assert_eq!(title1, "自定义标题");
+        assert_eq!(title2, "First request", "源标题为空时不覆盖新行标题");
+
+        drop(conn);
         fs::remove_dir_all(&codex).ok();
         Ok(())
     }

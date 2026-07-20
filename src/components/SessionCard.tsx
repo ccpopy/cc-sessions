@@ -10,6 +10,7 @@ import {
   Inbox,
   MoreHorizontal,
   Network,
+  Pencil,
   RotateCw,
   ShieldCheck,
   Trash2,
@@ -52,6 +53,7 @@ type Props = {
   onClone?: (s: SessionSummary) => void;
   onOpenFamily?: (s: SessionSummary) => void;
   onExportMarkdown?: (s: SessionSummary) => void;
+  onRename?: (s: SessionSummary) => void;
   query?: string;
   showProject?: boolean;
   overlay?: FamilyOverlay;
@@ -73,6 +75,7 @@ export const SessionCard = memo(function SessionCard({
   onClone,
   onOpenFamily,
   onExportMarkdown,
+  onRename,
   query = "",
   showProject = true,
   overlay,
@@ -311,6 +314,12 @@ export const SessionCard = memo(function SessionCard({
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
+                {onRename && (
+                  <DropdownMenuItem onClick={() => onRename(s)}>
+                    <Pencil className="h-4 w-4" />
+                    重命名
+                  </DropdownMenuItem>
+                )}
                 <DropdownMenuItem onClick={() => onBackup(s)}>
                   <Archive className="h-4 w-4" />
                   单条备份

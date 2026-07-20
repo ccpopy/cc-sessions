@@ -333,6 +333,85 @@ pub fn set_archived_with_lock(
     family::with_lock(lock, |_guard| set_archived_codex_locked(codex_dir, id, v))
 }
 
+/// 重命名会话：写 threads.title（官方 App 与本软件共用这一名称来源）。
+///
+/// 同一家族的全部分支一起改名——provider 切换会产生新 id，只改当前分支的话，
+/// 切换后名称又会退回首条消息（用户反馈 #8）。返回实际更新的 threads 行数。
+pub fn rename_session_with_lock(
+    provider: Option<String>,
+    codex_dir: String,
+    id: String,
+    title: String,
+    lock: &family::FamilyLock,
+) -> AppResult<u32> {
+    if provider_or_codex(provider) != "codex" {
+        return Err(AppError::Other("Claude 会话暂不支持重命名".into()));
+    }
+    let title = title.trim().to_string();
+    if title.is_empty() {
+        return Err(AppError::Other("会话名称不能为空".into()));
+    }
+    if title.chars().count() > 120 {
+        return Err(AppError::Other("会话名称过长（最多 120 个字符）".into()));
+    }
+    family::with_lock(lock, |_guard| rename_session_locked(codex_dir, id, title))
+}
+
+fn rename_session_locked(codex_dir: String, id: String, title: String) -> AppResult<u32> {
+    let codex = PathBuf::from(&codex_dir);
+    if !paths::state_db_path(&codex).is_file() {
+        return Err(AppError::InvalidCodexDir(format!(
+            "state_5.sqlite 不存在，无法重命名会话: {}",
+            paths::state_db_path(&codex).to_string_lossy()
+        )));
+    }
+
+    let mut store = family::load(&codex)?;
+    let mut ids: Vec<String> = vec![id.clone()];
+    let family_id = store.index.get(&id).cloned();
+    if let Some(family_id) = family_id.as_ref() {
+        if let Some(family) = store.families.get(family_id) {
+            ids = family.chain.iter().map(|b| b.id.clone()).collect();
+            if !ids.iter().any(|x| x == &id) {
+                ids.push(id.clone());
+            }
+        }
+    }
+
+    let state = state_db::open(&codex)?;
+    let now = chrono::Utc::now().timestamp();
+    let mut renamed = 0u32;
+    for sid in &ids {
+        // 只更新 updated_at（秒），新 schema 的触发器会自动同步 updated_at_ms。
+        // bump updated_at 是为了让官方 App 的水位线增量同步能拉到这次改名，
+        // 否则要重启 App 才能看到新名字。
+        renamed += state.execute(
+            "UPDATE threads SET title = ?1, updated_at = ?2 WHERE id = ?3",
+            params![title, now, sid],
+        )? as u32;
+    }
+    if renamed == 0 {
+        return Err(AppError::NotFound(format!("threads 中未找到会话 {id}")));
+    }
+
+    // session_index.jsonl：仅刷新已有条目的 thread_name（不给归档会话补条目）。
+    let index_ids = crate::repair::read_session_index_ids(&codex)?;
+    for sid in &ids {
+        if index_ids.contains(sid) {
+            crate::repair::append_index_line(&codex, sid, &title, Path::new(""))?;
+        }
+    }
+
+    if let Some(family_id) = family_id {
+        if let Some(family) = store.families.get_mut(&family_id) {
+            family.title = title.clone();
+            family.updated_at = chrono::Utc::now().to_rfc3339();
+            family::save(&codex, &store)?;
+        }
+    }
+    Ok(renamed)
+}
+
 fn set_archived_codex_locked(codex_dir: String, id: String, v: bool) -> AppResult<()> {
     let codex = PathBuf::from(&codex_dir);
     let mut family_store = family::load(&codex)?;
@@ -1581,6 +1660,129 @@ mod tests {
             id: id.to_string(),
             rollout_path: path.map(|path| path.to_string_lossy().into_owned()),
         }
+    }
+
+    #[test]
+    fn rename_session_updates_title_and_bumps_updated_at() -> AppResult<()> {
+        let codex = temp_dir("codex-rename-session");
+        let conn = create_codex_threads_table(&codex)?;
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path, title, updated_at, archived)
+             VALUES ('rename-me', 'x.jsonl', '旧标题', 1770000000, 0)",
+            [],
+        )?;
+        drop(conn);
+
+        let lock = family::FamilyLock::default();
+        let renamed = rename_session_with_lock(
+            Some("codex".into()),
+            codex.to_string_lossy().into_owned(),
+            "rename-me".into(),
+            "  新的会话名  ".into(),
+            &lock,
+        )?;
+        assert_eq!(renamed, 1);
+
+        let conn = rusqlite::Connection::open(codex.join("state_5.sqlite"))?;
+        let (title, updated_at): (String, i64) = conn.query_row(
+            "SELECT title, updated_at FROM threads WHERE id = 'rename-me'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(title, "新的会话名");
+        assert!(
+            updated_at > 1770000000,
+            "重命名应 bump updated_at 以便官方 App 增量同步可见"
+        );
+
+        // 空名与 Claude 会话必须被拒绝
+        assert!(rename_session_with_lock(
+            Some("codex".into()),
+            codex.to_string_lossy().into_owned(),
+            "rename-me".into(),
+            "   ".into(),
+            &lock,
+        )
+        .is_err());
+        assert!(rename_session_with_lock(
+            Some("claude".into()),
+            codex.to_string_lossy().into_owned(),
+            "rename-me".into(),
+            "名字".into(),
+            &lock,
+        )
+        .is_err());
+        assert!(rename_session_with_lock(
+            Some("codex".into()),
+            codex.to_string_lossy().into_owned(),
+            "missing-id".into(),
+            "名字".into(),
+            &lock,
+        )
+        .is_err());
+
+        drop(conn);
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn rename_session_updates_family_without_readding_archived_index_entries() -> AppResult<()> {
+        let codex = temp_dir("codex-rename-session-family");
+        let family_id = "family-rename";
+        let archived_id = "019d-family-rename-archived";
+        let active_id = "019d-family-rename-active";
+        codex_family_fixture(
+            &codex,
+            family_id,
+            active_id,
+            &[
+                FamilyBranchFixture {
+                    id: archived_id,
+                    archived: true,
+                },
+                FamilyBranchFixture {
+                    id: active_id,
+                    archived: false,
+                },
+            ],
+        )?;
+
+        let lock = family::FamilyLock::default();
+        let renamed = rename_session_with_lock(
+            Some("codex".into()),
+            codex.to_string_lossy().into_owned(),
+            active_id.into(),
+            "家族新名称".into(),
+            &lock,
+        )?;
+        assert_eq!(renamed, 2);
+
+        let conn = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let matching: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM threads WHERE id IN (?1, ?2) AND title = ?3",
+            params![archived_id, active_id, "家族新名称"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(matching, 2, "同一家族的活跃与归档分支都应改名");
+        drop(conn);
+
+        let index = fs::read_to_string(paths::session_index_path(&codex))?;
+        assert!(index.contains(active_id));
+        assert!(index.contains("家族新名称"));
+        assert!(
+            !index.contains(archived_id),
+            "改名不得把归档分支重新写回活跃索引"
+        );
+
+        let store = family::load(&codex)?;
+        assert_eq!(
+            store.families.get(family_id).expect("family").title,
+            "家族新名称"
+        );
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
     }
 
     #[test]

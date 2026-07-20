@@ -58,6 +58,7 @@ pub fn run() {
             commands::group_sessions_by_project,
             commands::search_sessions,
             commands::set_archived,
+            commands::rename_session,
             commands::delete_session,
             commands::delete_sessions,
             commands::preview_session_head,

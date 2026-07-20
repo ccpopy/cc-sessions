@@ -665,6 +665,8 @@ export const api = {
     invokeCommand<SessionSummary[]>("search_sessions", { provider, codexDir, claudeDir, query }),
   setArchived: (provider: SessionProvider, codexDir: string, id: string, v: boolean) =>
     invokeCommand<void>("set_archived", { provider, codexDir, id, v }),
+  renameSession: (provider: SessionProvider, codexDir: string, id: string, title: string) =>
+    invokeCommand<number>("rename_session", { provider, codexDir, id, title }),
   deleteSession: (
     provider: SessionProvider,
     codexDir: string,
