@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::error::AppResult;
-use crate::models::{PreviewEvent, SessionMetaBrief};
+use crate::models::{
+    PreviewEvent, SessionMetaBrief, TimelineMessageBrief, UserPromptBrief, UserPromptList,
+};
 
 const PREVIEW_CAPACITY_HINT_MAX: usize = 1024;
 fn classify(index: usize, raw: Value) -> PreviewEvent {
@@ -364,6 +366,119 @@ fn preview_capacity_hint(limit: usize) -> usize {
     limit.min(PREVIEW_CAPACITY_HINT_MAX)
 }
 
+/// 时间线消息预览的最大字符数：悬浮卡片/列表只需要开头片段。
+const TIMELINE_MESSAGE_PREVIEW_CHARS: usize = 400;
+
+/// 扫描整个会话文件，以真实用户提问作为时间线刻度，并附带其后最后一条 Agent 回复摘要。
+/// 不携带 raw，负载远小于全量 preview_session_range。
+pub fn preview_session_user_prompts(
+    provider: Option<String>,
+    rollout_path: String,
+) -> AppResult<UserPromptList> {
+    match provider.as_deref().unwrap_or("codex") {
+        "codex" => user_prompts_impl(&rollout_path, |index, raw| Some(classify(index, raw))),
+        "claude" => user_prompts_impl(&rollout_path, crate::claude_sessions::classify_preview),
+        other => Err(crate::error::AppError::Other(format!(
+            "不支持的 provider: {other}"
+        ))),
+    }
+}
+
+fn user_prompts_impl(
+    path: &str,
+    classify_line: impl Fn(usize, Value) -> Option<PreviewEvent>,
+) -> AppResult<UserPromptList> {
+    let f = File::open(PathBuf::from(path))?;
+    let reader = BufReader::new(f);
+    let mut prompts = Vec::new();
+    let mut total_events = 0usize;
+    for (i, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(raw) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(event) = classify_line(i, raw) else {
+            continue;
+        };
+        // offset 必须与 preview_session_range 的事件计数保持一致，前端靠它分页加载到目标
+        let offset = total_events;
+        total_events += 1;
+        if !preview_event_is_conversation(&event) {
+            continue;
+        }
+        let event_text = preview_event_text(&event);
+        let display_text = if event.role == "user" {
+            timeline_user_text(&event_text)
+        } else {
+            event_text
+        };
+        let text = clip_timeline_preview(&display_text);
+        match event.role.as_str() {
+            "user" => prompts.push(UserPromptBrief {
+                index: event.index,
+                offset,
+                timestamp: event.timestamp.clone(),
+                text,
+                response: None,
+            }),
+            // 一轮里可能出现多条 Agent 消息；保留最后一条，更接近最终答复摘要。
+            "assistant" if !text.is_empty() => {
+                if let Some(prompt) = prompts.last_mut() {
+                    prompt.response = Some(TimelineMessageBrief {
+                        index: event.index,
+                        offset,
+                        timestamp: event.timestamp.clone(),
+                        text,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(UserPromptList {
+        prompts,
+        total_events,
+    })
+}
+
+/// 保留换行的截断：与 trim() 的单行摘要不同，悬浮卡片需要多行预览。
+fn clip_timeline_preview(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= TIMELINE_MESSAGE_PREVIEW_CHARS {
+        return trimmed.to_string();
+    }
+    let mut out: String = trimmed
+        .chars()
+        .take(TIMELINE_MESSAGE_PREVIEW_CHARS)
+        .collect();
+    out.push('…');
+    out
+}
+
+/// Codex 带附件的用户消息会把文件清单和真实请求包装在同一段文本中。
+/// 时间线只展示 `My request for Codex:` 标题后的正文，避免附件元数据占满卡片。
+fn timeline_user_text(text: &str) -> String {
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        let heading = line.trim().trim_start_matches('#').trim();
+        if heading.eq_ignore_ascii_case("My request for Codex:") {
+            return lines
+                .filter(|line| {
+                    let trimmed = line.trim_start();
+                    !trimmed.starts_with("<image") && !trimmed.starts_with("</image")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_string();
+        }
+    }
+    text.to_string()
+}
+
 pub fn read_rollout_token_total(path: &Path) -> AppResult<i64> {
     const REVERSE_SCAN_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -705,6 +820,143 @@ mod tests {
         let event = classify(0, raw);
 
         assert!(!preview_event_is_conversation(&event));
+    }
+
+    #[test]
+    fn user_prompts_collects_only_real_user_questions() -> AppResult<()> {
+        let file = temp_file("cc-session-manager-rollout-user-prompts-test");
+        {
+            let mut out = File::create(&file)?;
+            for value in [
+                serde_json::json!({
+                    "type": "session_meta",
+                    "payload": {"id": "session-1"}
+                }),
+                // 内部上下文消息：不应计入提问
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "<environment_context>\nfoo\n</environment_context>"}]
+                    }
+                }),
+                // 展示层事件消息：与「仅看对话消息」一致，不计入提问
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "第一个问题"}
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "timestamp": "2026-07-21T10:00:00Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "# Files mentioned by the user:\n\n## My request for Codex:\n第一个问题\n<image name=[Image #1]>\n</image>"
+                        }]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "回答"}]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "第二个问题"}]
+                    }
+                }),
+            ] {
+                writeln!(out, "{}", serde_json::to_string(&value)?)?;
+            }
+        }
+
+        let list = preview_session_user_prompts(
+            Some("codex".to_string()),
+            file.to_string_lossy().into_owned(),
+        )?;
+        fs::remove_file(file).ok();
+
+        assert_eq!(list.total_events, 6);
+        assert_eq!(list.prompts.len(), 2);
+        assert_eq!(list.prompts[0].text, "第一个问题");
+        assert_eq!(list.prompts[0].index, 3);
+        assert_eq!(list.prompts[0].offset, 3);
+        assert_eq!(list.prompts[0].timestamp, "2026-07-21T10:00:00Z");
+        let response = list.prompts[0]
+            .response
+            .as_ref()
+            .expect("第一轮应包含 Agent 回复");
+        assert_eq!(response.text, "回答");
+        assert_eq!(response.index, 4);
+        assert_eq!(response.offset, 4);
+        assert_eq!(list.prompts[1].text, "第二个问题");
+        assert_eq!(list.prompts[1].index, 5);
+        assert_eq!(list.prompts[1].offset, 5);
+        assert!(list.prompts[1].response.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn user_prompts_pair_claude_question_with_last_agent_reply() -> AppResult<()> {
+        let file = temp_file("cc-session-manager-claude-timeline-test");
+        {
+            let mut out = File::create(&file)?;
+            for value in [
+                serde_json::json!({
+                    "type": "user",
+                    "timestamp": "2026-07-21T10:00:00Z",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "帮我检查这个问题"}]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "assistant",
+                    "timestamp": "2026-07-21T10:00:01Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "我先检查代码。"}]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "assistant",
+                    "timestamp": "2026-07-21T10:00:02Z",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "已经定位并修复。"}]
+                    }
+                }),
+            ] {
+                writeln!(out, "{}", serde_json::to_string(&value)?)?;
+            }
+        }
+
+        let list = preview_session_user_prompts(
+            Some("claude".to_string()),
+            file.to_string_lossy().into_owned(),
+        )?;
+        fs::remove_file(file).ok();
+
+        assert_eq!(list.total_events, 3);
+        assert_eq!(list.prompts.len(), 1);
+        assert_eq!(list.prompts[0].text, "帮我检查这个问题");
+        let response = list.prompts[0]
+            .response
+            .as_ref()
+            .expect("Claude 对话轮次应包含回复");
+        assert_eq!(response.text, "已经定位并修复。");
+        assert_eq!(response.index, 2);
+        assert_eq!(response.offset, 2);
+        Ok(())
     }
 
     #[test]

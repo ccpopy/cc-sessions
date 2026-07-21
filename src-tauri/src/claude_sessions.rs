@@ -314,7 +314,7 @@ fn parse_session(path: &Path) -> AppResult<Option<SessionSummary>> {
     }))
 }
 
-fn classify_preview(index: usize, raw: Value) -> Option<PreviewEvent> {
+pub(crate) fn classify_preview(index: usize, raw: Value) -> Option<PreviewEvent> {
     let timestamp = raw
         .get("timestamp")
         .and_then(Value::as_str)

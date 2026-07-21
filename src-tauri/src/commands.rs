@@ -646,6 +646,14 @@ pub async fn preview_session_range(
 }
 
 #[tauri::command]
+pub async fn preview_session_user_prompts(
+    provider: Option<String>,
+    rollout_path: String,
+) -> AppResult<UserPromptList> {
+    run_blocking(move || crate::rollout::preview_session_user_prompts(provider, rollout_path)).await
+}
+
+#[tauri::command]
 pub async fn preview_session_meta(
     provider: Option<String>,
     rollout_path: String,

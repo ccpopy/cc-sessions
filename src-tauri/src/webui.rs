@@ -221,6 +221,10 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             usize_arg(&args, "offset")?,
             usize_arg(&args, "limit")?,
         )),
+        "preview_session_user_prompts" => to_result_value(rollout::preview_session_user_prompts(
+            opt_string_arg(&args, "provider")?,
+            string_arg(&args, "rolloutPath")?,
+        )),
         "preview_session_meta" => to_result_value(rollout::preview_session_meta(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "rolloutPath")?,

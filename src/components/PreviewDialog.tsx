@@ -2,11 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent a
 import {
   Bot,
   ChevronDown,
+  ChevronsDown,
   Copy,
   FileJson,
   FolderOpen,
   GitBranch,
   History,
+  Loader2,
   MessageSquare,
   Network,
   Pencil,
@@ -48,11 +50,13 @@ import {
   type EditHistory,
   type PreviewEvent,
   type SessionSummary,
+  type UserPromptBrief,
 } from "@/lib/api";
 import { copyText } from "@/lib/clipboard";
 import { absoluteTime, formatTimeString, humanTokens } from "@/lib/format";
 import { shouldIgnoreTextEditingHotkey } from "@/lib/keyboard";
 import { parseUserMessageAttachments } from "@/lib/messageAttachments";
+import { PromptTimeline } from "@/components/PromptTimeline";
 import {
   collectRelatedSubagents,
   type RelatedSubagentSession,
@@ -133,10 +137,16 @@ export function PreviewDialog({
   const [deletePlan, setDeletePlan] = useState<DeletePlan | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [editHistory, setEditHistory] = useState<EditHistory | null>(null);
+  const [prompts, setPrompts] = useState<UserPromptBrief[] | null>(null);
+  const [totalEvents, setTotalEvents] = useState(0);
+  const [activeTimelineIndex, setActiveTimelineIndex] = useState<number | null>(null);
+  const [loadingAll, setLoadingAll] = useState(false);
   const offsetRef = useRef(0);
   const loadingRef = useRef(false);
   const doneRef = useRef(false);
   const viewportRef = useRef<HTMLDivElement | null>(null);
+  const pendingJumpRef = useRef<number | null>(null);
+  const scrollSpyRafRef = useRef(0);
   const canForkSession = provider === "codex" && !customRolloutPath && !!session && !!codexDir;
   // 备份/导入预览（customRolloutPath）不允许编辑，只能编辑真实会话文件
   const canMutateSession = !customRolloutPath && !!session && !!backupDir && !!rolloutPath;
@@ -168,14 +178,96 @@ export function PreviewDialog({
     }
   }, [provider, rolloutPath]);
 
+  /** 等待进行中的分页请求结束，避免并发拉取重复区间 */
+  const waitForIdle = useCallback(async () => {
+    while (loadingRef.current) {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    }
+  }, []);
+
+  /** 一次性把事件加载到指定事件序号（时间线跳转用），带一页余量 */
+  const loadUpTo = useCallback(
+    async (targetOffset: number) => {
+      await waitForIdle();
+      if (doneRef.current || offsetRef.current > targetOffset || !rolloutPath) return;
+      loadingRef.current = true;
+      setLoading(true);
+      try {
+        const need = targetOffset - offsetRef.current + 1 + PAGE;
+        const next = await api.previewRange(provider, rolloutPath, offsetRef.current, need);
+        if (next.length > 0) {
+          offsetRef.current += next.length;
+          setEvents((prev) => [...prev, ...next]);
+        }
+        if (next.length < need) {
+          doneRef.current = true;
+          setDone(true);
+        }
+      } finally {
+        loadingRef.current = false;
+        setLoading(false);
+      }
+    },
+    [provider, rolloutPath, waitForIdle],
+  );
+
+  /** 一次加载余下全部事件 */
+  const loadAll = useCallback(async () => {
+    await waitForIdle();
+    if (doneRef.current || !rolloutPath) return;
+    loadingRef.current = true;
+    setLoading(true);
+    setLoadingAll(true);
+    try {
+      const next = await api.previewRange(
+        provider,
+        rolloutPath,
+        offsetRef.current,
+        Number.MAX_SAFE_INTEGER,
+      );
+      if (next.length > 0) {
+        offsetRef.current += next.length;
+        setEvents((prev) => [...prev, ...next]);
+      }
+      doneRef.current = true;
+      setDone(true);
+    } finally {
+      loadingRef.current = false;
+      setLoading(false);
+      setLoadingAll(false);
+    }
+  }, [provider, rolloutPath, waitForIdle]);
+
+  /** 拉取全量用户提问（时间线数据）；属于增强功能，失败时静默降级为无时间线 */
+  const loadPrompts = useCallback(async () => {
+    if (!rolloutPath) {
+      setPrompts(null);
+      setTotalEvents(0);
+      return;
+    }
+    try {
+      const list = await api.previewUserPrompts(provider, rolloutPath);
+      setPrompts(list.prompts);
+      setTotalEvents(list.total_events);
+    } catch {
+      setPrompts(null);
+      setTotalEvents(0);
+    }
+  }, [provider, rolloutPath]);
+
   const resetAndReload = useCallback(() => {
     setEvents([]);
     setDone(false);
     doneRef.current = false;
     loadingRef.current = false;
     offsetRef.current = 0;
+    pendingJumpRef.current = null;
+    setActiveTimelineIndex(null);
+    setPrompts(null);
+    setTotalEvents(0);
     void loadMore();
-  }, [loadMore]);
+    void loadPrompts();
+  }, [loadMore, loadPrompts]);
 
   useEffect(() => {
     if (!open || !rolloutPath) return;
@@ -206,11 +298,78 @@ export function PreviewDialog({
     });
   }, [events, filter, onlyMsg]);
 
+  const timelineIndexSet = useMemo(
+    () => new Set((prompts ?? []).map((prompt) => prompt.index)),
+    [prompts],
+  );
+
+  /** 把待跳转的目标消息滚动到视口顶部并闪烁高亮 */
+  const scrollPendingIntoView = useCallback(() => {
+    const target = pendingJumpRef.current;
+    if (target === null) return;
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const el = viewport.querySelector<HTMLElement>(`[data-event-index="${target}"]`);
+    if (!el) return;
+    pendingJumpRef.current = null;
+    const viewportRect = viewport.getBoundingClientRect();
+    const elRect = el.getBoundingClientRect();
+    viewport.scrollTo({ top: viewport.scrollTop + (elRect.top - viewportRect.top) - 16 });
+    el.classList.remove("preview-jump-flash");
+    // 强制 reflow 以便重复跳转同一条时也能重新触发动画
+    void el.offsetWidth;
+    el.classList.add("preview-jump-flash");
+    window.setTimeout(() => el.classList.remove("preview-jump-flash"), 1700);
+  }, []);
+
+  /** 滚动跟随：视口上沿 1/3 处上方最近的一条用户提问视为当前时间线位置。 */
+  const updateActiveFromScroll = useCallback(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const anchors = viewport.querySelectorAll<HTMLElement>("[data-timeline-anchor]");
+    if (anchors.length === 0) return;
+    const threshold =
+      viewport.getBoundingClientRect().top + viewport.clientHeight * 0.33;
+    let current: number | null = null;
+    anchors.forEach((node) => {
+      if (node.getBoundingClientRect().top <= threshold) {
+        current = Number(node.dataset.eventIndex);
+      }
+    });
+    if (current === null) current = Number(anchors[0].dataset.eventIndex);
+    if (Number.isFinite(current)) setActiveTimelineIndex(current);
+  }, []);
+
+  const jumpToTimelineMessage = useCallback(
+    (prompt: UserPromptBrief) => {
+      setActiveTimelineIndex(prompt.index);
+      pendingJumpRef.current = prompt.index;
+      // 文本过滤可能把目标消息隐藏，跳转时清空
+      setFilter("");
+      void loadUpTo(prompt.offset).then(() => scrollPendingIntoView());
+    },
+    [loadUpTo, scrollPendingIntoView],
+  );
+
+  // 加载/过滤变化后：完成待跳转的定位，并刷新当前提问高亮
+  useEffect(() => {
+    scrollPendingIntoView();
+    updateActiveFromScroll();
+  }, [filtered, scrollPendingIntoView, updateActiveFromScroll]);
+
+  useEffect(() => {
+    return () => {
+      if (scrollSpyRafRef.current) cancelAnimationFrame(scrollSpyRafRef.current);
+    };
+  }, []);
+
   const onScroll = (e: React.UIEvent<HTMLDivElement>) => {
     const el = e.currentTarget;
     if (el.scrollHeight - el.scrollTop - el.clientHeight < 200) {
       void loadMore();
     }
+    if (scrollSpyRafRef.current) cancelAnimationFrame(scrollSpyRafRef.current);
+    scrollSpyRafRef.current = requestAnimationFrame(updateActiveFromScroll);
   };
 
   const onPreviewKeyDown = useCallback(
@@ -555,11 +714,34 @@ export function PreviewDialog({
             <span className="text-[11px] text-muted-foreground">
               显示 <span className="tabular-nums text-foreground/80">{filtered.length}</span>
               <span className="mx-1 text-muted-foreground/50">/</span>
-              已加载 <span className="tabular-nums text-foreground/80">{events.length}</span> 条
+              已加载 <span className="tabular-nums text-foreground/80">{events.length}</span>
+              {totalEvents > 0 && (
+                <>
+                  <span className="mx-1 text-muted-foreground/50">/</span>
+                  共 <span className="tabular-nums text-foreground/80">{totalEvents}</span>
+                </>
+              )}{" "}
+              条
               <span className="ml-1 text-muted-foreground/70">
                 {!done ? "· 滚动加载更多" : "· 已到末尾"}
               </span>
             </span>
+            {!done && events.length > 0 && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 gap-1.5 px-2 text-xs"
+                disabled={loadingAll}
+                onClick={() => void loadAll()}
+              >
+                {loadingAll ? (
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                ) : (
+                  <ChevronsDown className="h-3 w-3" />
+                )}
+                {loadingAll ? "加载中…" : "加载全部"}
+              </Button>
+            )}
             <div className="ml-auto flex items-center gap-0.5">
               {session && (
                 <>
@@ -597,63 +779,78 @@ export function PreviewDialog({
           </div>
         </DialogHeader>
 
-        <ScrollArea
-          className="min-h-0 flex-1 bg-muted/30"
-          viewportRef={viewportRef}
-          onViewportScroll={onScroll}
-        >
-          <div className="mx-auto w-full max-w-3xl min-w-0 space-y-4 overflow-x-hidden px-6 py-6">
-            {!onlyMsg && relatedSubagents.length > 0 && (
-              <SubagentOverview key={session?.id} items={relatedSubagents} />
-            )}
+        <div className="relative min-h-0 flex-1">
+          <ScrollArea
+            className="h-full bg-muted/30"
+            viewportRef={viewportRef}
+            onViewportScroll={onScroll}
+          >
+            <div className="mx-auto w-full max-w-3xl min-w-0 space-y-4 overflow-x-hidden px-6 py-6">
+              {!onlyMsg && relatedSubagents.length > 0 && (
+                <SubagentOverview key={session?.id} items={relatedSubagents} />
+              )}
 
-            {filtered.length === 0 && !loading && (onlyMsg || relatedSubagents.length === 0) && (
-              <div className="flex flex-col items-center justify-center gap-2 py-16 text-center text-muted-foreground">
-                <Sparkles className="h-8 w-8 opacity-50" />
-                <div className="text-sm">
-                  {events.length === 0 ? "无事件" : "无匹配事件"}
+              {filtered.length === 0 && !loading && (onlyMsg || relatedSubagents.length === 0) && (
+                <div className="flex flex-col items-center justify-center gap-2 py-16 text-center text-muted-foreground">
+                  <Sparkles className="h-8 w-8 opacity-50" />
+                  <div className="text-sm">
+                    {events.length === 0 ? "无事件" : "无匹配事件"}
+                  </div>
                 </div>
-              </div>
-            )}
+              )}
 
-            {filtered.map((e) => (
-              <EventBubble
-                key={e.index}
-                e={e}
-                actions={{
-                  fork: {
-                    enabled: canForkSession && isStableForkNode(e),
-                    pending: forking,
-                    onSelect: requestForkAt,
-                  },
-                  edit: editActions,
-                }}
-              />
-            ))}
-
-            {loading && (
-              <div className="flex justify-center py-4 text-xs text-muted-foreground">加载中…</div>
-            )}
-            {!done && events.length > 0 && (
-              <div className="flex justify-center pt-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-8"
-                  disabled={loading}
-                  onClick={() => void loadMore()}
+              {filtered.map((e) => (
+                <div
+                  key={e.index}
+                  data-event-index={e.index}
+                  data-timeline-anchor={timelineIndexSet.has(e.index) || undefined}
                 >
-                  加载更多事件
-                </Button>
-              </div>
-            )}
-            {done && events.length > 0 && (
-              <div className="flex justify-center pt-4 text-xs text-muted-foreground/70">
-                — 会话末尾 —
-              </div>
-            )}
-          </div>
-        </ScrollArea>
+                  <EventBubble
+                    e={e}
+                    actions={{
+                      fork: {
+                        enabled: canForkSession && isStableForkNode(e),
+                        pending: forking,
+                        onSelect: requestForkAt,
+                      },
+                      edit: editActions,
+                    }}
+                  />
+                </div>
+              ))}
+
+              {loading && (
+                <div className="flex justify-center py-4 text-xs text-muted-foreground">加载中…</div>
+              )}
+              {!done && events.length > 0 && (
+                <div className="flex justify-center pt-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-8"
+                    disabled={loading}
+                    onClick={() => void loadMore()}
+                  >
+                    加载更多事件
+                  </Button>
+                </div>
+              )}
+              {done && events.length > 0 && (
+                <div className="flex justify-center pt-4 text-xs text-muted-foreground/70">
+                  — 会话末尾 —
+                </div>
+              )}
+            </div>
+          </ScrollArea>
+
+          {prompts && prompts.length > 0 && (
+            <PromptTimeline
+              prompts={prompts}
+              activeIndex={activeTimelineIndex}
+              onJump={jumpToTimelineMessage}
+            />
+          )}
+        </div>
       </DialogContent>
     </Dialog>
     <AlertDialog open={!!forkTarget} onOpenChange={(v) => !v && !forking && setForkTarget(null)}>

@@ -351,3 +351,23 @@ mark {
 .thin-scrollbar::-webkit-scrollbar-thumb:hover {
   @apply bg-muted-foreground/50;
 }
+
+/* --- 预览时间线跳转定位高亮 --- */
+@keyframes preview-jump-flash {
+  0% {
+    background-color: hsl(var(--primary) / 0.14);
+    box-shadow: inset 2px 0 0 0 hsl(var(--primary) / 0.55);
+  }
+  70% {
+    background-color: hsl(var(--primary) / 0.1);
+    box-shadow: inset 2px 0 0 0 hsl(var(--primary) / 0.4);
+  }
+  100% {
+    background-color: transparent;
+    box-shadow: inset 2px 0 0 0 transparent;
+  }
+}
+.preview-jump-flash {
+  animation: preview-jump-flash 1.6s ease-out both;
+  border-radius: 0.5rem;
+}

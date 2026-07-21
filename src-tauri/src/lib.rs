@@ -63,6 +63,7 @@ pub fn run() {
             commands::delete_sessions,
             commands::preview_session_head,
             commands::preview_session_range,
+            commands::preview_session_user_prompts,
             commands::preview_session_meta,
             commands::plan_session_event_deletion,
             commands::edit_session_event_text,

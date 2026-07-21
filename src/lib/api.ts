@@ -119,6 +119,25 @@ export type PreviewEvent = {
   raw: unknown;
 };
 
+export type TimelineMessageBrief = {
+  /** Agent 回复所在的会话文件行号；仅用于该轮悬浮摘要，不作为独立时间线刻度。 */
+  index: number;
+  /** Agent 回复在预览分页计数中的事件序号。 */
+  offset: number;
+  timestamp: string;
+  text: string;
+};
+
+export type UserPromptBrief = TimelineMessageBrief & {
+  /** 同一轮最后一条 Agent 回复，只展示在左侧刻度的悬浮摘要中。 */
+  response: TimelineMessageBrief | null;
+};
+
+export type UserPromptList = {
+  prompts: UserPromptBrief[];
+  total_events: number;
+};
+
 export type SessionMetaBrief = {
   id: string | null;
   timestamp: string | null;
@@ -693,6 +712,8 @@ export const api = {
     invokeCommand<PreviewEvent[]>("preview_session_head", { provider, rolloutPath, limit }),
   previewRange: (provider: SessionProvider, rolloutPath: string, offset: number, limit: number) =>
     invokeCommand<PreviewEvent[]>("preview_session_range", { provider, rolloutPath, offset, limit }),
+  previewUserPrompts: (provider: SessionProvider, rolloutPath: string) =>
+    invokeCommand<UserPromptList>("preview_session_user_prompts", { provider, rolloutPath }),
   previewMeta: (provider: SessionProvider, rolloutPath: string) =>
     invokeCommand<SessionMetaBrief>("preview_session_meta", { provider, rolloutPath }),
   readPreviewImage: (path: string) =>
