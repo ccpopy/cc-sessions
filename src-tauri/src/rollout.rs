@@ -440,7 +440,8 @@ const TIMELINE_MESSAGE_PREVIEW_CHARS: usize = 400;
 
 /// 扫描整个会话文件，以真实用户提问作为时间线刻度，并附带 Agent 回复摘要。
 /// 优先使用最终答复；如果一轮在最终答复前被用户引导或中断，则使用最后一条过程
-/// 消息证明该轮已经得到响应。完全没有 Agent 活动的提问不会进入对话时间线。
+/// 消息证明该轮已经得到响应。出现下一条真实提问时，如果上一轮完全没有 Agent
+/// 活动，才从对话时间线隐藏上一条提问；会话末尾的待处理提问仍然保留。
 /// 不携带 raw，负载远小于全量 preview_session_range。
 pub fn preview_session_user_prompts(
     provider: Option<String>,
@@ -567,7 +568,6 @@ fn user_prompts_impl(
             _ => {}
         }
     }
-    discard_inactive_current_prompt(&mut prompts, current_has_agent_activity);
     Ok(UserPromptList {
         prompts,
         total_events,
@@ -1025,7 +1025,7 @@ mod tests {
         fs::remove_file(file).ok();
 
         assert_eq!(list.total_events, 6);
-        assert_eq!(list.prompts.len(), 1);
+        assert_eq!(list.prompts.len(), 2);
         assert_eq!(list.prompts[0].text, "第一个问题");
         assert_eq!(list.prompts[0].index, 3);
         assert_eq!(list.prompts[0].offset, 3);
@@ -1037,6 +1037,10 @@ mod tests {
         assert_eq!(response.text, "回答");
         assert_eq!(response.index, 4);
         assert_eq!(response.offset, 4);
+        assert_eq!(list.prompts[1].text, "第二个问题");
+        assert_eq!(list.prompts[1].index, 5);
+        assert_eq!(list.prompts[1].offset, 5);
+        assert!(list.prompts[1].response.is_none());
         Ok(())
     }
 
@@ -1198,13 +1202,15 @@ mod tests {
         )?;
         fs::remove_file(file).ok();
 
-        assert_eq!(list.prompts.len(), 1);
+        assert_eq!(list.prompts.len(), 2);
         let response = list.prompts[0]
             .response
             .as_ref()
             .expect("有过程消息的轮次不应标记为无回复");
         assert_eq!(response.text, "继续检查。");
         assert_eq!(response.index, 2);
+        assert_eq!(list.prompts[1].text, "补充一下要求");
+        assert!(list.prompts[1].response.is_none());
         Ok(())
     }
 
@@ -1317,9 +1323,11 @@ mod tests {
         )?;
         fs::remove_file(file).ok();
 
-        assert_eq!(list.prompts.len(), 1);
+        assert_eq!(list.prompts.len(), 2);
         assert_eq!(list.prompts[0].text, "帮我检查");
         assert!(list.prompts[0].response.is_none());
+        assert_eq!(list.prompts[1].text, "下一条问题");
+        assert!(list.prompts[1].response.is_none());
         Ok(())
     }
 
@@ -1416,9 +1424,44 @@ mod tests {
                 .iter()
                 .map(|prompt| prompt.text.as_str())
                 .collect::<Vec<_>>(),
-            vec!["需要思考的问题", "需要工具的问题"]
+            vec!["需要思考的问题", "需要工具的问题", "没有活动的问题"]
         );
         assert!(list.prompts.iter().all(|prompt| prompt.response.is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn user_prompts_keeps_latest_pending_question_without_agent_activity() -> AppResult<()> {
+        let file = temp_file("cc-session-manager-latest-pending-timeline-test");
+        {
+            let mut out = File::create(&file)?;
+            for value in [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "刚刚提交的问题"}]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {"type": "task_started"}
+                }),
+            ] {
+                writeln!(out, "{}", serde_json::to_string(&value)?)?;
+            }
+        }
+
+        let list = preview_session_user_prompts(
+            Some("codex".to_string()),
+            file.to_string_lossy().into_owned(),
+        )?;
+        fs::remove_file(file).ok();
+
+        assert_eq!(list.prompts.len(), 1);
+        assert_eq!(list.prompts[0].text, "刚刚提交的问题");
+        assert!(list.prompts[0].response.is_none());
         Ok(())
     }
 
