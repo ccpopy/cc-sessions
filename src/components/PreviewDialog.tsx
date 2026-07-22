@@ -820,7 +820,6 @@ export function PreviewDialog({
                   <CollapsedTurnGroup
                     key={`collapsed-${row.key}`}
                     events={row.events}
-                    hasFinalResponse={row.hasFinalResponse}
                   >
                     {(event) => (
                       <div key={event.index} data-event-index={event.index}>
@@ -1108,11 +1107,9 @@ export function PreviewDialog({
  */
 function CollapsedTurnGroup({
   events,
-  hasFinalResponse,
   children,
 }: {
   events: PreviewEvent[];
-  hasFinalResponse: boolean;
   children: (event: PreviewEvent) => React.ReactNode;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -1128,9 +1125,7 @@ function CollapsedTurnGroup({
         <span>
           {expanded
             ? "收起过程消息"
-            : hasFinalResponse
-              ? `已折叠 ${events.length} 条过程消息（最终答复见下方）`
-              : `已折叠 ${events.length} 条过程消息（本轮没有最终答复）`}
+            : `已折叠 ${events.length} 条过程消息`}
         </span>
         <ChevronDown
           className={cn("h-3 w-3 transition-transform", expanded && "rotate-180")}

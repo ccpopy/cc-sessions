@@ -321,7 +321,7 @@ export function PromptTimeline({ prompts, activeIndex, onJump }: Props) {
             ) : (
               <div className="mt-1 flex items-center gap-2 border-t border-border/45 px-2 pt-2 text-[11px] text-muted-foreground/70">
                 <CircleSlash className="h-3.5 w-3.5 shrink-0" />
-                <span>该提问没有收到回复（可能被中断或重新编辑）</span>
+                <span>该提问没有收到回复（中断、重新编辑或者引导思考）</span>
               </div>
             )}
 
@@ -347,7 +347,7 @@ export function PromptTimeline({ prompts, activeIndex, onJump }: Props) {
               <button
                 type="button"
                 aria-pressed={hideUnanswered}
-                title="无回复的提问多为被中断或重新编辑产生"
+                title="无回复的提问可能来自中断、重新编辑或者引导思考"
                 onClick={() => {
                   clearScrub();
                   setHideUnanswered((value) => !value);

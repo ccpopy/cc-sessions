@@ -18,6 +18,49 @@ fn provider_or_codex(provider: Option<String>) -> String {
     provider.unwrap_or_else(|| "codex".to_string())
 }
 
+/// Codex App 的活跃会话列表标题以 session_index.jsonl 的 thread_name 为准。
+///
+/// state_5.sqlite 的 threads.title 可能仍停留在首条用户消息，即使 Codex App 已经
+/// 为会话生成了简短标题。索引不是核心数据库，单行损坏时跳过该行并回退数据库
+/// 标题，避免因为可选缓存损坏导致整个会话列表不可用。
+fn read_session_index_titles(codex_dir: &Path) -> AppResult<HashMap<String, String>> {
+    let path = paths::session_index_path(codex_dir);
+    let mut titles = HashMap::new();
+    if !path.is_file() {
+        return Ok(titles);
+    }
+
+    for line in BufReader::new(File::open(path)?).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(id) = value
+            .get("id")
+            .or_else(|| value.get("session_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        let Some(thread_name) = value
+            .get("thread_name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+        else {
+            continue;
+        };
+        // 如果存在重复记录，后出现的记录代表较新的标题。
+        titles.insert(id.to_string(), thread_name.to_string());
+    }
+    Ok(titles)
+}
+
 fn query_summaries(
     codex_dir: &Path,
     where_clause: &str,
@@ -25,6 +68,7 @@ fn query_summaries(
 ) -> AppResult<Vec<SessionSummary>> {
     let state = state_db::open_ro(codex_dir)?;
     let logs_conn = logs_db::open_ro(codex_dir).ok();
+    let index_titles = read_session_index_titles(codex_dir)?;
 
     let sql = format!(
         "SELECT id, rollout_path, cwd, title, COALESCE(first_user_message,''), model, reasoning_effort,
@@ -41,7 +85,7 @@ fn query_summaries(
             let id: String = row.get(0)?;
             let rollout_path_raw: String = row.get(1)?;
             let cwd_raw: String = row.get(2)?;
-            let title: String = row.get(3)?;
+            let database_title: String = row.get(3)?;
             let first_user_message: String = row.get(4)?;
             let model: Option<String> = row.get(5)?;
             let reasoning_effort: Option<String> = row.get(6)?;
@@ -62,6 +106,11 @@ fn query_summaries(
             let rollout_bytes = fs::metadata(&rollout_path).map(|m| m.len()).unwrap_or(0);
 
             let resume_command = format!("codex resume {}", id);
+            let title = if archived == 0 {
+                index_titles.get(&id).cloned().unwrap_or(database_title)
+            } else {
+                database_title
+            };
             Ok(SessionSummary {
                 provider: "codex".into(),
                 id,
@@ -1723,6 +1772,47 @@ mod tests {
 
         drop(conn);
         fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn list_sessions_prefers_active_session_index_title() -> AppResult<()> {
+        let codex = temp_dir("codex-session-index-title");
+        let conn = create_codex_threads_table(&codex)?;
+        conn.execute(
+            "INSERT INTO threads (
+                id, rollout_path, cwd, title, first_user_message, model, reasoning_effort,
+                tokens_used, created_at, updated_at, archived, archived_at, git_branch, source,
+                agent_nickname, agent_role
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 0, 1770000000, 1770000300, 0, NULL, NULL, NULL, NULL, NULL)",
+            (
+                "indexed-title",
+                codex.join("sessions/indexed-title.jsonl").to_string_lossy().into_owned(),
+                "F:\\work\\indexed-title",
+                "数据库中的首条用户消息",
+                "数据库中的首条用户消息",
+                "gpt-5",
+            ),
+        )?;
+        drop(conn);
+        fs::write(
+            paths::session_index_path(&codex),
+            concat!(
+                "{\"id\":\"indexed-title\",\"thread_name\":\"较早的索引标题\"}\n",
+                "{broken json\n",
+                "{\"id\":\"indexed-title\",\"thread_name\":\"Codex 生成的简短标题\"}\n"
+            ),
+        )?;
+
+        let sessions = list_sessions(
+            Some("codex".to_string()),
+            codex.to_string_lossy().into_owned(),
+            None,
+        )?;
+        fs::remove_dir_all(&codex).ok();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title, "Codex 生成的简短标题");
         Ok(())
     }
 
