@@ -438,7 +438,9 @@ fn preview_capacity_hint(limit: usize) -> usize {
 /// 时间线消息预览的最大字符数：悬浮卡片/列表只需要开头片段。
 const TIMELINE_MESSAGE_PREVIEW_CHARS: usize = 400;
 
-/// 扫描整个会话文件，以真实用户提问作为时间线刻度，并附带其最终 Agent 回复摘要。
+/// 扫描整个会话文件，以真实用户提问作为时间线刻度，并附带 Agent 回复摘要。
+/// 优先使用最终答复；如果一轮在最终答复前被用户引导或中断，则使用最后一条过程
+/// 消息证明该轮已经得到响应。完全没有 Agent 消息时才视为无回复。
 /// 不携带 raw，负载远小于全量 preview_session_range。
 pub fn preview_session_user_prompts(
     provider: Option<String>,
@@ -462,6 +464,7 @@ fn user_prompts_impl(
     let mut prompts = Vec::new();
     let mut total_events = 0usize;
     let mut current_has_explicit_assistant_phase = false;
+    let mut current_has_final_answer = false;
     for (i, line) in reader.lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
@@ -496,31 +499,37 @@ fn user_prompts_impl(
                     response: None,
                 });
                 current_has_explicit_assistant_phase = false;
+                current_has_final_answer = false;
             }
             "assistant" if !text.is_empty() => {
                 let phase = assistant_message_phase(&event);
                 if phase.is_some() && !current_has_explicit_assistant_phase {
                     current_has_explicit_assistant_phase = true;
-                    // 一旦发现 Codex phase，就不能再把之前的无 phase 消息当作最终答复。
+                    // 一旦发现 Codex phase，就不能再把之前的无 phase 消息当作回复摘要。
                     if let Some(prompt) = prompts.last_mut() {
                         prompt.response = None;
                     }
                 }
-                let is_final_response = match phase {
-                    Some("final_answer") => true,
-                    Some(_) => false,
-                    None => !current_has_explicit_assistant_phase,
-                };
-                if !is_final_response {
-                    continue;
-                }
                 if let Some(prompt) = prompts.last_mut() {
-                    prompt.response = Some(TimelineMessageBrief {
-                        index: event.index,
-                        offset,
-                        timestamp: event.timestamp.clone(),
-                        text,
-                    });
+                    let should_use_response = match phase {
+                        // 最终答复始终覆盖之前作为兜底的过程消息。
+                        Some("final_answer") => {
+                            current_has_final_answer = true;
+                            true
+                        }
+                        // 最终答复出现前持续更新，以本轮最后一条过程消息作为兜底。
+                        Some(_) => !current_has_final_answer,
+                        // 旧版 Codex 与 Claude 没有 phase，继续保留每轮最后一条。
+                        None => !current_has_explicit_assistant_phase,
+                    };
+                    if should_use_response {
+                        prompt.response = Some(TimelineMessageBrief {
+                            index: event.index,
+                            offset,
+                            timestamp: event.timestamp.clone(),
+                            text,
+                        });
+                    }
                 }
             }
             _ => {}
@@ -1101,7 +1110,7 @@ mod tests {
     }
 
     #[test]
-    fn user_prompts_treats_commentary_only_codex_turn_as_unanswered() -> AppResult<()> {
+    fn user_prompts_uses_last_commentary_when_codex_turn_has_no_final_answer() -> AppResult<()> {
         let file = temp_file("cc-session-manager-codex-commentary-only-timeline-test");
         {
             let mut out = File::create(&file)?;
@@ -1121,6 +1130,59 @@ mod tests {
                         "role": "assistant",
                         "phase": "commentary",
                         "content": [{"type": "output_text", "text": "正在检查。"}]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "commentary",
+                        "content": [{"type": "output_text", "text": "继续检查。"}]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "补充一下要求"}]
+                    }
+                }),
+            ] {
+                writeln!(out, "{}", serde_json::to_string(&value)?)?;
+            }
+        }
+
+        let list = preview_session_user_prompts(
+            Some("codex".to_string()),
+            file.to_string_lossy().into_owned(),
+        )?;
+        fs::remove_file(file).ok();
+
+        assert_eq!(list.prompts.len(), 2);
+        let response = list.prompts[0]
+            .response
+            .as_ref()
+            .expect("有过程消息的轮次不应标记为无回复");
+        assert_eq!(response.text, "继续检查。");
+        assert_eq!(response.index, 2);
+        assert!(list.prompts[1].response.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn user_prompts_treats_turn_without_any_agent_message_as_unanswered() -> AppResult<()> {
+        let file = temp_file("cc-session-manager-codex-no-agent-response-timeline-test");
+        {
+            let mut out = File::create(&file)?;
+            for value in [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "帮我检查"}]
                     }
                 }),
                 serde_json::json!({
