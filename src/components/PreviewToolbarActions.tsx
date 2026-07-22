@@ -30,53 +30,50 @@ export function PreviewToolbarActions({
 }: Props) {
   return (
     <div className="ml-auto flex shrink-0 items-center gap-0.5">
-      {hasSession && (
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-8 w-8 text-muted-foreground hover:text-foreground"
-              aria-label="会话操作"
-              title="会话操作"
-            >
-              <MoreHorizontal className="h-4 w-4" />
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="w-44">
-            <DropdownMenuItem onSelect={() => void onCopySessionId()}>
-              <Copy className="h-4 w-4" />
-              复制会话 ID
-            </DropdownMenuItem>
-            <DropdownMenuItem onSelect={() => void onCopyResume()}>
-              <Copy className="h-4 w-4" />
-              复制 resume
-            </DropdownMenuItem>
-            <DropdownMenuItem onSelect={() => void onRevealDirectory()}>
-              <FolderOpen className="h-4 w-4" />
-              打开目录
-            </DropdownMenuItem>
-            {canOpenEditHistory && (
-              <>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem onSelect={onOpenEditHistory}>
-                  <History className="h-4 w-4" />
-                  编辑历史
-                </DropdownMenuItem>
-              </>
-            )}
-          </DropdownMenuContent>
-        </DropdownMenu>
-      )}
-      <Button
-        variant="ghost"
-        size="sm"
-        className="h-8 gap-1.5 px-2.5"
-        onClick={() => void onCopyPath()}
-      >
-        <FileJson className="h-3.5 w-3.5" />
-        复制路径
-      </Button>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-8 w-8 text-muted-foreground hover:text-foreground"
+            aria-label="会话操作"
+            title="会话操作"
+          >
+            <MoreHorizontal className="h-4 w-4" />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="w-44">
+          {hasSession && (
+            <>
+              <DropdownMenuItem onSelect={() => void onCopySessionId()}>
+                <Copy className="h-4 w-4" />
+                复制会话 ID
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => void onCopyResume()}>
+                <Copy className="h-4 w-4" />
+                复制 resume
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => void onRevealDirectory()}>
+                <FolderOpen className="h-4 w-4" />
+                打开目录
+              </DropdownMenuItem>
+            </>
+          )}
+          <DropdownMenuItem onSelect={() => void onCopyPath()}>
+            <FileJson className="h-4 w-4" />
+            复制路径
+          </DropdownMenuItem>
+          {canOpenEditHistory && (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onSelect={onOpenEditHistory}>
+                <History className="h-4 w-4" />
+                编辑历史
+              </DropdownMenuItem>
+            </>
+          )}
+        </DropdownMenuContent>
+      </DropdownMenu>
     </div>
   );
 }
