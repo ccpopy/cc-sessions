@@ -7,6 +7,8 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { Bot, ListOrdered, User, X } from "lucide-react";
+import ReactMarkdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 import type { UserPromptBrief } from "@/lib/api";
 import { formatTimeString } from "@/lib/format";
@@ -33,6 +35,53 @@ const MARKER_PROGRESS_SCALE = 0.7692;
 const NEIGHBOR_PROGRESS = [1, 0.7, 0.4, 0.2] as const;
 const MARKER_EASING =
   "linear(0, .398 10%, .682 20%, .843 30%, .925 40%, .972 50%, 1.004 60%, 1.008 70%, 1.003 80%, 1)";
+
+/**
+ * 时间线处在可点击卡片/列表项内部，不能直接嵌套 Markdown 的链接和块级节点。
+ * 这里保留强调、删除线和行内代码等语义，同时把链接压缩为标签文本、把块级
+ * 内容压平为行内摘要，避免 `[名称](本地长路径)` 在问题列表中完整展开。
+ */
+const timelineMarkdownComponents: Components = {
+  p: ({ children }) => <>{children} </>,
+  h1: ({ children }) => <><strong>{children}</strong> </>,
+  h2: ({ children }) => <><strong>{children}</strong> </>,
+  h3: ({ children }) => <><strong>{children}</strong> </>,
+  h4: ({ children }) => <><strong>{children}</strong> </>,
+  h5: ({ children }) => <><strong>{children}</strong> </>,
+  h6: ({ children }) => <><strong>{children}</strong> </>,
+  a: ({ children, href }) => (
+    <span
+      title={href}
+      className="font-medium underline decoration-current/35 underline-offset-2"
+    >
+      {children}
+    </span>
+  ),
+  code: ({ children }) => (
+    <code className="rounded bg-muted px-1 py-px font-mono text-[0.92em] text-foreground/85">
+      {children}
+    </code>
+  ),
+  pre: ({ children }) => <>{children} </>,
+  blockquote: ({ children }) => <><span className="opacity-65">“</span>{children}<span className="opacity-65">”</span> </>,
+  ul: ({ children }) => <>{children}</>,
+  ol: ({ children }) => <>{children}</>,
+  li: ({ children }) => <>• {children} </>,
+  table: ({ children }) => <>{children}</>,
+  thead: ({ children }) => <>{children}</>,
+  tbody: ({ children }) => <>{children}</>,
+  tr: ({ children }) => <>{children} </>,
+  th: ({ children }) => <><strong>{children}</strong><span className="opacity-50"> · </span></>,
+  td: ({ children }) => <>{children}<span className="opacity-50"> · </span></>,
+  br: () => <> </>,
+  hr: () => <span className="opacity-50"> · </span>,
+  img: ({ alt }) => (
+    <span className="font-normal text-muted-foreground">
+      {alt ? `[图片：${alt}]` : "[图片]"}
+    </span>
+  ),
+  input: ({ checked }) => <span aria-hidden="true">{checked ? "☑ " : "☐ "}</span>,
+};
 
 /**
  * 对话预览左侧用户提问导航。
@@ -247,17 +296,19 @@ export function PromptTimeline({ prompts, activeIndex, onJump }: Props) {
           >
             <div className="flex gap-2 px-2 py-1">
               <User className="mt-0.5 h-3.5 w-3.5 shrink-0 text-foreground/60" />
-              <p className="line-clamp-2 min-w-0 whitespace-pre-wrap break-words text-[12px] font-medium leading-[1.45] text-popover-foreground">
-                {messageText(hovered.prompt)}
-              </p>
+              <TimelineMarkdownExcerpt
+                text={messageText(hovered.prompt)}
+                className="line-clamp-2 min-w-0 text-[12px] font-medium leading-[1.45] text-popover-foreground"
+              />
             </div>
 
             {hovered.prompt.response && (
               <div className="mt-1 flex gap-2 border-t border-border/45 px-2 pt-2">
                 <Bot className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                <p className="line-clamp-3 min-w-0 whitespace-pre-wrap break-words text-[11px] leading-[1.5] text-muted-foreground">
-                  {messageText(hovered.prompt.response)}
-                </p>
+                <TimelineMarkdownExcerpt
+                  text={messageText(hovered.prompt.response)}
+                  className="line-clamp-3 min-w-0 text-[11px] leading-[1.5] text-muted-foreground"
+                />
               </div>
             )}
 
@@ -309,9 +360,10 @@ export function PromptTimeline({ prompts, activeIndex, onJump }: Props) {
                     )}
                   >
                     <User className="mt-0.5 h-3.5 w-3.5 shrink-0 text-foreground/60" />
-                    <span className="line-clamp-2 min-w-0 break-words text-xs font-medium leading-relaxed text-popover-foreground">
-                      {messageText(prompt)}
-                    </span>
+                    <TimelineMarkdownExcerpt
+                      text={messageText(prompt)}
+                      className="line-clamp-2 min-w-0 text-xs font-medium leading-relaxed text-popover-foreground"
+                    />
                   </button>
                 </div>
               );
@@ -337,6 +389,20 @@ function revealActiveRow(container: HTMLElement | null, activeIndex: number) {
 function messageText(message: { text: string }): string {
   const text = message.text.trim();
   return text.replace(/^\s{0,3}#{1,6}\s+/, "") || "(无文本内容)";
+}
+
+function TimelineMarkdownExcerpt({ text, className }: { text: string; className?: string }) {
+  return (
+    <span className={cn("block max-w-full overflow-hidden break-words", className)}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={timelineMarkdownComponents}
+        skipHtml
+      >
+        {text}
+      </ReactMarkdown>
+    </span>
+  );
 }
 
 function clamp(value: number, min: number, max: number): number {
