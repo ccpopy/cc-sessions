@@ -6,7 +6,7 @@ import {
   useState,
   type PointerEvent as ReactPointerEvent,
 } from "react";
-import { Bot, ListOrdered, User, X } from "lucide-react";
+import { Bot, CircleSlash, ListOrdered, User, X } from "lucide-react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -100,6 +100,8 @@ export function PromptTimeline({ prompts, activeIndex, onJump }: Props) {
   const [hoverAnchorY, setHoverAnchorY] = useState(0);
   const [hovered, setHovered] = useState<Marker | null>(null);
   const [listOpen, setListOpen] = useState(false);
+  // 无回复的提问多为被中断/重新编辑产生的“无效提问”，可按需隐藏。
+  const [hideUnanswered, setHideUnanswered] = useState(false);
 
   useLayoutEffect(() => {
     const el = containerRef.current;
@@ -121,12 +123,19 @@ export function PromptTimeline({ prompts, activeIndex, onJump }: Props) {
     return () => observer.disconnect();
   }, [hovered]);
 
-  const markers = useMemo<Marker[]>(
-    () => prompts.map((prompt, listIndex) => ({
+  const markers = useMemo<Marker[]>(() => {
+    const all = prompts.map((prompt, listIndex) => ({
       prompt,
       ordinal: listIndex + 1,
       listIndex,
-    })),
+    }));
+    const visible = hideUnanswered ? all.filter((m) => m.prompt.response) : all;
+    // 过滤后重排 listIndex，保证刻度间距与悬停放大计算连续；ordinal 保留原始序号。
+    return visible.map((marker, listIndex) => ({ ...marker, listIndex }));
+  }, [hideUnanswered, prompts]);
+
+  const unansweredCount = useMemo(
+    () => prompts.filter((prompt) => !prompt.response).length,
     [prompts],
   );
 
@@ -220,6 +229,7 @@ export function PromptTimeline({ prompts, activeIndex, onJump }: Props) {
       >
         {markers.map((marker) => {
           const isActive = marker.prompt.index === activeIndex;
+          const unanswered = !marker.prompt.response;
           const distance = hovered
             ? Math.abs(marker.listIndex - hovered.listIndex)
             : Number.POSITIVE_INFINITY;
@@ -254,7 +264,9 @@ export function PromptTimeline({ prompts, activeIndex, onJump }: Props) {
                       ? "bg-foreground opacity-100"
                       : isActive
                         ? "bg-foreground opacity-60"
-                        : "bg-muted-foreground opacity-40",
+                        : unanswered
+                          ? "bg-muted-foreground opacity-[0.18]"
+                          : "bg-muted-foreground opacity-40",
                     "group-focus-visible:bg-foreground group-focus-visible:opacity-100",
                   )}
                   style={{
@@ -286,10 +298,6 @@ export function PromptTimeline({ prompts, activeIndex, onJump }: Props) {
           }}
           onClick={() => onJump(hovered.prompt)}
         >
-          <span
-            aria-hidden="true"
-            className="absolute -left-1.5 top-5 h-3 w-3 rotate-45 border-b border-l border-border/80 bg-popover"
-          />
           <div
             key={hovered.prompt.index}
             className="relative overflow-hidden rounded-xl px-3.5 py-3 animate-in fade-in slide-in-from-bottom-1 duration-200 motion-reduce:animate-none"
@@ -302,13 +310,18 @@ export function PromptTimeline({ prompts, activeIndex, onJump }: Props) {
               />
             </div>
 
-            {hovered.prompt.response && (
+            {hovered.prompt.response ? (
               <div className="mt-1 flex gap-2 border-t border-border/45 px-2 pt-2">
                 <Bot className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                 <TimelineMarkdownExcerpt
                   text={messageText(hovered.prompt.response)}
                   className="line-clamp-3 min-w-0 text-[11px] leading-[1.5] text-muted-foreground"
                 />
+              </div>
+            ) : (
+              <div className="mt-1 flex items-center gap-2 border-t border-border/45 px-2 pt-2 text-[11px] text-muted-foreground/70">
+                <CircleSlash className="h-3.5 w-3.5 shrink-0" />
+                <span>该提问没有收到回复（可能被中断或重新编辑）</span>
               </div>
             )}
 
@@ -328,8 +341,28 @@ export function PromptTimeline({ prompts, activeIndex, onJump }: Props) {
           <div className="flex shrink-0 items-center gap-2 border-b border-border/60 py-2 pl-9 pr-2">
             <span className="text-xs font-medium">对话时间线</span>
             <span className="text-[11px] tabular-nums text-muted-foreground">
-              {prompts.length} 条提问
+              {markers.length} 条提问
             </span>
+            {unansweredCount > 0 && (
+              <button
+                type="button"
+                aria-pressed={hideUnanswered}
+                title="无回复的提问多为被中断或重新编辑产生"
+                onClick={() => {
+                  clearScrub();
+                  setHideUnanswered((value) => !value);
+                }}
+                className={cn(
+                  "flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[10px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                  hideUnanswered
+                    ? "border-border bg-accent text-foreground"
+                    : "border-border/60 text-muted-foreground hover:bg-accent hover:text-foreground",
+                )}
+              >
+                <CircleSlash className="h-3 w-3" />
+                {hideUnanswered ? `已隐藏 ${unansweredCount} 条无回复` : `隐藏无回复（${unansweredCount}）`}
+              </button>
+            )}
             <button
               type="button"
               aria-label="关闭对话时间线"
@@ -340,14 +373,21 @@ export function PromptTimeline({ prompts, activeIndex, onJump }: Props) {
             </button>
           </div>
           <div ref={panelListRef} className="thin-scrollbar min-h-0 flex-1 overflow-y-auto">
-            {prompts.map((prompt, index) => {
+            {markers.map((marker) => {
+              const prompt = marker.prompt;
               const promptActive = prompt.index === activeIndex;
               return (
                 <div key={prompt.index} className="border-b border-border/40 last:border-b-0">
-                  <div className="px-3 pb-1 pt-2 text-[10px] tabular-nums text-muted-foreground/75">
-                    <span className={cn(promptActive && "font-semibold text-foreground")}>#{index + 1}</span>
+                  <div className="flex items-center px-3 pb-1 pt-2 text-[10px] tabular-nums text-muted-foreground/75">
+                    <span className={cn(promptActive && "font-semibold text-foreground")}>#{marker.ordinal}</span>
                     {prompt.timestamp && (
                       <span className="ml-2">{formatTimeString(prompt.timestamp)}</span>
+                    )}
+                    {!prompt.response && (
+                      <span className="ml-auto flex items-center gap-1 text-muted-foreground/60">
+                        <CircleSlash className="h-3 w-3" />
+                        未回复
+                      </span>
                     )}
                   </div>
                   <button

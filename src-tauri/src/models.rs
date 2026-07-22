@@ -124,7 +124,7 @@ pub struct PreviewEvent {
     pub raw: serde_json::Value,
 }
 
-/// 某轮 Agent 回复的悬浮摘要；不作为独立时间线刻度。
+/// 某轮 Agent 最终回复的悬浮摘要；不作为独立时间线刻度。
 #[derive(Debug, Clone, Serialize)]
 pub struct TimelineMessageBrief {
     pub index: usize,
@@ -133,7 +133,7 @@ pub struct TimelineMessageBrief {
     pub text: String,
 }
 
-/// 预览时间线的一轮对话：仅用户提问作为刻度，并携带本轮最后一条 Agent 回复摘要。
+/// 预览时间线的一轮对话：仅用户提问作为刻度，并携带本轮最终 Agent 回复摘要。
 /// index 与 PreviewEvent.index（行号）对齐，offset 是该事件在预览分页计数中的序号。
 #[derive(Debug, Clone, Serialize)]
 pub struct UserPromptBrief {

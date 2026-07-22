@@ -62,6 +62,10 @@ import {
   type RelatedSubagentSession,
 } from "@/lib/sessionSource";
 import { parseEmbeddedTranscriptPrompt, type EmbeddedTranscriptPrompt } from "@/lib/sessionText";
+import {
+  buildConversationPreviewRows,
+  type ConversationPreviewRow,
+} from "@/lib/conversationDisplay";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
 
@@ -302,6 +306,18 @@ export function PreviewDialog({
     () => new Set((prompts ?? []).map((prompt) => prompt.index)),
     [prompts],
   );
+
+  /**
+   * 对齐 Codex App 的对话展示：显式 commentary 属于过程消息，final_answer 才是
+   * 最终答复；旧日志与 Claude 没有 phase 时退回到每轮最后一条。文本过滤时不
+   * 折叠，避免搜索命中的消息被隐藏。
+   */
+  const rows = useMemo<ConversationPreviewRow[]>(() => {
+    if (!onlyMsg || filter) {
+      return filtered.map((event) => ({ type: "event", event }));
+    }
+    return buildConversationPreviewRows(filtered);
+  }, [filtered, filter, onlyMsg]);
 
   /** 把待跳转的目标消息滚动到视口顶部并闪烁高亮 */
   const scrollPendingIntoView = useCallback(() => {
@@ -799,25 +815,49 @@ export function PreviewDialog({
                 </div>
               )}
 
-              {filtered.map((e) => (
-                <div
-                  key={e.index}
-                  data-event-index={e.index}
-                  data-timeline-anchor={timelineIndexSet.has(e.index) || undefined}
-                >
-                  <EventBubble
-                    e={e}
-                    actions={{
-                      fork: {
-                        enabled: canForkSession && isStableForkNode(e),
-                        pending: forking,
-                        onSelect: requestForkAt,
-                      },
-                      edit: editActions,
-                    }}
-                  />
-                </div>
-              ))}
+              {rows.map((row) =>
+                row.type === "collapsed" ? (
+                  <CollapsedTurnGroup
+                    key={`collapsed-${row.key}`}
+                    events={row.events}
+                    hasFinalResponse={row.hasFinalResponse}
+                  >
+                    {(event) => (
+                      <div key={event.index} data-event-index={event.index}>
+                        <EventBubble
+                          e={event}
+                          actions={{
+                            fork: {
+                              enabled: canForkSession && isStableForkNode(event),
+                              pending: forking,
+                              onSelect: requestForkAt,
+                            },
+                            edit: editActions,
+                          }}
+                        />
+                      </div>
+                    )}
+                  </CollapsedTurnGroup>
+                ) : (
+                  <div
+                    key={row.event.index}
+                    data-event-index={row.event.index}
+                    data-timeline-anchor={timelineIndexSet.has(row.event.index) || undefined}
+                  >
+                    <EventBubble
+                      e={row.event}
+                      actions={{
+                        fork: {
+                          enabled: canForkSession && isStableForkNode(row.event),
+                          pending: forking,
+                          onSelect: requestForkAt,
+                        },
+                        edit: editActions,
+                      }}
+                    />
+                  </div>
+                ),
+              )}
 
               {loading && (
                 <div className="flex justify-center py-4 text-xs text-muted-foreground">加载中…</div>
@@ -1061,6 +1101,49 @@ export function PreviewDialog({
 }
 
 /* ---------- 单条事件（聊天气泡）---------- */
+
+/**
+ * 一轮里最终答复之前的过程性 Agent 消息。Codex App 不在对话流中展示这些消息，
+ * 默认折叠成一行提示，点击可展开查看（展开后仍支持编辑/回溯等操作）。
+ */
+function CollapsedTurnGroup({
+  events,
+  hasFinalResponse,
+  children,
+}: {
+  events: PreviewEvent[];
+  hasFinalResponse: boolean;
+  children: (event: PreviewEvent) => React.ReactNode;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <div className="space-y-4">
+      <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((value) => !value)}
+        className="mx-auto flex items-center gap-1.5 rounded-full border border-border/60 bg-background/60 px-3 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        <Bot className="h-3 w-3" />
+        <span>
+          {expanded
+            ? "收起过程消息"
+            : hasFinalResponse
+              ? `已折叠 ${events.length} 条过程消息（最终答复见下方）`
+              : `已折叠 ${events.length} 条过程消息（本轮没有最终答复）`}
+        </span>
+        <ChevronDown
+          className={cn("h-3 w-3 transition-transform", expanded && "rotate-180")}
+        />
+      </button>
+      {expanded && (
+        <div className="space-y-4 border-l-2 border-border/50 pl-3 opacity-90">
+          {events.map((event) => children(event))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function EventBubble({ e, actions }: { e: PreviewEvent; actions: NodeActionSet }) {
   const ts = formatTimeString(e.timestamp);

@@ -110,7 +110,7 @@ Windows release 版构建后可直接运行：
 
 菜单中的 Codex / Claude 会话入口默认显示主会话；查看列表、搜索、按项目查看和按大小查看时，可以选择“只查看子代理会话”，这样子代理也能继续使用同一套分页、项目分组和排序能力。
 
-交互菜单里的“预览会话内容”默认只显示 Codex / Claude Code 应用中可见的用户消息和助手消息，不显示工具调用、工具返回、元数据，也会过滤 Codex 注入的 AGENTS 指令和环境上下文。如需排查完整 JSONL 事件流，可在预览模式中选择“全部事件”。
+交互菜单里的“预览会话内容”默认只显示 Codex / Claude Code 应用中可见的用户消息和每轮最终答复，不显示中间过程消息、工具调用、工具返回、元数据，也会过滤 Codex 注入的 AGENTS 指令和环境上下文。如需排查完整 JSONL 事件流，可在预览模式中选择“全部事件”。
 
 需要脚本化或机器可读输出时，再使用子命令：
 
@@ -146,7 +146,7 @@ cc-sessions repair index --dry-run
 cc-sessions bundle export --out-dir ./bundles --id <session-id>
 ```
 
-默认路径与桌面端一致：Codex 读取 `~/.codex`，Claude Code 读取 `~/.claude`。可通过 `--codex-dir`、`--claude-dir` 覆盖；Windows 下读取 WSL 内 Codex 数据时，`--codex-dir` 使用 `\\wsl.localhost\<发行版>\home\<用户>\.codex` 这类 UNC 路径。`list`、`search` 和 `projects` 默认只显示主会话，加入 `--subagent` 后只显示子代理会话，并保留按时间、项目和大小的排序 / 分组能力。`list` 和 `search` 支持 `--sort size` 按 token 从小到大排序，便于找出问候测试等低消耗无效会话。`preview` 默认是 `--mode conversation`，输出完整正文；`--summary` 可切回一行摘要，`--raw` 输出原始 JSONL，`--all` 或 `--limit 0` 会一直读取到文件末尾。如需查看工具调用、工具返回和原始元数据，请使用 `--mode all`。需要机器可读输出时加 `--json`。
+默认路径与桌面端一致：Codex 读取 `~/.codex`，Claude Code 读取 `~/.claude`。可通过 `--codex-dir`、`--claude-dir` 覆盖；Windows 下读取 WSL 内 Codex 数据时，`--codex-dir` 使用 `\\wsl.localhost\<发行版>\home\<用户>\.codex` 这类 UNC 路径。`list`、`search` 和 `projects` 默认只显示主会话，加入 `--subagent` 后只显示子代理会话，并保留按时间、项目和大小的排序 / 分组能力。`list` 和 `search` 支持 `--sort size` 按 token 从小到大排序，便于找出问候测试等低消耗无效会话。`preview` 默认是 `--mode conversation`，输出用户消息和每轮最终答复的完整正文；`--summary` 可切回一行摘要，`--raw` 输出筛选后的原始 JSONL，`--all` 或 `--limit 0` 会一直读取到文件末尾。如需查看中间过程消息、工具调用、工具返回和原始元数据，请使用 `--mode all`。需要机器可读输出时加 `--json`。
 
 ### CLI Web UI
 

@@ -208,6 +208,75 @@ pub fn preview_event_is_conversation_or_reasoning(event: &PreviewEvent) -> bool 
     preview_event_is_conversation(event) || event.role == "reasoning"
 }
 
+fn assistant_message_phase(event: &PreviewEvent) -> Option<&str> {
+    if event.role != "assistant" {
+        return None;
+    }
+    event
+        .raw
+        .get("payload")
+        .and_then(|payload| payload.get("phase"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            event
+                .raw
+                .get("message")
+                .and_then(|message| message.get("phase"))
+                .and_then(Value::as_str)
+        })
+}
+
+/// CLI 对话预览的流式规整器。
+///
+/// Codex 用 `phase=commentary/final_answer` 区分过程播报与最终答复；旧版 Codex
+/// 和 Claude 没有 phase，此时保留每轮最后一条 assistant 消息。推理消息会保持
+/// 原有顺序，只有中间 assistant 消息会被省略。
+#[derive(Default)]
+pub struct ConversationDisplayReducer {
+    pending_turn: Vec<PreviewEvent>,
+}
+
+impl ConversationDisplayReducer {
+    pub fn push(&mut self, event: PreviewEvent, out: &mut Vec<PreviewEvent>) {
+        if event.role == "user" && preview_event_is_conversation(&event) {
+            self.flush_pending_turn(out);
+            out.push(event);
+        } else {
+            self.pending_turn.push(event);
+        }
+    }
+
+    pub fn finish(&mut self, out: &mut Vec<PreviewEvent>) {
+        self.flush_pending_turn(out);
+    }
+
+    fn flush_pending_turn(&mut self, out: &mut Vec<PreviewEvent>) {
+        if self.pending_turn.is_empty() {
+            return;
+        }
+
+        let has_explicit_phase = self
+            .pending_turn
+            .iter()
+            .any(|event| event.role == "assistant" && assistant_message_phase(event).is_some());
+        let final_index = if has_explicit_phase {
+            self.pending_turn.iter().rposition(|event| {
+                event.role == "assistant" && assistant_message_phase(event) == Some("final_answer")
+            })
+        } else {
+            self.pending_turn
+                .iter()
+                .rposition(|event| event.role == "assistant")
+        };
+
+        for (index, event) in self.pending_turn.drain(..).enumerate() {
+            if event.role != "assistant" || final_index == Some(index) {
+                out.push(event);
+            }
+        }
+    }
+}
+
 fn is_internal_codex_context_message(event: &PreviewEvent) -> bool {
     if event.role != "user" {
         return false;
@@ -369,7 +438,7 @@ fn preview_capacity_hint(limit: usize) -> usize {
 /// 时间线消息预览的最大字符数：悬浮卡片/列表只需要开头片段。
 const TIMELINE_MESSAGE_PREVIEW_CHARS: usize = 400;
 
-/// 扫描整个会话文件，以真实用户提问作为时间线刻度，并附带其后最后一条 Agent 回复摘要。
+/// 扫描整个会话文件，以真实用户提问作为时间线刻度，并附带其最终 Agent 回复摘要。
 /// 不携带 raw，负载远小于全量 preview_session_range。
 pub fn preview_session_user_prompts(
     provider: Option<String>,
@@ -392,6 +461,7 @@ fn user_prompts_impl(
     let reader = BufReader::new(f);
     let mut prompts = Vec::new();
     let mut total_events = 0usize;
+    let mut current_has_explicit_assistant_phase = false;
     for (i, line) in reader.lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
@@ -417,15 +487,33 @@ fn user_prompts_impl(
         };
         let text = clip_timeline_preview(&display_text);
         match event.role.as_str() {
-            "user" => prompts.push(UserPromptBrief {
-                index: event.index,
-                offset,
-                timestamp: event.timestamp.clone(),
-                text,
-                response: None,
-            }),
-            // 一轮里可能出现多条 Agent 消息；保留最后一条，更接近最终答复摘要。
+            "user" => {
+                prompts.push(UserPromptBrief {
+                    index: event.index,
+                    offset,
+                    timestamp: event.timestamp.clone(),
+                    text,
+                    response: None,
+                });
+                current_has_explicit_assistant_phase = false;
+            }
             "assistant" if !text.is_empty() => {
+                let phase = assistant_message_phase(&event);
+                if phase.is_some() && !current_has_explicit_assistant_phase {
+                    current_has_explicit_assistant_phase = true;
+                    // 一旦发现 Codex phase，就不能再把之前的无 phase 消息当作最终答复。
+                    if let Some(prompt) = prompts.last_mut() {
+                        prompt.response = None;
+                    }
+                }
+                let is_final_response = match phase {
+                    Some("final_answer") => true,
+                    Some(_) => false,
+                    None => !current_has_explicit_assistant_phase,
+                };
+                if !is_final_response {
+                    continue;
+                }
                 if let Some(prompt) = prompts.last_mut() {
                     prompt.response = Some(TimelineMessageBrief {
                         index: event.index,
@@ -957,6 +1045,158 @@ mod tests {
         assert_eq!(response.index, 2);
         assert_eq!(response.offset, 2);
         Ok(())
+    }
+
+    #[test]
+    fn user_prompts_uses_codex_final_answer_instead_of_commentary() -> AppResult<()> {
+        let file = temp_file("cc-session-manager-codex-final-answer-timeline-test");
+        {
+            let mut out = File::create(&file)?;
+            for value in [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "帮我检查"}]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "commentary",
+                        "content": [{"type": "output_text", "text": "我先检查。"}]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": "已经修复。"}]
+                    }
+                }),
+            ] {
+                writeln!(out, "{}", serde_json::to_string(&value)?)?;
+            }
+        }
+
+        let list = preview_session_user_prompts(
+            Some("codex".to_string()),
+            file.to_string_lossy().into_owned(),
+        )?;
+        fs::remove_file(file).ok();
+
+        assert_eq!(list.prompts.len(), 1);
+        let response = list.prompts[0]
+            .response
+            .as_ref()
+            .expect("final_answer 应作为时间线回复");
+        assert_eq!(response.text, "已经修复。");
+        assert_eq!(response.index, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn user_prompts_treats_commentary_only_codex_turn_as_unanswered() -> AppResult<()> {
+        let file = temp_file("cc-session-manager-codex-commentary-only-timeline-test");
+        {
+            let mut out = File::create(&file)?;
+            for value in [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "帮我检查"}]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "commentary",
+                        "content": [{"type": "output_text", "text": "正在检查。"}]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {"type": "turn_aborted"}
+                }),
+            ] {
+                writeln!(out, "{}", serde_json::to_string(&value)?)?;
+            }
+        }
+
+        let list = preview_session_user_prompts(
+            Some("codex".to_string()),
+            file.to_string_lossy().into_owned(),
+        )?;
+        fs::remove_file(file).ok();
+
+        assert_eq!(list.prompts.len(), 1);
+        assert!(list.prompts[0].response.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn conversation_display_reducer_keeps_only_the_turn_final_answer() {
+        let events = [
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": "问题一"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": "过程消息"
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": "最终答复"
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": "问题二"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": "中断前过程消息"
+                }
+            }),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, raw)| classify(index, raw));
+
+        let mut reducer = ConversationDisplayReducer::default();
+        let mut visible = Vec::new();
+        for event in events {
+            reducer.push(event, &mut visible);
+        }
+        reducer.finish(&mut visible);
+
+        assert_eq!(
+            visible.iter().map(|event| event.index).collect::<Vec<_>>(),
+            vec![0, 2, 3]
+        );
     }
 
     #[test]

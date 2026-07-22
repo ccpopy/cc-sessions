@@ -350,6 +350,7 @@ fn collect_preview_events(
 ) -> CliResult<Vec<cc_session_manager_lib::models::PreviewEvent>> {
     let mut raw_offset = offset;
     let mut selected = Vec::new();
+    let mut conversation_reducer = rollout::ConversationDisplayReducer::default();
     let batch = 100usize;
     loop {
         let next_limit = match limit {
@@ -374,8 +375,15 @@ fn collect_preview_events(
         }
         for event in events {
             if mode == PreviewMode::All || preview_event_visible(&event, mode) {
-                selected.push(event);
+                if mode == PreviewMode::All {
+                    selected.push(event);
+                } else {
+                    conversation_reducer.push(event, &mut selected);
+                }
                 if limit.is_some_and(|max| selected.len() >= max) {
+                    if let Some(max) = limit {
+                        selected.truncate(max);
+                    }
                     return Ok(selected);
                 }
             }
@@ -384,6 +392,12 @@ fn collect_preview_events(
         if fetched < next_limit {
             break;
         }
+    }
+    if mode != PreviewMode::All {
+        conversation_reducer.finish(&mut selected);
+    }
+    if let Some(max) = limit {
+        selected.truncate(max);
     }
     Ok(selected)
 }

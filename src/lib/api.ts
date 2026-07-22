@@ -129,7 +129,7 @@ export type TimelineMessageBrief = {
 };
 
 export type UserPromptBrief = TimelineMessageBrief & {
-  /** 同一轮最后一条 Agent 回复，只展示在左侧刻度的悬浮摘要中。 */
+  /** 同一轮最终 Agent 回复，只展示在左侧刻度的悬浮摘要中。 */
   response: TimelineMessageBrief | null;
 };
 

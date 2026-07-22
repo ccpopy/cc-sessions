@@ -527,7 +527,7 @@ fn preview_session(provider: &str, session: &SessionSummary) -> MenuResult<()> {
 }
 
 fn choose_preview_mode() -> MenuResult<PreviewMode> {
-    println!("1. 仅对话消息（默认，不显示工具调用）");
+    println!("1. 仅对话消息（默认，每轮只显示最终答复）");
     println!("2. 对话消息 + 推理过程");
     println!("3. 全部事件（包含工具调用、工具返回、元数据）");
     match prompt("请选择预览模式 [1]: ")?.as_str() {
@@ -558,6 +558,7 @@ fn collect_preview_events(
 ) -> MenuResult<Vec<PreviewEvent>> {
     let mut offset = 0usize;
     let mut selected = Vec::new();
+    let mut conversation_reducer = rollout::ConversationDisplayReducer::default();
     let batch = 100usize;
     loop {
         let next_limit = match limit {
@@ -583,8 +584,15 @@ fn collect_preview_events(
         }
         for event in events {
             if matches!(mode, PreviewMode::All) || preview_event_visible(&event, mode) {
-                selected.push(event);
+                if matches!(mode, PreviewMode::All) {
+                    selected.push(event);
+                } else {
+                    conversation_reducer.push(event, &mut selected);
+                }
                 if limit.is_some_and(|max| selected.len() >= max) {
+                    if let Some(max) = limit {
+                        selected.truncate(max);
+                    }
                     return Ok(selected);
                 }
             }
@@ -593,6 +601,12 @@ fn collect_preview_events(
         if fetched < next_limit {
             break;
         }
+    }
+    if !matches!(mode, PreviewMode::All) {
+        conversation_reducer.finish(&mut selected);
+    }
+    if let Some(max) = limit {
+        selected.truncate(max);
     }
     Ok(selected)
 }
