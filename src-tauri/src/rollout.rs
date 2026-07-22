@@ -440,29 +440,55 @@ const TIMELINE_MESSAGE_PREVIEW_CHARS: usize = 400;
 
 /// 扫描整个会话文件，以真实用户提问作为时间线刻度，并附带 Agent 回复摘要。
 /// 优先使用最终答复；如果一轮在最终答复前被用户引导或中断，则使用最后一条过程
-/// 消息证明该轮已经得到响应。完全没有 Agent 消息时才视为无回复。
+/// 消息证明该轮已经得到响应。完全没有 Agent 活动的提问不会进入对话时间线。
 /// 不携带 raw，负载远小于全量 preview_session_range。
 pub fn preview_session_user_prompts(
     provider: Option<String>,
     rollout_path: String,
 ) -> AppResult<UserPromptList> {
     match provider.as_deref().unwrap_or("codex") {
-        "codex" => user_prompts_impl(&rollout_path, |index, raw| Some(classify(index, raw))),
-        "claude" => user_prompts_impl(&rollout_path, crate::claude_sessions::classify_preview),
+        "codex" => user_prompts_impl(
+            &rollout_path,
+            |index, raw| Some(classify(index, raw)),
+            codex_event_is_agent_activity,
+        ),
+        "claude" => user_prompts_impl(
+            &rollout_path,
+            crate::claude_sessions::classify_preview,
+            claude_event_is_agent_activity,
+        ),
         other => Err(crate::error::AppError::Other(format!(
             "不支持的 provider: {other}"
         ))),
     }
 }
 
+fn codex_event_is_agent_activity(event: &PreviewEvent) -> bool {
+    (raw_type(event) == "event_msg" && payload_type(event) == "agent_message")
+        || (event.role == "assistant"
+            && preview_event_is_conversation(event)
+            && !preview_event_text(event).trim().is_empty())
+}
+
+fn claude_event_is_agent_activity(event: &PreviewEvent) -> bool {
+    event
+        .raw
+        .get("message")
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str)
+        == Some("assistant")
+}
+
 fn user_prompts_impl(
     path: &str,
     classify_line: impl Fn(usize, Value) -> Option<PreviewEvent>,
+    event_is_agent_activity: impl Fn(&PreviewEvent) -> bool,
 ) -> AppResult<UserPromptList> {
     let f = File::open(PathBuf::from(path))?;
     let reader = BufReader::new(f);
     let mut prompts = Vec::new();
     let mut total_events = 0usize;
+    let mut current_has_agent_activity = false;
     let mut current_has_explicit_assistant_phase = false;
     let mut current_has_final_answer = false;
     for (i, line) in reader.lines().enumerate() {
@@ -479,28 +505,34 @@ fn user_prompts_impl(
         // offset 必须与 preview_session_range 的事件计数保持一致，前端靠它分页加载到目标
         let offset = total_events;
         total_events += 1;
-        if !preview_event_is_conversation(&event) {
+
+        let is_conversation = preview_event_is_conversation(&event);
+        if is_conversation && event.role == "user" {
+            discard_inactive_current_prompt(&mut prompts, current_has_agent_activity);
+            let text = clip_timeline_preview(&timeline_user_text(&preview_event_text(&event)));
+            prompts.push(UserPromptBrief {
+                index: event.index,
+                offset,
+                timestamp: event.timestamp.clone(),
+                text,
+                response: None,
+            });
+            current_has_agent_activity = false;
+            current_has_explicit_assistant_phase = false;
+            current_has_final_answer = false;
             continue;
         }
+
+        if !prompts.is_empty() && event_is_agent_activity(&event) {
+            current_has_agent_activity = true;
+        }
+        if !is_conversation {
+            continue;
+        }
+
         let event_text = preview_event_text(&event);
-        let display_text = if event.role == "user" {
-            timeline_user_text(&event_text)
-        } else {
-            event_text
-        };
-        let text = clip_timeline_preview(&display_text);
+        let text = clip_timeline_preview(&event_text);
         match event.role.as_str() {
-            "user" => {
-                prompts.push(UserPromptBrief {
-                    index: event.index,
-                    offset,
-                    timestamp: event.timestamp.clone(),
-                    text,
-                    response: None,
-                });
-                current_has_explicit_assistant_phase = false;
-                current_has_final_answer = false;
-            }
             "assistant" if !text.is_empty() => {
                 let phase = assistant_message_phase(&event);
                 if phase.is_some() && !current_has_explicit_assistant_phase {
@@ -535,10 +567,20 @@ fn user_prompts_impl(
             _ => {}
         }
     }
+    discard_inactive_current_prompt(&mut prompts, current_has_agent_activity);
     Ok(UserPromptList {
         prompts,
         total_events,
     })
+}
+
+fn discard_inactive_current_prompt(
+    prompts: &mut Vec<UserPromptBrief>,
+    current_has_agent_activity: bool,
+) {
+    if !current_has_agent_activity {
+        prompts.pop();
+    }
 }
 
 /// 保留换行的截断：与 trim() 的单行摘要不同，悬浮卡片需要多行预览。
@@ -983,7 +1025,7 @@ mod tests {
         fs::remove_file(file).ok();
 
         assert_eq!(list.total_events, 6);
-        assert_eq!(list.prompts.len(), 2);
+        assert_eq!(list.prompts.len(), 1);
         assert_eq!(list.prompts[0].text, "第一个问题");
         assert_eq!(list.prompts[0].index, 3);
         assert_eq!(list.prompts[0].offset, 3);
@@ -995,10 +1037,6 @@ mod tests {
         assert_eq!(response.text, "回答");
         assert_eq!(response.index, 4);
         assert_eq!(response.offset, 4);
-        assert_eq!(list.prompts[1].text, "第二个问题");
-        assert_eq!(list.prompts[1].index, 5);
-        assert_eq!(list.prompts[1].offset, 5);
-        assert!(list.prompts[1].response.is_none());
         Ok(())
     }
 
@@ -1160,19 +1198,18 @@ mod tests {
         )?;
         fs::remove_file(file).ok();
 
-        assert_eq!(list.prompts.len(), 2);
+        assert_eq!(list.prompts.len(), 1);
         let response = list.prompts[0]
             .response
             .as_ref()
             .expect("有过程消息的轮次不应标记为无回复");
         assert_eq!(response.text, "继续检查。");
         assert_eq!(response.index, 2);
-        assert!(list.prompts[1].response.is_none());
         Ok(())
     }
 
     #[test]
-    fn user_prompts_treats_turn_without_any_agent_message_as_unanswered() -> AppResult<()> {
+    fn user_prompts_hides_codex_turn_without_any_agent_activity() -> AppResult<()> {
         let file = temp_file("cc-session-manager-codex-no-agent-response-timeline-test");
         {
             let mut out = File::create(&file)?;
@@ -1186,8 +1223,88 @@ mod tests {
                     }
                 }),
                 serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{"type": "input_text", "text": "内部说明"}]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {"type": "task_started"}
+                }),
+                serde_json::json!({
                     "type": "event_msg",
                     "payload": {"type": "turn_aborted"}
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "继续执行"}]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": "已继续。"}]
+                    }
+                }),
+            ] {
+                writeln!(out, "{}", serde_json::to_string(&value)?)?;
+            }
+        }
+
+        let path = file.to_string_lossy().into_owned();
+        let list = preview_session_user_prompts(Some("codex".to_string()), path.clone())?;
+        let all_events = preview_session_range(Some("codex".to_string()), path, 0, usize::MAX)?;
+        fs::remove_file(file).ok();
+
+        assert_eq!(list.prompts.len(), 1);
+        assert_eq!(list.prompts[0].text, "继续执行");
+        assert_eq!(
+            list.prompts[0]
+                .response
+                .as_ref()
+                .map(|response| response.text.as_str()),
+            Some("已继续。")
+        );
+        assert_eq!(all_events.len(), 6);
+        assert_eq!(all_events[0].role, "user");
+        assert_eq!(preview_event_text(&all_events[0]), "帮我检查");
+        Ok(())
+    }
+
+    #[test]
+    fn user_prompts_keeps_codex_turn_with_agent_event_message() -> AppResult<()> {
+        let file = temp_file("cc-session-manager-codex-agent-event-timeline-test");
+        {
+            let mut out = File::create(&file)?;
+            for value in [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "帮我检查"}]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {"type": "agent_message", "message": "正在检查。"}
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "下一条问题"}]
+                    }
                 }),
             ] {
                 writeln!(out, "{}", serde_json::to_string(&value)?)?;
@@ -1201,7 +1318,107 @@ mod tests {
         fs::remove_file(file).ok();
 
         assert_eq!(list.prompts.len(), 1);
+        assert_eq!(list.prompts[0].text, "帮我检查");
         assert!(list.prompts[0].response.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn user_prompts_hides_claude_turn_without_assistant_activity() -> AppResult<()> {
+        let file = temp_file("cc-session-manager-claude-no-agent-response-timeline-test");
+        {
+            let mut out = File::create(&file)?;
+            for value in [
+                serde_json::json!({
+                    "type": "user",
+                    "message": {"role": "user", "content": "第一个问题"}
+                }),
+                serde_json::json!({
+                    "type": "progress",
+                    "data": {"type": "hook_progress"}
+                }),
+                serde_json::json!({
+                    "type": "user",
+                    "message": {"role": "user", "content": "第二个问题"}
+                }),
+                serde_json::json!({
+                    "type": "assistant",
+                    "message": {"role": "assistant", "content": "第二个回答"}
+                }),
+            ] {
+                writeln!(out, "{}", serde_json::to_string(&value)?)?;
+            }
+        }
+
+        let list = preview_session_user_prompts(
+            Some("claude".to_string()),
+            file.to_string_lossy().into_owned(),
+        )?;
+        fs::remove_file(file).ok();
+
+        assert_eq!(list.prompts.len(), 1);
+        assert_eq!(list.prompts[0].text, "第二个问题");
+        assert_eq!(
+            list.prompts[0]
+                .response
+                .as_ref()
+                .map(|response| response.text.as_str()),
+            Some("第二个回答")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn user_prompts_keeps_claude_turn_with_thinking_or_tool_use() -> AppResult<()> {
+        let file = temp_file("cc-session-manager-claude-agent-activity-timeline-test");
+        {
+            let mut out = File::create(&file)?;
+            for value in [
+                serde_json::json!({
+                    "type": "user",
+                    "message": {"role": "user", "content": "需要思考的问题"}
+                }),
+                serde_json::json!({
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "thinking", "thinking": "正在分析", "signature": "x"}]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "user",
+                    "message": {"role": "user", "content": "需要工具的问题"}
+                }),
+                serde_json::json!({
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "tool_use", "id": "tool-1", "name": "Read", "input": {}}]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "user",
+                    "message": {"role": "user", "content": "没有活动的问题"}
+                }),
+            ] {
+                writeln!(out, "{}", serde_json::to_string(&value)?)?;
+            }
+        }
+
+        let list = preview_session_user_prompts(
+            Some("claude".to_string()),
+            file.to_string_lossy().into_owned(),
+        )?;
+        fs::remove_file(file).ok();
+
+        assert_eq!(
+            list.prompts
+                .iter()
+                .map(|prompt| prompt.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["需要思考的问题", "需要工具的问题"]
+        );
+        assert!(list.prompts.iter().all(|prompt| prompt.response.is_none()));
         Ok(())
     }
 

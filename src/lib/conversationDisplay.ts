@@ -59,6 +59,21 @@ export function buildConversationPreviewRows(
   return rows;
 }
 
+/**
+ * 时间线只返回确实发生过 Agent 活动的用户轮次。时间线数据尚未加载或加载失败时
+ * 保持兼容，不提前隐藏用户消息。
+ */
+export function isVisibleConversationEvent(
+  event: PreviewEvent,
+  visiblePromptIndexes: ReadonlySet<number> | null,
+): boolean {
+  return (
+    event.role !== "user" ||
+    visiblePromptIndexes === null ||
+    visiblePromptIndexes.has(event.index)
+  );
+}
+
 function assistantMessagePhase(event: PreviewEvent): string | null {
   if (event.role !== "assistant") return null;
   const raw = event.raw as {

@@ -64,6 +64,7 @@ import {
 import { parseEmbeddedTranscriptPrompt, type EmbeddedTranscriptPrompt } from "@/lib/sessionText";
 import {
   buildConversationPreviewRows,
+  isVisibleConversationEvent,
   type ConversationPreviewRow,
 } from "@/lib/conversationDisplay";
 import { cn } from "@/lib/utils";
@@ -289,9 +290,19 @@ export function PreviewDialog({
     }
   }, [done, events.length, loadMore, loading, open]);
 
+  const timelineIndexSet = useMemo(
+    () => (prompts === null ? null : new Set(prompts.map((prompt) => prompt.index))),
+    [prompts],
+  );
+
   const filtered = useMemo(() => {
     return events.filter((e) => {
-      if (onlyMsg && !isConversationMessage(e)) return false;
+      if (
+        onlyMsg &&
+        (!isConversationMessage(e) || !isVisibleConversationEvent(e, timelineIndexSet))
+      ) {
+        return false;
+      }
       if (!filter) return true;
       const low = filter.toLowerCase();
       return (
@@ -300,12 +311,7 @@ export function PreviewDialog({
         JSON.stringify(e.raw).toLowerCase().includes(low)
       );
     });
-  }, [events, filter, onlyMsg]);
-
-  const timelineIndexSet = useMemo(
-    () => new Set((prompts ?? []).map((prompt) => prompt.index)),
-    [prompts],
-  );
+  }, [events, filter, onlyMsg, timelineIndexSet]);
 
   /**
    * 对齐 Codex App 的对话展示：显式 commentary 属于过程消息，final_answer 才是
@@ -841,7 +847,7 @@ export function PreviewDialog({
                   <div
                     key={row.event.index}
                     data-event-index={row.event.index}
-                    data-timeline-anchor={timelineIndexSet.has(row.event.index) || undefined}
+                    data-timeline-anchor={timelineIndexSet?.has(row.event.index) || undefined}
                   >
                     <EventBubble
                       e={row.event}

@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { PreviewEvent } from "./api";
-import { buildConversationPreviewRows } from "./conversationDisplay.ts";
+import {
+  buildConversationPreviewRows,
+  isVisibleConversationEvent,
+} from "./conversationDisplay.ts";
 
 function event(
   index: number,
@@ -87,4 +90,16 @@ test("phase-less Claude messages keep the last assistant message as the reply", 
       ["event", 2],
     ],
   );
+});
+
+test("conversation-only view hides user prompts missing from the active timeline", () => {
+  const visiblePromptIndexes = new Set([2]);
+
+  assert.equal(isVisibleConversationEvent(event(0, "user"), visiblePromptIndexes), false);
+  assert.equal(isVisibleConversationEvent(event(1, "assistant"), visiblePromptIndexes), true);
+  assert.equal(isVisibleConversationEvent(event(2, "user"), visiblePromptIndexes), true);
+});
+
+test("conversation-only view keeps user prompts while timeline data is unavailable", () => {
+  assert.equal(isVisibleConversationEvent(event(0, "user"), null), true);
 });
