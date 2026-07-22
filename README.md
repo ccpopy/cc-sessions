@@ -20,7 +20,7 @@ CC Sessions 是一款本地桌面应用，用于浏览、检索、备份、导�
 - 将会话导出为人眼可读的 Markdown，用于知识归档或多 AI 之间的上下文传递。
 - 修复 Codex 本地索引、重建 `threads` 表、清理 orphan 记录。
 - Codex 会话支持 provider 分支管理，并可从稳定对话节点创建回溯分支。
-- 设置页面支持手动检查 GitHub Release 更新，并跳转至最新 Release 下载页面。
+- 设置页面支持检查 GitHub Release 更新；桌面版可下载、校验并自动安装到当前便携版或安装版所在目录，CLI WebUI 保留手动下载入口。
 
 ## 快捷键
 
@@ -211,7 +211,7 @@ git push origin v0.2.6
 
 工作流会在 Windows、macOS Apple Silicon、macOS Intel 和 Linux 上分别构建 Tauri 安装产物。macOS 打包要求 `src-tauri/icons/icon.icns` 存在，本仓库已提交 Tauri 生成的跨平台图标文件。
 
-Windows Release 会额外上传 `cc-session-manager-portable-v版本号-windows.exe`，这是无需安装即可直接运行的便携版可执行文件。
+Windows Release 会额外上传 `cc-session-manager-portable-v版本号-windows.exe`，这是无需安装即可直接运行的便携版可执行文件。便携 ZIP 内包含 `cc-session-manager.portable` 标记；应用内更新会关闭程序、在当前目录原位替换可执行文件并重新启动。NSIS/MSI 安装版更新会沿用当前检测到的安装目录，不会回到默认路径。
 
 Release 也会在 Windows、macOS Apple Silicon、macOS Intel 和 Linux job 中分别上传 `cc-sessions-cli-v版本号-平台.zip`，这是不依赖桌面环境的 CLI 版本；macOS CLI 包名会区分 `macos-arm64` 和 `macos-intel`。远程仓库推送版本 tag 触发发布时，CLI 包会和桌面安装包一起出现在同一个 GitHub Release 中。
 

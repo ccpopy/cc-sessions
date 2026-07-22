@@ -1,3 +1,5 @@
+#[cfg(feature = "desktop")]
+pub mod app_update;
 pub mod atomic_file;
 pub mod backup;
 pub mod bundle;
@@ -23,18 +25,25 @@ pub mod stats;
 pub mod webui;
 
 #[cfg(feature = "desktop")]
-#[cfg(debug_assertions)]
 use tauri::Manager;
 
 #[cfg(feature = "desktop")]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_fs::init())
         .manage(std::sync::Arc::new(family::FamilyLock::default()))
         .setup(|_app| {
+            app_update::cleanup_stale_update_dirs();
             #[cfg(debug_assertions)]
             {
                 if let Some(win) = _app.get_webview_window("main") {
@@ -47,6 +56,8 @@ pub fn run() {
             settings::get_settings,
             settings::save_settings,
             settings::app_version,
+            app_update::check_app_update,
+            app_update::install_app_update,
             settings::default_codex_dir,
             settings::default_claude_dir,
             settings::validate_codex_dir,

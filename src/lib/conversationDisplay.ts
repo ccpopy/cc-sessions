@@ -15,6 +15,7 @@ export type ConversationPreviewRow =
  */
 export function buildConversationPreviewRows(
   events: readonly PreviewEvent[],
+  options: { hideProcessMessages?: boolean } = {},
 ): ConversationPreviewRow[] {
   const rows: ConversationPreviewRow[] = [];
   let assistantRun: PreviewEvent[] = [];
@@ -33,7 +34,7 @@ export function buildConversationPreviewRows(
       : assistantRun.length - 1;
     const intermediate = assistantRun.filter((_, index) => index !== finalIndex);
 
-    if (intermediate.length > 0) {
+    if (intermediate.length > 0 && !options.hideProcessMessages) {
       rows.push({
         type: "collapsed",
         key: intermediate[0].index,

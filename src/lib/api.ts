@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { copyText } from "@/lib/clipboard";
 import { isTauriRuntime, isWebRuntime, webuiApiToken } from "@/lib/runtime";
+import { compareVersions, normalizeVersion } from "@/lib/version";
 
 async function invokeCommand<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   if (isTauriRuntime()) {
@@ -45,6 +46,8 @@ export type Settings = {
   backup_dir: string;
   open_command: string;
   refresh_interval_ms: number;
+  preview_only_messages: boolean;
+  preview_collapse_process: boolean;
 };
 
 export type DirValidation = {
@@ -54,6 +57,18 @@ export type DirValidation = {
   threads_count: number;
 };
 
+export type AppUpdateInfo = {
+  current_version: string;
+  latest_version: string;
+  html_url: string;
+  available: boolean;
+  can_auto_install: boolean;
+  install_mode: "portable" | "nsis" | "msi" | "webui" | "unsupported" | string;
+  install_dir: string | null;
+  asset_name: string | null;
+  message: string | null;
+};
+
 export type UpdateCheckResult =
   | {
       state: "idle";
@@ -61,18 +76,9 @@ export type UpdateCheckResult =
   | {
       state: "checking";
     }
-  | {
-      state: "current";
-      current_version: string;
-      latest_version: string;
-      html_url: string;
-    }
-  | {
-      state: "available";
-      current_version: string;
-      latest_version: string;
-      html_url: string;
-    }
+  | (AppUpdateInfo & {
+      state: "current" | "available" | "installing";
+    })
   | {
       state: "error";
       message: string;
@@ -662,6 +668,48 @@ export type PreviewImageData = {
 
 export const api = {
   appVersion: () => invokeCommand<string>("app_version"),
+  checkAppUpdate: async (): Promise<AppUpdateInfo> => {
+    if (isTauriRuntime()) {
+      return invokeCommand<AppUpdateInfo>("check_app_update");
+    }
+
+    const [currentVersion, response] = await Promise.all([
+      invokeCommand<string>("app_version"),
+      fetch("https://api.github.com/repos/ccpopy/cc-sessions/releases/latest", {
+        headers: { Accept: "application/vnd.github+json" },
+      }),
+    ]);
+    if (!response.ok) {
+      throw new Error(`GitHub 返回 ${response.status}`);
+    }
+    const payload = (await response.json()) as { tag_name?: unknown; html_url?: unknown };
+    const latestTag = typeof payload.tag_name === "string" ? payload.tag_name : "";
+    const htmlUrl = typeof payload.html_url === "string" ? payload.html_url : "";
+    if (!latestTag || !htmlUrl) {
+      throw new Error("GitHub Release 响应缺少 tag_name 或 html_url");
+    }
+    const latestVersion = normalizeVersion(latestTag);
+    const available = compareVersions(latestVersion, currentVersion) > 0;
+    return {
+      current_version: currentVersion,
+      latest_version: latestVersion,
+      html_url: htmlUrl,
+      available,
+      can_auto_install: false,
+      install_mode: "webui",
+      install_dir: null,
+      asset_name: null,
+      message: available
+        ? "CLI WebUI 无法自动替换桌面程序，请打开下载页面手动更新。"
+        : null,
+    };
+  },
+  installAppUpdate: async () => {
+    if (!isTauriRuntime()) {
+      throw new Error("CLI WebUI 无法自动安装桌面更新，请打开下载页面。");
+    }
+    return invokeCommand<void>("install_app_update");
+  },
   getSettings: () => invokeCommand<Settings>("get_settings"),
   saveSettings: (settings: Settings) => invokeCommand<void>("save_settings", { settings }),
   openLatestReleasePage: async () => {

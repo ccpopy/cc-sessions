@@ -10,6 +10,10 @@ pub struct Settings {
     pub open_command: String,
     #[serde(default = "default_refresh_ms")]
     pub refresh_interval_ms: u64,
+    #[serde(default = "default_true")]
+    pub preview_only_messages: bool,
+    #[serde(default = "default_true")]
+    pub preview_collapse_process: bool,
 }
 
 fn default_open_cmd() -> String {
@@ -37,6 +41,8 @@ impl Default for Settings {
             backup_dir: backup.to_string_lossy().into_owned(),
             open_command: "auto".into(),
             refresh_interval_ms: 5000,
+            preview_only_messages: true,
+            preview_collapse_process: true,
         }
     }
 }

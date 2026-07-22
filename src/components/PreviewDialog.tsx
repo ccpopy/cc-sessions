@@ -3,11 +3,8 @@ import {
   Bot,
   ChevronDown,
   ChevronsDown,
-  Copy,
   FileJson,
-  FolderOpen,
   GitBranch,
-  History,
   Loader2,
   MessageSquare,
   Network,
@@ -50,6 +47,7 @@ import {
   type EditHistory,
   type PreviewEvent,
   type SessionSummary,
+  type Settings,
   type UserPromptBrief,
 } from "@/lib/api";
 import { copyText } from "@/lib/clipboard";
@@ -57,6 +55,7 @@ import { absoluteTime, formatTimeString, humanTokens } from "@/lib/format";
 import { shouldIgnoreTextEditingHotkey } from "@/lib/keyboard";
 import { parseUserMessageAttachments } from "@/lib/messageAttachments";
 import { PromptTimeline } from "@/components/PromptTimeline";
+import { PreviewToolbarActions } from "@/components/PreviewToolbarActions";
 import {
   collectRelatedSubagents,
   type RelatedSubagentSession,
@@ -68,6 +67,7 @@ import {
   type ConversationPreviewRow,
 } from "@/lib/conversationDisplay";
 import { cn } from "@/lib/utils";
+import { useSettings } from "@/stores/settings";
 import { toast } from "sonner";
 
 type Props = {
@@ -133,6 +133,7 @@ export function PreviewDialog({
   const [done, setDone] = useState(false);
   const [filter, setFilter] = useState("");
   const [onlyMsg, setOnlyMsg] = useState(true);
+  const [collapseProcess, setCollapseProcess] = useState(true);
   const [forkTarget, setForkTarget] = useState<PreviewEvent | null>(null);
   const [forking, setForking] = useState(false);
   const [editTarget, setEditTarget] = useState<PreviewEvent | null>(null);
@@ -152,6 +153,8 @@ export function PreviewDialog({
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const pendingJumpRef = useRef<number | null>(null);
   const scrollSpyRafRef = useRef(0);
+  const preferenceSaveRef = useRef<Promise<void>>(Promise.resolve());
+  const appSettings = useSettings((state) => state.settings);
   const canForkSession = provider === "codex" && !customRolloutPath && !!session && !!codexDir;
   // 备份/导入预览（customRolloutPath）不允许编辑，只能编辑真实会话文件
   const canMutateSession = !customRolloutPath && !!session && !!backupDir && !!rolloutPath;
@@ -159,6 +162,41 @@ export function PreviewDialog({
     if (!session || session.provider !== "codex" || customRolloutPath) return [];
     return collectRelatedSubagents(session.id, allSessions);
   }, [allSessions, customRolloutPath, session]);
+
+  useEffect(() => {
+    if (!appSettings) return;
+    setOnlyMsg(appSettings.preview_only_messages);
+    setCollapseProcess(appSettings.preview_collapse_process);
+  }, [appSettings]);
+
+  const persistPreviewPreference = useCallback((patch: Partial<Settings>) => {
+    preferenceSaveRef.current = preferenceSaveRef.current.then(async () => {
+      try {
+        await useSettings.getState().save(patch);
+      } catch (error) {
+        toast.error("保存预览偏好失败", {
+          description: String((error as Error)?.message ?? error),
+        });
+        await useSettings.getState().load().catch(() => undefined);
+      }
+    });
+  }, []);
+
+  const changeOnlyMsg = useCallback(
+    (checked: boolean) => {
+      setOnlyMsg(checked);
+      persistPreviewPreference({ preview_only_messages: checked });
+    },
+    [persistPreviewPreference],
+  );
+
+  const changeCollapseProcess = useCallback(
+    (checked: boolean) => {
+      setCollapseProcess(checked);
+      persistPreviewPreference({ preview_collapse_process: checked });
+    },
+    [persistPreviewPreference],
+  );
 
   const loadMore = useCallback(async () => {
     if (loadingRef.current || doneRef.current || !rolloutPath) return;
@@ -277,7 +315,6 @@ export function PreviewDialog({
   useEffect(() => {
     if (!open || !rolloutPath) return;
     setFilter("");
-    setOnlyMsg(true);
     resetAndReload();
   }, [open, rolloutPath, resetAndReload]);
 
@@ -322,8 +359,10 @@ export function PreviewDialog({
     if (!onlyMsg || filter) {
       return filtered.map((event) => ({ type: "event", event }));
     }
-    return buildConversationPreviewRows(filtered);
-  }, [filtered, filter, onlyMsg]);
+    return buildConversationPreviewRows(filtered, {
+      hideProcessMessages: collapseProcess,
+    });
+  }, [collapseProcess, filtered, filter, onlyMsg]);
 
   /** 把待跳转的目标消息滚动到视口顶部并闪烁高亮 */
   const scrollPendingIntoView = useCallback(() => {
@@ -728,9 +767,23 @@ export function PreviewDialog({
               htmlFor="only-msg"
               className="group flex h-8 cursor-pointer items-center gap-2 rounded-md border border-border/70 bg-muted/30 px-2.5 transition-colors hover:bg-muted/50"
             >
-              <Switch id="only-msg" checked={onlyMsg} onCheckedChange={setOnlyMsg} />
+              <Switch id="only-msg" checked={onlyMsg} onCheckedChange={changeOnlyMsg} />
               <Label htmlFor="only-msg" className="cursor-pointer text-xs">
                 仅看对话消息
+              </Label>
+            </label>
+            <label
+              htmlFor="collapse-process"
+              className="group flex h-8 cursor-pointer items-center gap-2 rounded-md border border-border/70 bg-muted/30 px-2.5 transition-colors hover:bg-muted/50"
+              title="开启后隐藏过程消息；关闭后显示可展开的折叠提示"
+            >
+              <Switch
+                id="collapse-process"
+                checked={collapseProcess}
+                onCheckedChange={changeCollapseProcess}
+              />
+              <Label htmlFor="collapse-process" className="cursor-pointer text-xs">
+                折叠过程
               </Label>
             </label>
             <span className="text-[11px] text-muted-foreground">
@@ -764,40 +817,15 @@ export function PreviewDialog({
                 {loadingAll ? "加载中…" : "加载全部"}
               </Button>
             )}
-            <div className="ml-auto flex items-center gap-0.5">
-              {session && (
-                <>
-                  <Button variant="ghost" size="sm" className="h-8 gap-1.5 px-2.5" onClick={copySessionId}>
-                    <Copy className="h-3.5 w-3.5" />
-                    复制会话 ID
-                  </Button>
-                  <Button variant="ghost" size="sm" className="h-8 gap-1.5 px-2.5" onClick={copyResume}>
-                    <Copy className="h-3.5 w-3.5" />
-                    复制 resume
-                  </Button>
-                  <Button variant="ghost" size="sm" className="h-8 gap-1.5 px-2.5" onClick={reveal}>
-                    <FolderOpen className="h-3.5 w-3.5" />
-                    打开目录
-                  </Button>
-                  {canMutateSession && (
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-8 gap-1.5 px-2.5"
-                      onClick={openEditHistory}
-                    >
-                      <History className="h-3.5 w-3.5" />
-                      编辑历史
-                    </Button>
-                  )}
-                  <Separator orientation="vertical" className="mx-1 h-4 bg-border/60" />
-                </>
-              )}
-              <Button variant="ghost" size="sm" className="h-8 gap-1.5 px-2.5" onClick={copyPath}>
-                <FileJson className="h-3.5 w-3.5" />
-                复制路径
-              </Button>
-            </div>
+            <PreviewToolbarActions
+              hasSession={!!session}
+              canOpenEditHistory={canMutateSession}
+              onCopySessionId={copySessionId}
+              onCopyResume={copyResume}
+              onRevealDirectory={reveal}
+              onOpenEditHistory={openEditHistory}
+              onCopyPath={copyPath}
+            />
           </div>
         </DialogHeader>
 
@@ -1109,7 +1137,7 @@ export function PreviewDialog({
 
 /**
  * 一轮里最终答复之前的过程性 Agent 消息。Codex App 不在对话流中展示这些消息，
- * 默认折叠成一行提示，点击可展开查看（展开后仍支持编辑/回溯等操作）。
+ * “折叠过程”关闭时折叠成一行提示，点击可展开查看（展开后仍支持编辑/回溯等操作）。
  */
 function CollapsedTurnGroup({
   events,

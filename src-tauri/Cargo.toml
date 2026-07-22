@@ -27,6 +27,9 @@ desktop = [
     "dep:tauri-plugin-clipboard-manager",
     "dep:tauri-plugin-dialog",
     "dep:tauri-plugin-fs",
+    "dep:tauri-plugin-single-instance",
+    "dep:reqwest",
+    "dep:winreg",
 ]
 
 [build-dependencies]
@@ -37,6 +40,8 @@ tauri = { version = "2", features = [], optional = true }
 tauri-plugin-dialog = { version = "2", optional = true }
 tauri-plugin-clipboard-manager = { version = "2", optional = true }
 tauri-plugin-fs = { version = "2", optional = true }
+tauri-plugin-single-instance = { version = "2.4", optional = true }
+reqwest = { version = "0.13", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -52,6 +57,9 @@ tiny_http = "0.12"
 url = "2"
 getrandom = "0.2"
 base64 = "0.22"
+
+[target.'cfg(windows)'.dependencies]
+winreg = { version = "0.55", optional = true }
 
 [profile.release]
 panic = "abort"

@@ -271,4 +271,44 @@ mod tests {
         fs::remove_dir_all(root)?;
         Ok(())
     }
+
+    #[test]
+    fn legacy_settings_enable_preview_switches_by_default() -> AppResult<()> {
+        let root = temp_dir("legacy-preview-switches");
+        fs::create_dir_all(&root)?;
+        let file = root.join("settings.json");
+        fs::write(
+            &file,
+            serde_json::json!({
+                "codex_dir": "legacy-codex",
+                "backup_dir": "legacy-backups"
+            })
+            .to_string(),
+        )?;
+
+        let settings = read_settings_file(&file)?;
+
+        assert!(settings.preview_only_messages);
+        assert!(settings.preview_collapse_process);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn preview_switches_are_persisted() -> AppResult<()> {
+        let root = temp_dir("preview-switches-roundtrip");
+        fs::create_dir_all(&root)?;
+        let file = root.join("settings.json");
+        let mut settings = Settings::default();
+        settings.preview_only_messages = false;
+        settings.preview_collapse_process = false;
+
+        write_settings_file(&file, &settings)?;
+        let restored = read_settings_file(&file)?;
+
+        assert!(!restored.preview_only_messages);
+        assert!(!restored.preview_collapse_process);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
 }

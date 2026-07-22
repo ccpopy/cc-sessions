@@ -173,6 +173,7 @@ async function createPortablePackage() {
 
   await cleanDir(stage);
   await fs.copyFile(exePath, path.join(stage, executableName()));
+  await fs.writeFile(path.join(stage, "cc-session-manager.portable"), "portable\n", "utf8");
   if (executableOutputPath) {
     await fs.copyFile(exePath, executableOutputPath);
   }
@@ -192,6 +193,8 @@ async function createPortablePackage() {
         : "- Windows 10/11 with Microsoft Edge WebView2 Runtime.",
     "",
     "This is a portable package. It does not install shortcuts or an uninstaller.",
+    "The cc-session-manager.portable marker keeps in-app updates in this extracted folder.",
+    "When an update is installed, the app closes, replaces the executable in place, and restarts automatically.",
     "",
   ].join("\n");
   await fs.writeFile(path.join(stage, "README.txt"), readme, "utf8");

@@ -103,3 +103,37 @@ test("conversation-only view hides user prompts missing from the active timeline
 test("conversation-only view keeps user prompts while timeline data is unavailable", () => {
   assert.equal(isVisibleConversationEvent(event(0, "user"), null), true);
 });
+
+test("process collapse hides commentary rows while keeping the final answer", () => {
+  const rows = buildConversationPreviewRows(
+    [
+      event(0, "user"),
+      event(1, "assistant", "commentary"),
+      event(2, "assistant", "commentary"),
+      event(3, "assistant", "final_answer"),
+    ],
+    { hideProcessMessages: true },
+  );
+
+  assert.deepEqual(
+    rows.map((row) =>
+      row.type === "event" ? [row.type, row.event.index] : [row.type, row.key],
+    ),
+    [
+      ["event", 0],
+      ["event", 3],
+    ],
+  );
+});
+
+test("process collapse hides a commentary-only interrupted response", () => {
+  const rows = buildConversationPreviewRows(
+    [event(0, "user"), event(1, "assistant", "commentary"), event(2, "user")],
+    { hideProcessMessages: true },
+  );
+
+  assert.deepEqual(
+    rows.map((row) => (row.type === "event" ? row.event.index : row.key)),
+    [0, 2],
+  );
+});

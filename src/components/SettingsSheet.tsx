@@ -2,9 +2,11 @@ import { useEffect, useState, type ReactNode } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
+  Download,
   ExternalLink,
   FolderOpen,
   Home,
+  Loader2,
   RefreshCw,
   Settings as SettingsIcon,
 } from "lucide-react";
@@ -116,40 +118,31 @@ export function SettingsSheet({ trigger }: Props) {
   };
 
   const checkUpdate = async () => {
+    if (updateState.state === "installing") return;
     setUpdateState({ state: "checking" });
     try {
-      const [currentVersion, latest] = await Promise.all([
-        api.appVersion(),
-        fetch("https://api.github.com/repos/ccpopy/cc-sessions/releases/latest", {
-          headers: { Accept: "application/vnd.github+json" },
-        }),
-      ]);
-      if (!latest.ok) {
-        throw new Error(`GitHub 返回 ${latest.status}`);
-      }
-      const payload = await latest.json() as { tag_name?: unknown; html_url?: unknown };
-      const latestTag = typeof payload.tag_name === "string" ? payload.tag_name : "";
-      const htmlUrl = typeof payload.html_url === "string" ? payload.html_url : "";
-      if (!latestTag || !htmlUrl) {
-        throw new Error("GitHub Release 响应缺少 tag_name 或 html_url");
-      }
-      const latestVersion = normalizeVersion(latestTag);
-      const next: UpdateCheckResult = compareVersions(latestVersion, currentVersion) > 0
-        ? {
-            state: "available",
-            current_version: currentVersion,
-            latest_version: latestVersion,
-            html_url: htmlUrl,
-          }
-        : {
-            state: "current",
-            current_version: currentVersion,
-            latest_version: latestVersion,
-            html_url: htmlUrl,
-          };
-      setUpdateState(next);
+      const update = await api.checkAppUpdate();
+      setCurrentVersion(update.current_version);
+      setCurrentVersionError("");
+      setUpdateState({
+        ...update,
+        state: update.available ? "available" : "current",
+      });
     } catch (e: any) {
       setUpdateState({ state: "error", message: String(e?.message ?? e) });
+    }
+  };
+
+  const installUpdate = async () => {
+    if (updateState.state !== "available" || !updateState.can_auto_install) return;
+    const update = updateState;
+    setUpdateState({ ...update, state: "installing" });
+    try {
+      await api.installAppUpdate();
+      toast.success("更新包已下载，应用即将关闭并完成安装");
+    } catch (e: any) {
+      setUpdateState({ ...update, state: "available" });
+      toast.error("更新失败: " + String(e?.message ?? e));
     }
   };
 
@@ -259,7 +252,7 @@ export function SettingsSheet({ trigger }: Props) {
                 variant="outline"
                 size="sm"
                 className="h-8 shrink-0 gap-1.5"
-                disabled={updateState.state === "checking"}
+                disabled={updateState.state === "checking" || updateState.state === "installing"}
                 onClick={checkUpdate}
               >
                 <RefreshCw className={updateState.state === "checking" ? "h-3.5 w-3.5 animate-spin" : "h-3.5 w-3.5"} />
@@ -271,6 +264,7 @@ export function SettingsSheet({ trigger }: Props) {
               currentVersion={currentVersion}
               currentVersionError={currentVersionError}
               onOpenRelease={openReleasePage}
+              onInstall={installUpdate}
             />
           </div>
         </div>
@@ -290,11 +284,13 @@ function UpdateStatus({
   currentVersion,
   currentVersionError,
   onOpenRelease,
+  onInstall,
 }: {
   state: UpdateCheckResult;
   currentVersion: string;
   currentVersionError: string;
   onOpenRelease: () => void;
+  onInstall: () => void;
 }) {
   if (state.state === "idle") {
     return (
@@ -324,39 +320,77 @@ function UpdateStatus({
       </Badge>
     );
   }
+  if (state.state === "installing") {
+    return (
+      <div className="rounded-md border border-sky-500/30 bg-sky-500/5 px-3 py-2.5 text-xs">
+        <div className="flex items-center gap-2 font-medium text-sky-700 dark:text-sky-300">
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          正在下载并准备安装 {state.latest_version}
+        </div>
+        <p className="mt-1.5 leading-5 text-muted-foreground">
+          下载和校验完成后，应用会自动关闭、更新原位置并重新启动。
+        </p>
+      </div>
+    );
+  }
   return (
-    <div className="flex flex-wrap items-center gap-2">
-      <Badge variant="outline" className="gap-1 border-sky-500/40 bg-sky-500/10 text-sky-600 dark:text-sky-400">
-        有新版本 {state.latest_version}，当前 {state.current_version}
-      </Badge>
-      <Button variant="secondary" size="sm" className="h-7 gap-1.5" onClick={onOpenRelease}>
-        <ExternalLink className="h-3.5 w-3.5" />
-        打开下载页面
-      </Button>
+    <div className="space-y-2.5">
+      <div className="flex flex-wrap items-center gap-2">
+        <Badge variant="outline" className="gap-1 border-sky-500/40 bg-sky-500/10 text-sky-600 dark:text-sky-400">
+          有新版本 {state.latest_version}，当前 {state.current_version}
+        </Badge>
+        <span className="text-[11px] text-muted-foreground">
+          {installModeLabel(state.install_mode)}
+        </span>
+      </div>
+
+      {state.can_auto_install && state.install_dir && (
+        <div className="rounded-md border bg-muted/25 px-3 py-2 text-xs leading-5 text-muted-foreground">
+          <div>
+            更新位置：
+            <span className="break-all font-mono text-[11px] text-foreground/80">
+              {state.install_dir}
+            </span>
+          </div>
+          <div>
+            下载完成后会关闭当前应用，{state.install_mode === "portable" ? "原位替换便携版" : "沿用当前安装目录完成安装"}，随后自动重启。
+          </div>
+        </div>
+      )}
+
+      {state.message && (
+        <p className="text-xs leading-5 text-amber-600 dark:text-amber-400">{state.message}</p>
+      )}
+
+      <div className="flex flex-wrap items-center gap-2">
+        {state.can_auto_install && (
+          <Button size="sm" className="h-8 gap-1.5" onClick={onInstall}>
+            <Download className="h-3.5 w-3.5" />
+            下载并安装
+          </Button>
+        )}
+        <Button variant="secondary" size="sm" className="h-8 gap-1.5" onClick={onOpenRelease}>
+          <ExternalLink className="h-3.5 w-3.5" />
+          {state.can_auto_install ? "查看发布页" : "打开下载页面"}
+        </Button>
+      </div>
     </div>
   );
 }
 
-function normalizeVersion(raw: string): string {
-  return raw.trim().replace(/^v/i, "");
-}
-
-function compareVersions(a: string, b: string): number {
-  const pa = parseVersion(a);
-  const pb = parseVersion(b);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {
-    const da = pa[i] ?? 0;
-    const db = pb[i] ?? 0;
-    if (da !== db) return da > db ? 1 : -1;
+function installModeLabel(mode: string): string {
+  switch (mode) {
+    case "portable":
+      return "便携版原位更新";
+    case "nsis":
+      return "NSIS 安装版";
+    case "msi":
+      return "MSI 安装版";
+    case "webui":
+      return "CLI WebUI";
+    default:
+      return "手动更新";
   }
-  return 0;
-}
-
-function parseVersion(version: string): number[] {
-  return normalizeVersion(version)
-    .split(/[.-]/)
-    .map((part) => Number.parseInt(part, 10))
-    .filter((part) => Number.isFinite(part));
 }
 
 function ValidationBadge({ v, provider }: { v: DirValidation | null; provider: "codex" | "claude" }) {
