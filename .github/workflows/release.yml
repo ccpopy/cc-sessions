@@ -100,15 +100,25 @@ jobs:
           releaseBody: |
             ## Changes
 
-            ### 修复
-            - 修复用户提问时间线的悬浮摘要和展开列表直接显示 Markdown 源码的问题（#9）。
-            - Markdown 链接在时间线中仅显示标签，不再展开本地文件路径或长链接地址。
-            - Agent 回复摘要同步使用紧凑 Markdown 展示，避免问答两侧显示规则不一致。
+            ### 对话预览与时间线
+            - Codex 对话按 commentary / final_answer 区分过程消息和最终答复；仅在相邻用户提问之间完全没有 Agent 活动时隐藏前一条提问。
+            - 时间线导航使用相同过滤规则，同时保留会话末尾仍待处理的最新提问。
+            - Claude 会话按原生 assistant、thinking 和 tool_use 内容判断 Agent 活动，不套用 Codex 的 agent_message 结构。
+            - 会话列表优先同步官方标题，不再错误显示截断后的首条长消息。
 
-            ### 优化
-            - 时间线摘要保留加粗、删除线、行内代码和任务状态等常用 Markdown 语义。
-            - 标题、列表、表格及代码块会压缩为适合两至三行摘要的行内内容，完整消息气泡仍按完整 Markdown 渲染。
-            - 摘要跳过原始 HTML，并避免在时间线跳转按钮内嵌套可点击链接。
+            ### 预览交互
+            - 新增“折叠过程”开关；开启时隐藏过程消息和折叠提示，关闭时可点击展开过程消息。
+            - “仅看对话消息”和“折叠过程”默认开启，并在桌面端及 CLI WebUI 中跨重启持久化。
+            - 复制会话 ID、复制 resume、打开目录、复制路径和编辑历史统一收进预览顶部的 `···` 菜单。
+
+            ### 桌面应用
+            - 增加单实例保护，再次运行同一程序时唤起并聚焦已有窗口。
+            - 设置页支持下载、校验并自动安装 GitHub Release 更新；便携版原位替换，NSIS/MSI 安装版沿用当前安装目录。
+            - 更新包会校验 Release 资产大小和 SHA-256，安装完成后自动重启应用。
+
+            ### CLI WebUI
+            - 同步本次对话预览、时间线和显示偏好调整。
+            - CLI WebUI 检测到新版本时保留下载页面入口，不尝试替换桌面程序。
           releaseDraft: false
           prerelease: false
 
@@ -133,15 +143,20 @@ jobs:
         shell: pwsh
         run: node scripts/package-release.mjs --target portable
 
-      - name: Upload Windows portable executable
+      - name: Upload Windows portable packages
         if: matrix.platform == 'windows-latest'
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $version = node -p "require('./package.json').version"
-          $asset = "release/cc-session-manager-portable-v$version-windows.exe"
-          if (!(Test-Path $asset)) {
-            throw "Windows portable executable was not found: $asset"
+          $assets = @(
+            "release/cc-session-manager-portable-v$version-windows.exe",
+            "release/cc-session-manager-portable-v$version-windows.zip"
+          )
+          foreach ($asset in $assets) {
+            if (!(Test-Path $asset)) {
+              throw "Windows portable package was not found: $asset"
+            }
           }
-          gh release upload "${{ github.ref_name }}" $asset --clobber
+          gh release upload "${{ github.ref_name }}" $assets --clobber
