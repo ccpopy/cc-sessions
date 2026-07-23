@@ -97,32 +97,7 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: CC Sessions ${{ github.ref_name }}
-          releaseBody: |
-            ## Changes
-
-            ### 对话预览与时间线
-            - Codex 对话按 commentary / final_answer 区分过程消息和最终答复；仅在相邻用户提问之间完全没有 Agent 活动时隐藏前一条提问。
-            - 时间线导航使用相同过滤规则，同时保留会话末尾仍待处理的最新提问。
-            - Claude 会话按原生 assistant、thinking 和 tool_use 内容判断 Agent 活动，不套用 Codex 的 agent_message 结构。
-            - 会话列表优先同步官方标题，不再错误显示截断后的首条长消息。
-
-            ### 预览交互
-            - 将“折叠过程”开关调整为“过程消息”菜单，提供“全部收起”和“全部展开”操作，并支持每轮过程消息单独展开或收起。
-            - 全部收起或展开会重置当前会话的单轮覆盖状态；菜单对勾会根据当前已加载分组显示全部收起、全部展开或混合状态。
-            - 过程消息的默认展开状态会在桌面端及 CLI WebUI 中跨重启持久化；收起后会继续按需加载，避免长会话视口出现大块空白。
-            - 复制会话 ID、复制 resume、打开目录、复制路径和编辑历史统一收进预览顶部的 `···` 菜单。
-
-            ### 致谢
-            - 感谢 [firesahc](https://github.com/firesahc) 对 Issue #11 提供建议并持续参与测试反馈。
-
-            ### 桌面应用
-            - 增加单实例保护，再次运行同一程序时唤起并聚焦已有窗口。
-            - 设置页支持下载、校验并自动安装 GitHub Release 更新；便携版原位替换，NSIS/MSI 安装版沿用当前安装目录。
-            - 更新包会校验 Release 资产大小和 SHA-256，安装完成后自动重启应用。
-
-            ### CLI WebUI
-            - 同步本次对话预览、时间线和显示偏好调整。
-            - CLI WebUI 检测到新版本时保留下载页面入口，不尝试替换桌面程序。
+          generateReleaseNotes: true
           releaseDraft: false
           prerelease: false
 
