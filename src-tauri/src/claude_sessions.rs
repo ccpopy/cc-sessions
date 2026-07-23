@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::error::AppResult;
 use crate::models::{PreviewEvent, SessionMetaBrief, SessionSummary};
-use crate::paths;
+use crate::{fs_ops, paths};
 
 const PROVIDER: &str = "claude";
 const SUBAGENT_SOURCE: &str = "subagent";
@@ -277,6 +277,12 @@ fn parse_session(path: &Path) -> AppResult<Option<SessionSummary>> {
         .or_else(|| path_basename(&cwd_value))
         .unwrap_or_else(|| id.clone());
     let bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let resume_id = if is_subagent {
+        parent_session_id.as_deref().unwrap_or(&id)
+    } else {
+        id.as_str()
+    };
+    let resume_command = fs_ops::claude_resume_command(resume_id, Some(&cwd_value));
 
     Ok(Some(SessionSummary {
         provider: PROVIDER.to_string(),
@@ -303,14 +309,7 @@ fn parse_session(path: &Path) -> AppResult<Option<SessionSummary>> {
         rollout_bytes: bytes,
         logs_count: 0,
         has_backup: false,
-        resume_command: format!(
-            "claude --resume {}",
-            if is_subagent {
-                parent_session_id.as_deref().unwrap_or(&id)
-            } else {
-                id.as_str()
-            }
-        ),
+        resume_command,
     }))
 }
 
@@ -994,7 +993,10 @@ mod tests {
         assert_eq!(session.model.as_deref(), Some("claude-3-5-sonnet"));
         assert_eq!(session.reasoning_effort.as_deref(), Some("max"));
         assert_eq!(session.tokens_used, 15);
-        assert_eq!(session.resume_command, "claude --resume claude-1");
+        assert_eq!(
+            session.resume_command,
+            fs_ops::claude_resume_command("claude-1", Some("F:\\work\\sample-project"))
+        );
 
         let events = preview_range(&file.to_string_lossy(), 0, 10)?;
         fs::remove_dir_all(&claude).ok();
@@ -1019,7 +1021,10 @@ mod tests {
         assert_eq!(session.first_user_message, "inspect this subsystem");
         assert_eq!(session.title, "inspect this subsystem");
         assert_eq!(session.tokens_used, 10);
-        assert_eq!(session.resume_command, "claude --resume parent-session");
+        assert_eq!(
+            session.resume_command,
+            fs_ops::claude_resume_command("parent-session", Some("F:\\work\\sample-project"))
+        );
 
         let events = preview_range(&file.to_string_lossy(), 0, 10)?;
         fs::remove_dir_all(&claude).ok();

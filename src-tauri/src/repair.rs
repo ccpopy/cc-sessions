@@ -128,7 +128,7 @@ fn read_explicit_provider(codex_dir: &Path) -> AppResult<(Option<String>, bool)>
 }
 
 /// 返回 Codex 实际生效的 provider：显式值优先，否则默认 `openai`。
-fn effective_current_provider(codex_dir: &Path) -> AppResult<String> {
+pub(crate) fn effective_current_provider(codex_dir: &Path) -> AppResult<String> {
     Ok(read_explicit_provider(codex_dir)?
         .0
         .unwrap_or_else(|| DEFAULT_PROVIDER.to_string()))
@@ -2064,7 +2064,7 @@ fn mark_thread_archived(
 ///
 /// 三者缺一，官方 App 在"按项目分组"模式下都可能漏显新会话。文件不存在时无需处理；
 /// 已存在但不可读或损坏时必须显式报错，避免把“已同步”误报给用户。
-fn ensure_workspace_root_registered(codex: &Path, cwd: &str) -> AppResult<()> {
+pub(crate) fn ensure_workspace_root_registered(codex: &Path, cwd: &str) -> AppResult<()> {
     let cwd = cwd.trim();
     if cwd.is_empty() {
         return Ok(());
@@ -2389,7 +2389,7 @@ fn thread_state_is_subagent(states: &BTreeMap<String, ThreadRepairState>, id: &s
 
 // ========================= Provider 克隆 =========================
 
-fn new_session_id() -> String {
+pub(crate) fn new_session_id() -> String {
     // 与 codex protocol::ThreadId::new() 等价：UUIDv7（毫秒时间序 + 随机）
     use std::time::{SystemTime, UNIX_EPOCH};
     let ms = SystemTime::now()
@@ -2426,7 +2426,11 @@ fn new_session_id() -> String {
 
 /// 与 codex 原生 recorder 一致：sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl
 /// 文件名时间戳与 UUID 一一对应；调用方传入新生成的 UUIDv7 与对应时间。
-fn build_clone_path(codex_dir: &Path, new_id: &str, ts: &chrono::DateTime<chrono::Utc>) -> PathBuf {
+pub(crate) fn build_clone_path(
+    codex_dir: &Path,
+    new_id: &str,
+    ts: &chrono::DateTime<chrono::Utc>,
+) -> PathBuf {
     let dir = codex_dir
         .join("sessions")
         .join(ts.format("%Y").to_string())
@@ -2437,7 +2441,7 @@ fn build_clone_path(codex_dir: &Path, new_id: &str, ts: &chrono::DateTime<chrono
 }
 
 /// 验证生成的文件名能被 codex 的 parse_timestamp_uuid_from_filename 解析。
-fn validate_rollout_filename(path: &Path) -> AppResult<()> {
+pub(crate) fn validate_rollout_filename(path: &Path) -> AppResult<()> {
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())

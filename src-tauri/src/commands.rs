@@ -492,6 +492,29 @@ pub async fn fork_session_at_event(
 }
 
 #[tauri::command]
+pub async fn convert_session_provider(
+    codex_dir: String,
+    claude_dir: String,
+    source_provider: String,
+    rollout_path: String,
+    conversion_mode: Option<String>,
+    lock: SharedLock<'_>,
+) -> AppResult<ConvertReport> {
+    let lock = lock.inner().clone();
+    run_blocking(move || {
+        crate::convert::convert_session_with_lock(
+            codex_dir,
+            claude_dir,
+            source_provider,
+            rollout_path,
+            conversion_mode,
+            &lock,
+        )
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn clone_session_for_provider(
     codex_dir: String,
     session_id: String,

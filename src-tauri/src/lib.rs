@@ -6,6 +6,7 @@ pub mod bundle;
 pub mod claude_sessions;
 #[cfg(feature = "desktop")]
 pub mod commands;
+pub mod convert;
 pub mod edit;
 pub mod error;
 pub mod family;
@@ -108,6 +109,7 @@ pub fn run() {
             commands::diagnose_claude_gui_visibility,
             commands::repair_claude_gui_visibility,
             commands::clone_session_for_provider,
+            commands::convert_session_provider,
             commands::fork_session_at_event,
             commands::get_provider_sync_plan,
             commands::batch_clone_for_current_provider,

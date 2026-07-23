@@ -11,6 +11,45 @@ export type ConversationPreviewRow =
 
 export type ProcessGroupExpansionState = "collapsed" | "expanded" | "mixed";
 
+/** Claude 的一条 assistant 记录可同时包含文字和 tool_use；对话视图需要保留文字。 */
+export function isAssistantTextToolUseEvent(event: PreviewEvent): boolean {
+  if (event.role !== "tool_call") return false;
+  const raw = event.raw as {
+    message?: {
+      role?: unknown;
+      content?: unknown;
+    };
+  } | null;
+  if (raw?.message?.role !== "assistant" || !Array.isArray(raw.message.content)) {
+    return false;
+  }
+
+  let hasText = false;
+  let hasToolUse = false;
+  for (const block of raw.message.content) {
+    if (!block || typeof block !== "object") continue;
+    const item = block as { type?: unknown; text?: unknown };
+    if (item.type === "tool_use") {
+      hasToolUse = true;
+    } else if (
+      item.type === "text" &&
+      typeof item.text === "string" &&
+      item.text.trim().length > 0
+    ) {
+      hasText = true;
+    }
+  }
+  return hasText && hasToolUse;
+}
+
+/** 对话视图按 assistant 展示，raw 和索引不变；完整事件视图仍按 tool_call 展示。 */
+export function toConversationDisplayEvent(event: PreviewEvent): PreviewEvent {
+  if (event.role !== "tool_call" || !isAssistantTextToolUseEvent(event)) {
+    return event;
+  }
+  return { ...event, role: "assistant" };
+}
+
 /**
  * Codex 会明确标记 assistant 消息是过程播报（commentary）还是最终答复
  * （final_answer）。旧版 Codex 与 Claude 没有 phase，此时退回到“一轮最后一条”。

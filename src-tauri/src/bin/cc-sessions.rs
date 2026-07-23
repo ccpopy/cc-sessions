@@ -6,11 +6,12 @@ use std::path::{Path, PathBuf};
 
 use cc_session_manager_lib::error::AppError;
 use cc_session_manager_lib::models::{
-    BackupSummary, BundleExportTarget, BundleListItem, ImportMode, ProjectGroup, SessionSummary,
-    Settings, SwitchStrategy,
+    BackupSummary, BundleExportTarget, BundleListItem, ConvertReport, ImportMode, ProjectGroup,
+    SessionSummary, Settings, SwitchStrategy,
 };
 use cc_session_manager_lib::{
-    backup, bundle, family, fs_ops, paths, repair, rollout, sessions, settings, stats, webui,
+    backup, bundle, convert, family, fs_ops, paths, repair, rollout, sessions, settings, stats,
+    webui,
 };
 use serde::Serialize;
 
@@ -156,6 +157,7 @@ fn run_cli() -> CliResult<()> {
         "webui" => cmd_webui(&ctx, args),
         "meta" => cmd_meta(&ctx, args),
         "resume-command" => cmd_resume_command(&ctx, args),
+        "convert" => cmd_convert(&ctx, args),
         "stats" => cmd_stats(&ctx, args),
         "backup" => cmd_backup(&ctx, args),
         "bundle" => cmd_bundle(&ctx, args),
@@ -190,6 +192,7 @@ fn print_help() {
   webui [--host 127.0.0.1] [--port 17888]
   meta <rollout路径>
   resume-command <session-id>
+  convert <会话JSONL路径> [--mode simple|native]  # --provider 表示来源
   stats <kpi|projects|models|timeseries|heatmap>
   backup <create|list|open|verify|delete|restore|restore-all>
   bundle <export|export-all|list|verify|import|pack|unpack>
@@ -211,6 +214,8 @@ fn print_help() {
   cc-sessions preview ~/.codex/sessions/.../rollout-xxx.jsonl --mode all --limit 40
   cc-sessions webui --host 127.0.0.1 --port 17888
   cc-sessions --provider claude webui --host 127.0.0.1 --port 17888
+  cc-sessions --provider codex convert ~/.codex/sessions/.../rollout-xxx.jsonl --mode native
+  cc-sessions --provider claude convert ~/.claude/projects/.../<session-id>.jsonl --mode simple
   cc-sessions repair diagnose --json
   cc-sessions backup create --backup-dir ./backups --id <session-id> --name first-backup
   cc-sessions --provider claude bundle export --out-dir ./bundles --id <session-id> --rollout-path <transcript.jsonl>
@@ -510,8 +515,24 @@ fn cmd_resume_command(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> 
         .find(|session| session.id == id)
         .map(|session| session.resume_command)
         .map(Ok)
-        .unwrap_or_else(|| fs_ops::resume_command_text(Some(provider), id))?;
+        .unwrap_or_else(|| fs_ops::resume_command_text(Some(provider), id, None))?;
     output(ctx, &command, |command| println!("{command}"))
+}
+
+fn cmd_convert(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
+    let conversion_mode = parse_conversion_mode(take_value(&mut args, "--mode")?)?;
+    let rollout_path = conversion_path_arg(&mut args)?;
+    ensure_no_args(&args)?;
+    let source_provider = concrete_provider(ctx)?;
+    let report = convert::convert_session_with_lock(
+        ctx.codex_dir.clone(),
+        ctx.claude_dir.clone(),
+        source_provider,
+        rollout_path,
+        conversion_mode,
+        &ctx.family_lock,
+    )?;
+    output(ctx, &report, print_convert_report)
 }
 
 fn cmd_stats(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
@@ -1558,6 +1579,30 @@ fn parse_import_mode(value: Option<String>) -> CliResult<ImportMode> {
     }
 }
 
+fn parse_conversion_mode(value: Option<String>) -> CliResult<Option<String>> {
+    match value.as_deref() {
+        None => Ok(None),
+        Some("simple" | "native") => Ok(value),
+        Some(other) => Err(CliError::message(format!(
+            "不支持的 convert mode: {other}，可用值: simple, native"
+        ))),
+    }
+}
+
+fn conversion_path_arg(args: &mut Vec<String>) -> CliResult<String> {
+    let rollout_path = take_value(args, "--rollout-path")?;
+    let path_alias = take_value(args, "--path")?;
+    if rollout_path.is_some() && path_alias.is_some() {
+        return Err(CliError::message(
+            "--rollout-path 与 --path 只能使用其中一个",
+        ));
+    }
+    required(
+        rollout_path.or(path_alias).or_else(|| pop_command(args)),
+        "convert 需要会话 JSONL 路径",
+    )
+}
+
 fn print_sessions(sessions: &Vec<SessionSummary>) {
     println!("updated_at\tprovider\tarchived\ttokens\tbytes\tid\tcwd\ttitle");
     for session in sessions {
@@ -1626,6 +1671,28 @@ fn print_export_reports(reports: &Vec<cc_session_manager_lib::models::ExportRepo
         if let Some(error) = &report.error {
             println!("{}\terror={}", report.session_id, error);
         }
+    }
+}
+
+fn print_convert_report(report: &ConvertReport) {
+    println!(
+        "{} -> {}\tmode={}",
+        report.source_provider,
+        report.target_provider,
+        report.conversion_mode.as_deref().unwrap_or("simple")
+    );
+    println!("new_id\t{}", report.new_id);
+    println!("path\t{}", report.new_path);
+    println!("messages\t{}", report.imported_messages);
+    println!("resume\t{}", report.resume_command);
+    if report.dropped_reasoning > 0 {
+        println!("dropped_reasoning\t{}", report.dropped_reasoning);
+    }
+    if report.tool_notes > 0 {
+        println!("tool_events\t{}", report.tool_notes);
+    }
+    for warning in &report.warnings {
+        println!("warning\t{warning}");
     }
 }
 
@@ -1750,4 +1817,50 @@ fn ensure_no_args(args: &[String]) -> CliResult<()> {
 #[allow(dead_code)]
 fn normalize_path(value: String) -> String {
     PathBuf::from(value).to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conversion_mode_defaults_to_simple_and_accepts_native() {
+        assert_eq!(parse_conversion_mode(None).unwrap(), None);
+        assert_eq!(
+            parse_conversion_mode(Some("simple".into())).unwrap(),
+            Some("simple".into())
+        );
+        assert_eq!(
+            parse_conversion_mode(Some("native".into())).unwrap(),
+            Some("native".into())
+        );
+        assert!(parse_conversion_mode(Some("lossless".into())).is_err());
+    }
+
+    #[test]
+    fn conversion_path_accepts_position_and_named_aliases() {
+        let mut positional = vec!["session.jsonl".into()];
+        assert_eq!(
+            conversion_path_arg(&mut positional).unwrap(),
+            "session.jsonl"
+        );
+        assert!(positional.is_empty());
+
+        let mut named = vec!["--rollout-path".into(), "rollout.jsonl".into()];
+        assert_eq!(conversion_path_arg(&mut named).unwrap(), "rollout.jsonl");
+
+        let mut alias = vec!["--path".into(), "claude.jsonl".into()];
+        assert_eq!(conversion_path_arg(&mut alias).unwrap(), "claude.jsonl");
+    }
+
+    #[test]
+    fn conversion_path_rejects_conflicting_named_arguments() {
+        let mut args = vec![
+            "--rollout-path".into(),
+            "rollout.jsonl".into(),
+            "--path".into(),
+            "session.jsonl".into(),
+        ];
+        assert!(conversion_path_arg(&mut args).is_err());
+    }
 }

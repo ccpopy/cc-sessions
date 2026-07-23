@@ -370,6 +370,21 @@ pub struct BranchSyncState {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ConvertReport {
+    pub source_id: String,
+    pub source_provider: String,
+    pub target_provider: String,
+    pub conversion_mode: Option<String>,
+    pub new_id: String,
+    pub new_path: String,
+    pub resume_command: String,
+    pub imported_messages: u32,
+    pub dropped_reasoning: u32,
+    pub tool_notes: u32,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct CloneReport {
     pub source_id: String,
     pub new_id: Option<String>,

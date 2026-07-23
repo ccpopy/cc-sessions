@@ -1,6 +1,7 @@
 import { memo } from "react";
 import {
   Archive,
+  ArrowLeftRight,
   CheckCircle2,
   Copy,
   Eye,
@@ -53,6 +54,7 @@ type Props = {
   onClone?: (s: SessionSummary) => void;
   onOpenFamily?: (s: SessionSummary) => void;
   onExportMarkdown?: (s: SessionSummary) => void;
+  onConvert?: (s: SessionSummary) => void;
   onRename?: (s: SessionSummary) => void;
   query?: string;
   showProject?: boolean;
@@ -75,6 +77,7 @@ export const SessionCard = memo(function SessionCard({
   onClone,
   onOpenFamily,
   onExportMarkdown,
+  onConvert,
   onRename,
   query = "",
   showProject = true,
@@ -328,6 +331,12 @@ export const SessionCard = memo(function SessionCard({
                   <DropdownMenuItem onClick={() => onExportMarkdown(s)}>
                     <FileText className="h-4 w-4" />
                     导出为 Markdown
+                  </DropdownMenuItem>
+                )}
+                {onConvert && !isSubagent && (
+                  <DropdownMenuItem onClick={() => onConvert(s)}>
+                    <ArrowLeftRight className="h-4 w-4" />
+                    {s.provider === "codex" ? "转换为 Claude 会话" : "转换为 Codex 会话"}
                   </DropdownMenuItem>
                 )}
                 {onOpenFamily && (

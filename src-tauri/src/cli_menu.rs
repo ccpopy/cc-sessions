@@ -2,11 +2,11 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::{self, Write};
 
 use cc_session_manager_lib::models::{
-    BackupSummary, BundleExportTarget, BundleListItem, DeleteTarget, ExportReport, ImportMode,
-    PreviewEvent, ProjectGroup, SessionSummary, SwitchStrategy,
+    BackupSummary, BundleExportTarget, BundleListItem, ConvertReport, DeleteTarget, ExportReport,
+    ImportMode, PreviewEvent, ProjectGroup, SessionSummary, SwitchStrategy,
 };
 use cc_session_manager_lib::{
-    backup, bundle, family, paths, repair, rollout, sessions, settings, stats,
+    backup, bundle, convert, family, paths, repair, rollout, sessions, settings, stats,
 };
 
 type MenuResult<T> = Result<T, String>;
@@ -452,6 +452,12 @@ fn session_action_menu(
     session: SessionSummary,
 ) -> MenuResult<SessionActionResult> {
     loop {
+        let target_provider = conversion_target_provider(provider)?;
+        let conversion_suffix = if sessions::session_is_subagent(&session) {
+            "（子代理会话不支持）"
+        } else {
+            ""
+        };
         print_header(
             "会话操作",
             &[
@@ -466,14 +472,19 @@ fn session_action_menu(
         println!("3. 显示 resume 命令");
         println!("4. 创建备份");
         println!("5. 导出 Bundle");
+        println!(
+            "6. 转换为 {} 会话{}",
+            provider_label(target_provider),
+            conversion_suffix
+        );
         if provider == "codex" {
-            println!("6. 归档 / 取消归档");
+            println!("7. 归档 / 取消归档");
         } else {
-            println!("6. 归档 / 取消归档（Claude 不支持）");
+            println!("7. 归档 / 取消归档（Claude 不支持）");
         }
-        println!("7. 删除会话");
-        println!("8. 返回上一层");
-        println!("9. 返回主菜单");
+        println!("8. 删除会话");
+        println!("9. 返回上一层");
+        println!("10. 返回主菜单");
         println!("0. 退出");
 
         match prompt("请选择: ")?.as_str() {
@@ -482,13 +493,14 @@ fn session_action_menu(
             "3" => show_resume_command(provider, &session)?,
             "4" => create_backup_for_session(ctx, provider, &session)?,
             "5" => export_bundle_for_session(ctx, provider, &session)?,
-            "6" => toggle_archived(ctx, provider, &session)?,
-            "7" => {
+            "6" => convert_session(ctx, provider, &session)?,
+            "7" => toggle_archived(ctx, provider, &session)?,
+            "8" => {
                 delete_session(ctx, provider, &session)?;
                 return Ok(SessionActionResult::Refresh);
             }
-            "8" => return Ok(SessionActionResult::Back),
-            "9" => return Ok(SessionActionResult::Main),
+            "9" => return Ok(SessionActionResult::Back),
+            "10" => return Ok(SessionActionResult::Main),
             "0" => return Ok(SessionActionResult::Exit),
             _ => {
                 println!("无效选择。");
@@ -763,6 +775,92 @@ fn export_bundle_for_session(
     print_export_reports(&reports);
     pause()?;
     Ok(())
+}
+
+fn convert_session(ctx: &MenuContext, provider: &str, session: &SessionSummary) -> MenuResult<()> {
+    if sessions::session_is_subagent(session) {
+        println!("子代理会话暂不支持转换，请选择主会话。");
+        return pause().map(|_| ());
+    }
+
+    let target_provider = conversion_target_provider(provider)?;
+    let mode = choose_conversion_mode(provider)?;
+    println!(
+        "将新建一个 {} 会话，原会话不会修改。",
+        provider_label(target_provider)
+    );
+    if !confirm_default_no("确认开始转换？")? {
+        println!("已取消。");
+        return pause().map(|_| ());
+    }
+
+    let report = convert::convert_session_with_lock(
+        ctx.codex_dir.clone(),
+        ctx.claude_dir.clone(),
+        provider.to_string(),
+        session.rollout_path.clone(),
+        Some(mode.to_string()),
+        &ctx.family_lock,
+    )
+    .map_err(to_string)?;
+    print_convert_report(&report);
+    pause()?;
+    Ok(())
+}
+
+fn choose_conversion_mode(provider: &str) -> MenuResult<&'static str> {
+    let target_provider = conversion_target_provider(provider)?;
+    println!("1. 简洁续聊（推荐）");
+    if provider == "codex" {
+        println!("   只保留真实用户消息和每轮最终答复。");
+    } else {
+        println!("   保留可见对话，工具调用和结果转为文本注记。");
+    }
+    println!("2. 原生{}（实验）", provider_label(target_provider));
+    if provider == "codex" {
+        println!("   保留过程回复，完整工具事件转换为 Claude 工具格式。");
+    } else {
+        println!("   保留过程回复和图片，完整工具事件转换为 Codex 工具格式。");
+    }
+    conversion_mode_from_choice(&prompt("请选择转换模式 [1]: ")?)
+}
+
+fn conversion_mode_from_choice(choice: &str) -> MenuResult<&'static str> {
+    match choice {
+        "" | "1" => Ok("simple"),
+        "2" => Ok("native"),
+        _ => Err("无效转换模式。".to_string()),
+    }
+}
+
+fn conversion_target_provider(provider: &str) -> MenuResult<&'static str> {
+    match provider {
+        "codex" => Ok("claude"),
+        "claude" => Ok("codex"),
+        other => Err(format!("不支持的转换来源 provider: {other}")),
+    }
+}
+
+fn print_convert_report(report: &ConvertReport) {
+    println!(
+        "已转换: {} -> {} ({})",
+        provider_label(&report.source_provider),
+        provider_label(&report.target_provider),
+        report.conversion_mode.as_deref().unwrap_or("simple")
+    );
+    println!("新会话 ID: {}", report.new_id);
+    println!("会话路径: {}", report.new_path);
+    println!("消息数量: {}", report.imported_messages);
+    println!("恢复命令: {}", report.resume_command);
+    if report.dropped_reasoning > 0 {
+        println!("丢弃推理: {} 段", report.dropped_reasoning);
+    }
+    if report.tool_notes > 0 {
+        println!("处理工具事件: {} 条", report.tool_notes);
+    }
+    for warning in &report.warnings {
+        println!("警告: {warning}");
+    }
 }
 
 fn toggle_archived(ctx: &MenuContext, provider: &str, session: &SessionSummary) -> MenuResult<()> {
@@ -1966,6 +2064,7 @@ fn show_interactive_help() -> MenuResult<()> {
     println!("列表页支持 s 多选当前页序号、u 取消选择、c 清空选择、d 删除已选会话。");
     println!("会话列表默认显示主会话，选择子代理范围后只显示子代理会话。");
     println!("会话预览默认只显示用户和助手消息；选择“全部事件”才会显示工具调用。");
+    println!("进入主会话详情后，可选择“转换为 Claude/Codex”并指定转换模式。");
     println!("删除、覆盖恢复、清理和分支切换等危险操作需要输入 yes 确认。");
     println!("脚本用法仍然保留，例如 cc-sessions list --limit 20。");
     pause().map(|_| ())
@@ -2316,4 +2415,24 @@ fn compact(value: &str, max_chars: usize) -> String {
 
 fn to_string(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conversion_target_switches_provider() {
+        assert_eq!(conversion_target_provider("codex").unwrap(), "claude");
+        assert_eq!(conversion_target_provider("claude").unwrap(), "codex");
+        assert!(conversion_target_provider("all").is_err());
+    }
+
+    #[test]
+    fn conversion_mode_choice_defaults_to_simple() {
+        assert_eq!(conversion_mode_from_choice("").unwrap(), "simple");
+        assert_eq!(conversion_mode_from_choice("1").unwrap(), "simple");
+        assert_eq!(conversion_mode_from_choice("2").unwrap(), "native");
+        assert!(conversion_mode_from_choice("3").is_err());
+    }
 }

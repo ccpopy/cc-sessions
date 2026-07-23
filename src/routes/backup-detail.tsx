@@ -262,7 +262,7 @@ export default function BackupDetailRoute({ provider = "codex" }: { provider?: S
                         className="gap-1.5"
                         onClick={async () => {
                           try {
-                            const text = await api.copyResumeCommand(itemProvider, s.id);
+                            const text = await api.copyResumeCommand(itemProvider, s.id, s.cwd);
                             toast.success("已复制：" + text);
                           } catch (e: any) {
                             toast.error("复制失败：" + String(e?.message ?? e));

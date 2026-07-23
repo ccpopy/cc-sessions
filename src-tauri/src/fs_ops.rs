@@ -167,10 +167,34 @@ fn open_external(url: &str) -> AppResult<()> {
     Ok(())
 }
 
-pub fn resume_command_text(provider: Option<String>, session_id: String) -> AppResult<String> {
+pub fn claude_resume_command(session_id: &str, cwd: Option<&str>) -> String {
+    let cwd = cwd
+        .map(paths::strip_verbatim)
+        .filter(|value| !value.trim().is_empty());
+    let Some(cwd) = cwd else {
+        return format!("claude --resume {session_id}");
+    };
+
+    #[cfg(target_os = "windows")]
+    {
+        let quoted = cwd.replace('\'', "''");
+        format!("Set-Location -LiteralPath '{quoted}'; claude --resume {session_id}")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let quoted = cwd.replace('\'', "'\"'\"'");
+        format!("cd -- '{quoted}' && claude --resume {session_id}")
+    }
+}
+
+pub fn resume_command_text(
+    provider: Option<String>,
+    session_id: String,
+    cwd: Option<String>,
+) -> AppResult<String> {
     let text = match provider.as_deref().unwrap_or("codex") {
         "codex" => format!("codex resume {}", session_id),
-        "claude" => format!("claude --resume {}", session_id),
+        "claude" => claude_resume_command(&session_id, cwd.as_deref()),
         other => return Err(AppError::Other(format!("不支持的 provider: {other}"))),
     };
     Ok(text)
@@ -182,8 +206,9 @@ pub fn copy_resume_command(
     app: tauri::AppHandle,
     provider: Option<String>,
     session_id: String,
+    cwd: Option<String>,
 ) -> AppResult<String> {
-    let text = resume_command_text(provider, session_id)?;
+    let text = resume_command_text(provider, session_id, cwd)?;
     app.clipboard()
         .write_text(text.clone())
         .map_err(|e| AppError::Other(e.to_string()))?;
@@ -196,7 +221,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::read_preview_image;
+    use super::{claude_resume_command, read_preview_image};
 
     struct TestDir(PathBuf);
 
@@ -313,5 +338,24 @@ mod tests {
         let unsupported = read_preview_image(svg_path.to_string_lossy().into_owned())
             .expect_err("SVG must be rejected");
         assert!(unsupported.to_string().contains("不支持的图片格式"));
+    }
+
+    #[test]
+    fn claude_resume_command_changes_to_the_session_project() {
+        let command = claude_resume_command(
+            "019f8e89-c687-7ce5-9e82-5434fcc9f133",
+            Some("F:\\demo\\it's-project"),
+        );
+
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            command,
+            "Set-Location -LiteralPath 'F:\\demo\\it''s-project'; claude --resume 019f8e89-c687-7ce5-9e82-5434fcc9f133"
+        );
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            command,
+            "cd -- 'F:\\demo\\it'\"'\"'s-project' && claude --resume 019f8e89-c687-7ce5-9e82-5434fcc9f133"
+        );
     }
 }

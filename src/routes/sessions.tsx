@@ -16,6 +16,7 @@ import { SessionList } from "@/components/SessionList";
 import { PreviewDialog } from "@/components/PreviewDialog";
 import { MarkdownExportDialog } from "@/components/MarkdownExportDialog";
 import { BackupCreateDialog } from "@/components/BackupCreateDialog";
+import { ConvertSessionDialog } from "@/components/ConvertSessionDialog";
 import { DangerDialog } from "@/components/DangerDialog";
 import { RenameSessionDialog } from "@/components/RenameSessionDialog";
 import { EmptyState } from "@/components/EmptyState";
@@ -88,6 +89,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const [preview, setPreview] = useState<SessionSummary | null>(null);
   const [exportTarget, setExportTarget] = useState<SessionSummary | null>(null);
   const [renameTarget, setRenameTarget] = useState<SessionSummary | null>(null);
+  const [convertTarget, setConvertTarget] = useState<SessionSummary | null>(null);
   const [backupTargets, setBackupTargets] = useState<SessionSummary[]>([]);
   const [deleteTargets, setDeleteTargets] = useState<SessionSummary[]>([]);
   const [overlay, setOverlay] = useState<Map<string, FamilyOverlay>>(new Map());
@@ -385,7 +387,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
 
   const onCopyResume = async (s: SessionSummary) => {
     try {
-        const text = await api.copyResumeCommand(s.provider, s.id);
+      const text = await api.copyResumeCommand(s.provider, s.id, s.cwd);
       toast.success("已复制：" + text);
     } catch (e: any) {
       toast.error("复制失败：" + String(e?.message ?? e));
@@ -606,6 +608,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             onClone={isCodex ? onCloneOne : undefined}
             onOpenFamily={isCodex ? (s) => setFamilySheetId(s.id) : undefined}
             onExportMarkdown={setExportTarget}
+            onConvert={setConvertTarget}
             onRename={isCodex ? setRenameTarget : undefined}
           />
         )}
@@ -666,6 +669,14 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         onChanged={async () => {
           await refresh();
           await refreshOverlay();
+        }}
+      />
+
+      <ConvertSessionDialog
+        target={convertTarget}
+        onOpenChange={(v) => !v && setConvertTarget(null)}
+        onDone={() => {
+          void refresh();
         }}
       />
 

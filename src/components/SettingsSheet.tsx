@@ -139,7 +139,7 @@ export function SettingsSheet({ trigger }: Props) {
     setUpdateState({ ...update, state: "installing" });
     try {
       await api.installAppUpdate();
-      toast.success("更新包已下载，应用即将关闭并完成安装");
+      toast.success("更新安装已开始");
     } catch (e: any) {
       setUpdateState({ ...update, state: "available" });
       toast.error("更新失败: " + String(e?.message ?? e));
@@ -170,15 +170,19 @@ export function SettingsSheet({ trigger }: Props) {
   return (
     <Sheet>
       {trigger ? <SheetTrigger asChild>{trigger}</SheetTrigger> : defaultTrigger}
-      <SheetContent side="right" className="w-[440px] sm:max-w-[440px]">
-        <SheetHeader className="space-y-1">
+      <SheetContent
+        side="right"
+        className="flex h-full w-[440px] flex-col gap-0 overflow-hidden p-0 sm:max-w-[440px]"
+      >
+        <SheetHeader className="shrink-0 space-y-1 border-b px-6 pb-4 pt-6 pr-12">
           <SheetTitle>设置</SheetTitle>
           <SheetDescription>
             本地运行，只有手动检查更新时会请求 GitHub；路径配置以当前运行环境为准。
           </SheetDescription>
         </SheetHeader>
 
-        <div className="mt-6 space-y-6">
+        <div className="thin-scrollbar min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain px-6">
+          <div className="space-y-6 py-6">
           <div className="space-y-2">
             <Label className="text-sm font-medium">Codex 目录</Label>
             <div className="flex gap-2">
@@ -267,9 +271,10 @@ export function SettingsSheet({ trigger }: Props) {
               onInstall={installUpdate}
             />
           </div>
+          </div>
         </div>
 
-        <SheetFooter className="mt-6">
+        <SheetFooter className="shrink-0 border-t bg-background px-6 py-4">
           <Button onClick={onSave} className="w-full">
             保存设置
           </Button>
@@ -327,9 +332,6 @@ function UpdateStatus({
           <Loader2 className="h-3.5 w-3.5 animate-spin" />
           正在下载并准备安装 {state.latest_version}
         </div>
-        <p className="mt-1.5 leading-5 text-muted-foreground">
-          下载和校验完成后，应用会自动关闭、更新原位置并重新启动。
-        </p>
       </div>
     );
   }
@@ -339,9 +341,6 @@ function UpdateStatus({
         <Badge variant="outline" className="gap-1 border-sky-500/40 bg-sky-500/10 text-sky-600 dark:text-sky-400">
           有新版本 {state.latest_version}，当前 {state.current_version}
         </Badge>
-        <span className="text-[11px] text-muted-foreground">
-          {installModeLabel(state.install_mode)}
-        </span>
       </div>
 
       {state.can_auto_install && state.install_dir && (
@@ -351,9 +350,6 @@ function UpdateStatus({
             <span className="break-all font-mono text-[11px] text-foreground/80">
               {state.install_dir}
             </span>
-          </div>
-          <div>
-            下载完成后会关闭当前应用，{state.install_mode === "portable" ? "原位替换便携版" : "沿用当前安装目录完成安装"}，随后自动重启。
           </div>
         </div>
       )}
@@ -376,21 +372,6 @@ function UpdateStatus({
       </div>
     </div>
   );
-}
-
-function installModeLabel(mode: string): string {
-  switch (mode) {
-    case "portable":
-      return "便携版原位更新";
-    case "nsis":
-      return "NSIS 安装版";
-    case "msi":
-      return "MSI 安装版";
-    case "webui":
-      return "CLI WebUI";
-    default:
-      return "手动更新";
-  }
 }
 
 function ValidationBadge({ v, provider }: { v: DirValidation | null; provider: "codex" | "claude" }) {

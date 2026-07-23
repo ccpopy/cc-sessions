@@ -13,8 +13,8 @@ use url::Url;
 use crate::error::{AppError, AppResult};
 use crate::models::{ImportMode, ProjectPathMapping, Settings, SwitchStrategy};
 use crate::{
-    backup, bundle, edit, family, fs_ops, markdown_export, repair, rollout, sessions, settings,
-    stats,
+    backup, bundle, convert, edit, family, fs_ops, markdown_export, repair, rollout, sessions,
+    settings, stats,
 };
 
 const WEBUI_TOKEN_HEADER: &str = "X-CC-Sessions-Webui-Token";
@@ -377,6 +377,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
         "copy_resume_command" => to_result_value(fs_ops::resume_command_text(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "sessionId")?,
+            opt_string_arg(&args, "cwd")?,
         )),
         "read_preview_image" => {
             to_result_value(fs_ops::read_preview_image(string_arg(&args, "path")?))
@@ -422,6 +423,14 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "claudeDir")?,
             bool_arg(&args, "dryRun")?,
             opt_string_vec_arg(&args, "sessionIds")?,
+        )),
+        "convert_session_provider" => to_result_value(convert::convert_session_with_lock(
+            string_arg(&args, "codexDir")?,
+            string_arg(&args, "claudeDir")?,
+            string_arg(&args, "sourceProvider")?,
+            string_arg(&args, "rolloutPath")?,
+            opt_string_arg(&args, "conversionMode")?,
+            &state.family_lock,
         )),
         "clone_session_for_provider" => {
             to_result_value(repair::clone_session_for_provider_with_lock(

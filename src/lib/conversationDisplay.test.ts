@@ -3,9 +3,11 @@ import test from "node:test";
 import type { PreviewEvent } from "./api";
 import {
   buildConversationPreviewRows,
+  isAssistantTextToolUseEvent,
   isProcessGroupExpanded,
   isVisibleConversationEvent,
   summarizeProcessGroupExpansion,
+  toConversationDisplayEvent,
 } from "./conversationDisplay.ts";
 
 function event(
@@ -29,6 +31,61 @@ function event(
     },
   };
 }
+
+function claudeToolEvent(index: number, text: string | null): PreviewEvent {
+  return {
+    index,
+    timestamp: "",
+    role: "tool_call",
+    kind: "assistant",
+    text_summary: text ?? "[Tool: Bash]",
+    raw: {
+      type: "assistant",
+      message: {
+        role: "assistant",
+        phase: "commentary",
+        content: [
+          ...(text === null ? [] : [{ type: "text", text }]),
+          { type: "tool_use", id: `toolu_${index}`, name: "Bash", input: { command: "pwd" } },
+        ],
+      },
+    },
+  };
+}
+
+test("Claude text plus tool_use is projected as an assistant process message", () => {
+  const mixed = claudeToolEvent(1, "正在检查代理配置");
+  const projected = toConversationDisplayEvent(mixed);
+
+  assert.equal(isAssistantTextToolUseEvent(mixed), true);
+  assert.equal(projected.role, "assistant");
+  assert.equal(projected.raw, mixed.raw);
+
+  const rows = buildConversationPreviewRows([
+    event(0, "user"),
+    projected,
+    event(2, "assistant", "final_answer"),
+  ]);
+  assert.deepEqual(
+    rows.map((row) =>
+      row.type === "event"
+        ? [row.type, row.event.index]
+        : [row.type, row.events.map((item) => item.index), row.hasFinalResponse],
+    ),
+    [
+      ["event", 0],
+      ["process", [1], true],
+      ["event", 2],
+    ],
+  );
+});
+
+test("pure Claude tool_use stays a tool event", () => {
+  const toolOnly = claudeToolEvent(1, null);
+
+  assert.equal(isAssistantTextToolUseEvent(toolOnly), false);
+  assert.equal(toConversationDisplayEvent(toolOnly), toolOnly);
+});
 
 test("Codex commentary is grouped and the explicit final answer stays visible", () => {
   const rows = buildConversationPreviewRows([

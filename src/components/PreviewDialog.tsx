@@ -70,9 +70,11 @@ import {
 import { parseEmbeddedTranscriptPrompt, type EmbeddedTranscriptPrompt } from "@/lib/sessionText";
 import {
   buildConversationPreviewRows,
+  isAssistantTextToolUseEvent,
   isProcessGroupExpanded,
   isVisibleConversationEvent,
   summarizeProcessGroupExpansion,
+  toConversationDisplayEvent,
   type ConversationPreviewRow,
 } from "@/lib/conversationDisplay";
 import { cn } from "@/lib/utils";
@@ -400,15 +402,15 @@ export function PreviewDialog({
   }, [events, filter, onlyMsg, timelineIndexSet]);
 
   /**
-   * 对齐 Codex App 的对话展示：显式 commentary 属于过程消息，final_answer 才是
-   * 最终答复；旧日志与 Claude 没有 phase 时退回到每轮最后一条。文本过滤时不
-   * 折叠，避免搜索命中的消息被隐藏。
+   * 有 phase 时仅 final_answer 作为最终答复，commentary 折叠为过程。
+   * 无 phase 时使用每轮最后一条 assistant 消息。搜索结果不折叠。
    */
   const rows = useMemo<ConversationPreviewRow[]>(() => {
+    const displayEvents = onlyMsg ? filtered.map(toConversationDisplayEvent) : filtered;
     if (!onlyMsg || filter) {
-      return filtered.map((event) => ({ type: "event", event }));
+      return displayEvents.map((event) => ({ type: "event", event }));
     }
-    return buildConversationPreviewRows(filtered);
+    return buildConversationPreviewRows(displayEvents);
   }, [filtered, filter, onlyMsg]);
 
   const processRowKeys = useMemo(
@@ -552,7 +554,7 @@ export function PreviewDialog({
   const copyResume = async () => {
     if (!session) return;
     try {
-      const text = await api.copyResumeCommand(session.provider, session.id);
+      const text = await api.copyResumeCommand(session.provider, session.id, session.cwd);
       toast.success(`已复制：${text}`);
     } catch (e: any) {
       toast.error("复制失败：" + String(e?.message ?? e));
@@ -1888,7 +1890,9 @@ function extractText(e: PreviewEvent): string {
           if (Array.isArray(x?.content)) {
             return x.content.map((c: any) => c?.text ?? c?.content ?? "").filter(Boolean).join("\n");
           }
-          if (x?.type === "tool_use") return `[Tool: ${x.name ?? "unknown"}]`;
+          if (x?.type === "tool_use") {
+            return e.role === "assistant" ? "" : `[Tool: ${x.name ?? "unknown"}]`;
+          }
           return "";
         })
         .filter(Boolean)
@@ -2004,6 +2008,7 @@ function cleanDiffCommentText(text: string): string {
 function isConversationMessage(e: PreviewEvent): boolean {
   if (e.role === "subagent") return false;
   if (isInternalCodexContextMessage(e)) return false;
+  if (isAssistantTextToolUseEvent(e)) return true;
   const raw = e.raw as { message?: { role?: unknown } } | null;
   if (typeof raw?.message?.role === "string") {
     return e.role === "user" || e.role === "assistant";

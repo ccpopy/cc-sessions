@@ -28,12 +28,18 @@ async function invokeCommand<T>(command: string, args?: Record<string, unknown>)
   return data as T;
 }
 
-function resumeCommandText(provider: SessionProvider, sessionId: string) {
+function resumeCommandText(provider: SessionProvider, sessionId: string, cwd?: string) {
   switch (provider) {
     case "codex":
       return `codex resume ${sessionId}`;
-    case "claude":
+    case "claude": {
+      const projectDir = cwd?.trim();
+      if (projectDir) {
+        const quoted = projectDir.replaceAll("'", "''");
+        return `Set-Location -LiteralPath '${quoted}'; claude --resume ${sessionId}`;
+      }
       return `claude --resume ${sessionId}`;
+    }
   }
 }
 
@@ -462,6 +468,22 @@ export type CloneReport = {
   skipped_reason: string | null;
   error: string | null;
 };
+
+export type ConvertReport = {
+  source_id: string;
+  source_provider: SessionProvider;
+  target_provider: SessionProvider;
+  conversion_mode: SessionConversionMode | null;
+  new_id: string;
+  new_path: string;
+  resume_command: string;
+  imported_messages: number;
+  dropped_reasoning: number;
+  tool_notes: number;
+  warnings: string[];
+};
+
+export type SessionConversionMode = "simple" | "native";
 
 export type SyncBranchReport = {
   active_id: string;
@@ -944,13 +966,13 @@ export const api = {
     }),
 
   revealCwd: (cwd: string) => invokeCommand<void>("reveal_cwd", { cwd }),
-  copyResumeCommand: async (provider: SessionProvider, sessionId: string) => {
+  copyResumeCommand: async (provider: SessionProvider, sessionId: string, cwd?: string) => {
     if (isWebRuntime()) {
-      const text = resumeCommandText(provider, sessionId);
+      const text = resumeCommandText(provider, sessionId, cwd);
       await copyText(text);
       return text;
     }
-    return invokeCommand<string>("copy_resume_command", { provider, sessionId });
+    return invokeCommand<string>("copy_resume_command", { provider, sessionId, cwd });
   },
 
   // ========================= 修复 =========================
@@ -988,6 +1010,20 @@ export const api = {
       claudeDir,
       dryRun,
       sessionIds: sessionIds ?? null,
+    }),
+  convertSessionProvider: (p: {
+    codex_dir: string;
+    claude_dir: string;
+    source_provider: SessionProvider;
+    rollout_path: string;
+    conversion_mode?: SessionConversionMode;
+  }) =>
+    invokeCommand<ConvertReport>("convert_session_provider", {
+      codexDir: p.codex_dir,
+      claudeDir: p.claude_dir,
+      sourceProvider: p.source_provider,
+      rolloutPath: p.rollout_path,
+      conversionMode: p.conversion_mode ?? null,
     }),
   cloneSessionForProvider: (p: {
     codex_dir: string;

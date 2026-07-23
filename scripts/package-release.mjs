@@ -307,6 +307,8 @@ async function createCliPackage() {
     "./cc-sessions list --limit 20",
     "./cc-sessions webui --host 127.0.0.1 --port 17888",
     "./cc-sessions --provider claude webui --host 127.0.0.1 --port 17888",
+    "./cc-sessions --provider codex convert /path/to/rollout.jsonl --mode native",
+    "./cc-sessions --provider claude convert /path/to/session.jsonl --mode simple",
     "./cc-sessions repair diagnose --json",
     "",
     "This package includes cc-sessions.portable, so Web UI settings are stored beside the executable as cc-sessions-webui-settings.json.",
