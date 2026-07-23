@@ -3,11 +3,13 @@ import type { PreviewEvent } from "./api";
 export type ConversationPreviewRow =
   | { type: "event"; event: PreviewEvent }
   | {
-      type: "collapsed";
+      type: "process";
       key: number;
       events: PreviewEvent[];
       hasFinalResponse: boolean;
     };
+
+export type ProcessGroupExpansionState = "collapsed" | "expanded" | "mixed";
 
 /**
  * Codex 会明确标记 assistant 消息是过程播报（commentary）还是最终答复
@@ -15,7 +17,6 @@ export type ConversationPreviewRow =
  */
 export function buildConversationPreviewRows(
   events: readonly PreviewEvent[],
-  options: { hideProcessMessages?: boolean } = {},
 ): ConversationPreviewRow[] {
   const rows: ConversationPreviewRow[] = [];
   let assistantRun: PreviewEvent[] = [];
@@ -34,9 +35,9 @@ export function buildConversationPreviewRows(
       : assistantRun.length - 1;
     const intermediate = assistantRun.filter((_, index) => index !== finalIndex);
 
-    if (intermediate.length > 0 && !options.hideProcessMessages) {
+    if (intermediate.length > 0) {
       rows.push({
-        type: "collapsed",
+        type: "process",
         key: intermediate[0].index,
         events: intermediate,
         hasFinalResponse: finalIndex >= 0,
@@ -58,6 +59,38 @@ export function buildConversationPreviewRows(
   }
   flushAssistantRun();
   return rows;
+}
+
+/**
+ * 全局偏好只定义新过程分组的默认状态；单轮手动操作通过稳定的事件索引覆盖。
+ */
+export function isProcessGroupExpanded(
+  key: number,
+  collapseByDefault: boolean,
+  overrides: Readonly<Record<number, boolean>>,
+): boolean {
+  return overrides[key] ?? !collapseByDefault;
+}
+
+/** 当前已加载的过程分组是否全部收起、全部展开或处于混合状态。 */
+export function summarizeProcessGroupExpansion(
+  keys: readonly number[],
+  collapseByDefault: boolean,
+  overrides: Readonly<Record<number, boolean>>,
+): ProcessGroupExpansionState {
+  if (keys.length === 0) {
+    return collapseByDefault ? "collapsed" : "expanded";
+  }
+
+  let expandedCount = 0;
+  for (const key of keys) {
+    if (isProcessGroupExpanded(key, collapseByDefault, overrides)) {
+      expandedCount += 1;
+    }
+  }
+  if (expandedCount === 0) return "collapsed";
+  if (expandedCount === keys.length) return "expanded";
+  return "mixed";
 }
 
 /**

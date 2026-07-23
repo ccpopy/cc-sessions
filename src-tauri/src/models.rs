@@ -12,6 +12,7 @@ pub struct Settings {
     pub refresh_interval_ms: u64,
     #[serde(default = "default_true")]
     pub preview_only_messages: bool,
+    /// true = 过程消息默认全部收起；false = 默认全部展开。
     #[serde(default = "default_true")]
     pub preview_collapse_process: bool,
 }

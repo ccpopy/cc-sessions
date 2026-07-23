@@ -3,7 +3,9 @@ import test from "node:test";
 import type { PreviewEvent } from "./api";
 import {
   buildConversationPreviewRows,
+  isProcessGroupExpanded,
   isVisibleConversationEvent,
+  summarizeProcessGroupExpansion,
 } from "./conversationDisplay.ts";
 
 function event(
@@ -28,7 +30,7 @@ function event(
   };
 }
 
-test("Codex commentary is collapsed and the explicit final answer stays visible", () => {
+test("Codex commentary is grouped and the explicit final answer stays visible", () => {
   const rows = buildConversationPreviewRows([
     event(0, "user"),
     event(1, "assistant", "commentary"),
@@ -44,7 +46,7 @@ test("Codex commentary is collapsed and the explicit final answer stays visible"
     ),
     [
       ["event", 0],
-      ["collapsed", [1, 2], true],
+      ["process", [1, 2], true],
       ["event", 3],
     ],
   );
@@ -65,7 +67,7 @@ test("a commentary-only interrupted turn is not presented as having a final answ
     ),
     [
       ["event", 0],
-      ["collapsed", [1], false],
+      ["process", [1], false],
       ["event", 2],
     ],
   );
@@ -86,7 +88,7 @@ test("phase-less Claude messages keep the last assistant message as the reply", 
     ),
     [
       ["event", 0],
-      ["collapsed", [1], true],
+      ["process", [1], true],
       ["event", 2],
     ],
   );
@@ -104,36 +106,22 @@ test("conversation-only view keeps user prompts while timeline data is unavailab
   assert.equal(isVisibleConversationEvent(event(0, "user"), null), true);
 });
 
-test("process collapse hides commentary rows while keeping the final answer", () => {
-  const rows = buildConversationPreviewRows(
-    [
-      event(0, "user"),
-      event(1, "assistant", "commentary"),
-      event(2, "assistant", "commentary"),
-      event(3, "assistant", "final_answer"),
-    ],
-    { hideProcessMessages: true },
-  );
+test("process groups follow the global default and per-turn overrides", () => {
+  const overrides = { 10: true, 20: false };
 
-  assert.deepEqual(
-    rows.map((row) =>
-      row.type === "event" ? [row.type, row.event.index] : [row.type, row.key],
-    ),
-    [
-      ["event", 0],
-      ["event", 3],
-    ],
-  );
+  assert.equal(isProcessGroupExpanded(10, true, overrides), true);
+  assert.equal(isProcessGroupExpanded(20, false, overrides), false);
+  assert.equal(isProcessGroupExpanded(30, true, overrides), false);
+  assert.equal(isProcessGroupExpanded(30, false, overrides), true);
 });
 
-test("process collapse hides a commentary-only interrupted response", () => {
-  const rows = buildConversationPreviewRows(
-    [event(0, "user"), event(1, "assistant", "commentary"), event(2, "user")],
-    { hideProcessMessages: true },
-  );
-
-  assert.deepEqual(
-    rows.map((row) => (row.type === "event" ? row.event.index : row.key)),
-    [0, 2],
+test("process group expansion summary reports uniform and mixed states", () => {
+  assert.equal(summarizeProcessGroupExpansion([], true, {}), "collapsed");
+  assert.equal(summarizeProcessGroupExpansion([], false, {}), "expanded");
+  assert.equal(summarizeProcessGroupExpansion([10, 20], true, {}), "collapsed");
+  assert.equal(summarizeProcessGroupExpansion([10, 20], false, {}), "expanded");
+  assert.equal(
+    summarizeProcessGroupExpansion([10, 20], true, { 10: true }),
+    "mixed",
   );
 });

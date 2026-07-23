@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import {
   Bot,
+  Check,
   ChevronDown,
   ChevronsDown,
   FileJson,
@@ -35,6 +36,12 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
@@ -63,7 +70,9 @@ import {
 import { parseEmbeddedTranscriptPrompt, type EmbeddedTranscriptPrompt } from "@/lib/sessionText";
 import {
   buildConversationPreviewRows,
+  isProcessGroupExpanded,
   isVisibleConversationEvent,
+  summarizeProcessGroupExpansion,
   type ConversationPreviewRow,
 } from "@/lib/conversationDisplay";
 import { cn } from "@/lib/utils";
@@ -133,7 +142,10 @@ export function PreviewDialog({
   const [done, setDone] = useState(false);
   const [filter, setFilter] = useState("");
   const [onlyMsg, setOnlyMsg] = useState(true);
-  const [collapseProcess, setCollapseProcess] = useState(true);
+  const [processDefaultCollapsed, setProcessDefaultCollapsed] = useState(true);
+  const [processExpansionOverrides, setProcessExpansionOverrides] = useState<
+    Record<number, boolean>
+  >({});
   const [forkTarget, setForkTarget] = useState<PreviewEvent | null>(null);
   const [forking, setForking] = useState(false);
   const [editTarget, setEditTarget] = useState<PreviewEvent | null>(null);
@@ -163,11 +175,19 @@ export function PreviewDialog({
     return collectRelatedSubagents(session.id, allSessions);
   }, [allSessions, customRolloutPath, session]);
 
+  const previewOnlyMessages = appSettings?.preview_only_messages;
+  const previewCollapseProcess = appSettings?.preview_collapse_process;
+
   useEffect(() => {
-    if (!appSettings) return;
-    setOnlyMsg(appSettings.preview_only_messages);
-    setCollapseProcess(appSettings.preview_collapse_process);
-  }, [appSettings]);
+    if (previewOnlyMessages === undefined) return;
+    setOnlyMsg(previewOnlyMessages);
+  }, [previewOnlyMessages]);
+
+  useEffect(() => {
+    if (previewCollapseProcess === undefined) return;
+    setProcessDefaultCollapsed(previewCollapseProcess);
+    setProcessExpansionOverrides({});
+  }, [previewCollapseProcess]);
 
   const persistPreviewPreference = useCallback((patch: Partial<Settings>) => {
     preferenceSaveRef.current = preferenceSaveRef.current.then(async () => {
@@ -190,12 +210,29 @@ export function PreviewDialog({
     [persistPreviewPreference],
   );
 
-  const changeCollapseProcess = useCallback(
-    (checked: boolean) => {
-      setCollapseProcess(checked);
-      persistPreviewPreference({ preview_collapse_process: checked });
+  const changeProcessDefaultCollapsed = useCallback(
+    (collapsed: boolean) => {
+      setProcessDefaultCollapsed(collapsed);
+      setProcessExpansionOverrides({});
+      persistPreviewPreference({ preview_collapse_process: collapsed });
     },
     [persistPreviewPreference],
+  );
+
+  const changeProcessGroupExpanded = useCallback(
+    (key: number, expanded: boolean) => {
+      setProcessExpansionOverrides((current) => {
+        const defaultExpanded = !processDefaultCollapsed;
+        if (expanded === defaultExpanded) {
+          if (!(key in current)) return current;
+          const next = { ...current };
+          delete next[key];
+          return next;
+        }
+        return { ...current, [key]: expanded };
+      });
+    },
+    [processDefaultCollapsed],
   );
 
   const loadMore = useCallback(async () => {
@@ -300,6 +337,7 @@ export function PreviewDialog({
 
   const resetAndReload = useCallback(() => {
     setEvents([]);
+    setProcessExpansionOverrides({});
     setDone(false);
     doneRef.current = false;
     loadingRef.current = false;
@@ -322,10 +360,21 @@ export function PreviewDialog({
     if (!open || loading || done) return;
     const viewport = viewportRef.current;
     if (!viewport) return;
+    // 全部/单轮收起、切换消息过滤后，内容高度可能骤减；重新补页直到填满视口。
     if (viewport.scrollHeight <= viewport.clientHeight + 20) {
       void loadMore();
     }
-  }, [done, events.length, loadMore, loading, open]);
+  }, [
+    done,
+    events.length,
+    filter,
+    loadMore,
+    loading,
+    onlyMsg,
+    open,
+    processDefaultCollapsed,
+    processExpansionOverrides,
+  ]);
 
   const timelineIndexSet = useMemo(
     () => (prompts === null ? null : new Set(prompts.map((prompt) => prompt.index))),
@@ -359,10 +408,22 @@ export function PreviewDialog({
     if (!onlyMsg || filter) {
       return filtered.map((event) => ({ type: "event", event }));
     }
-    return buildConversationPreviewRows(filtered, {
-      hideProcessMessages: collapseProcess,
-    });
-  }, [collapseProcess, filtered, filter, onlyMsg]);
+    return buildConversationPreviewRows(filtered);
+  }, [filtered, filter, onlyMsg]);
+
+  const processRowKeys = useMemo(
+    () => rows.flatMap((row) => (row.type === "process" ? [row.key] : [])),
+    [rows],
+  );
+  const processExpansionState = useMemo(
+    () =>
+      summarizeProcessGroupExpansion(
+        processRowKeys,
+        processDefaultCollapsed,
+        processExpansionOverrides,
+      ),
+    [processDefaultCollapsed, processExpansionOverrides, processRowKeys],
+  );
 
   /** 把待跳转的目标消息滚动到视口顶部并闪烁高亮 */
   const scrollPendingIntoView = useCallback(() => {
@@ -772,20 +833,41 @@ export function PreviewDialog({
                 仅看对话消息
               </Label>
             </label>
-            <label
-              htmlFor="collapse-process"
-              className="group flex h-8 cursor-pointer items-center gap-2 rounded-md border border-border/70 bg-muted/30 px-2.5 transition-colors hover:bg-muted/50"
-              title="开启后隐藏过程消息；关闭后显示可展开的折叠提示"
-            >
-              <Switch
-                id="collapse-process"
-                checked={collapseProcess}
-                onCheckedChange={changeCollapseProcess}
-              />
-              <Label htmlFor="collapse-process" className="cursor-pointer text-xs">
-                折叠过程
-              </Label>
-            </label>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-8 gap-1.5 border-border/70 bg-muted/30 px-2.5 text-xs font-normal hover:bg-muted/50"
+                  disabled={!onlyMsg || Boolean(filter)}
+                  title={
+                    !onlyMsg
+                      ? "仅看对话消息开启后可统一收起或展开过程消息"
+                      : filter
+                        ? "过滤结果会直接显示命中的消息"
+                        : "统一收起或展开当前会话的过程消息"
+                  }
+                >
+                  <Bot className="h-3.5 w-3.5" />
+                  过程消息
+                  <ChevronDown className="h-3 w-3 text-muted-foreground" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" className="min-w-[7rem]">
+                <DropdownMenuItem onSelect={() => changeProcessDefaultCollapsed(true)}>
+                  <span>全部收起</span>
+                  {processExpansionState === "collapsed" && (
+                    <Check className="h-4 w-4 text-primary" />
+                  )}
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => changeProcessDefaultCollapsed(false)}>
+                  <span>全部展开</span>
+                  {processExpansionState === "expanded" && (
+                    <Check className="h-4 w-4 text-primary" />
+                  )}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
             <span className="text-[11px] text-muted-foreground">
               显示 <span className="tabular-nums text-foreground/80">{filtered.length}</span>
               <span className="mx-1 text-muted-foreground/50">/</span>
@@ -850,10 +932,18 @@ export function PreviewDialog({
               )}
 
               {rows.map((row) =>
-                row.type === "collapsed" ? (
-                  <CollapsedTurnGroup
-                    key={`collapsed-${row.key}`}
+                row.type === "process" ? (
+                  <ProcessTurnGroup
+                    key={`process-${row.key}`}
                     events={row.events}
+                    expanded={isProcessGroupExpanded(
+                      row.key,
+                      processDefaultCollapsed,
+                      processExpansionOverrides,
+                    )}
+                    onExpandedChange={(expanded) =>
+                      changeProcessGroupExpanded(row.key, expanded)
+                    }
                   >
                     {(event) => (
                       <div key={event.index} data-event-index={event.index}>
@@ -870,7 +960,7 @@ export function PreviewDialog({
                         />
                       </div>
                     )}
-                  </CollapsedTurnGroup>
+                  </ProcessTurnGroup>
                 ) : (
                   <div
                     key={row.event.index}
@@ -1137,29 +1227,32 @@ export function PreviewDialog({
 
 /**
  * 一轮里最终答复之前的过程性 Agent 消息。Codex App 不在对话流中展示这些消息，
- * “折叠过程”关闭时折叠成一行提示，点击可展开查看（展开后仍支持编辑/回溯等操作）。
+ * 默认状态由“全部收起/全部展开”决定，同时允许当前会话中的每一轮单独切换。
  */
-function CollapsedTurnGroup({
+function ProcessTurnGroup({
   events,
+  expanded,
+  onExpandedChange,
   children,
 }: {
   events: PreviewEvent[];
+  expanded: boolean;
+  onExpandedChange: (expanded: boolean) => void;
   children: (event: PreviewEvent) => React.ReactNode;
 }) {
-  const [expanded, setExpanded] = useState(false);
   return (
     <div className="space-y-4">
       <button
         type="button"
         aria-expanded={expanded}
-        onClick={() => setExpanded((value) => !value)}
+        onClick={() => onExpandedChange(!expanded)}
         className="mx-auto flex items-center gap-1.5 rounded-full border border-border/60 bg-background/60 px-3 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
         <Bot className="h-3 w-3" />
         <span>
           {expanded
-            ? "收起过程消息"
-            : `已折叠 ${events.length} 条过程消息`}
+            ? "收起本轮过程消息"
+            : `已收起 ${events.length} 条过程消息`}
         </span>
         <ChevronDown
           className={cn("h-3 w-3 transition-transform", expanded && "rotate-180")}

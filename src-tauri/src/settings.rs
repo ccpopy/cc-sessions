@@ -273,8 +273,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_settings_enable_preview_switches_by_default() -> AppResult<()> {
-        let root = temp_dir("legacy-preview-switches");
+    fn legacy_settings_enable_preview_preferences_by_default() -> AppResult<()> {
+        let root = temp_dir("legacy-preview-preferences");
         fs::create_dir_all(&root)?;
         let file = root.join("settings.json");
         fs::write(
@@ -295,8 +295,8 @@ mod tests {
     }
 
     #[test]
-    fn preview_switches_are_persisted() -> AppResult<()> {
-        let root = temp_dir("preview-switches-roundtrip");
+    fn preview_preferences_are_persisted() -> AppResult<()> {
+        let root = temp_dir("preview-preferences-roundtrip");
         fs::create_dir_all(&root)?;
         let file = root.join("settings.json");
         let mut settings = Settings::default();

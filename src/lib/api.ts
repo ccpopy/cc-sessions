@@ -47,6 +47,7 @@ export type Settings = {
   open_command: string;
   refresh_interval_ms: number;
   preview_only_messages: boolean;
+  /** true = 过程消息默认全部收起；false = 默认全部展开。 */
   preview_collapse_process: boolean;
 };
 

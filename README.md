@@ -269,6 +269,8 @@ xattr -d com.apple.quarantine cc-session-manager
 
 [thful](https://github.com/thful) —— 参与 Markdown 导出功能测试并反馈问题。
 
+[firesahc](https://github.com/firesahc) —— 为对话预览、时间线和过程消息交互提供建议，并持续参与测试和反馈。
+
 L站用户 @fengtang —— 参与会话编辑、删除和官方归档会话相关功能测试并反馈问题。
 
 ## License
