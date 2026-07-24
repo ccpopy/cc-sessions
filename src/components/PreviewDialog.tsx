@@ -8,6 +8,7 @@ import {
   GitBranch,
   Loader2,
   MessageSquare,
+  MousePointer2,
   Network,
   Pencil,
   Sparkles,
@@ -16,6 +17,7 @@ import {
   Undo2,
   User,
   Wrench,
+  X,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -154,6 +156,10 @@ export function PreviewDialog({
   const [editText, setEditText] = useState("");
   const [mutating, setMutating] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<PreviewEvent | null>(null);
+  const [isSelecting, setIsSelecting] = useState(false);
+  const [selectionFirstIndex, setSelectionFirstIndex] = useState<number | null>(null);
+  const [selectionSecondIndex, setSelectionSecondIndex] = useState<number | null>(null);
+  const [deleteSelectedTarget, setDeleteSelectedTarget] = useState<{ start: number; end: number } | null>(null);
   const [deletePlan, setDeletePlan] = useState<DeletePlan | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [editHistory, setEditHistory] = useState<EditHistory | null>(null);
@@ -355,6 +361,11 @@ export function PreviewDialog({
   useEffect(() => {
     if (!open || !rolloutPath) return;
     setFilter("");
+    setIsSelecting(false);
+    setSelectionFirstIndex(null);
+    setSelectionSecondIndex(null);
+    setDeleteSelectedTarget(null);
+    setDeletePlan(null);
     resetAndReload();
   }, [open, rolloutPath, resetAndReload]);
 
@@ -693,6 +704,58 @@ export function PreviewDialog({
     }
   };
 
+  const requestDeleteSelected = () => {
+    if (!canMutateSession || !rolloutPath || selectionFirstIndex === null || selectionSecondIndex === null) return;
+    const start = Math.min(selectionFirstIndex, selectionSecondIndex);
+    const end = Math.max(selectionFirstIndex, selectionSecondIndex);
+    setDeletePlan(null);
+    setDeleteSelectedTarget({ start, end });
+    const indices = events
+      .filter((e) => e.index >= start && e.index <= end && canDeleteEvent(provider, e))
+      .map((e) => e.index);
+    api
+      .planSessionEventDeletion(provider, rolloutPath, indices)
+      .then(setDeletePlan)
+      .catch((e: any) => {
+        toast.error("生成删除计划失败", { description: String(e?.message ?? e) });
+        setDeleteSelectedTarget(null);
+      });
+  };
+
+  const confirmDeleteSelected = async () => {
+    if (!session || !backupDir || !rolloutPath || !deleteSelectedTarget) return;
+    setMutating(true);
+    try {
+      const { start, end } = deleteSelectedTarget;
+      const indices = events
+        .filter((e) => e.index >= start && e.index <= end && canDeleteEvent(provider, e))
+        .map((e) => e.index);
+      const report = await api.deleteSessionEvents({
+        provider,
+        rollout_path: rolloutPath,
+        session_id: session.id,
+        backup_dir: backupDir,
+        line_nos: indices,
+      });
+      toast.success(`已删除 ${report.deleted_lines} 个事件`, {
+        description: report.snapshot_created
+          ? `删除前已自动保存原始快照 ${report.snapshot_created}`
+          : "本次删除已记入编辑历史，可随时撤销",
+      });
+      setDeleteSelectedTarget(null);
+      setDeletePlan(null);
+      setIsSelecting(false);
+      setSelectionFirstIndex(null);
+      setSelectionSecondIndex(null);
+      resetAndReload();
+      await onEdited?.();
+    } catch (e: any) {
+      toast.error("删除失败", { description: String(e?.message ?? e) });
+    } finally {
+      setMutating(false);
+    }
+  };
+
   const loadEditHistory = useCallback(async () => {
     if (!session || !backupDir || !rolloutPath) return;
     try {
@@ -814,6 +877,22 @@ export function PreviewDialog({
                       </span>
                     </>
                   )}
+                  <Dot />
+                  <span className="text-[11px] text-muted-foreground">
+                    显示 <span className="tabular-nums text-foreground/80">{filtered.length}</span>
+                    <span className="mx-1 text-muted-foreground/50">/</span>
+                    已加载 <span className="tabular-nums text-foreground/80">{events.length}</span>
+                    {totalEvents > 0 && (
+                      <>
+                        <span className="mx-1 text-muted-foreground/50">/</span>
+                        共 <span className="tabular-nums text-foreground/80">{totalEvents}</span>
+                      </>
+                    )}{" "}
+                    条
+                    <span className="ml-1 text-muted-foreground/70">
+                      {!done ? "· 滚动加载更多" : "· 已到末尾"}
+                    </span>
+                  </span>
                 </div>
               )}
             </div>
@@ -870,36 +949,76 @@ export function PreviewDialog({
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
-            <span className="text-[11px] text-muted-foreground">
-              显示 <span className="tabular-nums text-foreground/80">{filtered.length}</span>
-              <span className="mx-1 text-muted-foreground/50">/</span>
-              已加载 <span className="tabular-nums text-foreground/80">{events.length}</span>
-              {totalEvents > 0 && (
-                <>
-                  <span className="mx-1 text-muted-foreground/50">/</span>
-                  共 <span className="tabular-nums text-foreground/80">{totalEvents}</span>
-                </>
-              )}{" "}
-              条
-              <span className="ml-1 text-muted-foreground/70">
-                {!done ? "· 滚动加载更多" : "· 已到末尾"}
-              </span>
-            </span>
             {!done && events.length > 0 && (
               <Button
                 variant="outline"
                 size="sm"
-                className="h-7 gap-1.5 px-2 text-xs"
+                className="h-8 gap-1.5 border-border/70 bg-muted/30 px-2.5 text-xs font-normal hover:bg-muted/50"
                 disabled={loadingAll}
                 onClick={() => void loadAll()}
               >
                 {loadingAll ? (
-                  <Loader2 className="h-3 w-3 animate-spin" />
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
                 ) : (
-                  <ChevronsDown className="h-3 w-3" />
+                  <ChevronsDown className="h-3.5 w-3.5" />
                 )}
                 {loadingAll ? "加载中…" : "加载全部"}
               </Button>
+            )}
+            {canMutateSession && !isSelecting && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-8 gap-1.5 border-border/70 bg-muted/30 px-2.5 text-xs font-normal hover:bg-muted/50"
+                onClick={() => {
+                  setIsSelecting(true);
+                  setSelectionFirstIndex(null);
+                  setSelectionSecondIndex(null);
+                }}
+              >
+                <MousePointer2 className="h-3.5 w-3.5" />
+                开始选取
+              </Button>
+            )}
+            {canMutateSession && isSelecting && (
+              <>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-8 gap-1.5 border-border/70 bg-muted/30 px-2.5 text-xs font-normal hover:bg-muted/50"
+                  onClick={() => {
+                    setIsSelecting(false);
+                    setSelectionFirstIndex(null);
+                    setSelectionSecondIndex(null);
+                  }}
+                >
+                  <X className="h-3.5 w-3.5" />
+                  结束选取
+                </Button>
+                {selectionFirstIndex !== null && selectionSecondIndex !== null && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-8 gap-1.5 border-destructive/50 bg-destructive/10 px-2.5 text-xs font-normal text-destructive hover:bg-destructive/20"
+                    onClick={requestDeleteSelected}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                    删除选中
+                    <span className="tabular-nums">
+                      {events.filter(
+                        (e) =>
+                          e.index >= Math.min(selectionFirstIndex, selectionSecondIndex) &&
+                          e.index <= Math.max(selectionFirstIndex, selectionSecondIndex) &&
+                          canDeleteEvent(provider, e),
+                      ).length}
+                      条
+                    </span>
+                  </Button>
+                )}
+                {selectionFirstIndex !== null && selectionSecondIndex === null && (
+                  <span className="text-xs text-muted-foreground">请点击第二个事件完成选取</span>
+                )}
+              </>
             )}
             <PreviewToolbarActions
               hasSession={!!session}
@@ -947,8 +1066,42 @@ export function PreviewDialog({
                       changeProcessGroupExpanded(row.key, expanded)
                     }
                   >
-                    {(event) => (
-                      <div key={event.index} data-event-index={event.index}>
+                    {(event) => {
+                      const inRange =
+                        isSelecting &&
+                        selectionFirstIndex !== null &&
+                        selectionSecondIndex !== null &&
+                        event.index >= Math.min(selectionFirstIndex, selectionSecondIndex) &&
+                        event.index <= Math.max(selectionFirstIndex, selectionSecondIndex);
+                      const isStart =
+                        isSelecting &&
+                        selectionFirstIndex !== null &&
+                        selectionSecondIndex === null &&
+                        event.index === selectionFirstIndex;
+                      return (
+                      <div
+                        key={event.index}
+                        data-event-index={event.index}
+                        className={cn(
+                          isSelecting && "cursor-pointer",
+                          inRange && "bg-destructive/10 ring-1 ring-destructive/30",
+                          isStart && "bg-primary/10 ring-1 ring-primary/30",
+                        )}
+                        onClick={
+                          isSelecting
+                            ? () => {
+                                if (selectionFirstIndex === null) {
+                                  setSelectionFirstIndex(event.index);
+                                } else if (selectionSecondIndex === null) {
+                                  setSelectionSecondIndex(event.index);
+                                } else {
+                                  setSelectionFirstIndex(event.index);
+                                  setSelectionSecondIndex(null);
+                                }
+                              }
+                            : undefined
+                        }
+                      >
                         <EventBubble
                           e={event}
                           actions={{
@@ -961,13 +1114,42 @@ export function PreviewDialog({
                           }}
                         />
                       </div>
-                    )}
+                      );
+                    }}
                   </ProcessTurnGroup>
                 ) : (
                   <div
                     key={row.event.index}
                     data-event-index={row.event.index}
                     data-timeline-anchor={timelineIndexSet?.has(row.event.index) || undefined}
+                    className={cn(
+                      isSelecting && "cursor-pointer",
+                      isSelecting &&
+                        selectionFirstIndex !== null &&
+                        selectionSecondIndex !== null &&
+                        row.event.index >= Math.min(selectionFirstIndex, selectionSecondIndex) &&
+                        row.event.index <= Math.max(selectionFirstIndex, selectionSecondIndex) &&
+                        "bg-destructive/10 ring-1 ring-destructive/30",
+                      isSelecting &&
+                        selectionFirstIndex !== null &&
+                        selectionSecondIndex === null &&
+                        row.event.index === selectionFirstIndex &&
+                        "bg-primary/10 ring-1 ring-primary/30",
+                    )}
+                    onClick={
+                      isSelecting
+                        ? () => {
+                            if (selectionFirstIndex === null) {
+                              setSelectionFirstIndex(row.event.index);
+                            } else if (selectionSecondIndex === null) {
+                              setSelectionSecondIndex(row.event.index);
+                            } else {
+                              setSelectionFirstIndex(row.event.index);
+                              setSelectionSecondIndex(null);
+                            }
+                          }
+                        : undefined
+                    }
                   >
                     <EventBubble
                       e={row.event}
@@ -1136,6 +1318,74 @@ export function PreviewDialog({
             {mutating
               ? "删除中…"
               : `删除 ${deletePlan?.lines.length ?? 0} 个事件`}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+
+    {/* 删除选中事件 */}
+    <AlertDialog
+      open={!!deleteSelectedTarget}
+      onOpenChange={(v) => {
+        if (!v && !mutating) {
+          setDeleteSelectedTarget(null);
+          setDeletePlan(null);
+        }
+      }}
+    >
+      <AlertDialogContent className="sm:max-w-[640px]">
+        <AlertDialogHeader>
+          <AlertDialogTitle>删除选中事件</AlertDialogTitle>
+          <AlertDialogDescription>
+            将删除选取范围内的事件（含首尾）。为保证续聊不报错，配对的工具调用/返回、镜像行与关联推理会一起删除。
+            删除前会自动保存原始快照，可在「编辑历史」中撤销或还原。
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        {!deletePlan && (
+          <div className="py-2 text-center text-xs text-muted-foreground">正在生成删除计划…</div>
+        )}
+        {deletePlan && deletePlan.blocked.length > 0 && (
+          <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+            {deletePlan.blocked.map((b, i) => (
+              <div key={i}>{b}</div>
+            ))}
+          </div>
+        )}
+        {deletePlan && deletePlan.blocked.length === 0 && (
+          <div className="max-h-64 space-y-1 overflow-auto rounded-md border bg-muted/40 p-2">
+            <div className="mb-2 text-[11px] font-medium text-muted-foreground">
+              共 {deletePlan.lines.length} 个事件将被删除
+            </div>
+            {deletePlan.lines.map((l) => (
+              <div key={l.line_no} className="flex items-center gap-2 text-xs">
+                <span className="w-14 shrink-0 font-mono text-muted-foreground">
+                  line {l.line_no + 1}
+                </span>
+                <Badge
+                  variant={l.reason === "selected" ? "default" : "outline"}
+                  className="h-4 shrink-0 px-1 py-0 text-[10px] font-normal"
+                >
+                  {deleteReasonLabel(l.reason)}
+                </Badge>
+                <span className="shrink-0 text-muted-foreground">{l.role}</span>
+                <span className="min-w-0 flex-1 truncate">{l.summary}</span>
+              </div>
+            ))}
+          </div>
+        )}
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={mutating}>取消</AlertDialogCancel>
+          <AlertDialogAction
+            disabled={mutating || !deletePlan || deletePlan.blocked.length > 0}
+            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            onClick={(e) => {
+              e.preventDefault();
+              void confirmDeleteSelected();
+            }}
+          >
+            {mutating
+              ? "删除中…"
+              : `删除选中 ${deletePlan?.lines.length ?? 0} 个事件`}
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
