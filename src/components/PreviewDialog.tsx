@@ -8,6 +8,7 @@ import {
   GitBranch,
   Loader2,
   MessageSquare,
+  MousePointer2,
   Network,
   Pencil,
   Sparkles,
@@ -16,6 +17,7 @@ import {
   Undo2,
   User,
   Wrench,
+  X,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -154,6 +156,10 @@ export function PreviewDialog({
   const [editText, setEditText] = useState("");
   const [mutating, setMutating] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<PreviewEvent | null>(null);
+  const [isSelecting, setIsSelecting] = useState(false);
+  const [selectionFirstIndex, setSelectionFirstIndex] = useState<number | null>(null);
+  const [selectionSecondIndex, setSelectionSecondIndex] = useState<number | null>(null);
+  const [deleteSelectedTarget, setDeleteSelectedTarget] = useState<{ start: number; end: number } | null>(null);
   const [deletePlan, setDeletePlan] = useState<DeletePlan | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [editHistory, setEditHistory] = useState<EditHistory | null>(null);
@@ -355,6 +361,11 @@ export function PreviewDialog({
   useEffect(() => {
     if (!open || !rolloutPath) return;
     setFilter("");
+    setIsSelecting(false);
+    setSelectionFirstIndex(null);
+    setSelectionSecondIndex(null);
+    setDeleteSelectedTarget(null);
+    setDeletePlan(null);
     resetAndReload();
   }, [open, rolloutPath, resetAndReload]);
 
@@ -684,6 +695,58 @@ export function PreviewDialog({
       });
       setDeleteTarget(null);
       setDeletePlan(null);
+      resetAndReload();
+      await onEdited?.();
+    } catch (e: any) {
+      toast.error("删除失败", { description: String(e?.message ?? e) });
+    } finally {
+      setMutating(false);
+    }
+  };
+
+  const requestDeleteSelected = () => {
+    if (!canMutateSession || !rolloutPath || selectionFirstIndex === null || selectionSecondIndex === null) return;
+    const start = Math.min(selectionFirstIndex, selectionSecondIndex);
+    const end = Math.max(selectionFirstIndex, selectionSecondIndex);
+    setDeletePlan(null);
+    setDeleteSelectedTarget({ start, end });
+    const indices = events
+      .filter((e) => e.index >= start && e.index <= end && canDeleteEvent(provider, e))
+      .map((e) => e.index);
+    api
+      .planSessionEventDeletion(provider, rolloutPath, indices)
+      .then(setDeletePlan)
+      .catch((e: any) => {
+        toast.error("生成删除计划失败", { description: String(e?.message ?? e) });
+        setDeleteSelectedTarget(null);
+      });
+  };
+
+  const confirmDeleteSelected = async () => {
+    if (!session || !backupDir || !rolloutPath || !deleteSelectedTarget) return;
+    setMutating(true);
+    try {
+      const { start, end } = deleteSelectedTarget;
+      const indices = events
+        .filter((e) => e.index >= start && e.index <= end && canDeleteEvent(provider, e))
+        .map((e) => e.index);
+      const report = await api.deleteSessionEvents({
+        provider,
+        rollout_path: rolloutPath,
+        session_id: session.id,
+        backup_dir: backupDir,
+        line_nos: indices,
+      });
+      toast.success(`已删除 ${report.deleted_lines} 个事件`, {
+        description: report.snapshot_created
+          ? `删除前已自动保存原始快照 ${report.snapshot_created}`
+          : "本次删除已记入编辑历史，可随时撤销",
+      });
+      setDeleteSelectedTarget(null);
+      setDeletePlan(null);
+      setIsSelecting(false);
+      setSelectionFirstIndex(null);
+      setSelectionSecondIndex(null);
       resetAndReload();
       await onEdited?.();
     } catch (e: any) {
