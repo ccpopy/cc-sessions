@@ -91,6 +91,13 @@ export type UpdateCheckResult =
       message: string;
     };
 
+export type SessionConversionOrigin = {
+  source_provider: SessionProvider;
+  source_id: string;
+  conversion_mode: SessionConversionMode | null;
+  converted_at: string;
+};
+
 export type SessionSummary = {
   provider: SessionProvider;
   id: string;
@@ -104,6 +111,7 @@ export type SessionSummary = {
   source: string | null;
   agent_nickname: string | null;
   agent_role: string | null;
+  conversion_origin: SessionConversionOrigin | null;
   tokens_used: number;
   created_at: number;
   updated_at: number;

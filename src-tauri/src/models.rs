@@ -70,6 +70,7 @@ pub struct SessionSummary {
     pub source: Option<String>,
     pub agent_nickname: Option<String>,
     pub agent_role: Option<String>,
+    pub conversion_origin: Option<SessionConversionOrigin>,
     pub tokens_used: i64,
     pub created_at: i64,
     pub updated_at: i64,
@@ -79,6 +80,14 @@ pub struct SessionSummary {
     pub logs_count: i64,
     pub has_backup: bool,
     pub resume_command: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionConversionOrigin {
+    pub source_provider: String,
+    pub source_id: String,
+    pub conversion_mode: Option<String>,
+    pub converted_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -301,6 +301,7 @@ fn parse_session(path: &Path) -> AppResult<Option<SessionSummary>> {
         },
         agent_nickname: if is_subagent { agent_id } else { None },
         agent_role: if is_subagent { agent_role } else { None },
+        conversion_origin: None,
         tokens_used,
         created_at: created_at.unwrap_or(0),
         updated_at: updated_at.or(created_at).unwrap_or(0),

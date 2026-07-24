@@ -373,6 +373,7 @@ function toSessionSummary(m: ManifestSession, backupPath: string, provider: Sess
     source: null,
     agent_nickname: null,
     agent_role: null,
+    conversion_origin: null,
     tokens_used: m.tokens_used,
     created_at: m.created_at,
     updated_at: m.updated_at,

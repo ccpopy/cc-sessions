@@ -17,6 +17,7 @@ pub mod markdown_export;
 pub mod models;
 pub mod path_safety;
 pub mod paths;
+pub mod provenance;
 pub mod repair;
 pub mod rollout;
 pub mod sessions;

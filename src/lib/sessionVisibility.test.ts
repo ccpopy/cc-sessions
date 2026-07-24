@@ -17,6 +17,7 @@ function session(id: string, updatedAt: number): SessionSummary {
     source: null,
     agent_nickname: null,
     agent_role: null,
+    conversion_origin: null,
     tokens_used: 0,
     created_at: updatedAt - 10,
     updated_at: updatedAt,

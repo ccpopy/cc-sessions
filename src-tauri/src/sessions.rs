@@ -3,7 +3,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 
 use crate::atomic_file;
 use crate::error::{AppError, AppResult};
@@ -12,6 +12,7 @@ use crate::history;
 use crate::logs_db;
 use crate::models::{DeleteResult, DeleteTarget, ProjectGroup, SessionSummary};
 use crate::paths;
+use crate::provenance;
 use crate::state_db;
 
 fn provider_or_codex(provider: Option<String>) -> String {
@@ -61,6 +62,60 @@ fn read_session_index_titles(codex_dir: &Path) -> AppResult<HashMap<String, Stri
     Ok(titles)
 }
 
+/// 返回 Codex 当前对外展示的会话标题：活跃索引优先，数据库标题兜底。
+pub(crate) fn codex_display_title(codex_dir: &Path, id: &str) -> AppResult<Option<String>> {
+    let index_title = read_session_index_titles(codex_dir)?.remove(id);
+    if !paths::state_db_path(codex_dir).is_file() {
+        return Ok(index_title);
+    }
+    let state = state_db::open_ro(codex_dir)?;
+    let row = state
+        .query_row(
+            "SELECT COALESCE(title,''), COALESCE(first_user_message,''), COALESCE(archived,0)
+             FROM threads WHERE id = ?1",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    Ok(match row {
+        Some((database_title, first_user_message, archived)) => Some(select_codex_title(
+            index_title.as_deref(),
+            database_title,
+            &first_user_message,
+            archived != 0,
+        )),
+        None => index_title,
+    })
+}
+
+fn select_codex_title(
+    index_title: Option<&str>,
+    database_title: String,
+    first_user_message: &str,
+    archived: bool,
+) -> String {
+    if archived {
+        return database_title;
+    }
+
+    let database_trimmed = database_title.trim();
+    let first_trimmed = first_user_message.trim();
+    let index_is_prompt_only = index_title.is_some_and(|title| title.trim() == first_trimmed);
+    if !database_trimmed.is_empty() && database_trimmed != first_trimmed && index_is_prompt_only {
+        // 旧版互转会把生成标题写入 threads，却把首条提问写入 session_index。
+        // 只在这个明确特征下恢复数据库标题，其他活跃会话仍以官方索引为准。
+        return database_title;
+    }
+
+    index_title.map(String::from).unwrap_or(database_title)
+}
+
 fn query_summaries(
     codex_dir: &Path,
     where_clause: &str,
@@ -106,11 +161,12 @@ fn query_summaries(
             let rollout_bytes = fs::metadata(&rollout_path).map(|m| m.len()).unwrap_or(0);
 
             let resume_command = format!("codex resume {}", id);
-            let title = if archived == 0 {
-                index_titles.get(&id).cloned().unwrap_or(database_title)
-            } else {
-                database_title
-            };
+            let title = select_codex_title(
+                index_titles.get(&id).map(String::as_str),
+                database_title,
+                &first_user_message,
+                archived != 0,
+            );
             Ok(SessionSummary {
                 provider: "codex".into(),
                 id,
@@ -125,6 +181,7 @@ fn query_summaries(
                 source,
                 agent_nickname,
                 agent_role,
+                conversion_origin: None,
                 tokens_used,
                 created_at,
                 updated_at,
@@ -177,17 +234,18 @@ pub fn list_sessions(
     codex_dir: String,
     claude_dir: Option<String>,
 ) -> AppResult<Vec<SessionSummary>> {
+    let codex = PathBuf::from(&codex_dir);
     match provider_or_codex(provider).as_str() {
         "codex" => {
-            let p = PathBuf::from(&codex_dir);
-            let mut list = query_summaries(&p, "", &[])?;
+            let mut list = query_summaries(&codex, "", &[])?;
             // 官方 Codex app 归档会把 rollout 移到 archived_sessions/；
             // threads 记录缺失或漂移时，从归档目录补扫，保证归档会话可见。
-            let extra = supplement_archived_summaries(&p, &list)?;
+            let extra = supplement_archived_summaries(&codex, &list)?;
             if !extra.is_empty() {
                 list.extend(extra);
                 list.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
             }
+            provenance::annotate_sessions(&codex, &mut list);
             Ok(list)
         }
         "claude" => {
@@ -195,7 +253,9 @@ pub fn list_sessions(
                 claude_dir
                     .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
             );
-            crate::claude_sessions::scan_sessions(&p)
+            let mut list = crate::claude_sessions::scan_sessions(&p)?;
+            provenance::annotate_sessions(&codex, &mut list);
+            Ok(list)
         }
         other => Err(AppError::Other(format!("不支持的 provider: {other}"))),
     }
@@ -245,6 +305,7 @@ fn supplement_archived_summaries(
             source: brief.source.clone(),
             agent_nickname: None,
             agent_role: None,
+            conversion_origin: None,
             tokens_used: brief.tokens_used,
             created_at: brief.created_at_ms / 1000,
             updated_at: brief.updated_at_ms / 1000,
@@ -344,6 +405,10 @@ pub fn search_sessions(
                     || s.agent_role
                         .as_deref()
                         .map(|x| x.to_lowercase().contains(&val))
+                        .unwrap_or(false)
+                    || s.conversion_origin
+                        .as_ref()
+                        .map(|origin| origin.source_provider.to_lowercase().contains(&val))
                         .unwrap_or(false)
                     || s.cwd.to_lowercase().contains(&val)
             }
@@ -1813,6 +1878,43 @@ mod tests {
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].title, "Codex 生成的简短标题");
+        Ok(())
+    }
+
+    #[test]
+    fn list_sessions_recovers_generated_database_title_from_prompt_only_index() -> AppResult<()> {
+        let codex = temp_dir("codex-converted-title-mismatch");
+        let conn = create_codex_threads_table(&codex)?;
+        conn.execute(
+            "INSERT INTO threads (
+                id, rollout_path, cwd, title, first_user_message, model, reasoning_effort,
+                tokens_used, created_at, updated_at, archived, archived_at, git_branch, source,
+                agent_nickname, agent_role
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 0, 1770000000, 1770000300, 0, NULL, NULL, NULL, NULL, NULL)",
+            (
+                "converted-title",
+                codex.join("sessions/converted-title.jsonl").to_string_lossy().into_owned(),
+                "F:\\work\\converted-title",
+                "Claude 自动生成标题",
+                "这是首条用户提问",
+                "gpt-5",
+            ),
+        )?;
+        drop(conn);
+        fs::write(
+            paths::session_index_path(&codex),
+            "{\"id\":\"converted-title\",\"thread_name\":\"这是首条用户提问\"}\n",
+        )?;
+
+        let sessions = list_sessions(
+            Some("codex".to_string()),
+            codex.to_string_lossy().into_owned(),
+            None,
+        )?;
+        fs::remove_dir_all(&codex).ok();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title, "Claude 自动生成标题");
         Ok(())
     }
 

@@ -28,7 +28,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import type { FamilyOverlay, SessionSummary } from "@/lib/api";
+import type { FamilyOverlay, SessionConversionOrigin, SessionSummary } from "@/lib/api";
 import {
   absoluteTime,
   highlight,
@@ -102,29 +102,44 @@ export const SessionCard = memo(function SessionCard({
   return (
     <div
       className={cn(
-        "group relative w-full min-w-0 overflow-hidden rounded-lg border border-border/70 bg-card text-card-foreground shadow-sm transition-all duration-200",
+        "group relative w-full min-w-0 overflow-hidden rounded-lg border border-border/60 bg-card text-card-foreground shadow-[0_1px_2px_rgb(0_0_0/0.03)] transition-all duration-200",
         "before:pointer-events-none before:absolute before:bottom-3 before:left-0 before:top-3 before:w-[3px] before:rounded-r-full before:bg-emerald-500 before:opacity-0 before:transition-opacity before:duration-200",
-        "hover:-translate-y-[0.5px] hover:border-foreground/15 hover:shadow-[0_2px_8px_-3px_rgb(0_0_0/0.08)]",
+        "hover:-translate-y-px hover:border-foreground/15 hover:shadow-[0_3px_10px_-3px_rgb(0_0_0/0.09)] motion-reduce:transition-none motion-reduce:hover:translate-y-0",
         s.archived && "opacity-60",
         selected &&
           "border-emerald-500/45 bg-emerald-500/[0.035] before:opacity-100 dark:border-emerald-500/35 dark:bg-emerald-500/[0.07]",
       )}
     >
-      <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-2 p-4 sm:grid-cols-[auto_minmax(0,1fr)_auto]">
+      <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-x-3 p-4">
         <Checkbox
           checked={selected}
           onCheckedChange={() => onToggleSelect(s.id)}
-          className="mt-1.5"
+          className="mt-0.5"
           aria-label="选择会话"
         />
 
-        <div className="min-w-0 flex-1 space-y-2">
-          {/* 顶部元信息：项目名（可选） + id + 模型 */}
-          <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+        <div className="min-w-0 flex-1">
+          {/* 标题 + 更新时间 */}
+          <div className="flex min-w-0 items-start gap-3">
+            <div className="line-clamp-1 min-w-0 flex-1 wrap-anywhere text-sm font-semibold leading-snug">
+              <Hl text={displayTitle} q={query} />
+            </div>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="shrink-0 cursor-default whitespace-nowrap text-[11.5px] tabular-nums text-muted-foreground">
+                  {relativeTime(s.updated_at)}
+                </span>
+              </TooltipTrigger>
+              <TooltipContent align="end">更新 {absoluteTime(s.updated_at)}</TooltipContent>
+            </Tooltip>
+          </div>
+
+          {/* 元信息：项目名（可选） + id + 模型 + 状态徽章 */}
+          <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-[11.5px]">
             {showProject && (
               <>
                 <span
-                  className="min-w-0 cursor-default truncate font-medium text-foreground"
+                  className="min-w-0 cursor-default truncate font-medium text-foreground/70"
                   title={s.cwd}
                 >
                   <Hl text={s.cwd_display || s.cwd} q={query} />
@@ -132,21 +147,23 @@ export const SessionCard = memo(function SessionCard({
                 <MetaDot />
               </>
             )}
-            <span className="shrink-0 font-mono text-muted-foreground">{shortId(s.id)}</span>
+            <span className="shrink-0 font-mono text-[11px] text-muted-foreground">{shortId(s.id)}</span>
             {s.model && (
-              <Badge variant="secondary" className="h-5 max-w-44 truncate px-1.5 font-normal">
+              <Badge
+                variant="secondary"
+                className="h-5 max-w-44 truncate px-1.5 text-[11px] font-normal text-muted-foreground"
+              >
                 {s.model}
                 {s.reasoning_effort ? ` · ${s.reasoning_effort}` : ""}
               </Badge>
             )}
             {s.archived && (
-              <Badge variant="outline" className="h-5 px-1.5">
+              <Badge variant="outline" className="h-5 px-1.5 text-[11px] font-normal">
                 已归档
               </Badge>
             )}
-            <Badge variant="outline" className="h-5 px-1.5 font-normal text-muted-foreground">
-              {s.provider}
-            </Badge>
+            <ProviderBadge provider={s.provider} />
+            {s.conversion_origin && <ConversionOriginBadge origin={s.conversion_origin} />}
             {overlay?.provider && (
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -154,8 +171,8 @@ export const SessionCard = memo(function SessionCard({
                     variant="outline"
                     className={
                       overlay.clone_state === "matches"
-                        ? "h-5 border-emerald-500/30 px-1.5 font-normal text-emerald-600"
-                        : "h-5 px-1.5 font-normal text-muted-foreground"
+                        ? "h-5 border-emerald-500/30 px-1.5 text-[11px] font-normal text-emerald-600"
+                        : "h-5 px-1.5 text-[11px] font-normal text-muted-foreground"
                     }
                   >
                     {overlay.provider}
@@ -174,7 +191,7 @@ export const SessionCard = memo(function SessionCard({
                 <TooltipTrigger asChild>
                   <Badge
                     variant="outline"
-                    className="h-5 cursor-pointer gap-1 px-1.5 font-normal"
+                    className="h-5 cursor-pointer gap-1 px-1.5 text-[11px] font-normal"
                     onClick={(e) => {
                       e.stopPropagation();
                       onOpenFamily?.(s);
@@ -198,7 +215,7 @@ export const SessionCard = memo(function SessionCard({
                 <TooltipTrigger asChild>
                   <Badge
                     variant="outline"
-                    className="h-5 gap-1 border-violet-500/30 px-1.5 font-normal text-violet-600"
+                    className="h-5 gap-1 border-violet-500/30 px-1.5 text-[11px] font-normal text-violet-600"
                   >
                     <Network className="h-3 w-3" />
                     {subagent.label}
@@ -212,7 +229,7 @@ export const SessionCard = memo(function SessionCard({
                 variant="outline"
                 aria-disabled={syncBlocked}
                 className={cn(
-                  "h-5 gap-1 border-blue-500/40 px-1.5 font-normal text-blue-600",
+                  "h-5 gap-1 border-blue-500/40 px-1.5 text-[11px] font-normal text-blue-600",
                   syncBlocked
                     ? "cursor-not-allowed opacity-60"
                     : "cursor-pointer hover:bg-blue-500/10",
@@ -230,7 +247,7 @@ export const SessionCard = memo(function SessionCard({
             {overlay?.clone_state === "has_clone" && (
               <Badge
                 variant="outline"
-                className="h-5 gap-1 border-emerald-500/30 px-1.5 font-normal text-emerald-600"
+                className="h-5 gap-1 border-emerald-500/30 px-1.5 text-[11px] font-normal text-emerald-600"
               >
                 <CheckCircle2 className="h-3 w-3" />
                 已克隆
@@ -246,131 +263,129 @@ export const SessionCard = memo(function SessionCard({
             )}
           </div>
 
-          {/* 标题 */}
-          <div className="line-clamp-1 min-w-0 break-all text-sm font-semibold leading-snug">
-            <Hl text={displayTitle} q={query} />
-          </div>
-
           {/* 首条用户消息预览 */}
           {displayFirstUserMessage && (
-            <p className="line-clamp-2 min-w-0 [overflow-wrap:anywhere] text-sm leading-relaxed text-muted-foreground">
+            <p className="mt-1.5 line-clamp-2 min-w-0 wrap-anywhere text-[13px] leading-relaxed text-muted-foreground">
               <Hl text={displayFirstUserMessage} q={query} />
             </p>
           )}
 
-          {/* 底部：操作按钮 */}
-          <div className="flex min-w-0 flex-wrap items-center gap-1 pt-1">
-            <Button variant="outline" size="sm" onClick={() => onPreview(s)} className="h-8 gap-1.5 border-border/70">
-              <Eye className="h-3.5 w-3.5" />
-              预览
-            </Button>
-            {canCopyResume && (
-              <Button variant="ghost" size="sm" onClick={() => onCopyResume(s)} className="h-8 gap-1.5 text-muted-foreground hover:text-foreground">
-                <Copy className="h-3.5 w-3.5" />
-                resume
+          {/* 底部：操作按钮 + 体积信息 */}
+          <div className="mt-2.5 flex min-w-0 flex-wrap items-center justify-between gap-x-3 gap-y-1.5">
+            <div className="flex min-w-0 flex-wrap items-center gap-1">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => onPreview(s)}
+                className="h-7 gap-1.5 border-border/60 px-2.5 shadow-none hover:bg-muted/50"
+              >
+                <Eye className="h-3.5 w-3.5" />
+                预览
               </Button>
-            )}
-            {requiresActivation && (
+              {canCopyResume && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => onCopyResume(s)}
+                  className="h-7 gap-1.5 px-2.5 font-normal text-muted-foreground hover:text-foreground"
+                >
+                  <Copy className="h-3.5 w-3.5" />
+                  resume
+                </Button>
+              )}
+              {requiresActivation && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => onOpenFamily?.(s)}
+                  className="h-7 gap-1.5 px-2.5 font-normal text-muted-foreground hover:text-foreground"
+                >
+                  <GitBranch className="h-3.5 w-3.5" />
+                  先设为当前
+                </Button>
+              )}
               <Button
                 variant="ghost"
                 size="sm"
-                onClick={() => onOpenFamily?.(s)}
-                className="h-8 gap-1.5 text-muted-foreground hover:text-foreground"
+                onClick={() => onRevealCwd(s)}
+                className="h-7 gap-1.5 px-2.5 font-normal text-muted-foreground hover:text-foreground"
               >
-                <GitBranch className="h-3.5 w-3.5" />
-                先设为当前
+                <FolderOpen className="h-3.5 w-3.5" />
+                打开目录
               </Button>
-            )}
-            <Button variant="ghost" size="sm" onClick={() => onRevealCwd(s)} className="h-8 gap-1.5 text-muted-foreground hover:text-foreground">
-              <FolderOpen className="h-3.5 w-3.5" />
-              打开目录
-            </Button>
-          </div>
-        </div>
+            </div>
 
-        <div className="col-start-2 flex min-w-0 items-center justify-between gap-2 sm:col-start-3 sm:row-start-1 sm:min-w-[9rem] sm:flex-col sm:items-end sm:self-stretch">
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <span className="shrink-0 cursor-default whitespace-nowrap text-xs text-muted-foreground">
-                {relativeTime(s.updated_at)}
+            <div className="ml-auto flex shrink-0 items-center gap-1.5 font-mono text-[11px] tabular-nums text-muted-foreground">
+              {s.tokens_used > 0 && (
+                <span className="whitespace-nowrap">{humanTokens(s.tokens_used)} tok</span>
+              )}
+              {s.tokens_used > 0 && <MetaDot />}
+              <span className="whitespace-nowrap">
+                {humanBytes(s.rollout_bytes)}
               </span>
-            </TooltipTrigger>
-            <TooltipContent align="end">更新 {absoluteTime(s.updated_at)}</TooltipContent>
-          </Tooltip>
 
-          <div className="flex shrink-0 items-center gap-1.5 text-[11.5px] text-muted-foreground">
-            {s.tokens_used > 0 && (
-              <span className="inline-flex items-baseline gap-1 tabular-nums">
-                <span className="font-medium text-foreground/75">{humanTokens(s.tokens_used)}</span>
-                <span className="text-[10px] uppercase tracking-wide text-muted-foreground/60">tok</span>
-              </span>
-            )}
-            {s.tokens_used > 0 && <MetaDot />}
-            <span className="whitespace-nowrap tabular-nums font-medium text-foreground/75">
-              {humanBytes(s.rollout_bytes)}
-            </span>
-
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button variant="ghost" size="icon" className="ml-0.5 h-8 w-8 text-muted-foreground hover:text-foreground">
-                  <MoreHorizontal className="h-4 w-4" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                {onRename && (
-                  <DropdownMenuItem onClick={() => onRename(s)}>
-                    <Pencil className="h-4 w-4" />
-                    重命名
-                  </DropdownMenuItem>
-                )}
-                <DropdownMenuItem onClick={() => onBackup(s)}>
-                  <Archive className="h-4 w-4" />
-                  单条备份
-                </DropdownMenuItem>
-                {onExportMarkdown && (
-                  <DropdownMenuItem onClick={() => onExportMarkdown(s)}>
-                    <FileText className="h-4 w-4" />
-                    导出为 Markdown
-                  </DropdownMenuItem>
-                )}
-                {onConvert && !isSubagent && (
-                  <DropdownMenuItem onClick={() => onConvert(s)}>
-                    <ArrowLeftRight className="h-4 w-4" />
-                    {s.provider === "codex" ? "转换为 Claude 会话" : "转换为 Codex 会话"}
-                  </DropdownMenuItem>
-                )}
-                {onOpenFamily && (
-                  <DropdownMenuItem onClick={() => onOpenFamily(s)}>
-                    <Network className="h-4 w-4" />
-                    查看分支
-                  </DropdownMenuItem>
-                )}
-                {onClone && syncAction && (
-                  <DropdownMenuItem disabled={syncBlocked} onClick={() => onClone(s)}>
-                    <RotateCw className={cn("h-4 w-4", syncing && "animate-spin")} />
-                    {syncing ? "同步中…" : syncAction}
-                  </DropdownMenuItem>
-                )}
-                {onArchiveToggle && (
-                  <DropdownMenuItem onClick={() => onArchiveToggle(s)}>
-                    {s.archived ? <Undo2 className="h-4 w-4" /> : <Inbox className="h-4 w-4" />}
-                    {s.archived ? "取消归档" : "归档"}
-                  </DropdownMenuItem>
-                )}
-                {onDelete && (
-                  <>
-                    <DropdownMenuSeparator />
-                    <DropdownMenuItem
-                      onClick={() => onDelete(s)}
-                      className="text-destructive focus:text-destructive"
-                    >
-                      <Trash2 className="h-4 w-4" />
-                      删除会话
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="ghost" size="icon" className="ml-0.5 h-7 w-7 text-muted-foreground hover:text-foreground">
+                    <MoreHorizontal className="h-4 w-4" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  {onRename && (
+                    <DropdownMenuItem onClick={() => onRename(s)}>
+                      <Pencil className="h-4 w-4" />
+                      重命名
                     </DropdownMenuItem>
-                  </>
-                )}
-              </DropdownMenuContent>
-            </DropdownMenu>
+                  )}
+                  <DropdownMenuItem onClick={() => onBackup(s)}>
+                    <Archive className="h-4 w-4" />
+                    单条备份
+                  </DropdownMenuItem>
+                  {onExportMarkdown && (
+                    <DropdownMenuItem onClick={() => onExportMarkdown(s)}>
+                      <FileText className="h-4 w-4" />
+                      导出为 Markdown
+                    </DropdownMenuItem>
+                  )}
+                  {onConvert && !isSubagent && (
+                    <DropdownMenuItem onClick={() => onConvert(s)}>
+                      <ArrowLeftRight className="h-4 w-4" />
+                      {s.provider === "codex" ? "转换为 Claude 会话" : "转换为 Codex 会话"}
+                    </DropdownMenuItem>
+                  )}
+                  {onOpenFamily && (
+                    <DropdownMenuItem onClick={() => onOpenFamily(s)}>
+                      <Network className="h-4 w-4" />
+                      查看分支
+                    </DropdownMenuItem>
+                  )}
+                  {onClone && syncAction && (
+                    <DropdownMenuItem disabled={syncBlocked} onClick={() => onClone(s)}>
+                      <RotateCw className={cn("h-4 w-4", syncing && "animate-spin")} />
+                      {syncing ? "同步中…" : syncAction}
+                    </DropdownMenuItem>
+                  )}
+                  {onArchiveToggle && (
+                    <DropdownMenuItem onClick={() => onArchiveToggle(s)}>
+                      {s.archived ? <Undo2 className="h-4 w-4" /> : <Inbox className="h-4 w-4" />}
+                      {s.archived ? "取消归档" : "归档"}
+                    </DropdownMenuItem>
+                  )}
+                  {onDelete && (
+                    <>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem
+                        onClick={() => onDelete(s)}
+                        className="text-destructive focus:text-destructive"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                        删除会话
+                      </DropdownMenuItem>
+                    </>
+                  )}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
           </div>
         </div>
       </div>
@@ -400,6 +415,75 @@ function syncActionLabel(cloneState: string | undefined, currentProvider: string
   if (cloneState === "resync") return "修复本地索引";
   if (cloneState === "clonable" && currentProvider) return `同步到 ${currentProvider}`;
   return "";
+}
+
+function ProviderBadge({ provider }: { provider: string }) {
+  const presentation = providerPresentation(provider);
+  return (
+    <Badge
+      variant="outline"
+      aria-label={`当前会话格式：${presentation.label}`}
+      className={cn("h-5 px-1.5 text-[11px] font-normal", presentation.className)}
+    >
+      {presentation.label}
+    </Badge>
+  );
+}
+
+function ConversionOriginBadge({ origin }: { origin: SessionConversionOrigin }) {
+  const source = providerPresentation(origin.source_provider);
+  const mode =
+    origin.conversion_mode === "native"
+      ? "原生模式"
+      : origin.conversion_mode === "simple"
+        ? "简洁模式"
+        : "转换模式未知";
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Badge
+          variant="outline"
+          aria-label={`转换来源：${source.label}`}
+          className={cn("h-5 gap-1 px-1.5 text-[11px] font-normal", source.className)}
+        >
+          <ArrowLeftRight className="h-3 w-3" />
+          来自 {source.label}
+        </Badge>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-80 space-y-1">
+        <div>由 CC Sessions 从 {source.label} 会话转换 · {mode}</div>
+        <div className="font-mono text-[11px] opacity-80">原会话 {origin.source_id}</div>
+        <div className="text-[11px] opacity-70">转换于 {formatConversionTime(origin.converted_at)}</div>
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+function providerPresentation(provider: string): { label: string; className: string } {
+  if (provider === "codex") {
+    return {
+      label: "Codex",
+      className:
+        "border-[#10A37F]/35 bg-[#10A37F]/10 text-[#087A60] dark:text-[#6EE7C2]",
+    };
+  }
+  if (provider === "claude") {
+    return {
+      label: "Claude",
+      className:
+        "border-[#D97757]/40 bg-[#D97757]/10 text-[#B3563B] dark:text-[#F2A386]",
+    };
+  }
+  return {
+    label: provider || "未知",
+    className: "border-border text-muted-foreground",
+  };
+}
+
+function formatConversionTime(value: string): string {
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return value;
+  return new Date(timestamp).toLocaleString(undefined, { hour12: false });
 }
 
 function subagentLabel(

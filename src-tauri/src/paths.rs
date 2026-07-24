@@ -150,6 +150,11 @@ pub fn family_store_path(codex: &Path) -> PathBuf {
     codex.join("session_family.json")
 }
 
+/// CC Sessions 自己维护的转换来源登记，Codex/Claude 原生均不读取。
+pub fn session_provenance_path(codex: &Path) -> PathBuf {
+    codex.join("session_provenance.json")
+}
+
 /// 从 rollout 绝对路径推算相对于 codex_dir 的相对路径。
 /// 若不是 codex 子路径则返回 `sessions/<basename>`（保底）。
 #[allow(dead_code)]

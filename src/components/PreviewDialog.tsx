@@ -1287,23 +1287,25 @@ export function PreviewDialog({
           </div>
         )}
         {deletePlan && deletePlan.blocked.length === 0 && (
-          <div className="max-h-64 space-y-1 overflow-auto rounded-md border bg-muted/40 p-2">
-            {deletePlan.lines.map((l) => (
-              <div key={l.line_no} className="flex items-center gap-2 text-xs">
-                <span className="w-14 shrink-0 font-mono text-muted-foreground">
-                  line {l.line_no + 1}
-                </span>
-                <Badge
-                  variant={l.reason === "selected" ? "default" : "outline"}
-                  className="h-4 shrink-0 px-1 py-0 text-[10px] font-normal"
-                >
-                  {deleteReasonLabel(l.reason)}
-                </Badge>
-                <span className="shrink-0 text-muted-foreground">{l.role}</span>
-                <span className="min-w-0 flex-1 truncate">{l.summary}</span>
-              </div>
-            ))}
-          </div>
+          <ScrollArea className="rounded-md border bg-muted/40" viewportClassName="max-h-72">
+            <div className="space-y-1.5 p-2 pr-3">
+              {deletePlan.lines.map((l) => (
+                <div key={l.line_no} className="flex items-start gap-2 text-xs leading-[1.45]">
+                  <span className="w-16 shrink-0 select-none text-right font-mono text-[11px] tabular-nums text-muted-foreground">
+                    line {l.line_no + 1}
+                  </span>
+                  <Badge
+                    variant={l.reason === "selected" ? "default" : "outline"}
+                    className="mt-px h-4 shrink-0 px-1 py-0 text-[10px] font-normal"
+                  >
+                    {deleteReasonLabel(l.reason)}
+                  </Badge>
+                  <span className="shrink-0 text-muted-foreground">{l.role}</span>
+                  <span className="min-w-0 flex-1 wrap-anywhere">{l.summary}</span>
+                </div>
+              ))}
+            </div>
+          </ScrollArea>
         )}
         <AlertDialogFooter>
           <AlertDialogCancel disabled={mutating}>取消</AlertDialogCancel>
@@ -1352,26 +1354,28 @@ export function PreviewDialog({
           </div>
         )}
         {deletePlan && deletePlan.blocked.length === 0 && (
-          <div className="max-h-64 space-y-1 overflow-auto rounded-md border bg-muted/40 p-2">
-            <div className="mb-2 text-[11px] font-medium text-muted-foreground">
-              共 {deletePlan.lines.length} 个事件将被删除
-            </div>
-            {deletePlan.lines.map((l) => (
-              <div key={l.line_no} className="flex items-center gap-2 text-xs">
-                <span className="w-14 shrink-0 font-mono text-muted-foreground">
-                  line {l.line_no + 1}
-                </span>
-                <Badge
-                  variant={l.reason === "selected" ? "default" : "outline"}
-                  className="h-4 shrink-0 px-1 py-0 text-[10px] font-normal"
-                >
-                  {deleteReasonLabel(l.reason)}
-                </Badge>
-                <span className="shrink-0 text-muted-foreground">{l.role}</span>
-                <span className="min-w-0 flex-1 truncate">{l.summary}</span>
+          <ScrollArea className="rounded-md border bg-muted/40" viewportClassName="max-h-72">
+            <div className="space-y-1.5 p-2 pr-3">
+              <div className="mb-2 text-[11px] font-medium text-muted-foreground">
+                共 {deletePlan.lines.length} 个事件将被删除
               </div>
-            ))}
-          </div>
+              {deletePlan.lines.map((l) => (
+                <div key={l.line_no} className="flex items-start gap-2 text-xs leading-[1.45]">
+                  <span className="w-16 shrink-0 select-none text-right font-mono text-[11px] tabular-nums text-muted-foreground">
+                    line {l.line_no + 1}
+                  </span>
+                  <Badge
+                    variant={l.reason === "selected" ? "default" : "outline"}
+                    className="mt-px h-4 shrink-0 px-1 py-0 text-[10px] font-normal"
+                  >
+                    {deleteReasonLabel(l.reason)}
+                  </Badge>
+                  <span className="shrink-0 text-muted-foreground">{l.role}</span>
+                  <span className="min-w-0 flex-1 wrap-anywhere">{l.summary}</span>
+                </div>
+              ))}
+            </div>
+          </ScrollArea>
         )}
         <AlertDialogFooter>
           <AlertDialogCancel disabled={mutating}>取消</AlertDialogCancel>

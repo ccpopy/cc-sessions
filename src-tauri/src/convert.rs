@@ -17,7 +17,7 @@ use walkdir::WalkDir;
 
 use crate::error::{AppError, AppResult};
 use crate::models::ConvertReport;
-use crate::{atomic_file, family, fs_ops, paths, repair, state_db};
+use crate::{atomic_file, family, fs_ops, paths, provenance, repair, sessions, state_db};
 
 /// 降级工具注记不包含转换来源。
 const TOOL_CALL_TAG: &str = "tool_call";
@@ -198,6 +198,13 @@ fn convert_claude_to_codex(
     let identity = detect_codex_identity(&codex);
     let built = build_codex_lines(&new_id, &cwd, &provider, &parsed, &identity, &now, mode);
     let imported_messages = parsed.messages.len() as u32;
+    let source_id = parsed.source_id.clone().unwrap_or_else(|| {
+        source
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
+    let title = conversion_title(parsed.title.as_deref(), &parsed.messages);
 
     if let Some(parent) = new_abs.parent() {
         fs::create_dir_all(parent)?;
@@ -237,34 +244,34 @@ fn convert_claude_to_codex(
             cleanup_failed_import(&new_abs);
             return Err(AppError::Other(format!("同步 threads 失败: {error}")));
         }
-        if let Some(title) = parsed.title.as_deref() {
-            let _ = state.execute(
-                "UPDATE threads SET title = ?1 WHERE id = ?2",
-                rusqlite::params![title, new_id],
-            );
+        if let Err(error) = state.execute(
+            "UPDATE threads SET title = ?1 WHERE id = ?2",
+            rusqlite::params![title, new_id],
+        ) {
+            warnings.push(format!("同步 threads 标题失败: {error}"));
         }
     } else {
         warnings.push("Codex App 会话列表未同步：未找到 state_5.sqlite".into());
     }
-    if let Err(error) = repair::append_index_line(
-        &codex,
-        &new_id,
-        &truncate_chars(first_user_preview(&parsed.messages), 200),
-        &new_abs,
-    ) {
+    if let Err(error) = repair::append_index_line(&codex, &new_id, &title, &new_abs) {
         warnings.push(format!("写入 session_index 失败: {error}"));
     }
     if let Err(error) = repair::ensure_workspace_root_registered(&codex, &cwd) {
         warnings.push(format!("注册 workspace root 失败: {error}"));
     }
+    if let Err(error) = provenance::record_conversion(
+        &codex,
+        "codex",
+        &new_id,
+        "claude",
+        &source_id,
+        Some(mode.as_str()),
+    ) {
+        warnings.push(format!("记录转换来源失败（不影响会话使用）: {error}"));
+    }
 
     Ok(ConvertReport {
-        source_id: parsed.source_id.unwrap_or_else(|| {
-            source
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        }),
+        source_id,
         source_provider: "claude".into(),
         target_provider: "codex".into(),
         conversion_mode: Some(mode.as_str().into()),
@@ -288,6 +295,14 @@ fn first_user_preview(messages: &[ConvMessage]) -> &str {
         .find(|m| m.role == Role::User)
         .map(|m| m.text.as_str())
         .unwrap_or("")
+}
+
+fn conversion_title(explicit_title: Option<&str>, messages: &[ConvMessage]) -> String {
+    let title = explicit_title
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| first_user_preview(messages).trim());
+    truncate_chars(title, 200)
 }
 
 #[derive(Debug, Default)]
@@ -1283,10 +1298,10 @@ fn convert_codex_to_claude(
     rollout_path: &str,
     mode: ClaudeImportMode,
 ) -> AppResult<ConvertReport> {
-    let _ = codex_dir;
+    let codex = PathBuf::from(codex_dir);
     let claude = PathBuf::from(claude_dir);
     let source = PathBuf::from(rollout_path);
-    let parsed = parse_codex_rollout(&source)?;
+    let mut parsed = parse_codex_rollout(&source)?;
     let Some(cwd) = parsed.cwd.clone() else {
         return Err(AppError::Other(
             "源 rollout 缺少 cwd（session_meta/turn_context 均未提供）".into(),
@@ -1298,14 +1313,43 @@ fn convert_codex_to_claude(
         ));
     }
 
+    let source_id = parsed.source_id.clone().unwrap_or_else(|| {
+        source
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
+    let mut warnings = Vec::new();
+    if !codex.as_os_str().is_empty() && !source_id.is_empty() {
+        match sessions::codex_display_title(&codex, &source_id) {
+            Ok(title) => parsed.title = title,
+            Err(error) => warnings.push(format!("读取 Codex 标题失败，已保留内容转换: {error}")),
+        }
+    }
+
     let projects = paths::claude_projects_dir(&claude);
     let project_dir = projects.join(encode_claude_project_dir(&cwd));
     fs::create_dir_all(&project_dir)?;
     let new_id = repair::new_session_id();
     let new_abs = project_dir.join(format!("{new_id}.jsonl"));
     let identity = detect_claude_identity(&projects);
-    let built = build_claude_lines(&new_id, &cwd, &parsed, &identity, mode);
+    let mut built = build_claude_lines(&new_id, &cwd, &parsed, &identity, mode);
     let imported_messages = built.lines.len() as u32;
+    if let Some(title) = parsed
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+    {
+        built.lines.push(
+            json!({
+                "type": "custom-title",
+                "sessionId": new_id,
+                "customTitle": truncate_chars(title, 200),
+            })
+            .to_string(),
+        );
+    }
 
     atomic_file::create_with_writer_if_absent(&new_abs, |out| {
         for line in &built.lines {
@@ -1314,7 +1358,6 @@ fn convert_codex_to_claude(
         Ok(())
     })?;
 
-    let mut warnings = Vec::new();
     if mode == ClaudeImportMode::Native {
         warnings.push(
             "原生Claude（实验）依赖当前 Claude 会话格式。如果会话无法恢复，请改用简洁续聊。".into(),
@@ -1326,9 +1369,21 @@ fn convert_codex_to_claude(
             ));
         }
     }
+    if !codex.as_os_str().is_empty() {
+        if let Err(error) = provenance::record_conversion(
+            &codex,
+            "claude",
+            &new_id,
+            "codex",
+            &source_id,
+            Some(mode.as_str()),
+        ) {
+            warnings.push(format!("记录转换来源失败（不影响会话使用）: {error}"));
+        }
+    }
 
     Ok(ConvertReport {
-        source_id: parsed.source_id.unwrap_or_default(),
+        source_id,
         source_provider: "codex".into(),
         target_provider: "claude".into(),
         conversion_mode: Some(mode.as_str().into()),
@@ -1467,6 +1522,7 @@ struct ParsedCodexRollout {
     cwd: Option<String>,
     git_branch: Option<String>,
     model: Option<String>,
+    title: Option<String>,
     messages: Vec<ConvMessage>,
     events: Vec<CodexEvent>,
     stats: ExtractStats,
@@ -3150,6 +3206,54 @@ mod tests {
     }
 
     #[test]
+    fn claude_to_codex_keeps_source_title_in_index_and_records_origin() {
+        let root = temp_dir("cla2codex-title-origin");
+        let codex = root.join("codex");
+        fs::create_dir_all(&codex).unwrap();
+        let source = root.join("source-claude.jsonl");
+        write_lines(
+            &source,
+            &[
+                claude_record("user", "这是首条用户提问", "F:\\demo\\project"),
+                json!({
+                    "type": "ai-title",
+                    "sessionId": "src-session",
+                    "aiTitle": "Claude 自动生成标题",
+                }),
+            ],
+        );
+
+        let report = convert_claude_to_codex(
+            codex.to_string_lossy().as_ref(),
+            source.to_string_lossy().as_ref(),
+            CodexImportMode::Simple,
+        )
+        .unwrap();
+
+        let index: Value = serde_json::from_str(
+            fs::read_to_string(paths::session_index_path(&codex))
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(index["thread_name"], "Claude 自动生成标题");
+
+        let provenance: Value = serde_json::from_str(
+            &fs::read_to_string(paths::session_provenance_path(&codex)).unwrap(),
+        )
+        .unwrap();
+        let key = format!("codex:{}", report.new_id);
+        let origin = provenance["sessions"].get(&key).unwrap();
+        assert_eq!(origin["source_provider"], "claude");
+        assert_eq!(origin["source_id"], "src-session");
+        assert_eq!(origin["conversion_mode"], "simple");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn claude_to_codex_native_mode_writes_tool_events_and_images() {
         let root = temp_dir("cla2codex-native");
         let codex = root.join("codex");
@@ -3622,6 +3726,86 @@ mod tests {
         assert!(report
             .resume_command
             .ends_with(&format!("claude --resume {}", report.new_id)));
+    }
+
+    #[test]
+    fn codex_to_claude_writes_custom_title_and_records_origin() {
+        let root = temp_dir("codex2cla-title-origin");
+        let codex = root.join("codex");
+        let claude = root.join("claude");
+        fs::create_dir_all(&codex).unwrap();
+        fs::create_dir_all(paths::claude_projects_dir(&claude)).unwrap();
+        fs::write(
+            paths::session_index_path(&codex),
+            concat!(
+                "{\"id\":\"src-codex-title\",",
+                "\"thread_name\":\"Codex 自动生成标题\",",
+                "\"updated_at\":\"2026-07-24T00:00:00Z\"}\n"
+            ),
+        )
+        .unwrap();
+        let source = root.join("rollout.jsonl");
+        write_lines(
+            &source,
+            &[
+                json!({
+                    "timestamp": "2026-07-24T00:00:00.000Z",
+                    "type": "session_meta",
+                    "payload": {"id": "src-codex-title", "cwd": "F:\\demo\\project"},
+                }),
+                json!({
+                    "timestamp": "2026-07-24T00:00:01.000Z",
+                    "type": "response_item",
+                    "payload": {"type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": "这是首条用户提问"}]},
+                }),
+                json!({
+                    "timestamp": "2026-07-24T00:00:02.000Z",
+                    "type": "response_item",
+                    "payload": {"type": "message", "role": "assistant", "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": "完成"}]},
+                }),
+            ],
+        );
+
+        let report = convert_codex_to_claude(
+            codex.to_string_lossy().as_ref(),
+            claude.to_string_lossy().as_ref(),
+            source.to_string_lossy().as_ref(),
+            ClaudeImportMode::Simple,
+        )
+        .unwrap();
+        assert_eq!(report.imported_messages, 2);
+
+        let records = fs::read_to_string(&report.new_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let title = records
+            .iter()
+            .find(|record| record["type"] == "custom-title")
+            .unwrap();
+        assert_eq!(title["customTitle"], "Codex 自动生成标题");
+        assert_eq!(title["sessionId"], report.new_id);
+
+        let listed = crate::claude_sessions::scan_sessions(&claude).unwrap();
+        let converted = listed
+            .iter()
+            .find(|session| session.id == report.new_id)
+            .unwrap();
+        assert_eq!(converted.title, "Codex 自动生成标题");
+
+        let provenance: Value = serde_json::from_str(
+            &fs::read_to_string(paths::session_provenance_path(&codex)).unwrap(),
+        )
+        .unwrap();
+        let key = format!("claude:{}", report.new_id);
+        let origin = provenance["sessions"].get(&key).unwrap();
+        assert_eq!(origin["source_provider"], "codex");
+        assert_eq!(origin["source_id"], "src-codex-title");
+
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
