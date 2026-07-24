@@ -1010,8 +1010,42 @@ export function PreviewDialog({
                       changeProcessGroupExpanded(row.key, expanded)
                     }
                   >
-                    {(event) => (
-                      <div key={event.index} data-event-index={event.index}>
+                    {(event) => {
+                      const inRange =
+                        isSelecting &&
+                        selectionFirstIndex !== null &&
+                        selectionSecondIndex !== null &&
+                        event.index >= Math.min(selectionFirstIndex, selectionSecondIndex) &&
+                        event.index <= Math.max(selectionFirstIndex, selectionSecondIndex);
+                      const isStart =
+                        isSelecting &&
+                        selectionFirstIndex !== null &&
+                        selectionSecondIndex === null &&
+                        event.index === selectionFirstIndex;
+                      return (
+                      <div
+                        key={event.index}
+                        data-event-index={event.index}
+                        className={cn(
+                          isSelecting && "cursor-pointer",
+                          inRange && "bg-destructive/10 ring-1 ring-destructive/30",
+                          isStart && "bg-primary/10 ring-1 ring-primary/30",
+                        )}
+                        onClick={
+                          isSelecting
+                            ? () => {
+                                if (selectionFirstIndex === null) {
+                                  setSelectionFirstIndex(event.index);
+                                } else if (selectionSecondIndex === null) {
+                                  setSelectionSecondIndex(event.index);
+                                } else {
+                                  setSelectionFirstIndex(event.index);
+                                  setSelectionSecondIndex(null);
+                                }
+                              }
+                            : undefined
+                        }
+                      >
                         <EventBubble
                           e={event}
                           actions={{
@@ -1024,13 +1058,42 @@ export function PreviewDialog({
                           }}
                         />
                       </div>
-                    )}
+                      );
+                    }}
                   </ProcessTurnGroup>
                 ) : (
                   <div
                     key={row.event.index}
                     data-event-index={row.event.index}
                     data-timeline-anchor={timelineIndexSet?.has(row.event.index) || undefined}
+                    className={cn(
+                      isSelecting && "cursor-pointer",
+                      isSelecting &&
+                        selectionFirstIndex !== null &&
+                        selectionSecondIndex !== null &&
+                        row.event.index >= Math.min(selectionFirstIndex, selectionSecondIndex) &&
+                        row.event.index <= Math.max(selectionFirstIndex, selectionSecondIndex) &&
+                        "bg-destructive/10 ring-1 ring-destructive/30",
+                      isSelecting &&
+                        selectionFirstIndex !== null &&
+                        selectionSecondIndex === null &&
+                        row.event.index === selectionFirstIndex &&
+                        "bg-primary/10 ring-1 ring-primary/30",
+                    )}
+                    onClick={
+                      isSelecting
+                        ? () => {
+                            if (selectionFirstIndex === null) {
+                              setSelectionFirstIndex(row.event.index);
+                            } else if (selectionSecondIndex === null) {
+                              setSelectionSecondIndex(row.event.index);
+                            } else {
+                              setSelectionFirstIndex(row.event.index);
+                              setSelectionSecondIndex(null);
+                            }
+                          }
+                        : undefined
+                    }
                   >
                     <EventBubble
                       e={row.event}
