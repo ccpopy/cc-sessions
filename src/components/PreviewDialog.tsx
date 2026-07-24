@@ -877,6 +877,22 @@ export function PreviewDialog({
                       </span>
                     </>
                   )}
+                  <Dot />
+                  <span className="text-[11px] text-muted-foreground">
+                    显示 <span className="tabular-nums text-foreground/80">{filtered.length}</span>
+                    <span className="mx-1 text-muted-foreground/50">/</span>
+                    已加载 <span className="tabular-nums text-foreground/80">{events.length}</span>
+                    {totalEvents > 0 && (
+                      <>
+                        <span className="mx-1 text-muted-foreground/50">/</span>
+                        共 <span className="tabular-nums text-foreground/80">{totalEvents}</span>
+                      </>
+                    )}{" "}
+                    条
+                    <span className="ml-1 text-muted-foreground/70">
+                      {!done ? "· 滚动加载更多" : "· 已到末尾"}
+                    </span>
+                  </span>
                 </div>
               )}
             </div>
@@ -933,36 +949,76 @@ export function PreviewDialog({
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
-            <span className="text-[11px] text-muted-foreground">
-              显示 <span className="tabular-nums text-foreground/80">{filtered.length}</span>
-              <span className="mx-1 text-muted-foreground/50">/</span>
-              已加载 <span className="tabular-nums text-foreground/80">{events.length}</span>
-              {totalEvents > 0 && (
-                <>
-                  <span className="mx-1 text-muted-foreground/50">/</span>
-                  共 <span className="tabular-nums text-foreground/80">{totalEvents}</span>
-                </>
-              )}{" "}
-              条
-              <span className="ml-1 text-muted-foreground/70">
-                {!done ? "· 滚动加载更多" : "· 已到末尾"}
-              </span>
-            </span>
             {!done && events.length > 0 && (
               <Button
                 variant="outline"
                 size="sm"
-                className="h-7 gap-1.5 px-2 text-xs"
+                className="h-8 gap-1.5 border-border/70 bg-muted/30 px-2.5 text-xs font-normal hover:bg-muted/50"
                 disabled={loadingAll}
                 onClick={() => void loadAll()}
               >
                 {loadingAll ? (
-                  <Loader2 className="h-3 w-3 animate-spin" />
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
                 ) : (
-                  <ChevronsDown className="h-3 w-3" />
+                  <ChevronsDown className="h-3.5 w-3.5" />
                 )}
                 {loadingAll ? "加载中…" : "加载全部"}
               </Button>
+            )}
+            {canMutateSession && !isSelecting && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-8 gap-1.5 border-border/70 bg-muted/30 px-2.5 text-xs font-normal hover:bg-muted/50"
+                onClick={() => {
+                  setIsSelecting(true);
+                  setSelectionFirstIndex(null);
+                  setSelectionSecondIndex(null);
+                }}
+              >
+                <MousePointer2 className="h-3.5 w-3.5" />
+                开始选取
+              </Button>
+            )}
+            {canMutateSession && isSelecting && (
+              <>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-8 gap-1.5 border-border/70 bg-muted/30 px-2.5 text-xs font-normal hover:bg-muted/50"
+                  onClick={() => {
+                    setIsSelecting(false);
+                    setSelectionFirstIndex(null);
+                    setSelectionSecondIndex(null);
+                  }}
+                >
+                  <X className="h-3.5 w-3.5" />
+                  结束选取
+                </Button>
+                {selectionFirstIndex !== null && selectionSecondIndex !== null && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-8 gap-1.5 border-destructive/50 bg-destructive/10 px-2.5 text-xs font-normal text-destructive hover:bg-destructive/20"
+                    onClick={requestDeleteSelected}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                    删除选中
+                    <span className="tabular-nums">
+                      {events.filter(
+                        (e) =>
+                          e.index >= Math.min(selectionFirstIndex, selectionSecondIndex) &&
+                          e.index <= Math.max(selectionFirstIndex, selectionSecondIndex) &&
+                          canDeleteEvent(provider, e),
+                      ).length}
+                      条
+                    </span>
+                  </Button>
+                )}
+                {selectionFirstIndex !== null && selectionSecondIndex === null && (
+                  <span className="text-xs text-muted-foreground">请点击第二个事件完成选取</span>
+                )}
+              </>
             )}
             <PreviewToolbarActions
               hasSession={!!session}
@@ -1262,6 +1318,74 @@ export function PreviewDialog({
             {mutating
               ? "删除中…"
               : `删除 ${deletePlan?.lines.length ?? 0} 个事件`}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+
+    {/* 删除选中事件 */}
+    <AlertDialog
+      open={!!deleteSelectedTarget}
+      onOpenChange={(v) => {
+        if (!v && !mutating) {
+          setDeleteSelectedTarget(null);
+          setDeletePlan(null);
+        }
+      }}
+    >
+      <AlertDialogContent className="sm:max-w-[640px]">
+        <AlertDialogHeader>
+          <AlertDialogTitle>删除选中事件</AlertDialogTitle>
+          <AlertDialogDescription>
+            将删除选取范围内的事件（含首尾）。为保证续聊不报错，配对的工具调用/返回、镜像行与关联推理会一起删除。
+            删除前会自动保存原始快照，可在「编辑历史」中撤销或还原。
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        {!deletePlan && (
+          <div className="py-2 text-center text-xs text-muted-foreground">正在生成删除计划…</div>
+        )}
+        {deletePlan && deletePlan.blocked.length > 0 && (
+          <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+            {deletePlan.blocked.map((b, i) => (
+              <div key={i}>{b}</div>
+            ))}
+          </div>
+        )}
+        {deletePlan && deletePlan.blocked.length === 0 && (
+          <div className="max-h-64 space-y-1 overflow-auto rounded-md border bg-muted/40 p-2">
+            <div className="mb-2 text-[11px] font-medium text-muted-foreground">
+              共 {deletePlan.lines.length} 个事件将被删除
+            </div>
+            {deletePlan.lines.map((l) => (
+              <div key={l.line_no} className="flex items-center gap-2 text-xs">
+                <span className="w-14 shrink-0 font-mono text-muted-foreground">
+                  line {l.line_no + 1}
+                </span>
+                <Badge
+                  variant={l.reason === "selected" ? "default" : "outline"}
+                  className="h-4 shrink-0 px-1 py-0 text-[10px] font-normal"
+                >
+                  {deleteReasonLabel(l.reason)}
+                </Badge>
+                <span className="shrink-0 text-muted-foreground">{l.role}</span>
+                <span className="min-w-0 flex-1 truncate">{l.summary}</span>
+              </div>
+            ))}
+          </div>
+        )}
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={mutating}>取消</AlertDialogCancel>
+          <AlertDialogAction
+            disabled={mutating || !deletePlan || deletePlan.blocked.length > 0}
+            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            onClick={(e) => {
+              e.preventDefault();
+              void confirmDeleteSelected();
+            }}
+          >
+            {mutating
+              ? "删除中…"
+              : `删除选中 ${deletePlan?.lines.length ?? 0} 个事件`}
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
