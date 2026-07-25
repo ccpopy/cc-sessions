@@ -456,6 +456,12 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             usize_arg(&args, "eventIndex")?,
             &state.family_lock,
         )),
+        "duplicate_session" => to_result_value(repair::duplicate_session_with_lock(
+            string_arg(&args, "codexDir")?,
+            string_arg(&args, "sessionId")?,
+            string_arg(&args, "rolloutPath")?,
+            &state.family_lock,
+        )),
         "get_provider_sync_plan" => to_result_value(repair::get_provider_sync_plan_with_lock(
             string_arg(&args, "codexDir")?,
             &state.family_lock,

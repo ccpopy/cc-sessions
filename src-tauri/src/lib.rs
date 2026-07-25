@@ -113,6 +113,7 @@ pub fn run() {
             commands::clone_session_for_provider,
             commands::convert_session_provider,
             commands::fork_session_at_event,
+            commands::duplicate_session,
             commands::get_provider_sync_plan,
             commands::batch_clone_for_current_provider,
             commands::rollback_family_active,

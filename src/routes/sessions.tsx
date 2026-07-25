@@ -295,6 +295,27 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     if (next.length !== selected.size) setSelection(next);
   }, [selected, setSelection, visibleSessions]);
 
+  const onDuplicate = useCallback(
+    async (s: SessionSummary) => {
+      if (!settings) return;
+      try {
+        const report = await api.duplicateSession({
+          codex_dir: settings.codex_dir,
+          session_id: s.id,
+          rollout_path: s.rollout_path,
+        });
+        toast.success("已完整 Fork 会话", {
+          description: `新会话 ${report.new_id.slice(0, 8)}，共 ${report.total_lines} 行`,
+        });
+        await refresh();
+        await refreshOverlay();
+      } catch (e: any) {
+        toast.error("Fork 会话失败", { description: String(e?.message ?? e) });
+      }
+    },
+    [settings, refresh, refreshOverlay],
+  );
+
   const onCloneOne = useCallback(
     async (s: SessionSummary) => {
       if (!settings || !currentProvider) return;
@@ -608,6 +629,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             onBackup={(s) => setBackupTargets([s])}
             onDelete={(s) => setDeleteTargets([s])}
             onClone={isCodex ? onCloneOne : undefined}
+            onDuplicate={isCodex ? onDuplicate : undefined}
             onOpenFamily={isCodex ? (s) => setFamilySheetId(s.id) : undefined}
             onExportMarkdown={setExportTarget}
             onConvert={setConvertTarget}

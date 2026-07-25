@@ -17,11 +17,12 @@ use crate::atomic_file;
 use crate::error::{AppError, AppResult};
 use crate::family;
 use crate::models::{
-    BranchStatus, BranchSyncReport, BranchSyncState, CloneReport, DiagnosticReport, Family,
-    FamilyBranch, ForkSessionReport, GuiVisibilityFixReport, GuiVisibilityIssue,
-    GuiVisibilityReport, HistoryOrphanReport, HistoryPruneReport, IndexRepairReport,
-    OrphanPruneReport, ProjectConfigIssue, ProjectConfigRepairItem, ProjectConfigRepairReport,
-    ProjectConfigReport, ProviderInfo, SwitchStrategy, SyncBranchReport, ThreadsRebuildReport,
+    BranchStatus, BranchSyncReport, BranchSyncState, CloneReport, DiagnosticReport,
+    DuplicateSessionReport, Family, FamilyBranch, ForkSessionReport, GuiVisibilityFixReport,
+    GuiVisibilityIssue, GuiVisibilityReport, HistoryOrphanReport, HistoryPruneReport,
+    IndexRepairReport, OrphanPruneReport, ProjectConfigIssue, ProjectConfigRepairItem,
+    ProjectConfigRepairReport, ProjectConfigReport, ProviderInfo, SwitchStrategy,
+    SyncBranchReport, ThreadsRebuildReport,
 };
 
 /// Codex CLI 的内建默认 provider（与官方文档一致）。
@@ -3226,6 +3227,89 @@ pub fn fork_session_at_event_with_lock(
 ) -> AppResult<ForkSessionReport> {
     family::with_lock(lock, |_g| {
         fork_session_at_event_locked(codex_dir, session_id, rollout_path, event_index)
+    })
+}
+
+fn duplicate_session_locked(
+    codex_dir: String,
+    session_id: String,
+    rollout_path: String,
+) -> AppResult<DuplicateSessionReport> {
+    let codex = PathBuf::from(&codex_dir);
+    let codex = codex.canonicalize().unwrap_or(codex);
+
+    // 替代 resolve_fork_source_rollout：不做 sessions/ 限制
+    let source_abs = PathBuf::from(&rollout_path).canonicalize().map_err(|err| {
+        AppError::NotFound(format!(
+            "源 rollout 不存在或无法访问: {} ({})",
+            rollout_path, err
+        ))
+    })?;
+    let source_brief = read_rollout_brief(&codex, &source_abs)?.ok_or_else(|| {
+        AppError::NotFound(format!(
+            "无法读取源 rollout 元数据: {}",
+            source_abs.to_string_lossy()
+        ))
+    })?;
+    if source_brief.id != session_id {
+        return Err(AppError::Other(format!(
+            "源 rollout id 与会话不一致：期望 {}，实际 {}",
+            session_id, source_brief.id
+        )));
+    }
+
+    let provider = source_brief
+        .model_provider
+        .clone()
+        .unwrap_or_else(|| DEFAULT_PROVIDER.to_string());
+
+    let new_id = new_session_id();
+    let now = chrono::Utc::now();
+    let new_abs = build_clone_path(&codex, &new_id, &now);
+    validate_rollout_filename(&new_abs)?;
+
+    // 复用 write_cloned_rollout：流式逐行复制 + session_meta 重写 + fingerprint 校验
+    write_cloned_rollout(&source_abs, &new_abs, &new_id, &provider, &session_id)?;
+
+    // 注册到 threads DB + session_index
+    ensure_state_db_exists(&codex)?;
+    let state = state_db::open(&codex)?;
+    sync_thread_from_rollout(&codex, &state, &new_abs)?;
+    carry_thread_title(&state, &session_id, &new_id)?;
+
+    // 推导 thread_name（写入后需重新读取以确认新文件元数据）
+    let new_brief = read_rollout_brief(&codex, &new_abs)?.ok_or_else(|| {
+        AppError::Other("新 rollout 缺少有效 session_meta.id".into())
+    })?;
+    let thread_name = if new_brief.first_user_message.is_empty() {
+        source_brief.first_user_message.clone()
+    } else {
+        new_brief.first_user_message
+    };
+    append_index_line(&codex, &new_id, &thread_name, &new_abs)?;
+
+    // 统计行数
+    let total_lines = {
+        let file = fs::File::open(&new_abs)?;
+        std::io::BufReader::new(file).lines().count() as u64
+    };
+
+    Ok(DuplicateSessionReport {
+        source_id: session_id,
+        new_id,
+        new_rollout_path: new_abs.to_string_lossy().into_owned(),
+        total_lines,
+    })
+}
+
+pub fn duplicate_session_with_lock(
+    codex_dir: String,
+    session_id: String,
+    rollout_path: String,
+    lock: &family::FamilyLock,
+) -> AppResult<DuplicateSessionReport> {
+    family::with_lock(lock, |_g| {
+        duplicate_session_locked(codex_dir, session_id, rollout_path)
     })
 }
 

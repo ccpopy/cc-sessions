@@ -492,6 +492,22 @@ pub async fn fork_session_at_event(
 }
 
 #[tauri::command]
+pub async fn duplicate_session(
+    codex_dir: String,
+    session_id: String,
+    rollout_path: String,
+    lock: SharedLock<'_>,
+) -> AppResult<DuplicateSessionReport> {
+    let lock = lock.inner().clone();
+    run_blocking(move || {
+        crate::repair::duplicate_session_with_lock(
+            codex_dir, session_id, rollout_path, &lock,
+        )
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn convert_session_provider(
     codex_dir: String,
     claude_dir: String,

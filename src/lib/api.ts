@@ -543,6 +543,13 @@ export type ForkSessionReport = {
   cut_summary: string;
 };
 
+export type DuplicateSessionReport = {
+  source_id: string;
+  new_id: string;
+  new_rollout_path: string;
+  total_lines: number;
+};
+
 export type SwitchStrategy = "continuous" | "scatter" | "follow";
 
 // ========================= 家族树 =========================
@@ -1067,6 +1074,16 @@ export const api = {
       sessionId: p.session_id,
       rolloutPath: p.rollout_path,
       eventIndex: p.event_index,
+    }),
+  duplicateSession: (p: {
+    codex_dir: string;
+    session_id: string;
+    rollout_path: string;
+  }) =>
+    invokeCommand<DuplicateSessionReport>("duplicate_session", {
+      codexDir: p.codex_dir,
+      sessionId: p.session_id,
+      rolloutPath: p.rollout_path,
     }),
   planSessionEventDeletion: (provider: string, rolloutPath: string, lineNos: number[]) =>
     invokeCommand<DeletePlan>("plan_session_event_deletion", {

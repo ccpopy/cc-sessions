@@ -424,6 +424,14 @@ pub struct ForkSessionReport {
     pub cut_summary: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DuplicateSessionReport {
+    pub source_id: String,
+    pub new_id: String,
+    pub new_rollout_path: String,
+    pub total_lines: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SwitchStrategy {

@@ -53,6 +53,7 @@ type Props = {
   onBackup: (s: SessionSummary) => void;
   onDelete?: (s: SessionSummary) => void;
   onClone?: (s: SessionSummary) => void;
+  onDuplicate?: (s: SessionSummary) => void;
   onOpenFamily?: (s: SessionSummary) => void;
   onExportMarkdown?: (s: SessionSummary) => void;
   onConvert?: (s: SessionSummary) => void;
@@ -77,6 +78,7 @@ export const SessionCard = memo(function SessionCard({
   onBackup,
   onDelete,
   onClone,
+  onDuplicate,
   onOpenFamily,
   onExportMarkdown,
   onConvert,
@@ -344,6 +346,12 @@ export const SessionCard = memo(function SessionCard({
                     <DropdownMenuItem onClick={() => onMoveCwd(s)}>
                       <Folders className="h-4 w-4" />
                       移动项目目录
+                    </DropdownMenuItem>
+                  )}
+                  {onDuplicate && (
+                    <DropdownMenuItem onClick={() => onDuplicate(s)}>
+                      <GitBranch className="h-4 w-4" />
+                      完整 Fork
                     </DropdownMenuItem>
                   )}
                   <DropdownMenuItem onClick={() => onBackup(s)}>
