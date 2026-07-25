@@ -234,6 +234,13 @@ export type EditHistory = {
   undo_blocked_reason: string | null;
 };
 
+export type MoveSessionCwdReport = {
+  old_cwd: string;
+  new_cwd: string;
+  threads_updated: number;
+  rollout_rewritten: boolean;
+};
+
 export type BackupSummary = {
   path: string;
   name: string;
@@ -765,6 +772,8 @@ export const api = {
     invokeCommand<void>("set_archived", { provider, codexDir, id, v }),
   renameSession: (provider: SessionProvider, codexDir: string, id: string, title: string) =>
     invokeCommand<number>("rename_session", { provider, codexDir, id, title }),
+  moveSessionCwd: (provider: SessionProvider, codexDir: string, id: string, targetCwd: string) =>
+    invokeCommand<MoveSessionCwdReport>("move_session_cwd", { provider, codexDir, id, targetCwd }),
   deleteSession: (
     provider: SessionProvider,
     codexDir: string,

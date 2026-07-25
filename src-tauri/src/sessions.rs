@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{params, OptionalExtension};
@@ -10,7 +10,9 @@ use crate::error::{AppError, AppResult};
 use crate::family;
 use crate::history;
 use crate::logs_db;
-use crate::models::{DeleteResult, DeleteTarget, ProjectGroup, SessionSummary};
+use crate::models::{
+    DeleteResult, DeleteTarget, MoveSessionCwdReport, ProjectGroup, SessionSummary,
+};
 use crate::paths;
 use crate::provenance;
 use crate::state_db;
@@ -524,6 +526,194 @@ fn rename_session_locked(codex_dir: String, id: String, title: String) -> AppRes
         }
     }
     Ok(renamed)
+}
+
+// ========================= 移动工作目录 (move session cwd) =========================
+
+/// 读取 rollout 文件，修改首行的 payload.cwd，用 atomic_file 原子写入。
+fn rewrite_rollout_cwd(path: &Path, new_cwd: &str) -> AppResult<bool> {
+    let fp = atomic_file::fingerprint(path)?;
+    let new_cwd = new_cwd.to_owned();
+    atomic_file::replace_with_writer_if_unchanged(path, &fp, |file| {
+        let raw = fs::read_to_string(path)?;
+        let first_line_end = raw.find('\n').unwrap_or(raw.len());
+        let (first_line, rest) = raw.split_at(first_line_end);
+        let mut meta: serde_json::Value = serde_json::from_str(first_line.trim())
+            .map_err(|e| AppError::Other(format!("无法解析 rollout session_meta: {e}")))?;
+
+        // Navigate to payload.cwd
+        let payload = meta
+            .get_mut("payload")
+            .and_then(|p| p.as_object_mut())
+            .ok_or_else(|| {
+                AppError::Other("rollout session_meta 缺少 payload 字段".into())
+            })?;
+        payload.insert("cwd".into(), serde_json::Value::String(new_cwd.clone()));
+
+        let updated_first = serde_json::to_string(&meta)
+            .map_err(|e| AppError::Other(format!("无法序列化 session_meta: {e}")))?;
+
+        // Preserve original line ending
+        let line_ending = if first_line.ends_with("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        write!(file, "{}{}{}", updated_first, line_ending, rest)?;
+        Ok(())
+    })?;
+    Ok(true)
+}
+
+/// 解析会话 ID 所属家族的全部 branch ID。
+/// 逻辑与 rename_session_locked 中的家族分支展开一致。
+fn resolve_family_ids_for_move(store: &crate::models::FamilyStore, id: &str) -> Vec<String> {
+    let mut ids: Vec<String> = vec![id.to_string()];
+    if let Some(family_id) = store.index.get(id) {
+        if let Some(family) = store.families.get(family_id) {
+            ids = family.chain.iter().map(|b| b.id.clone()).collect();
+            if !ids.iter().any(|x| x == id) {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    ids
+}
+
+/// 定位会话的 rollout 文件路径。
+/// 优先 threads 记录，缺失/漂移时按文件名兜底。
+fn locate_session_rollout(codex: &Path, id: &str) -> AppResult<PathBuf> {
+    let state = state_db::open(codex)?;
+    let db_path: Option<String> = match state.query_row(
+        "SELECT rollout_path FROM threads WHERE id = ?",
+        [id],
+        |row| row.get(0),
+    ) {
+        Ok(path) => Some(path),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let mut current: Option<PathBuf> = db_path
+        .as_ref()
+        .map(|raw| {
+            PathBuf::from(paths::strip_verbatim(
+                &paths::host_path_string_from_codex_record(codex, raw),
+            ))
+        })
+        .filter(|p| p.is_file());
+    let mut discovered = rollout_files_by_id(codex, id)?;
+    if discovered.len() > 1 {
+        return Err(AppError::Other(format!(
+            "发现 {} 个同 ID Codex rollout，无法安全移动 cwd，请先修复重复文件: {id}",
+            discovered.len()
+        )));
+    }
+    if current.is_none() {
+        current = discovered.pop();
+    }
+    let Some(current) = current else {
+        return Err(AppError::NotFound(format!(
+            "找不到会话 {id} 的 rollout 文件"
+        )));
+    };
+    validate_codex_rollout_path(codex, &current, id)?;
+    Ok(current)
+}
+
+/// 移动会话工作目录的核心逻辑（已持有锁）。
+fn move_session_cwd_locked(
+    codex_dir: String,
+    id: String,
+    target_cwd: String,
+) -> AppResult<MoveSessionCwdReport> {
+    let codex = PathBuf::from(&codex_dir);
+    if !paths::state_db_path(&codex).is_file() {
+        return Err(AppError::InvalidCodexDir(format!(
+            "state_5.sqlite 不存在，无法移动工作目录: {}",
+            paths::state_db_path(&codex).to_string_lossy()
+        )));
+    }
+
+    // 1. Locate rollout
+    let rollout = locate_session_rollout(&codex, &id)?;
+
+    // 2. Read old cwd from session_meta
+    let meta = family::read_session_meta(&rollout)?;
+    let old_cwd = meta["payload"]["cwd"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    // 3. Resolve family branch ids
+    let store = family::load(&codex)?;
+    let ids = resolve_family_ids_for_move(&store, &id);
+    drop(store);
+
+    // 4. Rewrite rollout cwd
+    rewrite_rollout_cwd(&rollout, &target_cwd)?;
+
+    // 5. Update threads table for all branch ids
+    let state = state_db::open(&codex)?;
+    let now = chrono::Utc::now().timestamp();
+    let mut threads_updated = 0u32;
+    for sid in &ids {
+        threads_updated += state.execute(
+            "UPDATE threads SET cwd = ?1, updated_at = ?2 WHERE id = ?3",
+            params![&target_cwd, now, sid],
+        )? as u32;
+    }
+    if threads_updated == 0 {
+        return Err(AppError::NotFound(format!(
+            "threads 中未找到会话 {id}"
+        )));
+    }
+
+    // 6. Refresh session_index.jsonl for existing entries
+    let index_ids = crate::repair::read_session_index_ids(&codex)?;
+    for sid in &ids {
+        if index_ids.contains(sid) {
+            let thread_name: String = state
+                .query_row(
+                    "SELECT COALESCE(NULLIF(title,''), COALESCE(first_user_message,'')) FROM threads WHERE id = ?",
+                    [sid],
+                    |r| r.get(0),
+                )
+                .unwrap_or_default();
+            crate::repair::append_index_line(&codex, sid, &thread_name, Path::new(""))?;
+        }
+    }
+
+    Ok(MoveSessionCwdReport {
+        old_cwd,
+        new_cwd: target_cwd,
+        threads_updated,
+        rollout_rewritten: true,
+    })
+}
+
+/// 带锁的入口：校验 provider、校验路径、上锁后委托 move_session_cwd_locked。
+pub fn move_session_cwd_with_lock(
+    provider: Option<String>,
+    codex_dir: String,
+    id: String,
+    target_cwd: String,
+    lock: &family::FamilyLock,
+) -> AppResult<MoveSessionCwdReport> {
+    if provider_or_codex(provider) != "codex" {
+        return Err(AppError::Other(
+            "Claude 会话暂不支持移动工作目录".into(),
+        ));
+    }
+    let target_cwd = target_cwd.trim().to_string();
+    if target_cwd.is_empty() {
+        return Err(AppError::Other("工作目录路径不能为空".into()));
+    }
+    if target_cwd.chars().count() > 1024 {
+        return Err(AppError::Other(
+            "工作目录路径过长（最多 1024 个字符）".into(),
+        ));
+    }
+    family::with_lock(lock, |_guard| move_session_cwd_locked(codex_dir, id, target_cwd))
 }
 
 fn set_archived_codex_locked(codex_dir: String, id: String, v: bool) -> AppResult<()> {

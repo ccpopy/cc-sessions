@@ -130,6 +130,14 @@ pub struct DeleteResult {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveSessionCwdReport {
+    pub old_cwd: String,
+    pub new_cwd: String,
+    pub threads_updated: u32,
+    pub rollout_rewritten: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PreviewEvent {
     pub index: usize,

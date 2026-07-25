@@ -781,6 +781,23 @@ pub async fn rename_session(
 }
 
 #[tauri::command]
+pub async fn move_session_cwd(
+    provider: Option<String>,
+    codex_dir: String,
+    id: String,
+    target_cwd: String,
+    lock: SharedLock<'_>,
+) -> AppResult<MoveSessionCwdReport> {
+    let lock = lock.inner().clone();
+    run_blocking(move || {
+        crate::sessions::move_session_cwd_with_lock(
+            provider, codex_dir, id, target_cwd, &lock,
+        )
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn stats_kpi(
     provider: Option<String>,
     codex_dir: String,

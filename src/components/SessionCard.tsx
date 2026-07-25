@@ -7,6 +7,7 @@ import {
   Eye,
   FileText,
   FolderOpen,
+  Folders,
   GitBranch,
   Inbox,
   MoreHorizontal,
@@ -56,6 +57,7 @@ type Props = {
   onExportMarkdown?: (s: SessionSummary) => void;
   onConvert?: (s: SessionSummary) => void;
   onRename?: (s: SessionSummary) => void;
+  onMoveCwd?: (s: SessionSummary) => void;
   query?: string;
   showProject?: boolean;
   overlay?: FamilyOverlay;
@@ -79,6 +81,7 @@ export const SessionCard = memo(function SessionCard({
   onExportMarkdown,
   onConvert,
   onRename,
+  onMoveCwd,
   query = "",
   showProject = true,
   overlay,
@@ -335,6 +338,12 @@ export const SessionCard = memo(function SessionCard({
                     <DropdownMenuItem onClick={() => onRename(s)}>
                       <Pencil className="h-4 w-4" />
                       重命名
+                    </DropdownMenuItem>
+                  )}
+                  {onMoveCwd && (
+                    <DropdownMenuItem onClick={() => onMoveCwd(s)}>
+                      <Folders className="h-4 w-4" />
+                      移动项目目录
                     </DropdownMenuItem>
                   )}
                   <DropdownMenuItem onClick={() => onBackup(s)}>

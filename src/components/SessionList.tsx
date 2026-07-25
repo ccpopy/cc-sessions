@@ -26,6 +26,7 @@ type Handlers = {
   onExportMarkdown?: (s: SessionSummary) => void;
   onConvert?: (s: SessionSummary) => void;
   onRename?: (s: SessionSummary) => void;
+  onMoveCwd?: (s: SessionSummary) => void;
 };
 
 type Props = Handlers & {
