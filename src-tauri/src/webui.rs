@@ -194,6 +194,13 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "title")?,
             &state.family_lock,
         )),
+        "move_session_cwd" => to_result_value(sessions::move_session_cwd_with_lock(
+            opt_string_arg(&args, "provider")?,
+            string_arg(&args, "codexDir")?,
+            string_arg(&args, "id")?,
+            string_arg(&args, "targetCwd")?,
+            &state.family_lock,
+        )),
         "delete_session" => to_result_value(sessions::delete_session_with_lock(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "codexDir")?,
@@ -447,6 +454,12 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "sessionId")?,
             string_arg(&args, "rolloutPath")?,
             usize_arg(&args, "eventIndex")?,
+            &state.family_lock,
+        )),
+        "duplicate_session" => to_result_value(repair::duplicate_session_with_lock(
+            string_arg(&args, "codexDir")?,
+            string_arg(&args, "sessionId")?,
+            string_arg(&args, "rolloutPath")?,
             &state.family_lock,
         )),
         "get_provider_sync_plan" => to_result_value(repair::get_provider_sync_plan_with_lock(

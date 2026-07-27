@@ -7,6 +7,7 @@ import {
   Eye,
   FileText,
   FolderOpen,
+  Folders,
   GitBranch,
   Inbox,
   MoreHorizontal,
@@ -52,10 +53,12 @@ type Props = {
   onBackup: (s: SessionSummary) => void;
   onDelete?: (s: SessionSummary) => void;
   onClone?: (s: SessionSummary) => void;
+  onDuplicate?: (s: SessionSummary) => void;
   onOpenFamily?: (s: SessionSummary) => void;
   onExportMarkdown?: (s: SessionSummary) => void;
   onConvert?: (s: SessionSummary) => void;
   onRename?: (s: SessionSummary) => void;
+  onMoveCwd?: (s: SessionSummary) => void;
   query?: string;
   showProject?: boolean;
   overlay?: FamilyOverlay;
@@ -75,10 +78,12 @@ export const SessionCard = memo(function SessionCard({
   onBackup,
   onDelete,
   onClone,
+  onDuplicate,
   onOpenFamily,
   onExportMarkdown,
   onConvert,
   onRename,
+  onMoveCwd,
   query = "",
   showProject = true,
   overlay,
@@ -304,14 +309,36 @@ export const SessionCard = memo(function SessionCard({
                   先设为当前
                 </Button>
               )}
+              {onRename && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => onRename(s)}
+                  className="h-7 gap-1.5 px-2.5 font-normal text-muted-foreground hover:text-foreground"
+                >
+                  <Pencil className="h-3.5 w-3.5" />
+                  重命名
+                </Button>
+              )}
+              {onDuplicate && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => onDuplicate(s)}
+                  className="h-7 gap-1.5 px-2.5 font-normal text-muted-foreground hover:text-foreground"
+                >
+                  <GitBranch className="h-3.5 w-3.5" />
+                  完整 Fork
+                </Button>
+              )}
               <Button
                 variant="ghost"
                 size="sm"
-                onClick={() => onRevealCwd(s)}
+                onClick={() => onBackup(s)}
                 className="h-7 gap-1.5 px-2.5 font-normal text-muted-foreground hover:text-foreground"
               >
-                <FolderOpen className="h-3.5 w-3.5" />
-                打开目录
+                <Archive className="h-3.5 w-3.5" />
+                单条备份
               </Button>
             </div>
 
@@ -331,16 +358,16 @@ export const SessionCard = memo(function SessionCard({
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
-                  {onRename && (
-                    <DropdownMenuItem onClick={() => onRename(s)}>
-                      <Pencil className="h-4 w-4" />
-                      重命名
+                  <DropdownMenuItem onClick={() => onRevealCwd(s)}>
+                    <FolderOpen className="h-4 w-4" />
+                    打开项目目录
+                  </DropdownMenuItem>
+                  {onMoveCwd && (
+                    <DropdownMenuItem onClick={() => onMoveCwd(s)}>
+                      <Folders className="h-4 w-4" />
+                      移动会话目录
                     </DropdownMenuItem>
                   )}
-                  <DropdownMenuItem onClick={() => onBackup(s)}>
-                    <Archive className="h-4 w-4" />
-                    单条备份
-                  </DropdownMenuItem>
                   {onExportMarkdown && (
                     <DropdownMenuItem onClick={() => onExportMarkdown(s)}>
                       <FileText className="h-4 w-4" />

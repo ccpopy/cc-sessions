@@ -130,6 +130,14 @@ pub struct DeleteResult {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveSessionCwdReport {
+    pub old_cwd: String,
+    pub new_cwd: String,
+    pub threads_updated: u32,
+    pub rollout_rewritten: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PreviewEvent {
     pub index: usize,
@@ -414,6 +422,14 @@ pub struct ForkSessionReport {
     pub cut_role: String,
     pub cut_kind: String,
     pub cut_summary: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DuplicateSessionReport {
+    pub source_id: String,
+    pub new_id: String,
+    pub new_rollout_path: String,
+    pub total_lines: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

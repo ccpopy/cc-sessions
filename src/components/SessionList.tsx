@@ -22,10 +22,12 @@ type Handlers = {
   onBackup: (s: SessionSummary) => void;
   onDelete?: (s: SessionSummary) => void;
   onClone?: (s: SessionSummary) => void;
+  onDuplicate?: (s: SessionSummary) => void;
   onOpenFamily?: (s: SessionSummary) => void;
   onExportMarkdown?: (s: SessionSummary) => void;
   onConvert?: (s: SessionSummary) => void;
   onRename?: (s: SessionSummary) => void;
+  onMoveCwd?: (s: SessionSummary) => void;
 };
 
 type Props = Handlers & {

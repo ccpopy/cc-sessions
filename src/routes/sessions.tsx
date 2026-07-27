@@ -19,6 +19,7 @@ import { BackupCreateDialog } from "@/components/BackupCreateDialog";
 import { ConvertSessionDialog } from "@/components/ConvertSessionDialog";
 import { DangerDialog } from "@/components/DangerDialog";
 import { RenameSessionDialog } from "@/components/RenameSessionDialog";
+import { MoveSessionCwdDialog } from "@/components/MoveSessionCwdDialog";
 import { EmptyState } from "@/components/EmptyState";
 import { FamilyHistorySheet } from "@/components/FamilyHistorySheet";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -89,6 +90,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const [preview, setPreview] = useState<SessionSummary | null>(null);
   const [exportTarget, setExportTarget] = useState<SessionSummary | null>(null);
   const [renameTarget, setRenameTarget] = useState<SessionSummary | null>(null);
+  const [moveTarget, setMoveTarget] = useState<SessionSummary | null>(null);
   const [convertTarget, setConvertTarget] = useState<SessionSummary | null>(null);
   const [backupTargets, setBackupTargets] = useState<SessionSummary[]>([]);
   const [deleteTargets, setDeleteTargets] = useState<SessionSummary[]>([]);
@@ -292,6 +294,27 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     const next = Array.from(selected).filter((id) => visibleIds.has(id));
     if (next.length !== selected.size) setSelection(next);
   }, [selected, setSelection, visibleSessions]);
+
+  const onDuplicate = useCallback(
+    async (s: SessionSummary) => {
+      if (!settings) return;
+      try {
+        const report = await api.duplicateSession({
+          codex_dir: settings.codex_dir,
+          session_id: s.id,
+          rollout_path: s.rollout_path,
+        });
+        toast.success("已完整 Fork 会话", {
+          description: `新会话 ${report.new_id.slice(0, 8)}，共 ${report.total_lines} 行`,
+        });
+        await refresh();
+        await refreshOverlay();
+      } catch (e: any) {
+        toast.error("Fork 会话失败", { description: String(e?.message ?? e) });
+      }
+    },
+    [settings, refresh, refreshOverlay],
+  );
 
   const onCloneOne = useCallback(
     async (s: SessionSummary) => {
@@ -606,10 +629,12 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             onBackup={(s) => setBackupTargets([s])}
             onDelete={(s) => setDeleteTargets([s])}
             onClone={isCodex ? onCloneOne : undefined}
+            onDuplicate={isCodex ? onDuplicate : undefined}
             onOpenFamily={isCodex ? (s) => setFamilySheetId(s.id) : undefined}
             onExportMarkdown={setExportTarget}
             onConvert={setConvertTarget}
             onRename={isCodex ? setRenameTarget : undefined}
+            onMoveCwd={isCodex ? setMoveTarget : undefined}
           />
         )}
       </ScrollArea>
@@ -655,6 +680,31 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             await refresh();
           } catch (e: any) {
             toast.error("重命名失败：" + String(e?.message ?? e));
+            throw e;
+          }
+        }}
+      />
+
+      <MoveSessionCwdDialog
+        open={!!moveTarget}
+        onOpenChange={(v) => !v && setMoveTarget(null)}
+        session={moveTarget}
+        onSubmit={async (targetCwd) => {
+          if (!settings || !moveTarget) return;
+          try {
+            const r = await api.moveSessionCwd(
+              provider,
+              settings.codex_dir,
+              moveTarget.id,
+              targetCwd,
+            );
+            toast.success(
+              `已移动到新项目：${basename(r.new_cwd)}` +
+              (r.threads_updated > 1 ? `（同步 ${r.threads_updated} 个分支）` : ""),
+            );
+            await refresh();
+          } catch (e: any) {
+            toast.error("移动失败：" + String(e?.message ?? e));
             throw e;
           }
         }}

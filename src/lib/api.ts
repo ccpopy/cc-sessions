@@ -234,6 +234,13 @@ export type EditHistory = {
   undo_blocked_reason: string | null;
 };
 
+export type MoveSessionCwdReport = {
+  old_cwd: string;
+  new_cwd: string;
+  threads_updated: number;
+  rollout_rewritten: boolean;
+};
+
 export type BackupSummary = {
   path: string;
   name: string;
@@ -536,6 +543,13 @@ export type ForkSessionReport = {
   cut_summary: string;
 };
 
+export type DuplicateSessionReport = {
+  source_id: string;
+  new_id: string;
+  new_rollout_path: string;
+  total_lines: number;
+};
+
 export type SwitchStrategy = "continuous" | "scatter" | "follow";
 
 // ========================= 家族树 =========================
@@ -765,6 +779,8 @@ export const api = {
     invokeCommand<void>("set_archived", { provider, codexDir, id, v }),
   renameSession: (provider: SessionProvider, codexDir: string, id: string, title: string) =>
     invokeCommand<number>("rename_session", { provider, codexDir, id, title }),
+  moveSessionCwd: (provider: SessionProvider, codexDir: string, id: string, targetCwd: string) =>
+    invokeCommand<MoveSessionCwdReport>("move_session_cwd", { provider, codexDir, id, targetCwd }),
   deleteSession: (
     provider: SessionProvider,
     codexDir: string,
@@ -1058,6 +1074,16 @@ export const api = {
       sessionId: p.session_id,
       rolloutPath: p.rollout_path,
       eventIndex: p.event_index,
+    }),
+  duplicateSession: (p: {
+    codex_dir: string;
+    session_id: string;
+    rollout_path: string;
+  }) =>
+    invokeCommand<DuplicateSessionReport>("duplicate_session", {
+      codexDir: p.codex_dir,
+      sessionId: p.session_id,
+      rolloutPath: p.rollout_path,
     }),
   planSessionEventDeletion: (provider: string, rolloutPath: string, lineNos: number[]) =>
     invokeCommand<DeletePlan>("plan_session_event_deletion", {
