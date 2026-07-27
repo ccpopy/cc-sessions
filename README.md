@@ -213,12 +213,12 @@ CLI 和桌面版的修复功能只处理 Codex 本地索引及可见性，不改
 - `src-tauri/Cargo.toml`
 - `src-tauri/tauri.conf.json`
 
-推送 `v0.4.5` 形式的 tag 会触发 GitHub Actions，并创建 Release：
+推送 `v0.4.6` 形式的 tag 会触发 GitHub Actions，并创建 Release：
 
 ```bash
-git tag -a v0.4.5 -m "v0.4.5"
+git tag -a v0.4.6 -m "v0.4.6"
 git push origin main
-git push origin v0.4.5
+git push origin v0.4.6
 ```
 
 工作流分别为 Windows、macOS Apple Silicon、macOS Intel 和 Linux 构建 Tauri 产物。macOS 打包需要 `src-tauri/icons/icon.icns`，仓库中已包含 Tauri 生成的跨平台图标。
