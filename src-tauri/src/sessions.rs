@@ -530,54 +530,71 @@ fn rename_session_locked(codex_dir: String, id: String, title: String) -> AppRes
 
 // ========================= 移动工作目录 (move session cwd) =========================
 
-/// 读取 rollout 文件，修改首行的 payload.cwd，用 atomic_file 原子写入。
+/// 流式重写 rollout 首行的 payload.cwd，保留原始换行风格和后续字节。
 fn rewrite_rollout_cwd(path: &Path, new_cwd: &str) -> AppResult<bool> {
     let fp = atomic_file::fingerprint(path)?;
-    let new_cwd = new_cwd.to_owned();
+    let mut source = BufReader::new(File::open(path)?);
+    let mut first_line = Vec::new();
+    if source.read_until(b'\n', &mut first_line)? == 0 {
+        return Err(AppError::Other(format!(
+            "rollout 为空，无法修改工作目录: {}",
+            path.to_string_lossy()
+        )));
+    }
+    let (json_end, line_ending): (usize, &[u8]) = if first_line.ends_with(b"\r\n") {
+        (first_line.len() - 2, b"\r\n")
+    } else if first_line.ends_with(b"\n") {
+        (first_line.len() - 1, b"\n")
+    } else {
+        (first_line.len(), b"")
+    };
+    let mut meta: serde_json::Value = serde_json::from_slice(&first_line[..json_end])
+        .map_err(|error| AppError::Other(format!("无法解析 rollout session_meta: {error}")))?;
+    if meta.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
+        return Err(AppError::Other(
+            "rollout 首行不是 session_meta，拒绝修改工作目录".into(),
+        ));
+    }
+    let payload = meta
+        .get_mut("payload")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| AppError::Other("rollout session_meta 缺少 payload 字段".into()))?;
+    if payload.get("cwd").and_then(serde_json::Value::as_str) == Some(new_cwd) {
+        return Ok(false);
+    }
+    payload.insert("cwd".into(), serde_json::Value::String(new_cwd.to_owned()));
+    let updated_first = serde_json::to_vec(&meta)
+        .map_err(|error| AppError::Other(format!("无法序列化 session_meta: {error}")))?;
+
     atomic_file::replace_with_writer_if_unchanged(path, &fp, |file| {
-        let raw = fs::read_to_string(path)?;
-        let first_line_end = raw.find('\n').unwrap_or(raw.len());
-        let (first_line, rest) = raw.split_at(first_line_end);
-        let mut meta: serde_json::Value = serde_json::from_str(first_line.trim())
-            .map_err(|e| AppError::Other(format!("无法解析 rollout session_meta: {e}")))?;
-
-        // Navigate to payload.cwd
-        let payload = meta
-            .get_mut("payload")
-            .and_then(|p| p.as_object_mut())
-            .ok_or_else(|| {
-                AppError::Other("rollout session_meta 缺少 payload 字段".into())
-            })?;
-        payload.insert("cwd".into(), serde_json::Value::String(new_cwd.clone()));
-
-        let updated_first = serde_json::to_string(&meta)
-            .map_err(|e| AppError::Other(format!("无法序列化 session_meta: {e}")))?;
-
-        // Preserve original line ending
-        let line_ending = if first_line.ends_with("\r\n") {
-            "\r\n"
-        } else {
-            "\n"
-        };
-        write!(file, "{}{}{}", updated_first, line_ending, rest)?;
+        let mut source = BufReader::new(File::open(path)?);
+        let mut discarded_first_line = Vec::new();
+        source.read_until(b'\n', &mut discarded_first_line)?;
+        file.write_all(&updated_first)?;
+        file.write_all(line_ending)?;
+        std::io::copy(&mut source, file)?;
         Ok(())
     })?;
     Ok(true)
 }
 
-/// 解析会话 ID 所属家族的全部 branch ID。
-/// 逻辑与 rename_session_locked 中的家族分支展开一致。
-fn resolve_family_ids_for_move(store: &crate::models::FamilyStore, id: &str) -> Vec<String> {
-    let mut ids: Vec<String> = vec![id.to_string()];
-    if let Some(family_id) = store.index.get(id) {
-        if let Some(family) = store.families.get(family_id) {
-            ids = family.chain.iter().map(|b| b.id.clone()).collect();
-            if !ids.iter().any(|x| x == id) {
-                ids.push(id.to_string());
-            }
-        }
-    }
-    ids
+fn resolve_family_ids_for_move(
+    store: &crate::models::FamilyStore,
+    id: &str,
+) -> AppResult<(Option<String>, Vec<String>)> {
+    let family_id = family::resolve_family_id_strict(store, id)?;
+    let ids = match family_id.as_ref() {
+        Some(family_id) => store
+            .families
+            .get(family_id)
+            .ok_or_else(|| AppError::NotFound(format!("family: {family_id}")))?
+            .chain
+            .iter()
+            .map(|branch| branch.id.clone())
+            .collect(),
+        None => vec![id.to_string()],
+    };
+    Ok((family_id, ids))
 }
 
 /// 定位会话的 rollout 文件路径。
@@ -620,6 +637,41 @@ fn locate_session_rollout(codex: &Path, id: &str) -> AppResult<PathBuf> {
     Ok(current)
 }
 
+fn normalize_move_target_cwd(codex: &Path, target_cwd: &str) -> AppResult<(PathBuf, String)> {
+    if target_cwd.chars().any(char::is_control) {
+        return Err(AppError::Path("工作目录路径不能包含控制字符".into()));
+    }
+    let host_path = paths::host_path_from_codex_record(codex, target_cwd);
+    if !host_path.is_absolute() {
+        return Err(AppError::Path(format!(
+            "工作目录必须是绝对路径: {}",
+            host_path.to_string_lossy()
+        )));
+    }
+    let canonical = host_path.canonicalize().map_err(|error| {
+        AppError::NotFound(format!(
+            "工作目录不存在或无法访问: {} ({error})",
+            host_path.to_string_lossy()
+        ))
+    })?;
+    if !canonical.is_dir() {
+        return Err(AppError::Path(format!(
+            "目标工作目录不是文件夹: {}",
+            canonical.to_string_lossy()
+        )));
+    }
+    let record_path = paths::codex_record_path_from_host(codex, &canonical)?;
+    Ok((canonical, record_path))
+}
+
+fn rollout_is_archived(codex: &Path, rollout: &Path) -> bool {
+    let archived_root = PathBuf::from(paths::strip_verbatim(
+        &paths::archived_sessions_dir(codex).to_string_lossy(),
+    ));
+    let rollout = PathBuf::from(paths::strip_verbatim(&rollout.to_string_lossy()));
+    rollout.starts_with(archived_root)
+}
+
 /// 移动会话工作目录的核心逻辑（已持有锁）。
 fn move_session_cwd_locked(
     codex_dir: String,
@@ -634,60 +686,139 @@ fn move_session_cwd_locked(
         )));
     }
 
-    // 1. Locate rollout
-    let rollout = locate_session_rollout(&codex, &id)?;
-
-    // 2. Read old cwd from session_meta
-    let meta = family::read_session_meta(&rollout)?;
-    let old_cwd = meta["payload"]["cwd"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-
-    // 3. Resolve family branch ids
-    let store = family::load(&codex)?;
-    let ids = resolve_family_ids_for_move(&store, &id);
-    drop(store);
-
-    // 4. Rewrite rollout cwd
-    rewrite_rollout_cwd(&rollout, &target_cwd)?;
-
-    // 5. Update threads table for all branch ids
-    let state = state_db::open(&codex)?;
-    let now = chrono::Utc::now().timestamp();
-    let mut threads_updated = 0u32;
+    let (target_host, target_record) = normalize_move_target_cwd(&codex, &target_cwd)?;
+    let new_cwd = paths::strip_verbatim(&target_host.to_string_lossy());
+    let mut store = family::load(&codex)?;
+    let (family_id, ids) = resolve_family_ids_for_move(&store, &id)?;
+    let mut rollouts = HashMap::new();
+    let mut old_cwd = String::new();
     for sid in &ids {
-        threads_updated += state.execute(
-            "UPDATE threads SET cwd = ?1, updated_at = ?2 WHERE id = ?3",
-            params![&target_cwd, now, sid],
-        )? as u32;
-    }
-    if threads_updated == 0 {
-        return Err(AppError::NotFound(format!(
-            "threads 中未找到会话 {id}"
-        )));
-    }
-
-    // 6. Refresh session_index.jsonl for existing entries
-    let index_ids = crate::repair::read_session_index_ids(&codex)?;
-    for sid in &ids {
-        if index_ids.contains(sid) {
-            let thread_name: String = state
-                .query_row(
-                    "SELECT COALESCE(NULLIF(title,''), COALESCE(first_user_message,'')) FROM threads WHERE id = ?",
-                    [sid],
-                    |r| r.get(0),
-                )
-                .unwrap_or_default();
-            crate::repair::append_index_line(&codex, sid, &thread_name, Path::new(""))?;
+        let rollout = locate_session_rollout(&codex, sid)?;
+        let meta = family::read_session_meta(&rollout)?;
+        let current_cwd = meta
+            .get("payload")
+            .and_then(|payload| payload.get("cwd"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if sid == &id {
+            old_cwd = paths::host_path_string_from_codex_record(&codex, &current_cwd);
         }
+        rollouts.insert(sid.clone(), (rollout, current_cwd));
     }
+    let index_ids = crate::repair::read_session_index_ids(&codex)?;
+    let state = state_db::open(&codex)?;
+    let transaction =
+        rusqlite::Transaction::new_unchecked(&state, rusqlite::TransactionBehavior::Immediate)?;
+    let mut journal = crate::repair::MutationJournal::default();
+    let mut rollout_rewritten = false;
+    let operation = (|| -> AppResult<u32> {
+        for sid in &ids {
+            let (rollout, current_cwd) = rollouts
+                .get(sid)
+                .ok_or_else(|| AppError::NotFound(format!("rollout: {sid}")))?;
+            if current_cwd != &target_record {
+                let rewritten = journal
+                    .mutate_file(rollout, || rewrite_rollout_cwd(rollout, &target_record))?;
+                rollout_rewritten |= rewritten;
+            }
+            if !crate::repair::upsert_thread_from_rollout(
+                &codex,
+                &transaction,
+                rollout,
+                rollout_is_archived(&codex, rollout),
+            )? {
+                return Err(AppError::InvalidCodexDir(format!(
+                    "rollout 缺少有效 session_meta.id，无法同步 threads: {}",
+                    rollout.to_string_lossy()
+                )));
+            }
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let mut threads_updated = 0u32;
+        for sid in &ids {
+            let updated = transaction.execute(
+                "UPDATE threads SET cwd = ?1, updated_at = ?2 WHERE id = ?3",
+                params![&target_record, now, sid],
+            )? as u32;
+            if updated == 0 {
+                return Err(AppError::NotFound(format!("threads 中未找到会话 {sid}")));
+            }
+            threads_updated += updated;
+        }
+
+        let global_state = paths::codex_global_state_json_path(&codex);
+        journal.mutate_file(&global_state, || {
+            crate::repair::ensure_workspace_root_registered(&codex, &target_record)
+        })?;
+
+        if rollout_rewritten {
+            if let Some(family_id) = family_id.as_ref() {
+                let family = store
+                    .families
+                    .get_mut(family_id)
+                    .ok_or_else(|| AppError::NotFound(format!("family: {family_id}")))?;
+                for branch in &mut family.chain {
+                    if matches!(branch.status, crate::models::BranchStatus::Archived) {
+                        let (rollout, _) = rollouts
+                            .get(&branch.id)
+                            .ok_or_else(|| AppError::NotFound(format!("rollout: {}", branch.id)))?;
+                        let (sha256, line_count) = family::compute_integrity(rollout)?;
+                        branch.sha256 = Some(sha256);
+                        branch.line_count = Some(line_count);
+                    }
+                }
+                family.updated_at = chrono::Utc::now().to_rfc3339();
+                let family_path = paths::family_store_path(&codex);
+                journal.mutate_file(&family_path, || family::save(&codex, &store))?;
+            }
+        }
+
+        if ids.iter().any(|sid| index_ids.contains(sid)) {
+            let index_path = paths::session_index_path(&codex);
+            journal.mutate_file(&index_path, || {
+                for sid in &ids {
+                    if !index_ids.contains(sid) {
+                        continue;
+                    }
+                    let thread_name: String = transaction.query_row(
+                        "SELECT COALESCE(NULLIF(title,''), COALESCE(first_user_message,'')) FROM threads WHERE id = ?",
+                        [sid],
+                        |row| row.get(0),
+                    )?;
+                    crate::repair::append_index_line(
+                        &codex,
+                        sid,
+                        &thread_name,
+                        Path::new(""),
+                    )?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(threads_updated)
+    })();
+
+    let threads_updated = match operation {
+        Ok(threads_updated) => {
+            crate::repair::commit_transaction_with_compensation(transaction, journal)?;
+            threads_updated
+        }
+        Err(error) => {
+            return Err(crate::repair::rollback_transaction_with_compensation(
+                transaction,
+                journal,
+                error,
+            ));
+        }
+    };
 
     Ok(MoveSessionCwdReport {
         old_cwd,
-        new_cwd: target_cwd,
+        new_cwd,
         threads_updated,
-        rollout_rewritten: true,
+        rollout_rewritten,
     })
 }
 
@@ -700,9 +831,7 @@ pub fn move_session_cwd_with_lock(
     lock: &family::FamilyLock,
 ) -> AppResult<MoveSessionCwdReport> {
     if provider_or_codex(provider) != "codex" {
-        return Err(AppError::Other(
-            "Claude 会话暂不支持移动工作目录".into(),
-        ));
+        return Err(AppError::Other("Claude 会话暂不支持移动工作目录".into()));
     }
     let target_cwd = target_cwd.trim().to_string();
     if target_cwd.is_empty() {
@@ -713,7 +842,9 @@ pub fn move_session_cwd_with_lock(
             "工作目录路径过长（最多 1024 个字符）".into(),
         ));
     }
-    family::with_lock(lock, |_guard| move_session_cwd_locked(codex_dir, id, target_cwd))
+    family::with_lock(lock, |_guard| {
+        move_session_cwd_locked(codex_dir, id, target_cwd)
+    })
 }
 
 fn set_archived_codex_locked(codex_dir: String, id: String, v: bool) -> AppResult<()> {
@@ -1733,7 +1864,11 @@ fn delete_one(codex_dir: &Path, id: &str) -> AppResult<DeleteResult> {
     Ok(delete_codex_artifacts(codex_dir, id)?.result)
 }
 
-fn validate_codex_rollout_path(codex_dir: &Path, path: &Path, id: &str) -> AppResult<()> {
+pub(crate) fn validate_codex_rollout_path(
+    codex_dir: &Path,
+    path: &Path,
+    id: &str,
+) -> AppResult<()> {
     let expected_suffix = format!("-{id}.jsonl");
     if !path
         .file_name()
@@ -1741,7 +1876,7 @@ fn validate_codex_rollout_path(codex_dir: &Path, path: &Path, id: &str) -> AppRe
         .is_some_and(|name| name.ends_with(&expected_suffix))
     {
         return Err(AppError::Path(format!(
-            "Codex rollout 路径与会话 ID 不匹配，拒绝删除: {}",
+            "Codex rollout 路径与会话 ID 不匹配，拒绝操作: {}",
             path.to_string_lossy()
         )));
     }
@@ -1771,7 +1906,7 @@ fn validate_codex_rollout_path(codex_dir: &Path, path: &Path, id: &str) -> AppRe
                 path,
                 crate::path_safety::EntryKind::File,
                 false,
-                "Codex rollout 删除目标",
+                "Codex rollout 操作目标",
             )?;
             let meta = family::read_session_meta(path)?;
             let actual_id = meta
@@ -1789,7 +1924,7 @@ fn validate_codex_rollout_path(codex_dir: &Path, path: &Path, id: &str) -> AppRe
         }
     }
     Err(AppError::Path(format!(
-        "Codex rollout 不在 sessions 或 archived_sessions 内，拒绝删除: {}",
+        "Codex rollout 不在 sessions 或 archived_sessions 内，拒绝操作: {}",
         path.to_string_lossy()
     )))
 }
@@ -2865,6 +3000,359 @@ mod tests {
         )?;
         fs::write(paths::session_index_path(codex), index_lines)?;
         Ok(paths_by_id)
+    }
+
+    fn rollout_cwd(path: &Path) -> AppResult<String> {
+        Ok(family::read_session_meta(path)?
+            .get("payload")
+            .and_then(|payload| payload.get("cwd"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string())
+    }
+
+    #[test]
+    fn rewrite_rollout_cwd_preserves_line_endings_and_tail_bytes() -> AppResult<()> {
+        let root = temp_dir("rewrite-rollout-cwd-line-endings");
+        fs::create_dir_all(&root)?;
+        let cases: [(&str, &[u8], &[u8]); 2] = [
+            (
+                "lf",
+                b"\n",
+                b"{\"type\":\"event_msg\",\"payload\":{\"message\":\"keep\"}}\nlast-line",
+            ),
+            (
+                "crlf",
+                b"\r\n",
+                b"{\"type\":\"event_msg\",\"payload\":{\"message\":\"keep\"}}\r\nlast-line",
+            ),
+        ];
+
+        for (label, line_ending, tail) in cases {
+            let path = root.join(format!("{label}.jsonl"));
+            let meta = serde_json::json!({
+                "timestamp": "2026-05-10T10:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": format!("rewrite-{label}"),
+                    "cwd": "F:\\old"
+                }
+            });
+            let mut original = serde_json::to_vec(&meta)?;
+            original.extend_from_slice(line_ending);
+            original.extend_from_slice(tail);
+            fs::write(&path, original)?;
+
+            assert!(rewrite_rollout_cwd(&path, "F:\\new")?);
+            let updated = fs::read(&path)?;
+            let newline = updated
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .expect("rewritten first line must keep its newline");
+            let json_end = if newline > 0 && updated[newline - 1] == b'\r' {
+                newline - 1
+            } else {
+                newline
+            };
+
+            assert_eq!(&updated[json_end..=newline], line_ending, "{label}");
+            assert_eq!(&updated[newline + 1..], tail, "{label}");
+            let rewritten_meta: serde_json::Value = serde_json::from_slice(&updated[..json_end])?;
+            assert_eq!(rewritten_meta["payload"]["cwd"], "F:\\new", "{label}");
+        }
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn rewrite_rollout_cwd_skips_identical_cwd_without_touching_file() -> AppResult<()> {
+        let root = temp_dir("rewrite-rollout-cwd-identical");
+        let path = root.join("same.jsonl");
+        fs::create_dir_all(&root)?;
+        let original = concat!(
+            "{\"timestamp\":\"2026-05-10T10:00:00Z\",\"type\":\"session_meta\",",
+            "\"payload\":{\"id\":\"same\",\"cwd\":\"F:\\\\same\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"message\":\"keep\"}}\n"
+        )
+        .as_bytes()
+        .to_vec();
+        fs::write(&path, &original)?;
+
+        assert!(!rewrite_rollout_cwd(&path, "F:\\same")?);
+        assert_eq!(fs::read(&path)?, original);
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn move_family_cwd_updates_all_rollouts_threads_workspace_and_integrity() -> AppResult<()> {
+        let codex = temp_dir("move-family-cwd");
+        let family_id = "family-move-cwd";
+        let active_id = "019d-family-move-active";
+        let archived_id = "019d-family-move-archived";
+        let paths_by_id = codex_family_fixture(
+            &codex,
+            family_id,
+            active_id,
+            &[
+                FamilyBranchFixture {
+                    id: active_id,
+                    archived: false,
+                },
+                FamilyBranchFixture {
+                    id: archived_id,
+                    archived: true,
+                },
+            ],
+        )?;
+        fs::write(paths::codex_global_state_json_path(&codex), "{}")?;
+        let target = codex.join("projects").join("new-workspace");
+        fs::create_dir_all(&target)?;
+        let expected_cwd = paths::strip_verbatim(&target.canonicalize()?.to_string_lossy());
+        let archived_before = family::load(&codex)?
+            .families
+            .get(family_id)
+            .and_then(|family| family.chain.iter().find(|branch| branch.id == archived_id))
+            .and_then(|branch| branch.sha256.clone())
+            .expect("archived branch fixture integrity");
+
+        let report = move_session_cwd_with_lock(
+            Some("codex".into()),
+            codex.to_string_lossy().into_owned(),
+            active_id.into(),
+            target.to_string_lossy().into_owned(),
+            &family::FamilyLock::default(),
+        )?;
+
+        assert!(report.rollout_rewritten);
+        assert_eq!(report.threads_updated, 2);
+        assert_eq!(report.new_cwd, expected_cwd);
+        for id in [active_id, archived_id] {
+            assert_eq!(
+                rollout_cwd(paths_by_id.get(id).expect("fixture path"))?,
+                expected_cwd
+            );
+        }
+
+        let state = state_db::open_ro(&codex)?;
+        for (id, expected_archived) in [(active_id, 0_i64), (archived_id, 1_i64)] {
+            let (cwd, archived): (String, i64) = state.query_row(
+                "SELECT cwd, CAST(archived AS INTEGER) FROM threads WHERE id = ?",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert_eq!(cwd, expected_cwd, "{id}");
+            assert_eq!(archived, expected_archived, "{id}");
+        }
+        drop(state);
+
+        let global: serde_json::Value =
+            serde_json::from_slice(&fs::read(paths::codex_global_state_json_path(&codex))?)?;
+        for key in [
+            "electron-saved-workspace-roots",
+            "active-workspace-roots",
+            "project-order",
+        ] {
+            assert!(
+                global[key].as_array().is_some_and(|values| values
+                    .iter()
+                    .any(|value| value.as_str() == Some(expected_cwd.as_str()))),
+                "workspace key {key} must contain the new cwd"
+            );
+        }
+
+        let store = family::load(&codex)?;
+        let archived_branch = store
+            .families
+            .get(family_id)
+            .and_then(|family| family.chain.iter().find(|branch| branch.id == archived_id))
+            .expect("archived family branch");
+        let archived_path = paths_by_id.get(archived_id).expect("archived rollout");
+        let (expected_sha, expected_lines) = family::compute_integrity(archived_path)?;
+        assert_ne!(
+            archived_branch.sha256.as_deref(),
+            Some(archived_before.as_str())
+        );
+        assert_eq!(
+            archived_branch.sha256.as_deref(),
+            Some(expected_sha.as_str())
+        );
+        assert_eq!(archived_branch.line_count, Some(expected_lines));
+
+        let index_ids = crate::repair::read_session_index_ids(&codex)?;
+        assert!(index_ids.contains(active_id));
+        assert!(!index_ids.contains(archived_id));
+
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn move_family_cwd_rolls_back_rollouts_and_threads_after_late_failure() -> AppResult<()> {
+        let codex = temp_dir("move-family-cwd-rollback");
+        let active_id = "019d-family-move-rollback-active";
+        let archived_id = "019d-family-move-rollback-archived";
+        let paths_by_id = codex_family_fixture(
+            &codex,
+            "family-move-cwd-rollback",
+            active_id,
+            &[
+                FamilyBranchFixture {
+                    id: active_id,
+                    archived: false,
+                },
+                FamilyBranchFixture {
+                    id: archived_id,
+                    archived: true,
+                },
+            ],
+        )?;
+        let rollout_before = paths_by_id
+            .iter()
+            .map(|(id, path)| fs::read(path).map(|bytes| (id.clone(), bytes)))
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let family_before = fs::read(paths::family_store_path(&codex))?;
+        let index_before = fs::read(paths::session_index_path(&codex))?;
+        let global_state = paths::codex_global_state_json_path(&codex);
+        fs::write(&global_state, "{broken json")?;
+        let global_before = fs::read(&global_state)?;
+        let target = codex.join("projects").join("rollback-target");
+        fs::create_dir_all(&target)?;
+
+        let error = move_session_cwd_with_lock(
+            Some("codex".into()),
+            codex.to_string_lossy().into_owned(),
+            active_id.into(),
+            target.to_string_lossy().into_owned(),
+            &family::FamilyLock::default(),
+        )
+        .expect_err("invalid global state must abort the family move");
+
+        assert!(error.to_string().contains("全局状态 JSON 损坏"), "{error}");
+        for (id, path) in &paths_by_id {
+            assert_eq!(
+                fs::read(path)?.as_slice(),
+                rollout_before[id].as_slice(),
+                "{id}"
+            );
+            assert_eq!(rollout_cwd(path)?, "F:\\w", "{id}");
+        }
+        assert_eq!(fs::read(paths::family_store_path(&codex))?, family_before);
+        assert_eq!(fs::read(paths::session_index_path(&codex))?, index_before);
+        assert_eq!(fs::read(&global_state)?, global_before);
+        let state = state_db::open_ro(&codex)?;
+        for id in [active_id, archived_id] {
+            let cwd: String =
+                state.query_row("SELECT cwd FROM threads WHERE id = ?", [id], |row| {
+                    row.get(0)
+                })?;
+            assert_eq!(cwd, "F:\\w", "{id}");
+        }
+        drop(state);
+
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn move_session_cwd_rejects_invalid_targets_before_writing() -> AppResult<()> {
+        let codex = temp_dir("move-cwd-invalid-target");
+        let session_id = "019d-move-invalid-target";
+        let paths_by_id = codex_family_fixture(
+            &codex,
+            "family-move-invalid-target",
+            session_id,
+            &[FamilyBranchFixture {
+                id: session_id,
+                archived: false,
+            }],
+        )?;
+        fs::write(paths::codex_global_state_json_path(&codex), "{}")?;
+        let tracked_paths = [
+            paths_by_id
+                .get(session_id)
+                .expect("fixture rollout")
+                .clone(),
+            paths::state_db_path(&codex),
+            paths::session_index_path(&codex),
+            paths::family_store_path(&codex),
+            paths::codex_global_state_json_path(&codex),
+        ];
+        let before = tracked_paths
+            .iter()
+            .map(|path| fs::read(path).map(|bytes| (path.clone(), bytes)))
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let missing = codex.join("projects").join("missing");
+        let lock = family::FamilyLock::default();
+
+        for target in [
+            "relative-project".to_string(),
+            missing.to_string_lossy().into_owned(),
+        ] {
+            assert!(move_session_cwd_with_lock(
+                Some("codex".into()),
+                codex.to_string_lossy().into_owned(),
+                session_id.into(),
+                target,
+                &lock,
+            )
+            .is_err());
+            for (path, expected) in &before {
+                let current = fs::read(path)?;
+                assert_eq!(
+                    current.as_slice(),
+                    expected.as_slice(),
+                    "must not modify {}",
+                    path.display()
+                );
+            }
+        }
+
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn move_orphan_rollout_cwd_rebuilds_missing_thread_row() -> AppResult<()> {
+        let codex = temp_dir("move-orphan-rollout-cwd");
+        let session_id = "019d-move-orphan-rollout";
+        drop(create_codex_threads_table(&codex)?);
+        let rollout = paths::sessions_dir(&codex)
+            .join("2026")
+            .join("05")
+            .join("10")
+            .join(format!("rollout-2026-05-10T10-00-00-{session_id}.jsonl"));
+        write_test_rollout(&rollout, session_id, "orphan rollout");
+        let target = codex.join("projects").join("orphan-target");
+        fs::create_dir_all(&target)?;
+        let expected_cwd = paths::strip_verbatim(&target.canonicalize()?.to_string_lossy());
+
+        let report = move_session_cwd_with_lock(
+            Some("codex".into()),
+            codex.to_string_lossy().into_owned(),
+            session_id.into(),
+            target.to_string_lossy().into_owned(),
+            &family::FamilyLock::default(),
+        )?;
+
+        assert!(report.rollout_rewritten);
+        assert_eq!(report.threads_updated, 1);
+        assert_eq!(rollout_cwd(&rollout)?, expected_cwd);
+        let state = state_db::open_ro(&codex)?;
+        let (cwd, rollout_path, archived): (String, String, i64) = state.query_row(
+            "SELECT cwd, rollout_path, CAST(archived AS INTEGER) FROM threads WHERE id = ?",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(cwd, expected_cwd);
+        assert_eq!(PathBuf::from(rollout_path), rollout);
+        assert_eq!(archived, 0);
+        drop(state);
+
+        fs::remove_dir_all(codex).ok();
+        Ok(())
     }
 
     #[test]

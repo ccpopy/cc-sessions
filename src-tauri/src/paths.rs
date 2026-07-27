@@ -44,9 +44,28 @@ pub fn host_path_string_from_codex_record(codex_dir: &Path, raw: &str) -> String
         .into_owned()
 }
 
+/// Convert a host-visible project path back to the path format stored by Codex.
+///
+/// A Codex directory selected through WSL is exposed to the Windows desktop app as a UNC path,
+/// while the Codex process inside WSL expects Linux paths in `session_meta.cwd` and `threads.cwd`.
+/// Refuse paths outside the selected distro instead of persisting an unusable Windows path.
+pub fn codex_record_path_from_host(codex_dir: &Path, host_path: &Path) -> AppResult<String> {
+    let cleaned = strip_verbatim(&host_path.to_string_lossy());
+    if let Some(mapping) = wsl_unc_mapping(codex_dir) {
+        return mapping.linux_path_for_host_path(&cleaned).ok_or_else(|| {
+            AppError::Path(format!(
+                "WSL Codex 的项目目录必须位于当前发行版 {} 中: {}",
+                mapping.unc_root, cleaned
+            ))
+        });
+    }
+    Ok(cleaned)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WslUncMapping {
     unc_root: String,
+    distro: String,
 }
 
 impl WslUncMapping {
@@ -60,20 +79,43 @@ impl WslUncMapping {
         }
         PathBuf::from(out)
     }
+
+    fn linux_path_for_host_path(&self, host_path: &str) -> Option<String> {
+        let (_, distro, segments) = parse_wsl_unc(host_path)?;
+        if !distro.eq_ignore_ascii_case(&self.distro) {
+            return None;
+        }
+        if segments.is_empty() {
+            return Some("/".to_string());
+        }
+        Some(format!("/{}", segments.join("/")))
+    }
 }
 
-fn wsl_unc_mapping(path: &Path) -> Option<WslUncMapping> {
-    let raw = strip_verbatim(&path.to_string_lossy());
-    let normalized = raw.replace('/', "\\");
+fn parse_wsl_unc(raw: &str) -> Option<(String, String, Vec<String>)> {
+    let normalized = strip_verbatim(raw).replace('/', "\\");
     let rest = normalized.strip_prefix(r"\\")?;
     let mut parts = rest.split('\\').filter(|part| !part.is_empty());
-    let server = parts.next()?;
+    let server = parts.next()?.to_string();
     if !server.eq_ignore_ascii_case("wsl.localhost") && !server.eq_ignore_ascii_case("wsl$") {
         return None;
     }
-    let distro = parts.next()?;
+    let distro = parts.next()?.to_string();
+    let segments = parts.map(str::to_string).collect::<Vec<_>>();
+    if segments
+        .iter()
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return None;
+    }
+    Some((server, distro, segments))
+}
+
+fn wsl_unc_mapping(path: &Path) -> Option<WslUncMapping> {
+    let (server, distro, _) = parse_wsl_unc(&path.to_string_lossy())?;
     Some(WslUncMapping {
         unc_root: format!(r"\\{}\{}", server, distro),
+        distro,
     })
 }
 
@@ -278,5 +320,46 @@ mod tests {
         let mapped = host_path_string_from_codex_record(codex, "/home/alice/.codex/a.jsonl");
 
         assert_eq!(mapped, r"/home/alice/.codex/a.jsonl");
+    }
+
+    #[test]
+    fn maps_wsl_host_paths_back_to_linux_records() -> AppResult<()> {
+        let codex = Path::new(r"\\wsl.localhost\Ubuntu\home\alice\.codex");
+        let host = Path::new(r"\\wsl.localhost\Ubuntu\home\alice\project");
+
+        assert_eq!(
+            codex_record_path_from_host(codex, host)?,
+            "/home/alice/project"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn maps_wsl_host_paths_across_unc_aliases_and_ascii_case() -> AppResult<()> {
+        let codex = Path::new(r"\\wsl$\Ubuntu\home\alice\.codex");
+        let host = Path::new(r"\\WSL.LOCALHOST\ubuntu\home\alice\project");
+
+        assert_eq!(
+            codex_record_path_from_host(codex, host)?,
+            "/home/alice/project"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_host_paths_outside_the_selected_wsl_distro() {
+        let codex = Path::new(r"\\wsl$\Ubuntu\home\alice\.codex");
+        let host = Path::new(r"C:\work\project");
+
+        assert!(codex_record_path_from_host(codex, host).is_err());
+
+        let other_distro = Path::new(r"\\wsl.localhost\Ubuntu-Preview\home\alice\project");
+        assert!(codex_record_path_from_host(codex, other_distro).is_err());
+
+        let unicode_distro = Path::new(r"\\wsl.localhost\发行版\home\alice\project");
+        assert!(codex_record_path_from_host(codex, unicode_distro).is_err());
+
+        let traversal = Path::new(r"\\wsl.localhost\Ubuntu\home\alice\..\bob\project");
+        assert!(codex_record_path_from_host(codex, traversal).is_err());
     }
 }

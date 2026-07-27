@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Loader2 } from "lucide-react";
+import { FolderOpen, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -12,6 +12,7 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import type { SessionSummary } from "@/lib/api";
+import { pickDirectoryPath } from "@/lib/dialog";
 
 type Props = {
   open: boolean;
@@ -21,9 +22,15 @@ type Props = {
   onSubmit: (targetCwd: string) => Promise<void>;
 };
 
-export function MoveSessionCwdDialog({ open, onOpenChange, session, onSubmit }: Props) {
+export function MoveSessionCwdDialog({
+  open,
+  onOpenChange,
+  session,
+  onSubmit,
+}: Props) {
   const [targetCwd, setTargetCwd] = useState("");
   const [saving, setSaving] = useState(false);
+  const [picking, setPicking] = useState(false);
 
   useEffect(() => {
     if (open && session) {
@@ -33,7 +40,7 @@ export function MoveSessionCwdDialog({ open, onOpenChange, session, onSubmit }: 
 
   const submit = async () => {
     const trimmed = targetCwd.trim();
-    if (!trimmed || saving) return;
+    if (!trimmed || saving || picking) return;
     setSaving(true);
     try {
       await onSubmit(trimmed);
@@ -45,8 +52,26 @@ export function MoveSessionCwdDialog({ open, onOpenChange, session, onSubmit }: 
     }
   };
 
+  const pickTarget = async () => {
+    if (saving || picking) return;
+    setPicking(true);
+    try {
+      const picked = await pickDirectoryPath({
+        defaultPath: targetCwd.trim() || session?.cwd || undefined,
+        title: "选择会话的新项目目录",
+        webPrompt: "请输入运行 cc-sessions webui 的环境可访问的新项目目录路径。",
+      });
+      if (picked) setTargetCwd(picked);
+    } finally {
+      setPicking(false);
+    }
+  };
+
   return (
-    <Dialog open={open} onOpenChange={(v) => !saving && onOpenChange(v)}>
+    <Dialog
+      open={open}
+      onOpenChange={(value) => !saving && !picking && onOpenChange(value)}
+    >
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>移动会话到其他项目</DialogTitle>
@@ -56,23 +81,47 @@ export function MoveSessionCwdDialog({ open, onOpenChange, session, onSubmit }: 
         </DialogHeader>
         <div className="grid gap-2">
           <Label htmlFor="cwd">工作目录路径</Label>
-          <Input
-            id="cwd"
-            value={targetCwd}
-            onChange={(e) => setTargetCwd(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.nativeEvent.isComposing) void submit();
-            }}
-            maxLength={1024}
-            placeholder="输入新的工作目录路径"
-            autoFocus
-          />
+          <div className="flex gap-2">
+            <Input
+              id="cwd"
+              value={targetCwd}
+              onChange={(e) => setTargetCwd(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.nativeEvent.isComposing) void submit();
+              }}
+              maxLength={1024}
+              placeholder="输入新的工作目录路径"
+              autoFocus
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="icon"
+              onClick={() => void pickTarget()}
+              disabled={saving || picking}
+              title="选择目录"
+              aria-label="选择目录"
+            >
+              {picking ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <FolderOpen className="h-4 w-4" />
+              )}
+            </Button>
+          </div>
         </div>
         <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={saving}>
+          <Button
+            variant="outline"
+            onClick={() => onOpenChange(false)}
+            disabled={saving || picking}
+          >
             取消
           </Button>
-          <Button onClick={() => void submit()} disabled={saving || !targetCwd.trim()}>
+          <Button
+            onClick={() => void submit()}
+            disabled={saving || picking || !targetCwd.trim()}
+          >
             {saving && <Loader2 className="h-4 w-4 animate-spin" />}
             保存
           </Button>

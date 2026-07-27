@@ -500,9 +500,7 @@ pub async fn duplicate_session(
 ) -> AppResult<DuplicateSessionReport> {
     let lock = lock.inner().clone();
     run_blocking(move || {
-        crate::repair::duplicate_session_with_lock(
-            codex_dir, session_id, rollout_path, &lock,
-        )
+        crate::repair::duplicate_session_with_lock(codex_dir, session_id, rollout_path, &lock)
     })
     .await
 }
@@ -806,9 +804,7 @@ pub async fn move_session_cwd(
 ) -> AppResult<MoveSessionCwdReport> {
     let lock = lock.inner().clone();
     run_blocking(move || {
-        crate::sessions::move_session_cwd_with_lock(
-            provider, codex_dir, id, target_cwd, &lock,
-        )
+        crate::sessions::move_session_cwd_with_lock(provider, codex_dir, id, target_cwd, &lock)
     })
     .await
 }

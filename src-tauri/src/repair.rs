@@ -21,8 +21,8 @@ use crate::models::{
     DuplicateSessionReport, Family, FamilyBranch, ForkSessionReport, GuiVisibilityFixReport,
     GuiVisibilityIssue, GuiVisibilityReport, HistoryOrphanReport, HistoryPruneReport,
     IndexRepairReport, OrphanPruneReport, ProjectConfigIssue, ProjectConfigRepairItem,
-    ProjectConfigRepairReport, ProjectConfigReport, ProviderInfo, SwitchStrategy,
-    SyncBranchReport, ThreadsRebuildReport,
+    ProjectConfigRepairReport, ProjectConfigReport, ProviderInfo, SwitchStrategy, SyncBranchReport,
+    ThreadsRebuildReport,
 };
 
 /// Codex CLI 的内建默认 provider（与官方文档一致）。
@@ -2749,22 +2749,32 @@ impl MutationCompensation {
 }
 
 #[derive(Debug, Default)]
-struct MutationJournal {
+pub(crate) struct MutationJournal {
     compensations: Vec<MutationCompensation>,
 }
 
 impl MutationJournal {
-    fn mutate_file<T>(
+    pub(crate) fn mutate_file<T>(
         &mut self,
         path: &Path,
         mutation: impl FnOnce() -> AppResult<T>,
     ) -> AppResult<T> {
         let snapshot = FileMutationSnapshot::capture(path)?;
-        let value = mutation()?;
-        if let Some(compensation) = snapshot.into_compensation()? {
-            self.compensations.push(compensation);
+        let mutation_result = mutation();
+        let compensation_result = snapshot.into_compensation();
+        match compensation_result {
+            Ok(Some(compensation)) => self.compensations.push(compensation),
+            Ok(None) => {}
+            Err(snapshot_error) => {
+                return match mutation_result {
+                    Ok(_) => Err(snapshot_error),
+                    Err(mutation_error) => Err(AppError::Other(format!(
+                        "{mutation_error}; 登记文件补偿失败: {snapshot_error}"
+                    ))),
+                };
+            }
         }
-        Ok(value)
+        mutation_result
     }
 
     fn move_file(&mut self, original: &Path, current: &Path) -> AppResult<()> {
@@ -2807,7 +2817,7 @@ impl MutationJournal {
     }
 }
 
-fn rollback_transaction_with_compensation(
+pub(crate) fn rollback_transaction_with_compensation(
     transaction: rusqlite::Transaction<'_>,
     journal: MutationJournal,
     primary_error: AppError,
@@ -2819,7 +2829,7 @@ fn rollback_transaction_with_compensation(
     journal.compensate(primary_error)
 }
 
-fn commit_transaction_with_compensation(
+pub(crate) fn commit_transaction_with_compensation(
     transaction: rusqlite::Transaction<'_>,
     journal: MutationJournal,
 ) -> AppResult<()> {
@@ -3238,13 +3248,14 @@ fn duplicate_session_locked(
     let codex = PathBuf::from(&codex_dir);
     let codex = codex.canonicalize().unwrap_or(codex);
 
-    // 替代 resolve_fork_source_rollout：不做 sessions/ 限制
-    let source_abs = PathBuf::from(&rollout_path).canonicalize().map_err(|err| {
+    let source = paths::host_path_from_codex_record(&codex, &rollout_path);
+    let source_abs = source.canonicalize().map_err(|error| {
         AppError::NotFound(format!(
-            "源 rollout 不存在或无法访问: {} ({})",
-            rollout_path, err
+            "源 rollout 不存在或无法访问: {} ({error})",
+            source.to_string_lossy()
         ))
     })?;
+    crate::sessions::validate_codex_rollout_path(&codex, &source_abs, &session_id)?;
     let source_brief = read_rollout_brief(&codex, &source_abs)?.ok_or_else(|| {
         AppError::NotFound(format!(
             "无法读取源 rollout 元数据: {}",
@@ -3268,30 +3279,51 @@ fn duplicate_session_locked(
     let new_abs = build_clone_path(&codex, &new_id, &now);
     validate_rollout_filename(&new_abs)?;
 
-    // 复用 write_cloned_rollout：流式逐行复制 + session_meta 重写 + fingerprint 校验
-    write_cloned_rollout(&source_abs, &new_abs, &new_id, &provider, &session_id)?;
-
-    // 注册到 threads DB + session_index
     ensure_state_db_exists(&codex)?;
     let state = state_db::open(&codex)?;
-    sync_thread_from_rollout(&codex, &state, &new_abs)?;
-    carry_thread_title(&state, &session_id, &new_id)?;
+    let transaction =
+        rusqlite::Transaction::new_unchecked(&state, rusqlite::TransactionBehavior::Immediate)?;
+    let mut journal = MutationJournal::default();
+    let operation = (|| -> AppResult<u64> {
+        journal.mutate_file(&new_abs, || {
+            write_cloned_rollout(&source_abs, &new_abs, &new_id, &provider, &session_id)
+        })?;
+        sync_thread_from_rollout(&codex, &transaction, &new_abs)?;
+        carry_thread_title(&transaction, &session_id, &new_id)?;
 
-    // 推导 thread_name（写入后需重新读取以确认新文件元数据）
-    let new_brief = read_rollout_brief(&codex, &new_abs)?.ok_or_else(|| {
-        AppError::Other("新 rollout 缺少有效 session_meta.id".into())
-    })?;
-    let thread_name = if new_brief.first_user_message.is_empty() {
-        source_brief.first_user_message.clone()
-    } else {
-        new_brief.first_user_message
-    };
-    append_index_line(&codex, &new_id, &thread_name, &new_abs)?;
+        let new_brief = read_rollout_brief(&codex, &new_abs)?
+            .ok_or_else(|| AppError::Other("新 rollout 缺少有效 session_meta.id".into()))?;
+        let thread_name = if new_brief.first_user_message.is_empty() {
+            source_brief.first_user_message.clone()
+        } else {
+            new_brief.first_user_message
+        };
+        let index_path = paths::session_index_path(&codex);
+        journal.mutate_file(&index_path, || {
+            append_index_line(&codex, &new_id, &thread_name, &new_abs)
+        })?;
+        if let Some(cwd) = new_brief.cwd.as_deref() {
+            let global_state = paths::codex_global_state_json_path(&codex);
+            journal.mutate_file(&global_state, || {
+                ensure_workspace_root_registered(&codex, cwd)
+            })?;
+        }
 
-    // 统计行数
-    let total_lines = {
         let file = fs::File::open(&new_abs)?;
-        std::io::BufReader::new(file).lines().count() as u64
+        Ok(std::io::BufReader::new(file).lines().count() as u64)
+    })();
+    let total_lines = match operation {
+        Ok(total_lines) => {
+            commit_transaction_with_compensation(transaction, journal)?;
+            total_lines
+        }
+        Err(error) => {
+            return Err(rollback_transaction_with_compensation(
+                transaction,
+                journal,
+                error,
+            ));
+        }
     };
 
     Ok(DuplicateSessionReport {
@@ -5072,6 +5104,135 @@ mod tests {
             [id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?)
+    }
+
+    #[test]
+    fn duplicate_session_keeps_source_and_registers_independent_copy() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-duplicate-session-test");
+        let source_id = "duplicate-session-source";
+        let source = write_conversation_rollout(&codex, source_id)?;
+        let source_before = fs::read(&source)?;
+        let state = create_full_state(&codex)?;
+        sync_thread_from_rollout(&codex, &state, &source)?;
+        state.execute(
+            "UPDATE threads SET title = 'Pinned source title' WHERE id = ?",
+            [source_id],
+        )?;
+        drop(state);
+        write_index_line(&codex, source_id)?;
+
+        let report = duplicate_session_with_lock(
+            codex.to_string_lossy().into_owned(),
+            source_id.to_string(),
+            source.to_string_lossy().into_owned(),
+            &family::FamilyLock::default(),
+        )?;
+
+        assert_eq!(report.source_id, source_id);
+        assert_ne!(report.new_id, source_id);
+        assert!(source.is_file());
+        assert_eq!(fs::read(&source)?, source_before);
+        let duplicated = PathBuf::from(&report.new_rollout_path);
+        assert!(duplicated.is_file());
+        let duplicated_brief = read_rollout_brief(&codex, &duplicated)?
+            .expect("duplicated rollout must contain session metadata");
+        assert_eq!(duplicated_brief.id, report.new_id);
+        assert_eq!(
+            BufReader::new(fs::File::open(&duplicated)?)
+                .lines()
+                .collect::<Result<Vec<_>, _>>()?
+                .len() as u64,
+            report.total_lines
+        );
+
+        let state = state_db::open_ro(&codex)?;
+        let (rollout_path, title, archived): (String, String, i64) = state.query_row(
+            "SELECT rollout_path, title, CAST(archived AS INTEGER) FROM threads WHERE id = ?",
+            [&report.new_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(PathBuf::from(rollout_path), duplicated);
+        assert_eq!(title, "Pinned source title");
+        assert_eq!(archived, 0);
+        let thread_count: i64 =
+            state.query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))?;
+        assert_eq!(thread_count, 2);
+        drop(state);
+
+        let index_ids = read_session_index_ids(&codex)?;
+        assert!(index_ids.contains(source_id));
+        assert!(index_ids.contains(&report.new_id));
+
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_session_rolls_back_file_thread_and_index_after_late_failure() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-duplicate-rollback-test");
+        let source_id = "duplicate-rollback-source";
+        let source = write_conversation_rollout(&codex, source_id)?;
+        let source_before = fs::read(&source)?;
+        let state = create_full_state(&codex)?;
+        sync_thread_from_rollout(&codex, &state, &source)?;
+        drop(state);
+        write_index_line(&codex, source_id)?;
+        let index_before = fs::read(paths::session_index_path(&codex))?;
+        let global_state = paths::codex_global_state_json_path(&codex);
+        fs::write(&global_state, "{broken json")?;
+        let global_before = fs::read(&global_state)?;
+
+        let error = duplicate_session_with_lock(
+            codex.to_string_lossy().into_owned(),
+            source_id.to_string(),
+            source.to_string_lossy().into_owned(),
+            &family::FamilyLock::default(),
+        )
+        .expect_err("invalid global state must abort a full duplicate");
+
+        assert!(error.to_string().contains("全局状态 JSON 损坏"), "{error}");
+        assert_eq!(fs::read(&source)?, source_before);
+        assert_eq!(family::scan_rollouts(&codex)?, vec![source.clone()]);
+        assert_eq!(fs::read(paths::session_index_path(&codex))?, index_before);
+        assert_eq!(fs::read(&global_state)?, global_before);
+        let state = state_db::open_ro(&codex)?;
+        let thread_ids = state
+            .prepare("SELECT id FROM threads ORDER BY id")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(thread_ids, vec![source_id.to_string()]);
+        drop(state);
+
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_session_rejects_rollout_outside_codex_roots() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-duplicate-outside-root-test");
+        fs::create_dir_all(paths::sessions_dir(&codex))?;
+        let source_id = "duplicate-outside-root-source";
+        let external_root = temp_codex_dir("cc-session-manager-external-rollout-test");
+        let external = external_root.join(format!("rollout-{source_id}.jsonl"));
+        write_sync_rollout(&external, source_id, DEFAULT_PROVIDER, &[])?;
+        let external_before = fs::read(&external)?;
+
+        let error = duplicate_session_with_lock(
+            codex.to_string_lossy().into_owned(),
+            source_id.to_string(),
+            external.to_string_lossy().into_owned(),
+            &family::FamilyLock::default(),
+        )
+        .expect_err("an external rollout must not be duplicated");
+
+        assert!(error.to_string().contains("不在 sessions"), "{error}");
+        assert_eq!(fs::read(&external)?, external_before);
+        assert!(family::scan_rollouts(&codex)?.is_empty());
+        assert!(!paths::state_db_path(&codex).exists());
+
+        fs::remove_dir_all(codex).ok();
+        fs::remove_dir_all(external_root).ok();
+        Ok(())
     }
 
     #[test]
