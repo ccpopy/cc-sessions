@@ -105,6 +105,39 @@ pub fn record_conversion(
     save(codex_dir, &store)
 }
 
+/// 把同 provider 下源会话的转换来源复制给新会话。
+///
+/// 来源仍保存在独立 sidecar 中，不触碰 rollout、tool_use/tool_result 或动态工具描述。
+/// 源会话没有来源记录时保持无操作，并返回 false。
+pub fn copy_conversion_origin(
+    codex_dir: &Path,
+    provider: &str,
+    source_id: &str,
+    target_id: &str,
+) -> AppResult<bool> {
+    if codex_dir.as_os_str().is_empty()
+        || !matches!(provider, "codex" | "claude")
+        || source_id.trim().is_empty()
+        || target_id.trim().is_empty()
+    {
+        return Err(AppError::Other("会话来源复制参数无效".into()));
+    }
+
+    let mut store = load(codex_dir)?;
+    let Some(origin) = store
+        .sessions
+        .get(&session_key(provider, source_id))
+        .cloned()
+    else {
+        return Ok(false);
+    };
+    store
+        .sessions
+        .insert(session_key(provider, target_id), origin);
+    save(codex_dir, &store)?;
+    Ok(true)
+}
+
 /// 来源登记属于可选展示信息；文件缺失或损坏不能阻断主会话列表。
 pub fn annotate_sessions(codex_dir: &Path, sessions: &mut [SessionSummary]) {
     let Ok(store) = load(codex_dir) else {
@@ -183,6 +216,46 @@ mod tests {
         assert_eq!(origin.conversion_mode.as_deref(), Some("native"));
         assert!(sessions[1].conversion_origin.is_none());
         assert!(paths::session_provenance_path(&codex).is_file());
+
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn copies_conversion_origin_to_an_independent_duplicate() -> AppResult<()> {
+        let codex = temp_dir("copy-origin");
+        record_conversion(
+            &codex,
+            "codex",
+            "source-session",
+            "claude",
+            "claude-session",
+            Some("native"),
+        )?;
+
+        assert!(copy_conversion_origin(
+            &codex,
+            "codex",
+            "source-session",
+            "target-session",
+        )?);
+
+        let mut sessions = vec![summary("codex", "target-session")];
+        annotate_sessions(&codex, &mut sessions);
+        let origin = sessions[0]
+            .conversion_origin
+            .as_ref()
+            .expect("copied origin");
+        assert_eq!(origin.source_provider, "claude");
+        assert_eq!(origin.source_id, "claude-session");
+        assert_eq!(origin.conversion_mode.as_deref(), Some("native"));
+
+        assert!(!copy_conversion_origin(
+            &codex,
+            "codex",
+            "missing-session",
+            "another-target",
+        )?);
 
         fs::remove_dir_all(codex).ok();
         Ok(())

@@ -6,7 +6,7 @@
 //! - `clone_session_for_provider`：把会话"克隆到当前 provider"（三种策略）
 //! - `batch_clone_for_current_provider`：对所有 provider 不匹配的家族做批量克隆
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -819,6 +819,14 @@ fn strip_user_message_prefix(text: &str) -> &str {
 
 fn metadata_string_field(payload: &Value, field: &str) -> Option<String> {
     payload.get(field).and_then(metadata_string_value)
+}
+
+fn metadata_git_field(payload: &Value, legacy_field: &str, git_field: &str) -> Option<String> {
+    payload
+        .get("git")
+        .and_then(|git| git.get(git_field))
+        .and_then(metadata_string_value)
+        .or_else(|| metadata_string_field(payload, legacy_field))
 }
 
 fn metadata_string_value(value: &Value) -> Option<String> {
@@ -1728,7 +1736,14 @@ const THREADS_COLS: &[&str] = &[
 /// 官方 App 的会话列表查询带 `preview <> ''` 谓词（对应库内 idx_threads_visible_*
 /// 部分索引），preview 为空的行在 App 中不可见，因此目标库存在这些列时必须写入；
 /// 旧版库没有这些列，写入前需按实际表结构过滤，避免 INSERT 报未知列错误。
-const THREADS_OPTIONAL_COLS: &[&str] = &["preview", "thread_source"];
+const THREADS_OPTIONAL_COLS: &[&str] = &[
+    "preview",
+    "thread_source",
+    "recency_at",
+    "recency_at_ms",
+    "history_mode",
+    "name",
+];
 
 /// threads 表当前实际存在的列名（按建表顺序）。
 pub(crate) fn threads_table_columns(state: &rusqlite::Connection) -> AppResult<Vec<String>> {
@@ -1833,11 +1848,22 @@ fn threads_upsert_sql(cols: &[&str]) -> String {
         .iter()
         .filter(|c| **c != "id")
         .map(|c| match *c {
-            // 官方 App 的“重命名”只落在 threads.title（rollout 里没有这份数据）。
-            // 行已存在时不得用 rollout 派生标题覆盖非空标题，否则自定义会话名会丢失。
-            "title" => "title=CASE WHEN TRIM(COALESCE(threads.title,''))='' \
-                 THEN excluded.title ELSE threads.title END"
-                .to_string(),
+            // title/name 都不是 rollout 的可靠来源；行已存在时不得用派生值覆盖
+            // 非空标题或显式名称，否则官方 App 生成标题/用户重命名会丢失。
+            "title" | "name" => format!(
+                "{c}=CASE WHEN TRIM(COALESCE(threads.{c},''))='' \
+                 THEN excluded.{c} ELSE threads.{c} END"
+            ),
+            // recency 是 SQLite 独立维护的列表排序水位；重扫旧 rollout 不能倒退它。
+            "recency_at" | "recency_at_ms" => format!("{c}=threads.{c}"),
+            // 空 preview 不能把原本可见的会话从新版官方列表中隐藏。
+            "preview" => {
+                "preview=COALESCE(NULLIF(excluded.preview,''), threads.preview)".to_string()
+            }
+            // 显式 Git 元数据更新只存在数据库中，陈旧 rollout 不得覆盖非空值。
+            "git_sha" | "git_branch" | "git_origin_url" => {
+                format!("{c}=COALESCE(threads.{c}, excluded.{c})")
+            }
             _ => format!("{c}=excluded.{c}"),
         })
         .collect::<Vec<_>>()
@@ -1892,6 +1918,8 @@ fn thread_values_from_rollout(
                 "updated_at" => Value::from(updated / 1000),
                 "created_at_ms" => Value::from(created),
                 "updated_at_ms" => Value::from(updated),
+                "recency_at" => Value::from(updated / 1000),
+                "recency_at_ms" => Value::from(updated),
                 "cwd" => Value::String(
                     metadata_string_field(&payload, "cwd")
                         .or_else(|| brief.cwd.clone())
@@ -1941,6 +1969,23 @@ fn thread_values_from_rollout(
                     .clone()
                     .map(Value::String)
                     .unwrap_or(Value::Null),
+                "git_sha" => metadata_git_field(&payload, "git_sha", "commit_hash")
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+                "git_branch" => metadata_git_field(&payload, "git_branch", "branch")
+                    .map(Value::String)
+                    .unwrap_or(Value::Null),
+                "git_origin_url" => {
+                    metadata_git_field(&payload, "git_origin_url", "repository_url")
+                        .map(Value::String)
+                        .unwrap_or(Value::Null)
+                }
+                "history_mode" => Value::String(
+                    metadata_string_field(&payload, "history_mode")
+                        .unwrap_or_else(|| "legacy".to_string()),
+                ),
+                // 官方 name 是可选的用户命名；rollout 本身不保存该值，后续从源 threads 行继承。
+                "name" => Value::Null,
                 // 官方 App 列表要求 preview 非空才可见；与 App 约定一致取首条用户消息。
                 "preview" => Value::String(brief.first_user_message.clone()),
                 "thread_source" => {
@@ -2014,21 +2059,37 @@ fn sync_thread_from_rollout(
     )))
 }
 
-/// 把源会话的 threads.title 带到克隆/fork 出的新分支。
+/// 把源会话的 threads.title/name 带到克隆/fork 出的新分支。
 ///
-/// 官方 App 的自定义会话名只存在 threads.title；新 id 的行由 rollout 派生，
-/// 不带过来的话切换 provider 后侧栏名称会退回“首条消息”。源行标题为空时不动。
+/// 新 id 的行由 rollout 派生，不带过来的话切换 provider 后侧栏名称会退回
+/// “首条消息”。源行对应字段为空时不覆盖新行的派生值。
 fn carry_thread_title(
     state: &rusqlite::Connection,
     source_id: &str,
     new_id: &str,
 ) -> AppResult<()> {
-    state.execute(
+    let has_name = threads_table_columns(state)?
+        .iter()
+        .any(|column| column == "name");
+    let sql = if has_name {
+        "UPDATE threads
+         SET title = CASE
+                 WHEN EXISTS (SELECT 1 FROM threads WHERE id = ?1 AND TRIM(COALESCE(title,'')) <> '')
+                 THEN (SELECT title FROM threads WHERE id = ?1)
+                 ELSE title
+             END,
+             name = CASE
+                 WHEN EXISTS (SELECT 1 FROM threads WHERE id = ?1 AND TRIM(COALESCE(name,'')) <> '')
+                 THEN (SELECT name FROM threads WHERE id = ?1)
+                 ELSE name
+             END
+         WHERE id = ?2"
+    } else {
         "UPDATE threads SET title = (SELECT title FROM threads WHERE id = ?1)
          WHERE id = ?2
-           AND EXISTS (SELECT 1 FROM threads WHERE id = ?1 AND TRIM(COALESCE(title,'')) <> '')",
-        rusqlite::params![source_id, new_id],
-    )?;
+           AND EXISTS (SELECT 1 FROM threads WHERE id = ?1 AND TRIM(COALESCE(title,'')) <> '')"
+    };
+    state.execute(sql, rusqlite::params![source_id, new_id])?;
     Ok(())
 }
 
@@ -2496,7 +2557,8 @@ pub(crate) fn validate_rollout_filename(path: &Path) -> AppResult<()> {
 
 fn rewrite_session_meta_identity(
     line: &str,
-    session_id: &str,
+    source_session_id: &str,
+    target_session_id: &str,
     provider: &str,
     timestamp_override: Option<&str>,
 ) -> AppResult<Option<String>> {
@@ -2514,7 +2576,11 @@ fn rewrite_session_meta_identity(
         .get_mut("payload")
         .and_then(Value::as_object_mut)
         .ok_or_else(|| AppError::Other("session_meta 缺少有效 payload".into()))?;
-    payload.insert("id".into(), Value::String(session_id.into()));
+    if payload.get("id").and_then(Value::as_str) != Some(source_session_id) {
+        return Ok(None);
+    }
+    payload.insert("id".into(), Value::String(target_session_id.into()));
+    payload.insert("session_id".into(), Value::String(target_session_id.into()));
     payload.insert("model_provider".into(), Value::String(provider.into()));
     if let Some(timestamp) = timestamp_override {
         payload.insert("timestamp".into(), Value::String(timestamp.to_string()));
@@ -2525,19 +2591,92 @@ fn rewrite_session_meta_identity(
     Ok(Some(serde_json::to_string(&value)?))
 }
 
+fn source_session_meta(line: &str, source_session_id: &str) -> AppResult<Option<Value>> {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return Ok(None);
+    };
+    if value.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return Ok(None);
+    }
+    let payload = value
+        .get("payload")
+        .and_then(Value::as_object)
+        .ok_or_else(|| AppError::Other("session_meta 缺少有效 payload".into()))?;
+    if payload.get("id").and_then(Value::as_str) != Some(source_session_id) {
+        return Ok(None);
+    }
+    Ok(Some(value))
+}
+
+fn ensure_legacy_history_mode(meta: &Value, operation: &str) -> AppResult<()> {
+    let history_mode = meta
+        .get("payload")
+        .and_then(|payload| payload.get("history_mode"));
+    match history_mode {
+        None => Ok(()),
+        Some(Value::String(mode)) if mode == "legacy" => Ok(()),
+        Some(Value::String(mode)) if mode == "paginated" => Err(AppError::Other(format!(
+            "{operation}暂不支持 history_mode=paginated；请使用 Codex 官方“在新任务中继续”完成派生"
+        ))),
+        Some(other) => Err(AppError::Other(format!(
+            "{operation}遇到不支持的 history_mode={}；请升级工具或使用 Codex 官方派生功能",
+            other
+        ))),
+    }
+}
+
+fn create_rollout_from_source_snapshot(
+    src_abs: &Path,
+    dest_abs: &Path,
+    source_fingerprint: &atomic_file::FileFingerprint,
+    writer: impl FnOnce(&mut fs::File) -> AppResult<()>,
+) -> AppResult<()> {
+    if let Some(parent) = dest_abs.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    atomic_file::create_with_writer_if_absent(dest_abs, |out| {
+        writer(out)?;
+        if atomic_file::fingerprint(src_abs)? != *source_fingerprint {
+            return Err(AppError::Other(format!(
+                "源 rollout 在复制期间发生变化，已取消新会话创建: {}",
+                src_abs.to_string_lossy()
+            )));
+        }
+        Ok(())
+    })?;
+
+    let post_commit = atomic_file::fingerprint(src_abs);
+    if matches!(post_commit.as_ref(), Ok(current) if current == source_fingerprint) {
+        return Ok(());
+    }
+    let source_detail = post_commit
+        .err()
+        .map(|error| format!(": {error}"))
+        .unwrap_or_default();
+    match fs::remove_file(dest_abs) {
+        Ok(()) => Err(AppError::Other(format!(
+            "源 rollout 在复制提交时发生变化，已移除未登记会话{}: {}",
+            source_detail,
+            src_abs.to_string_lossy()
+        ))),
+        Err(error) => Err(AppError::Other(format!(
+            "源 rollout 在复制提交时发生变化{}，且未登记会话清理失败 {}: {error}",
+            source_detail,
+            dest_abs.to_string_lossy()
+        ))),
+    }
+}
+
 /// 深拷 rollout 到新 id + 新 provider；返回新文件绝对路径。
 fn write_cloned_rollout(
     src_abs: &Path,
     dest_abs: &Path,
     new_id: &str,
     new_provider: &str,
-    _source_id: &str,
+    source_id: &str,
 ) -> AppResult<()> {
-    if let Some(parent) = dest_abs.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let source_fingerprint = atomic_file::fingerprint(src_abs)?;
-    atomic_file::create_with_writer_if_absent(dest_abs, |out| {
+    create_rollout_from_source_snapshot(src_abs, dest_abs, &source_fingerprint, |out| {
         let reader = BufReader::new(fs::File::open(src_abs)?);
         let clone_timestamp = chrono::Utc::now().to_rfc3339();
         let mut found_session_meta = false;
@@ -2546,10 +2685,19 @@ fn write_cloned_rollout(
             if line.trim().is_empty() {
                 continue;
             }
+            if !found_session_meta {
+                if let Some(meta) = source_session_meta(&line, source_id)? {
+                    ensure_legacy_history_mode(&meta, "provider 克隆")?;
+                }
+            }
             let timestamp_override = (!found_session_meta).then_some(clone_timestamp.as_str());
-            if let Some(rewritten) =
-                rewrite_session_meta_identity(&line, new_id, new_provider, timestamp_override)?
-            {
+            if let Some(rewritten) = rewrite_session_meta_identity(
+                &line,
+                source_id,
+                new_id,
+                new_provider,
+                timestamp_override,
+            )? {
                 writeln!(out, "{rewritten}")?;
                 found_session_meta = true;
                 continue;
@@ -2562,34 +2710,238 @@ fn write_cloned_rollout(
                 src_abs.to_string_lossy()
             )));
         }
-        if atomic_file::fingerprint(src_abs)? != source_fingerprint {
-            return Err(AppError::Other(format!(
-                "源 rollout 在克隆期间发生变化，已取消 provider 分支创建: {}",
+        Ok(())
+    })
+}
+
+#[derive(Default)]
+struct DuplicateTailState {
+    turn_active: bool,
+    active_turn_id: Option<String>,
+    pending_tool_calls: HashSet<String>,
+    unterminated_user_turn: bool,
+}
+
+impl DuplicateTailState {
+    fn observe(&mut self, value: &Value) {
+        let outer_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let payload = value.get("payload").unwrap_or(value);
+        let payload_type = payload
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        if outer_type == "event_msg" {
+            match payload_type {
+                "task_started" | "turn_started" => {
+                    self.turn_active = true;
+                    self.active_turn_id = payload
+                        .get("turn_id")
+                        .and_then(Value::as_str)
+                        .map(String::from);
+                    self.pending_tool_calls.clear();
+                    self.unterminated_user_turn = false;
+                }
+                "task_complete" | "turn_complete" | "turn_aborted" => {
+                    self.turn_active = false;
+                    self.active_turn_id = None;
+                    self.pending_tool_calls.clear();
+                    self.unterminated_user_turn = false;
+                }
+                "user_message" => self.unterminated_user_turn = true,
+                _ => {}
+            }
+            return;
+        }
+        if outer_type != "response_item" {
+            return;
+        }
+
+        match payload_type {
+            "message" => {
+                if let Some(role) = payload.get("role").and_then(Value::as_str) {
+                    if role == "user" {
+                        self.unterminated_user_turn = true;
+                    }
+                }
+            }
+            "function_call" | "custom_tool_call" | "tool_search_call" => {
+                if let Some(call_id) = response_item_call_id(payload) {
+                    self.pending_tool_calls.insert(call_id);
+                }
+            }
+            "function_call_output" | "custom_tool_call_output" | "tool_search_output" => {
+                if let Some(call_id) = response_item_call_id(payload) {
+                    self.pending_tool_calls.remove(&call_id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn needs_interruption(&self) -> bool {
+        self.turn_active || self.unterminated_user_turn || !self.pending_tool_calls.is_empty()
+    }
+}
+
+fn response_item_call_id(payload: &Value) -> Option<String> {
+    payload
+        .get("call_id")
+        .or_else(|| payload.get("id"))
+        .and_then(Value::as_str)
+        .map(String::from)
+}
+
+fn build_independent_duplicate_meta(
+    mut source_meta: Value,
+    new_id: &str,
+    provider: &str,
+    source_id: &str,
+    timestamp: &str,
+) -> AppResult<String> {
+    ensure_legacy_history_mode(&source_meta, "完整 Fork")?;
+    source_meta["timestamp"] = Value::String(timestamp.to_string());
+    let payload = source_meta
+        .get_mut("payload")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| AppError::Other("session_meta 缺少有效 payload".into()))?;
+    let source_is_subagent = payload
+        .get("source")
+        .and_then(metadata_string_value)
+        .as_deref()
+        .is_some_and(|source| is_subagent_source(Some(source)));
+
+    payload.insert("id".into(), Value::String(new_id.to_string()));
+    payload.insert("session_id".into(), Value::String(new_id.to_string()));
+    payload.insert(
+        "forked_from_id".into(),
+        Value::String(source_id.to_string()),
+    );
+    payload.insert("timestamp".into(), Value::String(timestamp.to_string()));
+    payload.insert("model_provider".into(), Value::String(provider.to_string()));
+    payload.insert("thread_source".into(), Value::String("user".to_string()));
+    payload.insert("history_mode".into(), Value::String("legacy".to_string()));
+    if source_is_subagent || !payload.contains_key("source") {
+        payload.insert(
+            "source".into(),
+            Value::String(DEFAULT_THREAD_SOURCE.to_string()),
+        );
+    }
+    for field in [
+        "parent_thread_id",
+        "agent_nickname",
+        "agent_role",
+        "agent_type",
+        "agent_path",
+        "subagent_history_start_ordinal",
+        "history_base",
+        "context_window",
+        "clone_timestamp",
+        "cloned_from",
+    ] {
+        payload.remove(field);
+    }
+    Ok(serde_json::to_string(&source_meta)?)
+}
+
+fn write_interrupted_duplicate_boundary(
+    out: &mut fs::File,
+    turn_id: Option<&str>,
+) -> AppResult<()> {
+    const GUIDANCE: &str = "The user interrupted the previous turn on purpose. Any running unified exec processes may still be running in the background. If any tools/commands were aborted, they may have partially executed.";
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let marker = serde_json::json!({
+        "timestamp": timestamp,
+        "type": "response_item",
+        "payload": {
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": format!("<turn_aborted>\n{GUIDANCE}\n</turn_aborted>")
+            }]
+        }
+    });
+    let aborted = serde_json::json!({
+        "timestamp": timestamp,
+        "type": "event_msg",
+        "payload": {
+            "type": "turn_aborted",
+            "turn_id": turn_id,
+            "reason": "interrupted"
+        }
+    });
+    writeln!(out, "{}", serde_json::to_string(&marker)?)?;
+    writeln!(out, "{}", serde_json::to_string(&aborted)?)?;
+    Ok(())
+}
+
+fn write_duplicated_rollout(
+    src_abs: &Path,
+    dest_abs: &Path,
+    new_id: &str,
+    provider: &str,
+    source_id: &str,
+) -> AppResult<()> {
+    let source_fingerprint = atomic_file::fingerprint(src_abs)?;
+    let source_meta = {
+        let reader = BufReader::new(fs::File::open(src_abs)?);
+        let mut found = None;
+        for line in reader.lines() {
+            let line = line?;
+            if let Some(meta) = source_session_meta(&line, source_id)? {
+                found = Some(meta);
+                break;
+            }
+        }
+        found.ok_or_else(|| {
+            AppError::Other(format!(
+                "源 rollout 缺少当前会话的 session_meta: {}",
                 src_abs.to_string_lossy()
-            )));
+            ))
+        })?
+    };
+    let clone_timestamp = chrono::Utc::now().to_rfc3339();
+    let canonical = build_independent_duplicate_meta(
+        source_meta,
+        new_id,
+        provider,
+        source_id,
+        &clone_timestamp,
+    )?;
+
+    create_rollout_from_source_snapshot(src_abs, dest_abs, &source_fingerprint, |out| {
+        writeln!(out, "{canonical}")?;
+        let reader = BufReader::new(fs::File::open(src_abs)?);
+        let mut skipped_canonical = false;
+        let mut tail = DuplicateTailState::default();
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            if !skipped_canonical && source_session_meta(&line, source_id)?.is_some() {
+                skipped_canonical = true;
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                tail.observe(&value);
+            }
+            writeln!(out, "{line}")?;
+        }
+        if !skipped_canonical {
+            return Err(AppError::Other(
+                "复制期间未找到源会话 canonical meta".into(),
+            ));
+        }
+        if tail.needs_interruption() {
+            write_interrupted_duplicate_boundary(out, tail.active_turn_id.as_deref())?;
         }
         Ok(())
-    })?;
-    let post_commit = atomic_file::fingerprint(src_abs);
-    if !matches!(post_commit.as_ref(), Ok(current) if current == &source_fingerprint) {
-        let source_detail = post_commit
-            .err()
-            .map(|error| format!(": {error}"))
-            .unwrap_or_default();
-        return match fs::remove_file(dest_abs) {
-            Ok(()) => Err(AppError::Other(format!(
-                "源 rollout 在克隆提交时发生变化，已移除未登记分支{}: {}",
-                source_detail,
-                src_abs.to_string_lossy()
-            ))),
-            Err(error) => Err(AppError::Other(format!(
-                "源 rollout 在克隆提交时发生变化{}，且未登记分支清理失败 {}: {error}",
-                source_detail,
-                dest_abs.to_string_lossy()
-            ))),
-        };
-    }
-    Ok(())
+    })
 }
 
 #[derive(Debug)]
@@ -3158,21 +3510,23 @@ fn write_forked_rollout_prefix(
     atomic_file::create_with_writer_if_absent(dest_abs, |out| {
         for (idx, item) in prefix.lines.iter().enumerate() {
             if idx == 0 {
-                let mut value = item.value.clone();
                 let now_iso = chrono::Utc::now().to_rfc3339();
-                value["timestamp"] = Value::String(now_iso.clone());
-                let payload = value
-                    .get_mut("payload")
-                    .and_then(|p| p.as_object_mut())
+                let source_id = item
+                    .value
+                    .get("payload")
+                    .and_then(|payload| payload.get("id"))
+                    .and_then(Value::as_str)
                     .ok_or_else(|| {
-                        AppError::Other("session_meta.payload 缺失，无法重写新分支 id".into())
+                        AppError::Other("session_meta.payload.id 缺失，无法创建新分支".into())
                     })?;
-                payload.insert("id".into(), Value::String(new_id.to_string()));
-                payload.insert("timestamp".into(), Value::String(now_iso));
-                payload.insert("model_provider".into(), Value::String(provider.to_string()));
-                payload.remove("clone_timestamp");
-                payload.remove("cloned_from");
-                writeln!(out, "{}", serde_json::to_string(&value)?)?;
+                let canonical = build_independent_duplicate_meta(
+                    item.value.clone(),
+                    new_id,
+                    provider,
+                    source_id,
+                    &now_iso,
+                )?;
+                writeln!(out, "{canonical}")?;
             } else {
                 writeln!(out, "{}", item.raw_line)?;
             }
@@ -3286,10 +3640,15 @@ fn duplicate_session_locked(
     let mut journal = MutationJournal::default();
     let operation = (|| -> AppResult<u64> {
         journal.mutate_file(&new_abs, || {
-            write_cloned_rollout(&source_abs, &new_abs, &new_id, &provider, &session_id)
+            write_duplicated_rollout(&source_abs, &new_abs, &new_id, &provider, &session_id)
         })?;
         sync_thread_from_rollout(&codex, &transaction, &new_abs)?;
         carry_thread_title(&transaction, &session_id, &new_id)?;
+
+        let provenance_path = paths::session_provenance_path(&codex);
+        journal.mutate_file(&provenance_path, || {
+            crate::provenance::copy_conversion_origin(&codex, "codex", &session_id, &new_id)
+        })?;
 
         let new_brief = read_rollout_brief(&codex, &new_abs)?
             .ok_or_else(|| AppError::Other("新 rollout 缺少有效 session_meta.id".into()))?;
@@ -4560,8 +4919,14 @@ fn append_branch_extras_locked(
     let extras: Vec<String> = source_body[target_body.len()..]
         .iter()
         .map(|line| {
-            rewrite_session_meta_identity(line, &target_branch.id, &target_branch.provider, None)
-                .map(|rewritten| rewritten.unwrap_or_else(|| (*line).clone()))
+            rewrite_session_meta_identity(
+                line,
+                &source_branch.id,
+                &target_branch.id,
+                &target_branch.provider,
+                None,
+            )
+            .map(|rewritten| rewritten.unwrap_or_else(|| (*line).clone()))
         })
         .collect::<AppResult<_>>()?;
     let appended = u32::try_from(extras.len())
@@ -4581,6 +4946,7 @@ fn append_branch_extras_locked(
         for line in target_body.iter() {
             if let Some(rewritten) = rewrite_session_meta_identity(
                 line,
+                &target_branch.id,
                 &target_branch.id,
                 &target_branch.provider,
                 None,
@@ -5113,13 +5479,22 @@ mod tests {
         let source = write_conversation_rollout(&codex, source_id)?;
         let source_before = fs::read(&source)?;
         let state = create_full_state(&codex)?;
+        state.execute("ALTER TABLE threads ADD COLUMN name TEXT", [])?;
         sync_thread_from_rollout(&codex, &state, &source)?;
         state.execute(
-            "UPDATE threads SET title = 'Pinned source title' WHERE id = ?",
+            "UPDATE threads SET title = 'Pinned source title', name = 'Pinned source name' WHERE id = ?",
             [source_id],
         )?;
         drop(state);
         write_index_line(&codex, source_id)?;
+        crate::provenance::record_conversion(
+            &codex,
+            "codex",
+            source_id,
+            "claude",
+            "claude-source-session",
+            Some("native"),
+        )?;
 
         let report = duplicate_session_with_lock(
             codex.to_string_lossy().into_owned(),
@@ -5146,13 +5521,15 @@ mod tests {
         );
 
         let state = state_db::open_ro(&codex)?;
-        let (rollout_path, title, archived): (String, String, i64) = state.query_row(
-            "SELECT rollout_path, title, CAST(archived AS INTEGER) FROM threads WHERE id = ?",
+        let (rollout_path, title, name, archived): (String, String, String, i64) = state
+            .query_row(
+            "SELECT rollout_path, title, name, CAST(archived AS INTEGER) FROM threads WHERE id = ?",
             [&report.new_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
         assert_eq!(PathBuf::from(rollout_path), duplicated);
         assert_eq!(title, "Pinned source title");
+        assert_eq!(name, "Pinned source name");
         assert_eq!(archived, 0);
         let thread_count: i64 =
             state.query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))?;
@@ -5162,6 +5539,13 @@ mod tests {
         let index_ids = read_session_index_ids(&codex)?;
         assert!(index_ids.contains(source_id));
         assert!(index_ids.contains(&report.new_id));
+
+        let provenance: Value =
+            serde_json::from_slice(&fs::read(paths::session_provenance_path(&codex))?)?;
+        let copied_origin = &provenance["sessions"][format!("codex:{}", report.new_id)];
+        assert_eq!(copied_origin["source_provider"], "claude");
+        assert_eq!(copied_origin["source_id"], "claude-source-session");
+        assert_eq!(copied_origin["conversion_mode"], "native");
 
         fs::remove_dir_all(codex).ok();
         Ok(())
@@ -5177,7 +5561,16 @@ mod tests {
         sync_thread_from_rollout(&codex, &state, &source)?;
         drop(state);
         write_index_line(&codex, source_id)?;
+        crate::provenance::record_conversion(
+            &codex,
+            "codex",
+            source_id,
+            "claude",
+            "rollback-source-session",
+            Some("native"),
+        )?;
         let index_before = fs::read(paths::session_index_path(&codex))?;
+        let provenance_before = fs::read(paths::session_provenance_path(&codex))?;
         let global_state = paths::codex_global_state_json_path(&codex);
         fs::write(&global_state, "{broken json")?;
         let global_before = fs::read(&global_state)?;
@@ -5194,6 +5587,10 @@ mod tests {
         assert_eq!(fs::read(&source)?, source_before);
         assert_eq!(family::scan_rollouts(&codex)?, vec![source.clone()]);
         assert_eq!(fs::read(paths::session_index_path(&codex))?, index_before);
+        assert_eq!(
+            fs::read(paths::session_provenance_path(&codex))?,
+            provenance_before
+        );
         assert_eq!(fs::read(&global_state)?, global_before);
         let state = state_db::open_ro(&codex)?;
         let thread_ids = state
@@ -5311,15 +5708,28 @@ mod tests {
     }
 
     #[test]
-    fn cloned_rollout_rewrites_every_session_meta_identity() -> AppResult<()> {
+    fn cloned_rollout_rewrites_only_the_source_session_meta_identity() -> AppResult<()> {
         let codex = temp_codex_dir("cc-session-manager-clone-repeated-meta-test");
         let source = codex.join("sessions/source.jsonl");
         let target = codex.join("sessions/target.jsonl");
+        let ancestor_meta = serde_json::json!({
+            "timestamp": "2026-04-24T00:30:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "ancestor",
+                "session_id": "ancestor",
+                "model_provider": "ancestor-provider",
+                "cwd": "F:\\project\\ancestor",
+                "source": DEFAULT_THREAD_SOURCE
+            }
+        })
+        .to_string();
         let repeated_meta = serde_json::json!({
             "timestamp": "2026-04-24T01:00:00Z",
             "type": "session_meta",
             "payload": {
                 "id": "source",
+                "session_id": "source",
                 "timestamp": "2026-04-24T01:00:00Z",
                 "model_provider": DEFAULT_PROVIDER,
                 "cwd": "F:\\project\\example",
@@ -5327,7 +5737,12 @@ mod tests {
             }
         })
         .to_string();
-        write_sync_rollout(&source, "source", DEFAULT_PROVIDER, &[repeated_meta])?;
+        write_sync_rollout(
+            &source,
+            "source",
+            DEFAULT_PROVIDER,
+            &[ancestor_meta, repeated_meta],
+        )?;
 
         write_cloned_rollout(&source, &target, "target", "custom", "source")?;
 
@@ -5336,17 +5751,289 @@ mod tests {
             .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
             .filter(|value| value.get("type").and_then(Value::as_str) == Some("session_meta"))
             .collect::<Vec<_>>();
-        assert_eq!(session_meta.len(), 2);
-        for value in &session_meta {
-            assert_eq!(value["payload"]["id"], "target");
-            assert_eq!(value["payload"]["model_provider"], "custom");
-        }
+        assert_eq!(session_meta.len(), 3);
+        assert_eq!(session_meta[0]["payload"]["id"], "target");
+        assert_eq!(session_meta[0]["payload"]["session_id"], "target");
+        assert_eq!(session_meta[0]["payload"]["model_provider"], "custom");
+        assert_eq!(session_meta[1]["payload"]["id"], "ancestor");
+        assert_eq!(session_meta[1]["payload"]["session_id"], "ancestor");
         assert_eq!(
-            session_meta[1]["timestamp"],
+            session_meta[1]["payload"]["model_provider"],
+            "ancestor-provider"
+        );
+        assert_eq!(session_meta[2]["payload"]["id"], "target");
+        assert_eq!(session_meta[2]["payload"]["session_id"], "target");
+        assert_eq!(session_meta[2]["payload"]["model_provider"], "custom");
+        assert_eq!(
+            session_meta[2]["timestamp"],
             Value::String("2026-04-24T01:00:00Z".into())
         );
 
         fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn duplicated_rollout_creates_a_root_meta_and_interrupts_an_unfinished_turn() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-independent-duplicate-test");
+        let source = codex.join("sessions/source.jsonl");
+        let target = codex.join("sessions/target.jsonl");
+        fs::create_dir_all(source.parent().expect("source parent"))?;
+        let dynamic_tools = serde_json::json!([{
+            "name": "lookup",
+            "description": "keep this dynamic tool description",
+            "input_schema": {"type": "object"}
+        }]);
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-04-24T00:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "source",
+                    "session_id": "source",
+                    "parent_thread_id": "old-parent",
+                    "model_provider": DEFAULT_PROVIDER,
+                    "cwd": "F:\\project\\example",
+                    "source": {"subagent": {"thread_spawn": {"parent_thread_id": "old-parent"}}},
+                    "thread_source": "subagent",
+                    "agent_nickname": "Worker",
+                    "agent_role": "reviewer",
+                    "agent_path": "/root/reviewer",
+                    "dynamic_tools": dynamic_tools,
+                    "history_mode": "legacy"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-04-24T00:00:01Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "ancestor",
+                    "session_id": "ancestor",
+                    "model_provider": "ancestor-provider",
+                    "cwd": "F:\\project\\ancestor",
+                    "source": "vscode"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-04-24T00:00:02Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "source",
+                    "session_id": "source",
+                    "model_provider": DEFAULT_PROVIDER,
+                    "cwd": "F:\\project\\example",
+                    "source": "vscode"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-04-24T00:00:03Z",
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "active-turn"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-04-24T00:00:04Z",
+                "type": "response_item",
+                "payload": {"type": "custom_tool_call", "call_id": "call-1", "name": "lookup", "input": "{}"}
+            }),
+        ];
+        fs::write(
+            &source,
+            format!(
+                "{}\n",
+                lines
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        )?;
+
+        write_duplicated_rollout(&source, &target, "target", DEFAULT_PROVIDER, "source")?;
+
+        let values = read_rollout_lines(&target)?
+            .into_iter()
+            .map(|line| serde_json::from_str::<Value>(&line))
+            .collect::<Result<Vec<_>, _>>()?;
+        let canonical = &values[0];
+        assert_eq!(canonical["payload"]["id"], "target");
+        assert_eq!(canonical["payload"]["session_id"], "target");
+        assert_eq!(canonical["payload"]["forked_from_id"], "source");
+        assert_eq!(canonical["payload"]["source"], DEFAULT_THREAD_SOURCE);
+        assert_eq!(canonical["payload"]["thread_source"], "user");
+        assert_eq!(canonical["payload"]["history_mode"], "legacy");
+        assert_eq!(canonical["payload"]["dynamic_tools"], dynamic_tools);
+        for removed in [
+            "parent_thread_id",
+            "agent_nickname",
+            "agent_role",
+            "agent_path",
+        ] {
+            assert!(canonical["payload"].get(removed).is_none(), "{removed}");
+        }
+
+        let copied_meta = values
+            .iter()
+            .skip(1)
+            .filter(|value| value["type"] == "session_meta")
+            .collect::<Vec<_>>();
+        assert_eq!(copied_meta.len(), 2);
+        assert_eq!(copied_meta[0]["payload"]["id"], "ancestor");
+        assert_eq!(
+            copied_meta[0]["payload"]["model_provider"],
+            "ancestor-provider"
+        );
+        assert_eq!(copied_meta[1]["payload"]["id"], "source");
+
+        let marker = &values[values.len() - 2];
+        assert_eq!(marker["type"], "response_item");
+        assert_eq!(marker["payload"]["type"], "message");
+        assert_eq!(marker["payload"]["role"], "user");
+        assert!(marker["payload"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("<turn_aborted>")));
+        let aborted = &values[values.len() - 1];
+        assert_eq!(aborted["type"], "event_msg");
+        assert_eq!(aborted["payload"]["type"], "turn_aborted");
+        assert_eq!(aborted["payload"]["turn_id"], "active-turn");
+        assert_eq!(aborted["payload"]["reason"], "interrupted");
+
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn duplicated_rollout_interrupts_legacy_history_without_lifecycle_events() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-legacy-duplicate-boundary-test");
+        let source = codex.join("sessions/source.jsonl");
+        let target = codex.join("sessions/target.jsonl");
+        fs::create_dir_all(source.parent().expect("source parent"))?;
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-04-24T00:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "source",
+                    "session_id": "source",
+                    "model_provider": DEFAULT_PROVIDER,
+                    "cwd": "F:\\project\\example",
+                    "source": DEFAULT_THREAD_SOURCE,
+                    "history_mode": "legacy"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-04-24T00:00:01Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue"}]
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-04-24T00:00:02Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "partial"}]
+                }
+            }),
+        ];
+        fs::write(
+            &source,
+            format!(
+                "{}\n",
+                lines
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        )?;
+
+        write_duplicated_rollout(&source, &target, "target", DEFAULT_PROVIDER, "source")?;
+
+        let values = read_rollout_lines(&target)?
+            .into_iter()
+            .map(|line| serde_json::from_str::<Value>(&line))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(values[values.len() - 2]["payload"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("<turn_aborted>")));
+        assert_eq!(values[values.len() - 1]["payload"]["type"], "turn_aborted");
+        assert!(values[values.len() - 1]["payload"]["turn_id"].is_null());
+
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn duplicated_rollout_rejects_paginated_history() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-paginated-duplicate-test");
+        let source = codex.join("sessions/source.jsonl");
+        let target = codex.join("sessions/target.jsonl");
+        fs::create_dir_all(source.parent().expect("source parent"))?;
+        fs::write(
+            &source,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "timestamp": "2026-04-24T00:00:00Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "source",
+                        "session_id": "source",
+                        "model_provider": DEFAULT_PROVIDER,
+                        "cwd": "F:\\project\\example",
+                        "source": DEFAULT_THREAD_SOURCE,
+                        "history_mode": "paginated"
+                    }
+                })
+            ),
+        )?;
+
+        let error =
+            write_duplicated_rollout(&source, &target, "target", DEFAULT_PROVIDER, "source")
+                .expect_err("paginated history must not be copied as a standalone JSONL");
+
+        assert!(error.to_string().contains("paginated"), "{error}");
+        assert!(error.to_string().contains("Codex 官方"), "{error}");
+        assert!(!target.exists());
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn provider_clone_rejects_paginated_history() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-paginated-provider-clone-test");
+        let source = codex.join("sessions/source.jsonl");
+        let target = codex.join("sessions/target.jsonl");
+        fs::create_dir_all(source.parent().expect("source parent"))?;
+        fs::write(
+            &source,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "timestamp": "2026-04-24T00:00:00Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "source",
+                        "session_id": "source",
+                        "model_provider": DEFAULT_PROVIDER,
+                        "cwd": "F:\\project\\example",
+                        "source": DEFAULT_THREAD_SOURCE,
+                        "history_mode": "paginated"
+                    }
+                })
+            ),
+        )?;
+
+        let error = write_cloned_rollout(&source, &target, "target", "custom", "source")
+            .expect_err("paginated provider clone must use the official thread store");
+
+        assert!(error.to_string().contains("paginated"), "{error}");
+        assert!(!target.exists());
+        fs::remove_dir_all(codex).ok();
         Ok(())
     }
 
@@ -5952,7 +6639,7 @@ mod tests {
     }
 
     #[test]
-    fn upsert_thread_fills_preview_and_thread_source_when_columns_exist() -> AppResult<()> {
+    fn upsert_thread_fills_current_optional_columns_when_they_exist() -> AppResult<()> {
         let codex = temp_codex_dir("cc-session-manager-preview-cols-test");
         let rollout = write_conversation_rollout(&codex, "preview-session")?;
         {
@@ -5962,17 +6649,149 @@ mod tests {
                 [],
             )?;
             conn.execute("ALTER TABLE threads ADD COLUMN thread_source TEXT", [])?;
+            conn.execute(
+                "ALTER TABLE threads ADD COLUMN recency_at INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+            conn.execute(
+                "ALTER TABLE threads ADD COLUMN recency_at_ms INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+            conn.execute(
+                "ALTER TABLE threads ADD COLUMN history_mode TEXT NOT NULL DEFAULT 'legacy'",
+                [],
+            )?;
+            conn.execute("ALTER TABLE threads ADD COLUMN name TEXT", [])?;
         }
 
         let state = state_db::open(&codex)?;
         assert!(upsert_thread_from_rollout(&codex, &state, &rollout, false)?);
-        let (preview, thread_source): (String, String) = state.query_row(
-            "SELECT preview, thread_source FROM threads WHERE id = ?",
+        let (preview, thread_source, updated_at, updated_at_ms, recency_at, recency_at_ms, history_mode, name): (
+            String,
+            String,
+            i64,
+            i64,
+            i64,
+            i64,
+            String,
+            Option<String>,
+        ) = state.query_row(
+            "SELECT preview, thread_source, CAST(updated_at AS INTEGER), CAST(updated_at_ms AS INTEGER),
+                    recency_at, recency_at_ms, history_mode, name
+             FROM threads WHERE id = ?",
             ["preview-session"],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
         )?;
         assert_eq!(preview, "First request");
         assert_eq!(thread_source, "user");
+        assert_eq!(recency_at, updated_at);
+        assert_eq!(recency_at_ms, updated_at_ms);
+        assert_eq!(history_mode, "legacy");
+        assert!(name.is_none());
+
+        state.execute(
+            "UPDATE threads
+             SET recency_at = 1999999999,
+                 recency_at_ms = 1999999999123,
+                 preview = 'Pinned preview'
+             WHERE id = 'preview-session'",
+            [],
+        )?;
+        let canonical_line = fs::read_to_string(&rollout)?
+            .lines()
+            .next()
+            .expect("canonical session meta")
+            .to_string();
+        fs::write(&rollout, format!("{canonical_line}\n"))?;
+        assert!(upsert_thread_from_rollout(&codex, &state, &rollout, false)?);
+        let (preserved_recency, preserved_recency_ms, preserved_preview): (i64, i64, String) =
+            state.query_row(
+                "SELECT recency_at, recency_at_ms, preview FROM threads WHERE id = ?",
+                ["preview-session"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        assert_eq!(preserved_recency, 1_999_999_999);
+        assert_eq!(preserved_recency_ms, 1_999_999_999_123);
+        assert_eq!(preserved_preview, "Pinned preview");
+
+        drop(state);
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn upsert_thread_maps_nested_git_metadata() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-nested-git-test");
+        let rollout_dir = codex.join("sessions").join("2026").join("04").join("23");
+        fs::create_dir_all(&rollout_dir)?;
+        let rollout = rollout_dir.join("rollout-git-session.jsonl");
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-04-23T00:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "git-session",
+                    "session_id": "git-session",
+                    "model_provider": DEFAULT_PROVIDER,
+                    "cwd": "F:\\project\\example",
+                    "source": DEFAULT_THREAD_SOURCE,
+                    "git": {
+                        "commit_hash": "0123456789abcdef",
+                        "branch": "feature/nested-git",
+                        "repository_url": "https://example.invalid/repo.git"
+                    }
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": "2026-04-23T00:00:01Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Git request"}
+            })
+            .to_string(),
+        ];
+        fs::write(&rollout, format!("{}\n", lines.join("\n")))?;
+        create_full_state(&codex)?;
+
+        let state = state_db::open(&codex)?;
+        assert!(upsert_thread_from_rollout(&codex, &state, &rollout, false)?);
+        let git: (String, String, String) = state.query_row(
+            "SELECT git_sha, git_branch, git_origin_url FROM threads WHERE id = ?",
+            ["git-session"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(git.0, "0123456789abcdef");
+        assert_eq!(git.1, "feature/nested-git");
+        assert_eq!(git.2, "https://example.invalid/repo.git");
+
+        state.execute(
+            "UPDATE threads
+             SET git_sha = 'database-sha',
+                 git_branch = 'database-branch',
+                 git_origin_url = 'https://example.invalid/database.git'
+             WHERE id = 'git-session'",
+            [],
+        )?;
+        assert!(upsert_thread_from_rollout(&codex, &state, &rollout, false)?);
+        let preserved_git: (String, String, String) = state.query_row(
+            "SELECT git_sha, git_branch, git_origin_url FROM threads WHERE id = ?",
+            ["git-session"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(preserved_git.0, "database-sha");
+        assert_eq!(preserved_git.1, "database-branch");
+        assert_eq!(preserved_git.2, "https://example.invalid/database.git");
 
         drop(state);
         fs::remove_dir_all(&codex).ok();
@@ -6165,6 +6984,10 @@ mod tests {
                 .and_then(|x| x.as_str()),
             Some(report.new_id.as_str())
         );
+        assert_eq!(first["payload"]["session_id"], report.new_id);
+        assert_eq!(first["payload"]["forked_from_id"], source_id);
+        assert_eq!(first["payload"]["thread_source"], "user");
+        assert_eq!(first["payload"]["history_mode"], "legacy");
 
         assert!(!rollout.exists());
         assert!(paths::archived_sessions_dir(&codex)

@@ -10,6 +10,7 @@ import {
   Folders,
   GitBranch,
   Inbox,
+  Loader2,
   MoreHorizontal,
   Network,
   Pencil,
@@ -65,6 +66,7 @@ type Props = {
   currentProvider?: string | null;
   syncing?: boolean;
   syncDisabled?: boolean;
+  duplicating?: boolean;
 };
 
 export const SessionCard = memo(function SessionCard({
@@ -90,6 +92,7 @@ export const SessionCard = memo(function SessionCard({
   currentProvider,
   syncing = false,
   syncDisabled = false,
+  duplicating = false,
 }: Props) {
   const displayTitle = sessionDisplayTitle(s.title, s.first_user_message);
   const displayFirstUserMessage = sessionDisplayPreview(s.first_user_message);
@@ -324,11 +327,16 @@ export const SessionCard = memo(function SessionCard({
                 <Button
                   variant="ghost"
                   size="sm"
+                  disabled={duplicating}
                   onClick={() => onDuplicate(s)}
                   className="h-7 gap-1.5 px-2.5 font-normal text-muted-foreground hover:text-foreground"
                 >
-                  <GitBranch className="h-3.5 w-3.5" />
-                  完整 Fork
+                  {duplicating ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <GitBranch className="h-3.5 w-3.5" />
+                  )}
+                  {duplicating ? "Fork 中…" : "完整 Fork"}
                 </Button>
               )}
               <Button

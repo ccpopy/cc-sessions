@@ -37,6 +37,7 @@ type Props = Handlers & {
   currentProvider?: string | null;
   syncingSessionIds?: ReadonlySet<string>;
   syncActionsDisabled?: boolean;
+  duplicatingSessionIds?: ReadonlySet<string>;
 };
 
 type BucketKey = "today" | "yesterday" | "week" | "month" | "earlier";
@@ -48,6 +49,7 @@ export function SessionList({
   currentProvider,
   syncingSessionIds,
   syncActionsDisabled,
+  duplicatingSessionIds,
   ...h
 }: Props) {
   const view = useView((s) => s.view);
@@ -78,6 +80,7 @@ export function SessionList({
         currentProvider={currentProvider}
         syncingSessionIds={syncingSessionIds}
         syncActionsDisabled={syncActionsDisabled}
+        duplicatingSessionIds={duplicatingSessionIds}
       />
     );
   }
@@ -92,6 +95,7 @@ export function SessionList({
         currentProvider={currentProvider}
         syncingSessionIds={syncingSessionIds}
         syncActionsDisabled={syncActionsDisabled}
+        duplicatingSessionIds={duplicatingSessionIds}
       />
     );
   }
@@ -105,6 +109,7 @@ export function SessionList({
       currentProvider={currentProvider}
       syncingSessionIds={syncingSessionIds}
       syncActionsDisabled={syncActionsDisabled}
+      duplicatingSessionIds={duplicatingSessionIds}
     />
   );
 }
@@ -117,6 +122,7 @@ function TimeView({
   currentProvider,
   syncingSessionIds,
   syncActionsDisabled,
+  duplicatingSessionIds,
 }: {
   sessions: SessionSummary[];
   handlers: Handlers;
@@ -125,6 +131,7 @@ function TimeView({
   currentProvider?: string | null;
   syncingSessionIds?: ReadonlySet<string>;
   syncActionsDisabled?: boolean;
+  duplicatingSessionIds?: ReadonlySet<string>;
 }) {
   const selected = useSelection((s) => s.selected);
   const toggle = useSelection((s) => s.toggle);
@@ -191,6 +198,7 @@ function TimeView({
                   currentProvider={currentProvider}
                   syncing={syncingSessionIds?.has(s.id)}
                   syncDisabled={syncActionsDisabled}
+                  duplicating={duplicatingSessionIds?.has(s.id)}
                   {...handlers}
                 />
               ))}
@@ -210,6 +218,7 @@ function ProjectView({
   currentProvider,
   syncingSessionIds,
   syncActionsDisabled,
+  duplicatingSessionIds,
 }: {
   sessions: SessionSummary[];
   handlers: Handlers;
@@ -218,6 +227,7 @@ function ProjectView({
   currentProvider?: string | null;
   syncingSessionIds?: ReadonlySet<string>;
   syncActionsDisabled?: boolean;
+  duplicatingSessionIds?: ReadonlySet<string>;
 }) {
   const groups = useMemo(() => {
     const map = new Map<string, SessionSummary[]>();
@@ -249,6 +259,7 @@ function ProjectView({
           currentProvider={currentProvider}
           syncingSessionIds={syncingSessionIds}
           syncActionsDisabled={syncActionsDisabled}
+          duplicatingSessionIds={duplicatingSessionIds}
         />
       ))}
     </div>
@@ -263,6 +274,7 @@ function SizeView({
   currentProvider,
   syncingSessionIds,
   syncActionsDisabled,
+  duplicatingSessionIds,
 }: {
   sessions: SessionSummary[];
   handlers: Handlers;
@@ -271,6 +283,7 @@ function SizeView({
   currentProvider?: string | null;
   syncingSessionIds?: ReadonlySet<string>;
   syncActionsDisabled?: boolean;
+  duplicatingSessionIds?: ReadonlySet<string>;
 }) {
   const selected = useSelection((s) => s.selected);
   const toggle = useSelection((s) => s.toggle);
@@ -293,6 +306,7 @@ function SizeView({
           currentProvider={currentProvider}
           syncing={syncingSessionIds?.has(s.id)}
           syncDisabled={syncActionsDisabled}
+          duplicating={duplicatingSessionIds?.has(s.id)}
           {...handlers}
         />
       ))}

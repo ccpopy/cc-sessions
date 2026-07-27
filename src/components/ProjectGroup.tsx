@@ -22,9 +22,12 @@ type Handlers = {
   onBackup: (s: SessionSummary) => void;
   onDelete?: (s: SessionSummary) => void;
   onClone?: (s: SessionSummary) => void;
+  onDuplicate?: (s: SessionSummary) => void;
   onOpenFamily?: (s: SessionSummary) => void;
   onExportMarkdown?: (s: SessionSummary) => void;
+  onConvert?: (s: SessionSummary) => void;
   onRename?: (s: SessionSummary) => void;
+  onMoveCwd?: (s: SessionSummary) => void;
 };
 
 type Props = {
@@ -38,6 +41,7 @@ type Props = {
   currentProvider?: string | null;
   syncingSessionIds?: ReadonlySet<string>;
   syncActionsDisabled?: boolean;
+  duplicatingSessionIds?: ReadonlySet<string>;
 };
 
 export function ProjectGroupView({
@@ -51,6 +55,7 @@ export function ProjectGroupView({
   currentProvider,
   syncingSessionIds,
   syncActionsDisabled,
+  duplicatingSessionIds,
 }: Props) {
   const [open, setOpen] = useState(defaultOpen);
   const selected = useSelection((s) => s.selected);
@@ -125,6 +130,7 @@ export function ProjectGroupView({
               currentProvider={currentProvider}
               syncing={syncingSessionIds?.has(s.id)}
               syncDisabled={syncActionsDisabled}
+              duplicating={duplicatingSessionIds?.has(s.id)}
               {...handlers}
             />
           ))}

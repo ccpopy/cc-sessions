@@ -21,7 +21,8 @@ fn provider_or_codex(provider: Option<String>) -> String {
     provider.unwrap_or_else(|| "codex".to_string())
 }
 
-/// Codex App 的活跃会话列表标题以 session_index.jsonl 的 thread_name 为准。
+/// Codex App 的显式会话名以新版 threads.name 为准；没有显式名称时，活跃会话
+/// 再以 session_index.jsonl 的 thread_name 为准。
 ///
 /// state_5.sqlite 的 threads.title 可能仍停留在首条用户消息，即使 Codex App 已经
 /// 为会话生成了简短标题。索引不是核心数据库，单行损坏时跳过该行并回退数据库
@@ -64,44 +65,55 @@ fn read_session_index_titles(codex_dir: &Path) -> AppResult<HashMap<String, Stri
     Ok(titles)
 }
 
-/// 返回 Codex 当前对外展示的会话标题：活跃索引优先，数据库标题兜底。
+/// 返回 Codex 当前对外展示的会话标题：显式 name 优先，活跃索引其次，title 兜底。
 pub(crate) fn codex_display_title(codex_dir: &Path, id: &str) -> AppResult<Option<String>> {
     let index_title = read_session_index_titles(codex_dir)?.remove(id);
     if !paths::state_db_path(codex_dir).is_file() {
         return Ok(index_title);
     }
     let state = state_db::open_ro(codex_dir)?;
+    let has_name = crate::repair::threads_table_columns(&state)?
+        .iter()
+        .any(|column| column == "name");
+    let name_column = if has_name { "COALESCE(name,'')" } else { "''" };
+    let sql = format!(
+        "SELECT COALESCE(title,''), {name_column}, COALESCE(first_user_message,''), COALESCE(archived,0)
+         FROM threads WHERE id = ?1"
+    );
     let row = state
-        .query_row(
-            "SELECT COALESCE(title,''), COALESCE(first_user_message,''), COALESCE(archived,0)
-             FROM threads WHERE id = ?1",
-            [id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            },
-        )
+        .query_row(&sql, [id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
         .optional()?;
     Ok(match row {
-        Some((database_title, first_user_message, archived)) => Some(select_codex_title(
-            index_title.as_deref(),
-            database_title,
-            &first_user_message,
-            archived != 0,
-        )),
+        Some((database_title, database_name, first_user_message, archived)) => {
+            Some(select_codex_title(
+                index_title.as_deref(),
+                &database_name,
+                database_title,
+                &first_user_message,
+                archived != 0,
+            ))
+        }
         None => index_title,
     })
 }
 
 fn select_codex_title(
     index_title: Option<&str>,
+    database_name: &str,
     database_title: String,
     first_user_message: &str,
     archived: bool,
 ) -> String {
+    if !database_name.trim().is_empty() {
+        return database_name.to_string();
+    }
     if archived {
         return database_title;
     }
@@ -126,9 +138,13 @@ fn query_summaries(
     let state = state_db::open_ro(codex_dir)?;
     let logs_conn = logs_db::open_ro(codex_dir).ok();
     let index_titles = read_session_index_titles(codex_dir)?;
+    let has_name = crate::repair::threads_table_columns(&state)?
+        .iter()
+        .any(|column| column == "name");
+    let name_column = if has_name { "COALESCE(name,'')" } else { "''" };
 
     let sql = format!(
-        "SELECT id, rollout_path, cwd, title, COALESCE(first_user_message,''), model, reasoning_effort,
+        "SELECT id, rollout_path, cwd, COALESCE(title,''), {name_column}, COALESCE(first_user_message,''), model, reasoning_effort,
                 COALESCE(tokens_used,0), created_at, updated_at, COALESCE(archived,0),
                 git_branch, source, agent_nickname, agent_role
          FROM threads
@@ -143,17 +159,18 @@ fn query_summaries(
             let rollout_path_raw: String = row.get(1)?;
             let cwd_raw: String = row.get(2)?;
             let database_title: String = row.get(3)?;
-            let first_user_message: String = row.get(4)?;
-            let model: Option<String> = row.get(5)?;
-            let reasoning_effort: Option<String> = row.get(6)?;
-            let tokens_used: i64 = row.get(7)?;
-            let created_at: i64 = row.get(8)?;
-            let updated_at: i64 = row.get(9)?;
-            let archived: i64 = row.get(10)?;
-            let git_branch: Option<String> = row.get(11)?;
-            let source: Option<String> = row.get(12)?;
-            let agent_nickname: Option<String> = row.get(13)?;
-            let agent_role: Option<String> = row.get(14)?;
+            let database_name: String = row.get(4)?;
+            let first_user_message: String = row.get(5)?;
+            let model: Option<String> = row.get(6)?;
+            let reasoning_effort: Option<String> = row.get(7)?;
+            let tokens_used: i64 = row.get(8)?;
+            let created_at: i64 = row.get(9)?;
+            let updated_at: i64 = row.get(10)?;
+            let archived: i64 = row.get(11)?;
+            let git_branch: Option<String> = row.get(12)?;
+            let source: Option<String> = row.get(13)?;
+            let agent_nickname: Option<String> = row.get(14)?;
+            let agent_role: Option<String> = row.get(15)?;
 
             let rollout_path =
                 paths::host_path_string_from_codex_record(codex_dir, &rollout_path_raw);
@@ -165,6 +182,7 @@ fn query_summaries(
             let resume_command = format!("codex resume {}", id);
             let title = select_codex_title(
                 index_titles.get(&id).map(String::as_str),
+                &database_name,
                 database_title,
                 &first_user_message,
                 archived != 0,
@@ -449,7 +467,7 @@ pub fn set_archived_with_lock(
     family::with_lock(lock, |_guard| set_archived_codex_locked(codex_dir, id, v))
 }
 
-/// 重命名会话：写 threads.title（官方 App 与本软件共用这一名称来源）。
+/// 重命名会话：新版写 threads.name，同时兼容更新旧版 threads.title。
 ///
 /// 同一家族的全部分支一起改名——provider 切换会产生新 id，只改当前分支的话，
 /// 切换后名称又会退回首条消息（用户反馈 #8）。返回实际更新的 threads 行数。
@@ -495,16 +513,21 @@ fn rename_session_locked(codex_dir: String, id: String, title: String) -> AppRes
     }
 
     let state = state_db::open(&codex)?;
+    let has_name = crate::repair::threads_table_columns(&state)?
+        .iter()
+        .any(|column| column == "name");
     let now = chrono::Utc::now().timestamp();
     let mut renamed = 0u32;
     for sid in &ids {
         // 只更新 updated_at（秒），新 schema 的触发器会自动同步 updated_at_ms。
         // bump updated_at 是为了让官方 App 的水位线增量同步能拉到这次改名，
         // 否则要重启 App 才能看到新名字。
-        renamed += state.execute(
-            "UPDATE threads SET title = ?1, updated_at = ?2 WHERE id = ?3",
-            params![title, now, sid],
-        )? as u32;
+        let sql = if has_name {
+            "UPDATE threads SET title = ?1, name = ?1, updated_at = ?2 WHERE id = ?3"
+        } else {
+            "UPDATE threads SET title = ?1, updated_at = ?2 WHERE id = ?3"
+        };
+        renamed += state.execute(sql, params![title, now, sid])? as u32;
     }
     if renamed == 0 {
         return Err(AppError::NotFound(format!("threads 中未找到会话 {id}")));
@@ -530,49 +553,89 @@ fn rename_session_locked(codex_dir: String, id: String, title: String) -> AppRes
 
 // ========================= 移动工作目录 (move session cwd) =========================
 
-/// 流式重写 rollout 首行的 payload.cwd，保留原始换行风格和后续字节。
-fn rewrite_rollout_cwd(path: &Path, new_cwd: &str) -> AppResult<bool> {
+fn json_line_bounds(line: &[u8]) -> (usize, usize) {
+    if line.ends_with(b"\r\n") {
+        (line.len() - 2, 2)
+    } else if line.ends_with(b"\n") {
+        (line.len() - 1, 1)
+    } else {
+        (line.len(), 0)
+    }
+}
+
+fn matching_session_meta_cwd<'a>(
+    value: &'a serde_json::Value,
+    session_id: &str,
+) -> Option<&'a str> {
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let payload = value.get("payload")?.as_object()?;
+    (payload.get("id").and_then(serde_json::Value::as_str) == Some(session_id)).then(|| {
+        payload
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+    })
+}
+
+/// 流式重写属于当前会话 id 的全部 session_meta.cwd；祖先/嵌套历史元数据保持不变。
+fn rewrite_rollout_cwd(path: &Path, session_id: &str, new_cwd: &str) -> AppResult<bool> {
     let fp = atomic_file::fingerprint(path)?;
     let mut source = BufReader::new(File::open(path)?);
-    let mut first_line = Vec::new();
-    if source.read_until(b'\n', &mut first_line)? == 0 {
+    let mut matched = false;
+    let mut needs_rewrite = false;
+    loop {
+        let mut line = Vec::new();
+        if source.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        let (json_end, _) = json_line_bounds(&line);
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&line[..json_end]) else {
+            continue;
+        };
+        if let Some(cwd) = matching_session_meta_cwd(&value, session_id) {
+            matched = true;
+            needs_rewrite |= cwd != new_cwd;
+        }
+    }
+    if !matched {
         return Err(AppError::Other(format!(
-            "rollout 为空，无法修改工作目录: {}",
+            "rollout 缺少会话 {session_id} 的 session_meta，无法修改工作目录: {}",
             path.to_string_lossy()
         )));
     }
-    let (json_end, line_ending): (usize, &[u8]) = if first_line.ends_with(b"\r\n") {
-        (first_line.len() - 2, b"\r\n")
-    } else if first_line.ends_with(b"\n") {
-        (first_line.len() - 1, b"\n")
-    } else {
-        (first_line.len(), b"")
-    };
-    let mut meta: serde_json::Value = serde_json::from_slice(&first_line[..json_end])
-        .map_err(|error| AppError::Other(format!("无法解析 rollout session_meta: {error}")))?;
-    if meta.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
-        return Err(AppError::Other(
-            "rollout 首行不是 session_meta，拒绝修改工作目录".into(),
-        ));
-    }
-    let payload = meta
-        .get_mut("payload")
-        .and_then(serde_json::Value::as_object_mut)
-        .ok_or_else(|| AppError::Other("rollout session_meta 缺少 payload 字段".into()))?;
-    if payload.get("cwd").and_then(serde_json::Value::as_str) == Some(new_cwd) {
+    if !needs_rewrite {
         return Ok(false);
     }
-    payload.insert("cwd".into(), serde_json::Value::String(new_cwd.to_owned()));
-    let updated_first = serde_json::to_vec(&meta)
-        .map_err(|error| AppError::Other(format!("无法序列化 session_meta: {error}")))?;
 
     atomic_file::replace_with_writer_if_unchanged(path, &fp, |file| {
         let mut source = BufReader::new(File::open(path)?);
-        let mut discarded_first_line = Vec::new();
-        source.read_until(b'\n', &mut discarded_first_line)?;
-        file.write_all(&updated_first)?;
-        file.write_all(line_ending)?;
-        std::io::copy(&mut source, file)?;
+        loop {
+            let mut line = Vec::new();
+            if source.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            let (json_end, ending_len) = json_line_bounds(&line);
+            let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&line[..json_end])
+            else {
+                file.write_all(&line)?;
+                continue;
+            };
+            if matching_session_meta_cwd(&value, session_id).is_none() {
+                file.write_all(&line)?;
+                continue;
+            }
+            let payload = value
+                .get_mut("payload")
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or_else(|| AppError::Other("rollout session_meta 缺少 payload 字段".into()))?;
+            payload.insert("cwd".into(), serde_json::Value::String(new_cwd.to_owned()));
+            file.write_all(&serde_json::to_vec(&value)?)?;
+            if ending_len > 0 {
+                file.write_all(&line[line.len() - ending_len..])?;
+            }
+        }
         Ok(())
     })?;
     Ok(true)
@@ -704,24 +767,31 @@ fn move_session_cwd_locked(
         if sid == &id {
             old_cwd = paths::host_path_string_from_codex_record(&codex, &current_cwd);
         }
-        rollouts.insert(sid.clone(), (rollout, current_cwd));
+        rollouts.insert(sid.clone(), rollout);
     }
     let index_ids = crate::repair::read_session_index_ids(&codex)?;
     let state = state_db::open(&codex)?;
+    let has_name = crate::repair::threads_table_columns(&state)?
+        .iter()
+        .any(|column| column == "name");
+    let thread_name_sql = if has_name {
+        "SELECT COALESCE(NULLIF(name,''), NULLIF(title,''), COALESCE(first_user_message,'')) FROM threads WHERE id = ?"
+    } else {
+        "SELECT COALESCE(NULLIF(title,''), COALESCE(first_user_message,'')) FROM threads WHERE id = ?"
+    };
     let transaction =
         rusqlite::Transaction::new_unchecked(&state, rusqlite::TransactionBehavior::Immediate)?;
     let mut journal = crate::repair::MutationJournal::default();
     let mut rollout_rewritten = false;
     let operation = (|| -> AppResult<u32> {
         for sid in &ids {
-            let (rollout, current_cwd) = rollouts
+            let rollout = rollouts
                 .get(sid)
                 .ok_or_else(|| AppError::NotFound(format!("rollout: {sid}")))?;
-            if current_cwd != &target_record {
-                let rewritten = journal
-                    .mutate_file(rollout, || rewrite_rollout_cwd(rollout, &target_record))?;
-                rollout_rewritten |= rewritten;
-            }
+            let rewritten = journal.mutate_file(rollout, || {
+                rewrite_rollout_cwd(rollout, sid, &target_record)
+            })?;
+            rollout_rewritten |= rewritten;
             if !crate::repair::upsert_thread_from_rollout(
                 &codex,
                 &transaction,
@@ -761,7 +831,7 @@ fn move_session_cwd_locked(
                     .ok_or_else(|| AppError::NotFound(format!("family: {family_id}")))?;
                 for branch in &mut family.chain {
                     if matches!(branch.status, crate::models::BranchStatus::Archived) {
-                        let (rollout, _) = rollouts
+                        let rollout = rollouts
                             .get(&branch.id)
                             .ok_or_else(|| AppError::NotFound(format!("rollout: {}", branch.id)))?;
                         let (sha256, line_count) = family::compute_integrity(rollout)?;
@@ -782,17 +852,9 @@ fn move_session_cwd_locked(
                     if !index_ids.contains(sid) {
                         continue;
                     }
-                    let thread_name: String = transaction.query_row(
-                        "SELECT COALESCE(NULLIF(title,''), COALESCE(first_user_message,'')) FROM threads WHERE id = ?",
-                        [sid],
-                        |row| row.get(0),
-                    )?;
-                    crate::repair::append_index_line(
-                        &codex,
-                        sid,
-                        &thread_name,
-                        Path::new(""),
-                    )?;
+                    let thread_name: String =
+                        transaction.query_row(thread_name_sql, [sid], |row| row.get(0))?;
+                    crate::repair::append_index_line(&codex, sid, &thread_name, Path::new(""))?;
                 }
                 Ok(())
             })?;
@@ -950,12 +1012,16 @@ fn set_archived_codex_locked(codex_dir: String, id: String, v: bool) -> AppResul
             filter_index_file(&index_path, &id)?;
         }
     } else {
+        let has_name = crate::repair::threads_table_columns(&state)?
+            .iter()
+            .any(|column| column == "name");
+        let thread_name_sql = if has_name {
+            "SELECT COALESCE(NULLIF(name,''), NULLIF(title,''), COALESCE(first_user_message,'')) FROM threads WHERE id = ?"
+        } else {
+            "SELECT COALESCE(NULLIF(title,''), COALESCE(first_user_message,'')) FROM threads WHERE id = ?"
+        };
         let thread_name: String = state
-            .query_row(
-                "SELECT COALESCE(NULLIF(title,''), COALESCE(first_user_message,'')) FROM threads WHERE id = ?",
-                [&id],
-                |r| r.get(0),
-            )
+            .query_row(thread_name_sql, [&id], |r| r.get(0))
             .unwrap_or_default();
         crate::repair::append_index_line(&codex, &id, &thread_name, &target)?;
     }
@@ -2105,9 +2171,10 @@ mod tests {
     fn rename_session_updates_title_and_bumps_updated_at() -> AppResult<()> {
         let codex = temp_dir("codex-rename-session");
         let conn = create_codex_threads_table(&codex)?;
+        conn.execute("ALTER TABLE threads ADD COLUMN name TEXT", [])?;
         conn.execute(
-            "INSERT INTO threads (id, rollout_path, title, updated_at, archived)
-             VALUES ('rename-me', 'x.jsonl', '旧标题', 1770000000, 0)",
+            "INSERT INTO threads (id, rollout_path, title, name, updated_at, archived)
+             VALUES ('rename-me', 'x.jsonl', '旧标题', '旧名称', 1770000000, 0)",
             [],
         )?;
         drop(conn);
@@ -2123,12 +2190,13 @@ mod tests {
         assert_eq!(renamed, 1);
 
         let conn = rusqlite::Connection::open(codex.join("state_5.sqlite"))?;
-        let (title, updated_at): (String, i64) = conn.query_row(
-            "SELECT title, updated_at FROM threads WHERE id = 'rename-me'",
+        let (title, name, updated_at): (String, String, i64) = conn.query_row(
+            "SELECT title, name, updated_at FROM threads WHERE id = 'rename-me'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         assert_eq!(title, "新的会话名");
+        assert_eq!(name, "新的会话名");
         assert!(
             updated_at > 1770000000,
             "重命名应 bump updated_at 以便官方 App 增量同步可见"
@@ -2161,6 +2229,49 @@ mod tests {
         .is_err());
 
         drop(conn);
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn list_sessions_prefers_new_schema_name_over_legacy_title() -> AppResult<()> {
+        let codex = temp_dir("codex-thread-name");
+        let conn = create_codex_threads_table(&codex)?;
+        conn.execute("ALTER TABLE threads ADD COLUMN name TEXT", [])?;
+        conn.execute(
+            "INSERT INTO threads (
+                id, rollout_path, cwd, title, name, first_user_message, model, reasoning_effort,
+                tokens_used, created_at, updated_at, archived, archived_at, git_branch, source,
+                agent_nickname, agent_role
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 0, 1770000000, 1770000300, 0, NULL, NULL, NULL, NULL, NULL)",
+            (
+                "named-thread",
+                codex.join("sessions/named-thread.jsonl").to_string_lossy().into_owned(),
+                "F:\\work\\named-thread",
+                "旧 schema 标题",
+                "新版 schema 名称",
+                "首条用户消息",
+                "gpt-5",
+            ),
+        )?;
+        drop(conn);
+        fs::write(
+            paths::session_index_path(&codex),
+            "{\"id\":\"named-thread\",\"thread_name\":\"旧索引标题\"}\n",
+        )?;
+
+        let sessions = list_sessions(
+            Some("codex".to_string()),
+            codex.to_string_lossy().into_owned(),
+            None,
+        )?;
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title, "新版 schema 名称");
+        assert_eq!(
+            codex_display_title(&codex, "named-thread")?.as_deref(),
+            Some("新版 schema 名称")
+        );
         fs::remove_dir_all(&codex).ok();
         Ok(())
     }
@@ -3043,7 +3154,11 @@ mod tests {
             original.extend_from_slice(tail);
             fs::write(&path, original)?;
 
-            assert!(rewrite_rollout_cwd(&path, "F:\\new")?);
+            assert!(rewrite_rollout_cwd(
+                &path,
+                &format!("rewrite-{label}"),
+                "F:\\new"
+            )?);
             let updated = fs::read(&path)?;
             let newline = updated
                 .iter()
@@ -3079,8 +3194,63 @@ mod tests {
         .to_vec();
         fs::write(&path, &original)?;
 
-        assert!(!rewrite_rollout_cwd(&path, "F:\\same")?);
+        assert!(!rewrite_rollout_cwd(&path, "same", "F:\\same")?);
         assert_eq!(fs::read(&path)?, original);
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn rewrite_rollout_cwd_updates_every_matching_meta_but_preserves_ancestors() -> AppResult<()> {
+        let root = temp_dir("rewrite-rollout-cwd-repeated-meta");
+        let path = root.join("repeated.jsonl");
+        fs::create_dir_all(&root)?;
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-10T10:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": "current", "session_id": "current", "cwd": "F:\\new"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-10T10:00:01Z",
+                "type": "session_meta",
+                "payload": {"id": "ancestor", "session_id": "ancestor", "cwd": "F:\\ancestor"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-10T10:00:02Z",
+                "type": "session_meta",
+                "payload": {"id": "current", "session_id": "current", "cwd": "F:\\old"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-10T10:00:03Z",
+                "type": "event_msg",
+                "payload": {"type": "token_count"}
+            }),
+        ];
+        fs::write(
+            &path,
+            format!(
+                "{}\n",
+                lines
+                    .iter()
+                    .map(serde_json::Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        )?;
+
+        assert!(rewrite_rollout_cwd(&path, "current", "F:\\new")?);
+
+        let metas = fs::read_to_string(&path)?
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|value| value["type"] == "session_meta")
+            .collect::<Vec<_>>();
+        assert_eq!(metas.len(), 3);
+        assert_eq!(metas[0]["payload"]["cwd"], "F:\\new");
+        assert_eq!(metas[1]["payload"]["cwd"], "F:\\ancestor");
+        assert_eq!(metas[2]["payload"]["cwd"], "F:\\new");
 
         fs::remove_dir_all(root).ok();
         Ok(())

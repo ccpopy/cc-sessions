@@ -20,6 +20,7 @@ import { ConvertSessionDialog } from "@/components/ConvertSessionDialog";
 import { DangerDialog } from "@/components/DangerDialog";
 import { RenameSessionDialog } from "@/components/RenameSessionDialog";
 import { MoveSessionCwdDialog } from "@/components/MoveSessionCwdDialog";
+import { ForkRecommendationDialog } from "@/components/ForkRecommendationDialog";
 import { EmptyState } from "@/components/EmptyState";
 import { FamilyHistorySheet } from "@/components/FamilyHistorySheet";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -51,6 +52,7 @@ import {
   ProviderSyncRegistry,
   type ProviderSyncSnapshot,
 } from "@/lib/providerSyncRegistry";
+import { SessionActionRegistry } from "@/lib/sessionActionRegistry";
 import {
   selectNormalFamilySessions,
   sortSessionsByActivity,
@@ -91,6 +93,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const [exportTarget, setExportTarget] = useState<SessionSummary | null>(null);
   const [renameTarget, setRenameTarget] = useState<SessionSummary | null>(null);
   const [moveTarget, setMoveTarget] = useState<SessionSummary | null>(null);
+  const [duplicateTarget, setDuplicateTarget] = useState<SessionSummary | null>(null);
   const [convertTarget, setConvertTarget] = useState<SessionSummary | null>(null);
   const [backupTargets, setBackupTargets] = useState<SessionSummary[]>([]);
   const [deleteTargets, setDeleteTargets] = useState<SessionSummary[]>([]);
@@ -100,11 +103,18 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const [maintenanceError, setMaintenanceError] = useState<string | null>(null);
   const [familySheetId, setFamilySheetId] = useState<string | null>(null);
   const providerSyncRegistry = useRef(new ProviderSyncRegistry());
+  const duplicateRegistry = useRef(new SessionActionRegistry());
   const [providerSyncState, setProviderSyncState] = useState<ProviderSyncSnapshot>(() =>
     providerSyncRegistry.current.snapshot(),
   );
+  const [duplicatingSessionIds, setDuplicatingSessionIds] = useState<ReadonlySet<string>>(
+    () => duplicateRegistry.current.snapshot(),
+  );
   const publishProviderSyncState = useCallback(() => {
     setProviderSyncState(providerSyncRegistry.current.snapshot());
+  }, []);
+  const publishDuplicateState = useCallback(() => {
+    setDuplicatingSessionIds(duplicateRegistry.current.snapshot());
   }, []);
   const cloning =
     providerSyncState.batchActive || providerSyncState.sessionIds.size > 0;
@@ -298,6 +308,8 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const onDuplicate = useCallback(
     async (s: SessionSummary) => {
       if (!settings) return;
+      if (!duplicateRegistry.current.tryBegin(s.id)) return;
+      publishDuplicateState();
       try {
         const report = await api.duplicateSession({
           codex_dir: settings.codex_dir,
@@ -311,10 +323,19 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         await refreshOverlay();
       } catch (e: any) {
         toast.error("Fork 会话失败", { description: String(e?.message ?? e) });
+      } finally {
+        duplicateRegistry.current.finish(s.id);
+        publishDuplicateState();
       }
     },
-    [settings, refresh, refreshOverlay],
+    [settings, publishDuplicateState, refresh, refreshOverlay],
   );
+
+  const confirmDuplicate = useCallback(async () => {
+    if (!duplicateTarget) return;
+    await onDuplicate(duplicateTarget);
+    setDuplicateTarget(null);
+  }, [duplicateTarget, onDuplicate]);
 
   const onCloneOne = useCallback(
     async (s: SessionSummary) => {
@@ -622,6 +643,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             currentProvider={currentProvider}
             syncingSessionIds={providerSyncState.sessionIds}
             syncActionsDisabled={providerSyncState.batchActive}
+            duplicatingSessionIds={duplicatingSessionIds}
             onPreview={setPreview}
             onCopyResume={onCopyResume}
             onRevealCwd={onReveal}
@@ -629,7 +651,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             onBackup={(s) => setBackupTargets([s])}
             onDelete={(s) => setDeleteTargets([s])}
             onClone={isCodex ? onCloneOne : undefined}
-            onDuplicate={isCodex ? onDuplicate : undefined}
+            onDuplicate={isCodex ? setDuplicateTarget : undefined}
             onOpenFamily={isCodex ? (s) => setFamilySheetId(s.id) : undefined}
             onExportMarkdown={setExportTarget}
             onConvert={setConvertTarget}
@@ -708,6 +730,14 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             throw e;
           }
         }}
+      />
+
+      <ForkRecommendationDialog
+        open={!!duplicateTarget}
+        onOpenChange={(value) => !value && setDuplicateTarget(null)}
+        session={duplicateTarget}
+        running={!!duplicateTarget && duplicatingSessionIds.has(duplicateTarget.id)}
+        onConfirm={confirmDuplicate}
       />
 
       <FamilyHistorySheet
