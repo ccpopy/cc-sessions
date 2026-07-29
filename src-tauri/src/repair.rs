@@ -650,6 +650,17 @@ fn read_rollout_identity(path: &Path) -> AppResult<Option<RolloutIdentity>> {
     Ok(None)
 }
 
+fn scan_active_rollout_identities(codex: &Path) -> AppResult<Vec<(PathBuf, RolloutIdentity)>> {
+    let mut rollouts = Vec::new();
+    for path in family::scan_rollouts(codex)? {
+        let Some(identity) = read_rollout_identity(&path)? else {
+            continue;
+        };
+        rollouts.push((path, identity));
+    }
+    Ok(rollouts)
+}
+
 pub(crate) fn read_rollout_brief(codex_dir: &Path, path: &Path) -> AppResult<Option<RolloutBrief>> {
     let f = fs::File::open(path)?;
     let reader = BufReader::new(f);
@@ -4357,6 +4368,11 @@ fn list_mismatched_session_ids(codex: &Path, target_provider: &str) -> AppResult
     let mut out: Vec<String> = Vec::new();
     let thread_states = read_thread_state_map(codex)?;
     let index_ids = read_session_index_ids(codex)?;
+    let active_rollouts = scan_active_rollout_identities(codex)?;
+    let active_rollout_ids = active_rollouts
+        .iter()
+        .map(|(_, identity)| identity.id.as_str())
+        .collect::<BTreeSet<_>>();
 
     let store = family::load(codex)?;
     family_managed_ids.extend(store.index.keys().cloned());
@@ -4364,6 +4380,11 @@ fn list_mismatched_session_ids(codex: &Path, target_provider: &str) -> AppResult
         family_managed_ids.extend(f.chain.iter().map(|b| b.id.clone()));
         if let Some(active) = f.chain.iter().find(|b| b.id == f.active_id) {
             if !matches!(active.status, BranchStatus::Active) {
+                continue;
+            }
+            // family/threads 可能遗留已经不存在的 active 分支。没有源 rollout 时，
+            // provider 克隆无从执行；这类记录应由 orphan 清理处理，而不是制造必然失败的同步任务。
+            if !active_rollout_ids.contains(active.id.as_str()) {
                 continue;
             }
             // 手工归档的 family head 仍保持逻辑 Active 角色，但不应被 provider
@@ -4409,10 +4430,7 @@ fn list_mismatched_session_ids(codex: &Path, target_provider: &str) -> AppResult
         }
     }
 
-    for p in family::scan_rollouts(codex)? {
-        let Some(identity) = read_rollout_identity(&p)? else {
-            continue;
-        };
+    for (p, identity) in active_rollouts {
         if family_managed_ids.contains(&identity.id) {
             continue;
         }
@@ -7061,7 +7079,8 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_scan_includes_unregistered_rollouts_when_family_store_exists() -> AppResult<()> {
+    fn mismatched_scan_includes_unregistered_rollouts_but_skips_missing_family_heads(
+    ) -> AppResult<()> {
         let codex = temp_codex_dir("cc-session-manager-repair-test");
         fs::create_dir_all(&codex)?;
 
@@ -7116,11 +7135,17 @@ mod tests {
         write_rollout(&codex, "legacy-session", "anthropic")?;
 
         let targets = list_mismatched_session_ids(&codex, "openai")?;
+        let plan = get_provider_sync_plan_with_lock(
+            codex.to_string_lossy().into_owned(),
+            &family::FamilyLock::default(),
+        )?;
         fs::remove_dir_all(&codex).ok();
 
+        assert_eq!(targets, plan, "对外同步计划必须与内部可执行目标完全一致");
         assert_eq!(
-            targets,
-            vec!["managed-source".to_string(), "legacy-session".to_string()]
+            plan,
+            vec!["legacy-session".to_string()],
+            "family 元数据不能把已经没有 active rollout 的孤儿记录变成不可执行的同步任务"
         );
         Ok(())
     }

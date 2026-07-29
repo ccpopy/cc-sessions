@@ -1262,6 +1262,10 @@ fn validate_delete_id(id: &str) -> AppResult<()> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum CodexDeletePlanKey {
     Family(String),
+    Branch {
+        family_id: String,
+        branch_id: String,
+    },
     Session(String),
 }
 
@@ -1272,16 +1276,48 @@ fn delete_codex_targets_locked(
     let mut store = family::load(codex_dir)?;
     // Resolve every target before the first destructive write. A broken family/index mapping
     // must never leave a half-deleted logical conversation.
-    let plans = targets
+    let resolved = targets
         .iter()
         .map(|target| {
             validate_delete_id(&target.id)
                 .and_then(|()| family::resolve_family_id_strict(&store, &target.id))
-                .map(|family_id| match family_id {
-                    Some(id) => CodexDeletePlanKey::Family(id),
-                    None => CodexDeletePlanKey::Session(target.id.clone()),
+                .map(|family_id| {
+                    let is_active = family_id.as_ref().is_some_and(|family_id| {
+                        store
+                            .families
+                            .get(family_id)
+                            .is_some_and(|family| family.active_id == target.id)
+                    });
+                    (family_id, is_active)
                 })
                 .map_err(|error| error.to_string())
+        })
+        .collect::<Vec<_>>();
+    // 同一批次只要选中了 family 的 active 分支，仍按用户确认的“整组删除”执行；
+    // 这样 active + 历史分支混选时只进行一次物理删除，也保持输入结果顺序。
+    let families_selected_for_full_delete = resolved
+        .iter()
+        .filter_map(|resolution| match resolution {
+            Ok((Some(family_id), true)) => Some(family_id.clone()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let plans = targets
+        .iter()
+        .zip(resolved)
+        .map(|(target, resolution)| {
+            resolution.map(|(family_id, is_active)| match family_id {
+                Some(family_id)
+                    if is_active || families_selected_for_full_delete.contains(&family_id) =>
+                {
+                    CodexDeletePlanKey::Family(family_id)
+                }
+                Some(family_id) => CodexDeletePlanKey::Branch {
+                    family_id,
+                    branch_id: target.id.clone(),
+                },
+                None => CodexDeletePlanKey::Session(target.id.clone()),
+            })
         })
         .collect::<Vec<_>>();
 
@@ -1301,6 +1337,11 @@ fn delete_codex_targets_locked(
                     delete_codex_family_locked(codex_dir, &mut store, family_id, &target.id)
                         .unwrap_or_else(|error| failed_delete_result(target, error.to_string()))
                 }
+                CodexDeletePlanKey::Branch {
+                    family_id,
+                    branch_id,
+                } => delete_codex_family_branch_locked(codex_dir, &mut store, family_id, branch_id)
+                    .unwrap_or_else(|error| failed_delete_result(target, error.to_string())),
                 CodexDeletePlanKey::Session(id) => delete_codex_artifacts(codex_dir, id)
                     .map(|outcome| outcome.result)
                     .unwrap_or_else(|error| failed_delete_result(target, error.to_string())),
@@ -1315,6 +1356,60 @@ fn delete_codex_targets_locked(
         results.push(result);
     }
     Ok(results)
+}
+
+fn delete_codex_family_branch_locked(
+    codex_dir: &Path,
+    store: &mut crate::models::FamilyStore,
+    family_id: &str,
+    branch_id: &str,
+) -> AppResult<DeleteResult> {
+    let resolved_family_id = family::resolve_family_id_strict(store, branch_id)?
+        .ok_or_else(|| AppError::NotFound(format!("family branch: {branch_id}")))?;
+    if resolved_family_id != family_id {
+        return Err(AppError::Other(format!(
+            "分支 {branch_id} 属于 family {resolved_family_id}，请求却指定了 {family_id}"
+        )));
+    }
+    let family = store
+        .families
+        .get(family_id)
+        .ok_or_else(|| AppError::NotFound(format!("family: {family_id}")))?;
+    if family.active_id == branch_id {
+        return Err(AppError::Other(format!(
+            "不能单独删除 active 分支 {branch_id}"
+        )));
+    }
+
+    // 在删除物理数据前确认 family store 可写，避免普通权限问题留下半完成状态。
+    family::save(codex_dir, store)?;
+    let outcome = delete_codex_artifacts(codex_dir, branch_id)?;
+    let mut result = outcome.result;
+    if !outcome.structurally_removed {
+        if result.error.is_none() {
+            append_error(
+                &mut result,
+                format!("分支 {branch_id} 的核心记录未删除干净，family 元数据已保留"),
+            );
+        }
+        result.ok = false;
+        return Ok(result);
+    }
+
+    let before_metadata = store.clone();
+    if let Err(error) = family::remove_non_active_branch(store, family_id, branch_id)
+        .and_then(|_| family::save(codex_dir, store))
+    {
+        *store = before_metadata;
+        append_error(
+            &mut result,
+            format!("分支 {branch_id} 的文件已删除，但 family 元数据保存失败: {error}"),
+        );
+        result.ok = false;
+        return Ok(result);
+    }
+    result.ok = result.error.is_none();
+    Ok(result)
 }
 
 fn delete_codex_family_locked(
@@ -3689,6 +3784,81 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(remaining, 0);
+
+        drop(conn);
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn archived_list_delete_removes_only_selected_non_active_family_branch() -> AppResult<()> {
+        let codex = temp_dir("codex-delete-archived-family-branch");
+        let family_id = "family-archived-delete";
+        let archived_id = "019d-family-archived-delete-history";
+        let active_id = "019d-family-archived-delete-active";
+        let paths_by_id = codex_family_fixture(
+            &codex,
+            family_id,
+            active_id,
+            &[
+                FamilyBranchFixture {
+                    id: archived_id,
+                    archived: true,
+                },
+                FamilyBranchFixture {
+                    id: active_id,
+                    archived: false,
+                },
+            ],
+        )?;
+        let lock = family::FamilyLock::default();
+
+        let results = delete_sessions_with_lock(
+            Some("codex".to_string()),
+            codex.to_string_lossy().into_owned(),
+            None,
+            vec![archived_id.to_string()],
+            None,
+            &lock,
+        )?;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, archived_id);
+        assert!(results[0].ok, "{:?}", results[0].error);
+        assert_eq!(results[0].threads_rows_deleted, 1);
+        assert!(!paths_by_id[archived_id].exists());
+        assert!(
+            paths_by_id[active_id].is_file(),
+            "删除归档分支绝不能删除仍在使用的 active rollout"
+        );
+
+        let store = family::load(&codex)?;
+        let family = store
+            .families
+            .get(family_id)
+            .expect("active family remains");
+        assert_eq!(family.active_id, active_id);
+        assert_eq!(family.chain.len(), 1);
+        assert_eq!(family.chain[0].id, active_id);
+        assert!(!store.index.contains_key(archived_id));
+        assert_eq!(
+            store.index.get(active_id).map(String::as_str),
+            Some(family_id)
+        );
+
+        let conn = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let remaining: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM threads WHERE id IN (?1, ?2)",
+            params![archived_id, active_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(remaining, 1);
+        let remaining_id: String = conn.query_row(
+            "SELECT id FROM threads WHERE id IN (?1, ?2)",
+            params![archived_id, active_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(remaining_id, active_id);
 
         drop(conn);
         fs::remove_dir_all(codex).ok();
