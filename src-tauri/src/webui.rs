@@ -410,11 +410,13 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "codexDir")?,
             bool_arg(&args, "dryRun")?,
         )),
-        "prune_orphan_entries" => to_result_value(repair::prune_orphan_entries(
+        "prune_orphan_entries" => to_result_value(repair::prune_orphan_entries_with_lock(
             string_arg(&args, "codexDir")?,
             bool_arg(&args, "pruneIndex")?,
             bool_arg(&args, "pruneThreads")?,
+            bool_arg(&args, "pruneFamily")?,
             bool_arg(&args, "dryRun")?,
+            &state.family_lock,
         )),
         "diagnose_claude_history_orphans" => to_result_value(
             repair::diagnose_claude_history_orphans(string_arg(&args, "claudeDir")?),

@@ -456,6 +456,16 @@ pub fn remove_non_active_branch(
         .get_mut(family_id)
         .ok_or_else(|| AppError::NotFound(format!("family not found: {family_id}")))?;
     let removed = family.chain.remove(position);
+    if family.root_id == branch_id {
+        family.root_id = family
+            .chain
+            .first()
+            .ok_or_else(|| {
+                inconsistent_family(format!("family {family_id} 删除分支后 chain 为空"))
+            })?
+            .id
+            .clone();
+    }
     family.updated_at = now_iso();
     store.index.remove(branch_id);
     Ok(removed)
@@ -711,9 +721,7 @@ pub fn verify_integrity(codex_dir: &Path) -> AppResult<FamilyIntegrityReport> {
         for b in family.chain.iter() {
             let expected_sha = b.sha256.clone();
             let expected_lines = b.line_count;
-            if expected_sha.is_none() && b.id == family.active_id {
-                continue; // 当前可写分支不会固化校验
-            }
+            let unsealed_active = expected_sha.is_none() && b.id == family.active_id;
             let rel = paths::checked_relative_path(&b.rollout_relpath)?;
             let abs_main = codex_dir.join(&rel);
             let abs_archived =
@@ -736,6 +744,9 @@ pub fn verify_integrity(codex_dir: &Path) -> AppResult<FamilyIntegrityReport> {
                 });
                 continue;
             };
+            if unsealed_active {
+                continue; // 当前可写分支只检查是否存在，不做 sha256/行数校验
+            }
             match compute_integrity(&candidate) {
                 Ok((sha, lines)) => {
                     let sha_ok = expected_sha.as_deref() == Some(sha.as_str());
@@ -892,6 +903,7 @@ pub fn get_session_family_overlay_with_lock(
 
     // 3) 读 current provider
     let cur = Some(crate::repair::read_current_provider_export(&codex)?);
+    let sessions_root = paths::sessions_dir(&codex);
 
     let mut out: Vec<FamilyOverlay> = Vec::with_capacity(thread_state_of.len());
     for (id, (rollout_path, provider, source, archived)) in &thread_state_of {
@@ -900,23 +912,37 @@ pub fn get_session_family_overlay_with_lock(
                 &paths::host_path_string_from_codex_record(&codex, raw),
             ))
         });
-        let record_usable = if let (Some(provider), Some(rollout)) = (provider.as_deref(), rollout)
+        let recorded_rollout_available = rollout
+            .as_ref()
+            .is_some_and(|path| path.starts_with(&sessions_root) && path.is_file());
+        let record_usable =
+            if let (Some(provider), Some(rollout)) = (provider.as_deref(), rollout.as_deref()) {
+                crate::repair::rollout_record_is_usable_provider(
+                    &codex,
+                    id,
+                    provider,
+                    rollout,
+                    rollout_path.as_deref(),
+                    Some(provider),
+                    source.as_deref(),
+                    *archived,
+                    index_ids.contains(id),
+                )?
+            } else {
+                false
+            };
+        let family_id = store.index.get(id).cloned();
+        let family_rollout_available = if let Some(branch) = family_id
+            .as_ref()
+            .and_then(|family_id| store.families.get(family_id))
+            .and_then(|family| family.chain.iter().find(|branch| branch.id == *id))
         {
-            crate::repair::rollout_record_is_usable_provider(
-                &codex,
-                id,
-                provider,
-                &rollout,
-                rollout_path.as_deref(),
-                Some(provider),
-                source.as_deref(),
-                *archived,
-                index_ids.contains(id),
-            )?
+            let relative = paths::checked_relative_path(&branch.rollout_relpath)?;
+            relative.starts_with("sessions") && codex.join(relative).is_file()
         } else {
             false
         };
-        let family_id = store.index.get(id).cloned();
+        let source_rollout_available = recorded_rollout_available || family_rollout_available;
         let (branch_count, is_active_branch, clone_state) = match family_id.as_ref() {
             None => {
                 let cs = compute_clone_state(
@@ -927,6 +953,7 @@ pub fn get_session_family_overlay_with_lock(
                     source.as_deref(),
                     *archived,
                     record_usable,
+                    source_rollout_available,
                 );
                 (0u32, false, cs)
             }
@@ -973,6 +1000,7 @@ pub fn get_session_family_overlay_with_lock(
                     source.as_deref(),
                     *archived,
                     record_usable,
+                    source_rollout_available,
                 );
                 (branch_count, is_active, cs)
             }
@@ -997,12 +1025,16 @@ fn compute_clone_state(
     source: Option<&str>,
     archived: bool,
     record_usable: bool,
+    source_rollout_available: bool,
 ) -> String {
     if archived {
         return "matches".into();
     }
     if crate::repair::is_subagent_source(source) {
         return "subagent".into();
+    }
+    if !source_rollout_available {
+        return "unknown".into();
     }
     match (provider, current) {
         (Some(p), Some(cur)) if p == cur => {
@@ -1216,6 +1248,47 @@ mod tests {
     }
 
     #[test]
+    fn remove_non_active_branch_repairs_root_when_root_branch_is_removed() -> AppResult<()> {
+        let mut store = two_branch_store();
+        let family = store.families.get_mut("family-a").expect("family fixture");
+        family.root_id = "history-a".to_string();
+        family.chain.swap(0, 1);
+
+        let removed = remove_non_active_branch(&mut store, "family-a", "history-a")?;
+
+        assert_eq!(removed.id, "history-a");
+        let family = store.families.get("family-a").expect("family remains");
+        assert_eq!(family.root_id, "active-a");
+        assert_eq!(family.active_id, "active-a");
+        assert_eq!(family.chain.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn verify_integrity_reports_missing_unsealed_active_branch() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-family-missing-active-integrity-test");
+        fs::create_dir_all(&codex)?;
+        let mut store = FamilyStore::default();
+        ensure_family_for(
+            &mut store,
+            "missing-active",
+            "openai",
+            "sessions/2026/04/24/rollout-missing-active.jsonl",
+            "missing active",
+        );
+        save(&codex, &store)?;
+
+        let report = verify_integrity(&codex)?;
+
+        assert!(!report.all_ok);
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(report.items[0].branch_id, "missing-active");
+        assert!(report.items[0].missing);
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
     fn manual_archive_metadata_preserves_family_role_and_tracks_mutability() -> AppResult<()> {
         let codex = temp_codex_dir("cc-session-manager-family-archive-metadata-test");
         fs::create_dir_all(&codex)?;
@@ -1388,6 +1461,83 @@ mod tests {
             .find(|item| item.session_id == "overlay-source")
             .expect("source overlay");
         assert_eq!(source.clone_state, "has_clone");
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_does_not_offer_provider_sync_when_source_rollout_is_missing() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-overlay-missing-rollout-test");
+        fs::create_dir_all(&codex)?;
+        fs::write(
+            paths::session_index_path(&codex),
+            "{\"id\":\"missing-active\"}\n",
+        )?;
+        let conn = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        conn.execute(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                rollout_path TEXT,
+                model_provider TEXT,
+                source TEXT,
+                archived INTEGER
+            )",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path, model_provider, source, archived)
+             VALUES (?1, ?2, 'openai', 'cli', 0)",
+            params![
+                "missing-active",
+                codex
+                    .join("sessions/2026/04/24/rollout-missing-active.jsonl")
+                    .to_string_lossy()
+            ],
+        )?;
+        let family = Family {
+            family_id: "missing-family".to_string(),
+            root_id: "missing-active".to_string(),
+            title: "missing rollout".to_string(),
+            chain: vec![FamilyBranch {
+                id: "missing-active".to_string(),
+                provider: "openai".to_string(),
+                created_at: "2026-04-24T00:00:00Z".to_string(),
+                status: BranchStatus::Active,
+                rollout_relpath: "sessions/2026/04/24/rollout-missing-active.jsonl".to_string(),
+                sha256: None,
+                line_count: None,
+                note: None,
+            }],
+            active_id: "missing-active".to_string(),
+            updated_at: "2026-04-24T00:00:00Z".to_string(),
+        };
+        let mut families = BTreeMap::new();
+        families.insert("missing-family".to_string(), family);
+        let mut index = BTreeMap::new();
+        index.insert("missing-active".to_string(), "missing-family".to_string());
+        save(
+            &codex,
+            &FamilyStore {
+                version: 1,
+                families,
+                index,
+            },
+        )?;
+        drop(conn);
+
+        let overlay = get_session_family_overlay_with_lock(
+            codex.to_string_lossy().into_owned(),
+            &FamilyLock::default(),
+        )?;
+        let item = overlay
+            .iter()
+            .find(|item| item.session_id == "missing-active")
+            .expect("missing thread overlay");
+        assert_eq!(
+            item.clone_state, "unknown",
+            "缺少源 rollout 的 orphan 记录应交给 orphan 清理，而不是展示必然失败的同步操作"
+        );
 
         fs::remove_dir_all(&codex).ok();
         Ok(())

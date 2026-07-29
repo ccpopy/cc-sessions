@@ -424,10 +424,20 @@ pub async fn prune_orphan_entries(
     codex_dir: String,
     prune_index: bool,
     prune_threads: bool,
+    prune_family: bool,
     dry_run: bool,
+    lock: SharedLock<'_>,
 ) -> AppResult<OrphanPruneReport> {
+    let lock = lock.inner().clone();
     run_blocking(move || {
-        crate::repair::prune_orphan_entries(codex_dir, prune_index, prune_threads, dry_run)
+        crate::repair::prune_orphan_entries_with_lock(
+            codex_dir,
+            prune_index,
+            prune_threads,
+            prune_family,
+            dry_run,
+            &lock,
+        )
     })
     .await
 }

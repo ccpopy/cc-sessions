@@ -388,6 +388,9 @@ export type ProjectConfigRepairReport = {
 export type OrphanPruneReport = {
   index_removed: number;
   threads_removed: number;
+  family_branches_removed: number;
+  families_removed: number;
+  families_skipped: string[];
   dry_run: boolean;
 };
 
@@ -1015,12 +1018,14 @@ export const api = {
     codex_dir: string;
     prune_index: boolean;
     prune_threads: boolean;
+    prune_family: boolean;
     dry_run: boolean;
   }) =>
     invokeCommand<OrphanPruneReport>("prune_orphan_entries", {
       codexDir: p.codex_dir,
       pruneIndex: p.prune_index,
       pruneThreads: p.prune_threads,
+      pruneFamily: p.prune_family,
       dryRun: p.dry_run,
     }),
   diagnoseClaudeHistoryOrphans: (claudeDir: string) =>

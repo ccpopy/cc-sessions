@@ -650,6 +650,17 @@ fn read_rollout_identity(path: &Path) -> AppResult<Option<RolloutIdentity>> {
     Ok(None)
 }
 
+fn scan_active_rollout_identities(codex: &Path) -> AppResult<Vec<(PathBuf, RolloutIdentity)>> {
+    let mut rollouts = Vec::new();
+    for path in family::scan_rollouts(codex)? {
+        let Some(identity) = read_rollout_identity(&path)? else {
+            continue;
+        };
+        rollouts.push((path, identity));
+    }
+    Ok(rollouts)
+}
+
 pub(crate) fn read_rollout_brief(codex_dir: &Path, path: &Path) -> AppResult<Option<RolloutBrief>> {
     let f = fs::File::open(path)?;
     let reader = BufReader::new(f);
@@ -1065,11 +1076,157 @@ pub fn repair_session_index(codex_dir: String, dry_run: bool) -> AppResult<Index
 //
 // 与 `repair_session_index`/`rebuild_threads_table` 不同：此命令**只删除**
 // 指向已消失 rollout 的孤儿行（session_index.jsonl 里多出来的 id、threads
-// 表里多出来的 id），不会从 rollout 重建。适合只想"把残留清干净"的场景。
+// 表里多出来的 id，以及 session_family.json 中可安全确认的孤儿 family/分支），
+// 不会从 rollout 重建。适合只想"把残留清干净"的场景。
 pub fn prune_orphan_entries(
     codex_dir: String,
     prune_index: bool,
     prune_threads: bool,
+    dry_run: bool,
+) -> AppResult<OrphanPruneReport> {
+    let lock = family::FamilyLock::default();
+    prune_orphan_entries_with_lock(
+        codex_dir,
+        prune_index,
+        prune_threads,
+        prune_index || prune_threads,
+        dry_run,
+        &lock,
+    )
+}
+
+pub fn prune_orphan_entries_with_lock(
+    codex_dir: String,
+    prune_index: bool,
+    prune_threads: bool,
+    prune_family: bool,
+    dry_run: bool,
+    lock: &family::FamilyLock,
+) -> AppResult<OrphanPruneReport> {
+    family::with_lock(lock, |_g| {
+        prune_orphan_entries_locked(codex_dir, prune_index, prune_threads, prune_family, dry_run)
+    })
+}
+
+#[derive(Default)]
+struct FamilyOrphanPrunePlan {
+    family_ids: Vec<String>,
+    branches: Vec<(String, String)>,
+    skipped_family_ids: Vec<String>,
+}
+
+fn family_branch_rollout_exists(
+    codex: &Path,
+    branch: &FamilyBranch,
+    rollout_ids: &BTreeSet<String>,
+) -> Option<bool> {
+    if rollout_ids.contains(&branch.id) {
+        return Some(true);
+    }
+    let relative = paths::checked_relative_path(&branch.rollout_relpath).ok()?;
+    Some(codex.join(relative).is_file())
+}
+
+fn family_metadata_is_consistent(
+    store: &crate::models::FamilyStore,
+    family_id: &str,
+    family_record: &Family,
+) -> bool {
+    if family_record.family_id != family_id {
+        return false;
+    }
+    let chain_ids = family_record
+        .chain
+        .iter()
+        .map(|branch| branch.id.as_str())
+        .collect::<BTreeSet<_>>();
+    if store.index.iter().any(|(branch_id, mapped_family_id)| {
+        mapped_family_id == family_id && !chain_ids.contains(branch_id.as_str())
+    }) {
+        return false;
+    }
+    let Some(branch) = family_record.chain.first() else {
+        return true;
+    };
+    matches!(
+        family::resolve_family_id_strict(store, &branch.id),
+        Ok(Some(resolved_family_id)) if resolved_family_id == family_id
+    )
+}
+
+fn existing_family_branch_ids(
+    codex: &Path,
+    family_record: &Family,
+    rollout_ids: &BTreeSet<String>,
+) -> Option<BTreeSet<String>> {
+    let mut existing_branch_ids = BTreeSet::new();
+    for branch in &family_record.chain {
+        if family_branch_rollout_exists(codex, branch, rollout_ids)? {
+            existing_branch_ids.insert(branch.id.clone());
+        }
+    }
+    Some(existing_branch_ids)
+}
+
+fn plan_family_orphan_prune(
+    codex: &Path,
+    store: &crate::models::FamilyStore,
+    rollout_ids: &BTreeSet<String>,
+) -> FamilyOrphanPrunePlan {
+    let mut plan = FamilyOrphanPrunePlan::default();
+
+    for (family_id, family_record) in &store.families {
+        if !family_metadata_is_consistent(store, family_id, family_record) {
+            plan.skipped_family_ids.push(family_id.clone());
+            continue;
+        }
+        let Some(existing_branch_ids) =
+            existing_family_branch_ids(codex, family_record, rollout_ids)
+        else {
+            plan.skipped_family_ids.push(family_id.clone());
+            continue;
+        };
+
+        if existing_branch_ids.is_empty() {
+            plan.family_ids.push(family_id.clone());
+            continue;
+        }
+
+        let active_exists = family_record
+            .chain
+            .iter()
+            .find(|branch| branch.id == family_record.active_id)
+            .is_some_and(|branch| existing_branch_ids.contains(&branch.id));
+        if !active_exists {
+            plan.skipped_family_ids.push(family_id.clone());
+            continue;
+        }
+
+        let missing_branch_ids = family_record
+            .chain
+            .iter()
+            .filter(|branch| !existing_branch_ids.contains(&branch.id))
+            .map(|branch| branch.id.clone())
+            .collect::<Vec<_>>();
+        if missing_branch_ids.is_empty() {
+            continue;
+        }
+
+        plan.branches.extend(
+            missing_branch_ids
+                .into_iter()
+                .map(|branch_id| (family_id.clone(), branch_id)),
+        );
+    }
+
+    plan
+}
+
+fn prune_orphan_entries_locked(
+    codex_dir: String,
+    prune_index: bool,
+    prune_threads: bool,
+    prune_family: bool,
     dry_run: bool,
 ) -> AppResult<OrphanPruneReport> {
     let codex = PathBuf::from(&codex_dir);
@@ -1091,6 +1248,27 @@ pub fn prune_orphan_entries(
 
     let mut index_removed = 0u32;
     let mut threads_removed = 0u32;
+    let mut family_branches_removed = 0u32;
+    let mut families_removed = 0u32;
+    let mut families_skipped = Vec::new();
+
+    if prune_family {
+        let mut store = family::load(&codex)?;
+        let plan = plan_family_orphan_prune(&codex, &store, &all_rollout_ids);
+        family_branches_removed = plan.branches.len() as u32;
+        families_removed = plan.family_ids.len() as u32;
+        families_skipped = plan.skipped_family_ids;
+
+        if !dry_run && (family_branches_removed > 0 || families_removed > 0) {
+            for family_id in &plan.family_ids {
+                family::remove_family(&mut store, family_id)?;
+            }
+            for (family_id, branch_id) in &plan.branches {
+                family::remove_non_active_branch(&mut store, family_id, branch_id)?;
+            }
+            family::save(&codex, &store)?;
+        }
+    }
 
     if prune_index {
         let index_path = paths::session_index_path(&codex);
@@ -1144,6 +1322,9 @@ pub fn prune_orphan_entries(
     Ok(OrphanPruneReport {
         index_removed,
         threads_removed,
+        family_branches_removed,
+        families_removed,
+        families_skipped,
         dry_run,
     })
 }
@@ -4357,6 +4538,11 @@ fn list_mismatched_session_ids(codex: &Path, target_provider: &str) -> AppResult
     let mut out: Vec<String> = Vec::new();
     let thread_states = read_thread_state_map(codex)?;
     let index_ids = read_session_index_ids(codex)?;
+    let active_rollouts = scan_active_rollout_identities(codex)?;
+    let active_rollout_ids = active_rollouts
+        .iter()
+        .map(|(_, identity)| identity.id.as_str())
+        .collect::<BTreeSet<_>>();
 
     let store = family::load(codex)?;
     family_managed_ids.extend(store.index.keys().cloned());
@@ -4364,6 +4550,11 @@ fn list_mismatched_session_ids(codex: &Path, target_provider: &str) -> AppResult
         family_managed_ids.extend(f.chain.iter().map(|b| b.id.clone()));
         if let Some(active) = f.chain.iter().find(|b| b.id == f.active_id) {
             if !matches!(active.status, BranchStatus::Active) {
+                continue;
+            }
+            // family/threads 可能遗留已经不存在的 active 分支。没有源 rollout 时，
+            // provider 克隆无从执行；这类记录应由 orphan 清理处理，而不是制造必然失败的同步任务。
+            if !active_rollout_ids.contains(active.id.as_str()) {
                 continue;
             }
             // 手工归档的 family head 仍保持逻辑 Active 角色，但不应被 provider
@@ -4409,10 +4600,7 @@ fn list_mismatched_session_ids(codex: &Path, target_provider: &str) -> AppResult
         }
     }
 
-    for p in family::scan_rollouts(codex)? {
-        let Some(identity) = read_rollout_identity(&p)? else {
-            continue;
-        };
+    for (p, identity) in active_rollouts {
         if family_managed_ids.contains(&identity.id) {
             continue;
         }
@@ -7061,7 +7249,8 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_scan_includes_unregistered_rollouts_when_family_store_exists() -> AppResult<()> {
+    fn mismatched_scan_includes_unregistered_rollouts_but_skips_missing_family_heads(
+    ) -> AppResult<()> {
         let codex = temp_codex_dir("cc-session-manager-repair-test");
         fs::create_dir_all(&codex)?;
 
@@ -7116,11 +7305,17 @@ mod tests {
         write_rollout(&codex, "legacy-session", "anthropic")?;
 
         let targets = list_mismatched_session_ids(&codex, "openai")?;
+        let plan = get_provider_sync_plan_with_lock(
+            codex.to_string_lossy().into_owned(),
+            &family::FamilyLock::default(),
+        )?;
         fs::remove_dir_all(&codex).ok();
 
+        assert_eq!(targets, plan, "对外同步计划必须与内部可执行目标完全一致");
         assert_eq!(
-            targets,
-            vec!["managed-source".to_string(), "legacy-session".to_string()]
+            plan,
+            vec!["legacy-session".to_string()],
+            "family 元数据不能把已经没有 active rollout 的孤儿记录变成不可执行的同步任务"
         );
         Ok(())
     }
@@ -7335,6 +7530,271 @@ mod tests {
         assert_eq!(diag.threads_archived_count, 1);
         assert!(diag.orphan_in_threads.is_empty());
         assert_eq!(prune.threads_removed, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn prune_family_orphans_removes_fully_missing_families() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-prune-missing-family-test");
+        fs::create_dir_all(&codex)?;
+        save_two_branch_family(
+            &codex,
+            "missing-active",
+            DEFAULT_PROVIDER,
+            "sessions/2026/04/24/rollout-missing-active.jsonl",
+            "missing-history",
+            "custom",
+            "archived_sessions/rollout-missing-history.jsonl",
+        )?;
+
+        let report = prune_orphan_entries_with_lock(
+            codex.to_string_lossy().into_owned(),
+            false,
+            false,
+            true,
+            false,
+            &family::FamilyLock::default(),
+        )?;
+        let store = family::load(&codex)?;
+
+        assert_eq!(report.families_removed, 1);
+        assert_eq!(report.family_branches_removed, 0);
+        assert!(report.families_skipped.is_empty());
+        assert!(store.families.is_empty());
+        assert!(store.index.is_empty());
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn prune_family_orphans_removes_missing_non_active_branches_and_honors_dry_run() -> AppResult<()>
+    {
+        let codex = temp_codex_dir("cc-session-manager-prune-missing-branch-test");
+        write_rollout(&codex, "active-branch", DEFAULT_PROVIDER)?;
+        save_two_branch_family(
+            &codex,
+            "active-branch",
+            DEFAULT_PROVIDER,
+            "sessions/2026/04/22/rollout-active-branch.jsonl",
+            "missing-history",
+            "custom",
+            "archived_sessions/rollout-missing-history.jsonl",
+        )?;
+        let mut store = family::load(&codex)?;
+        let family = store
+            .families
+            .get_mut("active-branch")
+            .expect("family fixture");
+        family.root_id = "missing-history".to_string();
+        family.chain.swap(0, 1);
+        family::save(&codex, &store)?;
+        let before = serde_json::to_value(&store)?;
+        let lock = family::FamilyLock::default();
+
+        let preview = prune_orphan_entries_with_lock(
+            codex.to_string_lossy().into_owned(),
+            false,
+            false,
+            true,
+            true,
+            &lock,
+        )?;
+        assert_eq!(preview.family_branches_removed, 1);
+        assert_eq!(serde_json::to_value(family::load(&codex)?)?, before);
+
+        let report = prune_orphan_entries_with_lock(
+            codex.to_string_lossy().into_owned(),
+            false,
+            false,
+            true,
+            false,
+            &lock,
+        )?;
+        let store = family::load(&codex)?;
+        let family = store
+            .families
+            .get("active-branch")
+            .expect("surviving family");
+        assert_eq!(report.family_branches_removed, 1);
+        assert_eq!(report.families_removed, 0);
+        assert_eq!(family.root_id, "active-branch");
+        assert_eq!(family.active_id, "active-branch");
+        assert_eq!(family.chain.len(), 1);
+        assert!(!store.index.contains_key("missing-history"));
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn prune_family_orphans_skips_family_when_missing_branch_lacks_index_entry() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-prune-branch-index-gap-test");
+        write_rollout(&codex, "active-branch", DEFAULT_PROVIDER)?;
+        save_two_branch_family(
+            &codex,
+            "active-branch",
+            DEFAULT_PROVIDER,
+            "sessions/2026/04/22/rollout-active-branch.jsonl",
+            "missing-history",
+            "custom",
+            "archived_sessions/rollout-missing-history.jsonl",
+        )?;
+        let mut store = family::load(&codex)?;
+        store.index.remove("missing-history");
+        family::save(&codex, &store)?;
+        let before = serde_json::to_value(&store)?;
+
+        let report = prune_orphan_entries_with_lock(
+            codex.to_string_lossy().into_owned(),
+            false,
+            false,
+            true,
+            false,
+            &family::FamilyLock::default(),
+        )?;
+
+        assert_eq!(report.family_branches_removed, 0);
+        assert_eq!(report.families_removed, 0);
+        assert_eq!(report.families_skipped, vec!["active-branch".to_string()]);
+        assert_eq!(serde_json::to_value(family::load(&codex)?)?, before);
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn prune_family_orphans_skips_families_sharing_a_duplicated_branch() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-prune-cross-family-dup-test");
+        write_rollout(&codex, "active-a", DEFAULT_PROVIDER)?;
+        write_rollout(&codex, "active-b", DEFAULT_PROVIDER)?;
+        let dup_branch = FamilyBranch {
+            id: "dup-branch".to_string(),
+            provider: "custom".to_string(),
+            created_at: "2026-04-24T00:00:00Z".to_string(),
+            status: BranchStatus::Archived,
+            rollout_relpath: "archived_sessions/rollout-dup-branch.jsonl".to_string(),
+            sha256: None,
+            line_count: None,
+            note: None,
+        };
+        let make_family = |family_id: &str, active_id: &str| Family {
+            family_id: family_id.to_string(),
+            root_id: active_id.to_string(),
+            title: "dup family".to_string(),
+            chain: vec![
+                FamilyBranch {
+                    id: active_id.to_string(),
+                    provider: DEFAULT_PROVIDER.to_string(),
+                    created_at: "2026-04-24T00:00:00Z".to_string(),
+                    status: BranchStatus::Active,
+                    rollout_relpath: format!("sessions/2026/04/22/rollout-{active_id}.jsonl"),
+                    sha256: None,
+                    line_count: None,
+                    note: None,
+                },
+                dup_branch.clone(),
+            ],
+            active_id: active_id.to_string(),
+            updated_at: "2026-04-24T00:00:00Z".to_string(),
+        };
+        let mut families = BTreeMap::new();
+        families.insert("family-a".to_string(), make_family("family-a", "active-a"));
+        families.insert("family-b".to_string(), make_family("family-b", "active-b"));
+        let mut index = BTreeMap::new();
+        index.insert("active-a".to_string(), "family-a".to_string());
+        index.insert("active-b".to_string(), "family-b".to_string());
+        index.insert("dup-branch".to_string(), "family-a".to_string());
+        family::save(
+            &codex,
+            &FamilyStore {
+                version: 1,
+                families,
+                index,
+            },
+        )?;
+        let before = serde_json::to_value(family::load(&codex)?)?;
+
+        let report = prune_orphan_entries_with_lock(
+            codex.to_string_lossy().into_owned(),
+            false,
+            false,
+            true,
+            false,
+            &family::FamilyLock::default(),
+        )?;
+
+        assert_eq!(report.family_branches_removed, 0);
+        assert_eq!(report.families_removed, 0);
+        assert_eq!(
+            report.families_skipped,
+            vec!["family-a".to_string(), "family-b".to_string()]
+        );
+        assert_eq!(serde_json::to_value(family::load(&codex)?)?, before);
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn prune_family_orphans_preserves_archived_rollouts() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-prune-archived-family-test");
+        write_rollout(&codex, "active-branch", DEFAULT_PROVIDER)?;
+        write_rollout_in(&codex, "archived_sessions", "archived-branch", "custom")?;
+        save_two_branch_family(
+            &codex,
+            "active-branch",
+            DEFAULT_PROVIDER,
+            "sessions/2026/04/22/rollout-active-branch.jsonl",
+            "archived-branch",
+            "custom",
+            "archived_sessions/rollout-archived-branch.jsonl",
+        )?;
+
+        let report = prune_orphan_entries_with_lock(
+            codex.to_string_lossy().into_owned(),
+            false,
+            false,
+            true,
+            false,
+            &family::FamilyLock::default(),
+        )?;
+        let store = family::load(&codex)?;
+
+        assert_eq!(report.family_branches_removed, 0);
+        assert_eq!(report.families_removed, 0);
+        assert!(report.families_skipped.is_empty());
+        assert_eq!(store.families["active-branch"].chain.len(), 2);
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn prune_family_orphans_preserves_partial_family_when_active_rollout_is_missing(
+    ) -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-prune-missing-active-test");
+        write_rollout_in(&codex, "archived_sessions", "surviving-history", "custom")?;
+        save_two_branch_family(
+            &codex,
+            "missing-active",
+            DEFAULT_PROVIDER,
+            "sessions/2026/04/22/rollout-missing-active.jsonl",
+            "surviving-history",
+            "custom",
+            "archived_sessions/rollout-surviving-history.jsonl",
+        )?;
+        let before = serde_json::to_value(family::load(&codex)?)?;
+
+        let report = prune_orphan_entries_with_lock(
+            codex.to_string_lossy().into_owned(),
+            false,
+            false,
+            true,
+            false,
+            &family::FamilyLock::default(),
+        )?;
+
+        assert_eq!(report.family_branches_removed, 0);
+        assert_eq!(report.families_removed, 0);
+        assert_eq!(report.families_skipped, vec!["missing-active".to_string()]);
+        assert_eq!(serde_json::to_value(family::load(&codex)?)?, before);
+        fs::remove_dir_all(&codex).ok();
         Ok(())
     }
 

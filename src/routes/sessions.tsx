@@ -885,26 +885,38 @@ function DeleteSummary({
 }) {
   const totalBytes = targets.reduce((a, b) => a + b.rollout_bytes, 0);
   const totalTokens = targets.reduce((a, b) => a + b.tokens_used, 0);
-  const logicalGroups = new Map<string, number>();
+  const familiesToDelete = new Map<string, number>();
   for (const target of targets) {
     const item = overlay.get(target.id);
-    const key = item?.family_id ? `family:${item.family_id}` : `session:${target.id}`;
-    logicalGroups.set(key, Math.max(logicalGroups.get(key) ?? 0, item?.branch_count ?? 1));
+    if (!item?.family_id || !item.is_active_branch) continue;
+    familiesToDelete.set(
+      item.family_id,
+      Math.max(familiesToDelete.get(item.family_id) ?? 0, item.branch_count || 1),
+    );
   }
-  const totalBranches = Array.from(logicalGroups.values()).reduce((sum, count) => sum + count, 0);
-  const deletesFamily = provider === "codex" && Array.from(logicalGroups.values()).some((count) => count > 1);
+  const totalFamilyBranches = Array.from(familiesToDelete.values()).reduce(
+    (sum, count) => sum + count,
+    0,
+  );
+  const scopedTargets = targets.filter((target) => {
+    const familyId = overlay.get(target.id)?.family_id;
+    return !familyId || !familiesToDelete.has(familyId);
+  }).length;
+  const deletesFamily = provider === "codex" && familiesToDelete.size > 0;
   return (
     <div className="min-w-0 max-w-full space-y-2 wrap-anywhere">
       <div className="min-w-0 whitespace-normal">
         {deletesFamily ? (
           <>
-            将删除 <b>{logicalGroups.size}</b> 条逻辑会话及其全部 <b>{totalBranches}</b> 个
-            provider/历史分支。各分支的 threads、日志、rollout 和索引都会一并清理；若只想删除某个历史分支，请在“分支历史”面板操作。
+            将整组删除 <b>{familiesToDelete.size}</b> 条 active 会话及其全部{" "}
+            <b>{totalFamilyBranches}</b> 个 provider/历史分支
+            {scopedTargets > 0 && <>，并单独删除另外 <b>{scopedTargets}</b> 个所选会话或历史分支</>}。
+            只有选中 family 的 active 分支才会整组删除；单独选中的非 active 历史分支不会影响当前 active 会话。
           </>
         ) : provider === "codex" ? (
           <>
-            将删除 <b>{targets.length}</b> 条所选逻辑会话对应的 threads、日志、rollout 与索引。
-            若其中会话属于 provider/历史分支组，后端会删除整个会话组的全部分支；只删除单个历史分支请进入“分支历史”面板。
+            将删除 <b>{targets.length}</b> 个所选会话或历史分支对应的 threads、日志、rollout 与索引。
+            非 active 历史分支只删除自身，不会影响同一 family 的当前 active 会话。
           </>
         ) : (
           <>
