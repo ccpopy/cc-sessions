@@ -7626,6 +7626,113 @@ mod tests {
     }
 
     #[test]
+    fn prune_family_orphans_skips_family_when_missing_branch_lacks_index_entry() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-prune-branch-index-gap-test");
+        write_rollout(&codex, "active-branch", DEFAULT_PROVIDER)?;
+        save_two_branch_family(
+            &codex,
+            "active-branch",
+            DEFAULT_PROVIDER,
+            "sessions/2026/04/22/rollout-active-branch.jsonl",
+            "missing-history",
+            "custom",
+            "archived_sessions/rollout-missing-history.jsonl",
+        )?;
+        let mut store = family::load(&codex)?;
+        store.index.remove("missing-history");
+        family::save(&codex, &store)?;
+        let before = serde_json::to_value(&store)?;
+
+        let report = prune_orphan_entries_with_lock(
+            codex.to_string_lossy().into_owned(),
+            false,
+            false,
+            true,
+            false,
+            &family::FamilyLock::default(),
+        )?;
+
+        assert_eq!(report.family_branches_removed, 0);
+        assert_eq!(report.families_removed, 0);
+        assert_eq!(report.families_skipped, vec!["active-branch".to_string()]);
+        assert_eq!(serde_json::to_value(family::load(&codex)?)?, before);
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn prune_family_orphans_skips_families_sharing_a_duplicated_branch() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-prune-cross-family-dup-test");
+        write_rollout(&codex, "active-a", DEFAULT_PROVIDER)?;
+        write_rollout(&codex, "active-b", DEFAULT_PROVIDER)?;
+        let dup_branch = FamilyBranch {
+            id: "dup-branch".to_string(),
+            provider: "custom".to_string(),
+            created_at: "2026-04-24T00:00:00Z".to_string(),
+            status: BranchStatus::Archived,
+            rollout_relpath: "archived_sessions/rollout-dup-branch.jsonl".to_string(),
+            sha256: None,
+            line_count: None,
+            note: None,
+        };
+        let make_family = |family_id: &str, active_id: &str| Family {
+            family_id: family_id.to_string(),
+            root_id: active_id.to_string(),
+            title: "dup family".to_string(),
+            chain: vec![
+                FamilyBranch {
+                    id: active_id.to_string(),
+                    provider: DEFAULT_PROVIDER.to_string(),
+                    created_at: "2026-04-24T00:00:00Z".to_string(),
+                    status: BranchStatus::Active,
+                    rollout_relpath: format!("sessions/2026/04/22/rollout-{active_id}.jsonl"),
+                    sha256: None,
+                    line_count: None,
+                    note: None,
+                },
+                dup_branch.clone(),
+            ],
+            active_id: active_id.to_string(),
+            updated_at: "2026-04-24T00:00:00Z".to_string(),
+        };
+        let mut families = BTreeMap::new();
+        families.insert("family-a".to_string(), make_family("family-a", "active-a"));
+        families.insert("family-b".to_string(), make_family("family-b", "active-b"));
+        let mut index = BTreeMap::new();
+        index.insert("active-a".to_string(), "family-a".to_string());
+        index.insert("active-b".to_string(), "family-b".to_string());
+        index.insert("dup-branch".to_string(), "family-a".to_string());
+        family::save(
+            &codex,
+            &FamilyStore {
+                version: 1,
+                families,
+                index,
+            },
+        )?;
+        let before = serde_json::to_value(family::load(&codex)?)?;
+
+        let report = prune_orphan_entries_with_lock(
+            codex.to_string_lossy().into_owned(),
+            false,
+            false,
+            true,
+            false,
+            &family::FamilyLock::default(),
+        )?;
+
+        assert_eq!(report.family_branches_removed, 0);
+        assert_eq!(report.families_removed, 0);
+        assert_eq!(
+            report.families_skipped,
+            vec!["family-a".to_string(), "family-b".to_string()]
+        );
+        assert_eq!(serde_json::to_value(family::load(&codex)?)?, before);
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
     fn prune_family_orphans_preserves_archived_rollouts() -> AppResult<()> {
         let codex = temp_codex_dir("cc-session-manager-prune-archived-family-test");
         write_rollout(&codex, "active-branch", DEFAULT_PROVIDER)?;
