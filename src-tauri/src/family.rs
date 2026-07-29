@@ -456,6 +456,16 @@ pub fn remove_non_active_branch(
         .get_mut(family_id)
         .ok_or_else(|| AppError::NotFound(format!("family not found: {family_id}")))?;
     let removed = family.chain.remove(position);
+    if family.root_id == branch_id {
+        family.root_id = family
+            .chain
+            .first()
+            .ok_or_else(|| {
+                inconsistent_family(format!("family {family_id} 删除分支后 chain 为空"))
+            })?
+            .id
+            .clone();
+    }
     family.updated_at = now_iso();
     store.index.remove(branch_id);
     Ok(removed)
@@ -711,9 +721,7 @@ pub fn verify_integrity(codex_dir: &Path) -> AppResult<FamilyIntegrityReport> {
         for b in family.chain.iter() {
             let expected_sha = b.sha256.clone();
             let expected_lines = b.line_count;
-            if expected_sha.is_none() && b.id == family.active_id {
-                continue; // 当前可写分支不会固化校验
-            }
+            let unsealed_active = expected_sha.is_none() && b.id == family.active_id;
             let rel = paths::checked_relative_path(&b.rollout_relpath)?;
             let abs_main = codex_dir.join(&rel);
             let abs_archived =
@@ -736,6 +744,9 @@ pub fn verify_integrity(codex_dir: &Path) -> AppResult<FamilyIntegrityReport> {
                 });
                 continue;
             };
+            if unsealed_active {
+                continue; // 当前可写分支只检查是否存在，不做 sha256/行数校验
+            }
             match compute_integrity(&candidate) {
                 Ok((sha, lines)) => {
                     let sha_ok = expected_sha.as_deref() == Some(sha.as_str());
@@ -1233,6 +1244,47 @@ mod tests {
             store.index.get("active-a").map(String::as_str),
             Some("family-a")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn remove_non_active_branch_repairs_root_when_root_branch_is_removed() -> AppResult<()> {
+        let mut store = two_branch_store();
+        let family = store.families.get_mut("family-a").expect("family fixture");
+        family.root_id = "history-a".to_string();
+        family.chain.swap(0, 1);
+
+        let removed = remove_non_active_branch(&mut store, "family-a", "history-a")?;
+
+        assert_eq!(removed.id, "history-a");
+        let family = store.families.get("family-a").expect("family remains");
+        assert_eq!(family.root_id, "active-a");
+        assert_eq!(family.active_id, "active-a");
+        assert_eq!(family.chain.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn verify_integrity_reports_missing_unsealed_active_branch() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-family-missing-active-integrity-test");
+        fs::create_dir_all(&codex)?;
+        let mut store = FamilyStore::default();
+        ensure_family_for(
+            &mut store,
+            "missing-active",
+            "openai",
+            "sessions/2026/04/24/rollout-missing-active.jsonl",
+            "missing active",
+        );
+        save(&codex, &store)?;
+
+        let report = verify_integrity(&codex)?;
+
+        assert!(!report.all_ok);
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(report.items[0].branch_id, "missing-active");
+        assert!(report.items[0].missing);
+        fs::remove_dir_all(codex).ok();
         Ok(())
     }
 

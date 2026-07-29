@@ -654,6 +654,9 @@ pub struct ProjectConfigRepairReport {
 pub struct OrphanPruneReport {
     pub index_removed: u32,
     pub threads_removed: u32,
+    pub family_branches_removed: u32,
+    pub families_removed: u32,
+    pub families_skipped: Vec<String>,
     pub dry_run: bool,
 }
 

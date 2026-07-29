@@ -1717,18 +1717,33 @@ fn repair_threads(ctx: &MenuContext) -> MenuResult<()> {
 fn repair_prune(ctx: &MenuContext) -> MenuResult<()> {
     let prune_index = confirm_default_no("是否清理 session_index.jsonl 里的 orphan？")?;
     let prune_threads = confirm_default_no("是否清理 threads 表里的 orphan？")?;
-    if !prune_index && !prune_threads {
+    let prune_family = confirm_default_no("是否清理 session_family.json 里可安全确认的 orphan？")?;
+    if !prune_index && !prune_threads && !prune_family {
         println!("未选择任何清理目标。");
         return pause().map(|_| ());
     }
     let dry_run = choose_dry_run("清理 orphan 记录")?;
-    let report =
-        repair::prune_orphan_entries(ctx.codex_dir.clone(), prune_index, prune_threads, dry_run)
-            .map_err(to_string)?;
+    let report = repair::prune_orphan_entries_with_lock(
+        ctx.codex_dir.clone(),
+        prune_index,
+        prune_threads,
+        prune_family,
+        dry_run,
+        &ctx.family_lock,
+    )
+    .map_err(to_string)?;
     println!(
-        "index_removed={} threads_removed={} dry_run={}",
-        report.index_removed, report.threads_removed, report.dry_run
+        "index_removed={} threads_removed={} family_branches_removed={} families_removed={} families_skipped={} dry_run={}",
+        report.index_removed,
+        report.threads_removed,
+        report.family_branches_removed,
+        report.families_removed,
+        report.families_skipped.len(),
+        report.dry_run
     );
+    for family_id in report.families_skipped {
+        println!("family_skipped {family_id}");
+    }
     pause()?;
     Ok(())
 }

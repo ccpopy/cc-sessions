@@ -63,6 +63,7 @@ import {
   type FamilyIntegrityReport,
   type GuiVisibilityReport,
   type HistoryOrphanReport,
+  type OrphanPruneReport,
   type ProjectConfigReport,
   type ProviderInfo,
   type SessionProvider,
@@ -86,7 +87,9 @@ function CodexRepairRoute() {
   const [strategy, setStrategy] = useState<SwitchStrategy>("continuous");
   const [confirmBatch, setConfirmBatch] = useState(false);
   const [confirmProjectConfigRepair, setConfirmProjectConfigRepair] = useState(false);
-  const [confirmPrune, setConfirmPrune] = useState<null | "index" | "threads">(null);
+  const [confirmPrune, setConfirmPrune] = useState<null | "index" | "threads" | "family">(
+    null,
+  );
   const [running, setRunning] = useState<string | null>(null);
   const [dryRun, setDryRun] = useState(false);
   const expectedThreadsCount =
@@ -95,6 +98,7 @@ function CodexRepairRoute() {
     diag == null
       ? undefined
       : `threads 表包含 ${diag.threads_active_count} 条活跃会话和 ${diag.threads_archived_count} 条本工具归档备份；归档备份存放在 archived_sessions/，不等同于 Codex 官方设置页的“已归档对话”。`;
+  const missingFamilyBranches = integrity?.items.filter((item) => item.missing).length ?? 0;
 
   const refresh = useCallback(async () => {
     if (!codexDir) return;
@@ -129,6 +133,18 @@ function CodexRepairRoute() {
       toast.error(String((e as Error)?.message ?? e));
     } finally {
       setRunning(null);
+    }
+  };
+
+  const showFamilyPruneResult = (report: OrphanPruneReport, preview: boolean) => {
+    const action = preview ? "预览：将移除" : "已移除";
+    const message = `${action} ${report.family_branches_removed} 个孤儿分支、${report.families_removed} 个空 family`;
+    if (report.families_skipped.length > 0) {
+      toast.warning(`${message}；跳过 ${report.families_skipped.length} 个需人工确认的 family`, {
+        description: report.families_skipped.slice(0, 3).join("\n"),
+      });
+    } else {
+      toast.success(message);
     }
   };
 
@@ -310,6 +326,7 @@ function CodexRepairRoute() {
                                   codex_dir: codexDir,
                                   prune_index: true,
                                   prune_threads: false,
+                                  prune_family: false,
                                   dry_run: true,
                                 });
                                 toast.success(
@@ -355,6 +372,7 @@ function CodexRepairRoute() {
                                   codex_dir: codexDir,
                                   prune_index: false,
                                   prune_threads: true,
+                                  prune_family: false,
                                   dry_run: true,
                                 });
                                 toast.success(
@@ -673,8 +691,8 @@ function CodexRepairRoute() {
                         <Info className="h-3.5 w-3.5 text-muted-foreground" />
                       </TooltipTrigger>
                       <TooltipContent className="max-w-sm text-xs">
-                        对每次克隆时归档的旧分支做 sha256 + 行数校验，
-                        发现文件被外部改过或丢失时会在这里亮红。
+                        检查 family 中各分支的 rollout 是否存在，并对已归档旧分支做 sha256 +
+                        行数校验。文件被外部改过或丢失时会在这里亮红。
                       </TooltipContent>
                     </Tooltip>
                   </CardTitle>
@@ -688,7 +706,7 @@ function CodexRepairRoute() {
                     </div>
                   ) : (
                     <div className="space-y-1.5">
-                      <div className="flex items-center gap-2 text-xs">
+                      <div className="flex flex-wrap items-center gap-2 text-xs">
                         {integrity.all_ok ? (
                           <>
                             <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
@@ -703,6 +721,47 @@ function CodexRepairRoute() {
                             </span>
                           </>
                         )}
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              size="sm"
+                              variant={dryRun ? "outline" : "destructive"}
+                              onClick={() => {
+                                if (dryRun) {
+                                  void run("prune_family", async () => {
+                                    const report = await api.pruneOrphanEntries({
+                                      codex_dir: codexDir,
+                                      prune_index: false,
+                                      prune_threads: false,
+                                      prune_family: true,
+                                      dry_run: true,
+                                    });
+                                    showFamilyPruneResult(report, true);
+                                  });
+                                } else {
+                                  setConfirmPrune("family");
+                                }
+                              }}
+                              disabled={!!running || missingFamilyBranches === 0}
+                              className="ml-auto gap-1.5"
+                            >
+                              <Eraser className="h-3.5 w-3.5" />
+                              清理 family 残留
+                              {missingFamilyBranches > 0 && (
+                                <Badge
+                                  variant="outline"
+                                  className="ml-0.5 h-4 border-current/30 bg-background/20 px-1 text-[10px] font-normal"
+                                >
+                                  {missingFamilyBranches}
+                                </Badge>
+                              )}
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent className="max-w-sm text-xs">
+                            清理 <code>session_family.json</code> 中已确认没有 rollout
+                            的空 family 或非 active 历史分支。若 active 文件缺失但仍有历史分支，会保留并提示人工确认。
+                          </TooltipContent>
+                        </Tooltip>
                       </div>
                       <div className="max-h-64 max-w-full overflow-auto rounded-md border">
                         <table className="w-full text-xs">
@@ -864,23 +923,33 @@ function CodexRepairRoute() {
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>
-              {confirmPrune === "index" ? "清理索引残留" : "清理数据库残留"}
+              {confirmPrune === "index"
+                ? "清理索引残留"
+                : confirmPrune === "threads"
+                  ? "清理数据库残留"
+                  : "清理 family 残留"}
             </AlertDialogTitle>
             <AlertDialogDescription>
-              即将从{" "}
               {confirmPrune === "index" ? (
                 <>
-                  <code>session_index.jsonl</code> 删除{" "}
-                  <b>{diag?.orphan_in_index.length ?? 0}</b> 行
+                  即将从 <code>session_index.jsonl</code> 删除{" "}
+                  <b>{diag?.orphan_in_index.length ?? 0}</b> 行。这些条目指向的会话文件已经不存在，
+                  删除后不可撤销。对应的历史会话文件不会因此被再次修改。
+                </>
+              ) : confirmPrune === "threads" ? (
+                <>
+                  即将从应用数据库的 <code>threads</code> 表删除{" "}
+                  <b>{diag?.orphan_in_threads.length ?? 0}</b> 行。这些条目指向的会话文件已经不存在，
+                  删除后不可撤销。对应的历史会话文件不会因此被再次修改。
                 </>
               ) : (
                 <>
-                  应用数据库的 <code>threads</code> 表删除{" "}
-                  <b>{diag?.orphan_in_threads.length ?? 0}</b> 行
+                  即将检查 <code>session_family.json</code> 中的{" "}
+                  <b>{missingFamilyBranches}</b> 个缺失分支。只会自动删除没有任何 rollout 的空 family，
+                  或 active 文件仍存在时缺失的非 active 历史分支；active 文件缺失但仍有历史分支的
+                  family 会保留并报告，避免自动改变当前分支。
                 </>
               )}
-              。这些条目指向的会话文件已经不存在，删除后不可撤销。对应的历史会话文件
-              不会因此被再次修改。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -891,18 +960,27 @@ function CodexRepairRoute() {
                 const kind = confirmPrune;
                 setConfirmPrune(null);
                 if (!kind) return;
-                void run(kind === "index" ? "prune_index" : "prune_threads", async () => {
+                const runKey =
+                  kind === "index"
+                    ? "prune_index"
+                    : kind === "threads"
+                      ? "prune_threads"
+                      : "prune_family";
+                void run(runKey, async () => {
                   const r = await api.pruneOrphanEntries({
                     codex_dir: codexDir,
                     prune_index: kind === "index",
                     prune_threads: kind === "threads",
+                    prune_family: kind === "family",
                     dry_run: false,
                   });
-                  toast.success(
-                    kind === "index"
-                      ? `已从 session_index 删除 ${r.index_removed} 行`
-                      : `已从 threads 表删除 ${r.threads_removed} 行`,
-                  );
+                  if (kind === "index") {
+                    toast.success(`已从 session_index 删除 ${r.index_removed} 行`);
+                  } else if (kind === "threads") {
+                    toast.success(`已从 threads 表删除 ${r.threads_removed} 行`);
+                  } else {
+                    showFamilyPruneResult(r, false);
+                  }
                   await refresh();
                 });
               }}

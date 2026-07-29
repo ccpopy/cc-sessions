@@ -1038,22 +1038,35 @@ fn cmd_repair(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
         "prune" => {
             let prune_index = take_flag(&mut args, "--index");
             let prune_threads = take_flag(&mut args, "--threads");
+            let prune_family = take_flag(&mut args, "--family");
             let dry_run = take_flag(&mut args, "--dry-run");
             ensure_no_args(&args)?;
-            if !prune_index && !prune_threads {
-                return Err(CliError::message("prune 需要显式指定 --index 或 --threads"));
+            if !prune_index && !prune_threads && !prune_family {
+                return Err(CliError::message(
+                    "prune 需要显式指定 --index、--threads 或 --family",
+                ));
             }
-            let report = repair::prune_orphan_entries(
+            let report = repair::prune_orphan_entries_with_lock(
                 ctx.codex_dir.clone(),
                 prune_index,
                 prune_threads,
+                prune_family,
                 dry_run,
+                &ctx.family_lock,
             )?;
             output(ctx, &report, |report| {
                 println!(
-                    "index_removed={}\tthreads_removed={}\tdry_run={}",
-                    report.index_removed, report.threads_removed, report.dry_run
+                    "index_removed={}\tthreads_removed={}\tfamily_branches_removed={}\tfamilies_removed={}\tfamilies_skipped={}\tdry_run={}",
+                    report.index_removed,
+                    report.threads_removed,
+                    report.family_branches_removed,
+                    report.families_removed,
+                    report.families_skipped.len(),
+                    report.dry_run
                 );
+                for family_id in &report.families_skipped {
+                    println!("family_skipped\t{family_id}");
+                }
             })
         }
         "claude-history" => {
