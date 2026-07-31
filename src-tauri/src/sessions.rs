@@ -1025,10 +1025,135 @@ fn set_archived_codex_locked(codex_dir: String, id: String, v: bool) -> AppResul
             .unwrap_or_default();
         crate::repair::append_index_line(&codex, &id, &thread_name, &target)?;
     }
-    if family::update_manual_archive_metadata(&mut family_store, &codex, &id, v, &target)? {
+    let mut family_changed =
+        family::update_manual_archive_metadata(&mut family_store, &codex, &id, v, &target)?;
+    family_changed |=
+        reconcile_family_active_after_archive_toggle(&mut family_store, &codex, &state, &id)?;
+    if family_changed {
         family::save(&codex, &family_store)?;
     }
     Ok(())
+}
+
+struct UsableFamilyBranch {
+    id: String,
+    provider: String,
+    updated_at: i64,
+    created_at: i64,
+}
+
+/// 每次手工归档后，都按正常列表的选择规则同步 family active_id，避免默认卡片
+/// 与分支面板互相矛盾（Issue #21）。整个 family 都被归档时没有可用候选，保留
+/// 原 active_id，确保取消归档仍可恢复原分支。
+fn reconcile_family_active_after_archive_toggle(
+    store: &mut crate::models::FamilyStore,
+    codex_dir: &Path,
+    state: &rusqlite::Connection,
+    changed_id: &str,
+) -> AppResult<bool> {
+    let Some(family_id) = family::resolve_family_id_strict(store, changed_id)? else {
+        return Ok(false);
+    };
+    let (active_id, branches) = {
+        let family = store
+            .families
+            .get(&family_id)
+            .ok_or_else(|| AppError::NotFound(format!("family not found: {family_id}")))?;
+        (
+            family.active_id.clone(),
+            family
+                .chain
+                .iter()
+                .map(|branch| (branch.id.clone(), branch.provider.clone()))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let usable = load_usable_family_branches(codex_dir, state, &branches)?;
+    let current_provider = crate::repair::read_current_provider_export(codex_dir).ok();
+    let Some(representative) =
+        select_usable_family_representative(&usable, current_provider.as_deref(), &active_id)
+    else {
+        return Ok(false);
+    };
+    if representative.id == active_id {
+        return Ok(false);
+    }
+
+    family::set_active(store, &family_id, &representative.id)?;
+    Ok(true)
+}
+
+fn load_usable_family_branches(
+    codex_dir: &Path,
+    state: &rusqlite::Connection,
+    branches: &[(String, String)],
+) -> AppResult<Vec<UsableFamilyBranch>> {
+    let sessions_root = PathBuf::from(paths::strip_verbatim(
+        &paths::sessions_dir(codex_dir).to_string_lossy(),
+    ));
+    let mut usable = Vec::new();
+    for (branch_id, provider) in branches {
+        let row: Option<(Option<String>, i64, i64, i64)> = state
+            .query_row(
+                "SELECT rollout_path, COALESCE(archived,0), COALESCE(updated_at,0), COALESCE(created_at,0) FROM threads WHERE id = ?1",
+                [&branch_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((Some(raw_path), archived, updated_at, created_at)) = row else {
+            continue;
+        };
+        if archived != 0 {
+            continue;
+        }
+        let rollout = PathBuf::from(paths::strip_verbatim(
+            &paths::host_path_string_from_codex_record(codex_dir, &raw_path),
+        ));
+        if !rollout.starts_with(&sessions_root) || !rollout.is_file() {
+            continue;
+        }
+        usable.push(UsableFamilyBranch {
+            id: branch_id.clone(),
+            provider: provider.clone(),
+            updated_at,
+            created_at,
+        });
+    }
+    Ok(usable)
+}
+
+fn select_usable_family_representative<'a>(
+    usable: &'a [UsableFamilyBranch],
+    current_provider: Option<&str>,
+    active_id: &str,
+) -> Option<&'a UsableFamilyBranch> {
+    let has_current_provider = current_provider.is_some_and(|current| {
+        usable
+            .iter()
+            .any(|branch| branch.provider.as_str() == current)
+    });
+    let active_is_usable = usable.iter().any(|branch| branch.id == active_id);
+    usable
+        .iter()
+        .filter(|branch| {
+            if has_current_provider {
+                current_provider
+                    .as_deref()
+                    .is_some_and(|current| branch.provider.as_str() == current)
+            } else if active_is_usable {
+                branch.id == active_id
+            } else {
+                true
+            }
+        })
+        .max_by(|left, right| {
+            left.updated_at
+                .cmp(&right.updated_at)
+                .then_with(|| (left.id == active_id).cmp(&(right.id == active_id)))
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                // 与前端列表一致：其余字段相同时，较小的 id 优先。
+                .then_with(|| right.id.cmp(&left.id))
+        })
 }
 
 /// 从 rollout 文件名（rollout-YYYY-MM-DDTHH-MM-SS-<uuid>.jsonl）推导归属日期；
@@ -4054,6 +4179,206 @@ mod tests {
         assert_eq!(restored_branch.sha256, None);
         assert_eq!(restored_branch.line_count, None);
 
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn archiving_active_branch_promotes_only_remaining_unarchived_branch() -> AppResult<()> {
+        let codex = temp_dir("codex-archive-family-active-promotion");
+        let family_id = "family-archive-active-promotion";
+        let historical_id = "019d-family-archive-promotion-historical";
+        let active_id = "019d-family-archive-promotion-active";
+        codex_family_fixture(
+            &codex,
+            family_id,
+            active_id,
+            &[
+                FamilyBranchFixture {
+                    id: historical_id,
+                    archived: true,
+                },
+                FamilyBranchFixture {
+                    id: active_id,
+                    archived: false,
+                },
+            ],
+        )?;
+        let mut fixture_store = family::load(&codex)?;
+        for branch in &mut fixture_store
+            .families
+            .get_mut(family_id)
+            .expect("family fixture")
+            .chain
+        {
+            branch.provider = "openai".to_string();
+        }
+        family::save(&codex, &fixture_store)?;
+        let lock = family::FamilyLock::default();
+
+        // Issue #21: restore the historical branch first, then archive the
+        // family active branch. The restored branch is now the only usable
+        // branch and must become the family active branch as well.
+        set_archived_with_lock(
+            Some("codex".to_string()),
+            codex.to_string_lossy().into_owned(),
+            historical_id.to_string(),
+            false,
+            &lock,
+        )?;
+        let restored_store = family::load(&codex)?;
+        let restored_family = restored_store
+            .families
+            .get(family_id)
+            .expect("family remains after restoring history");
+        assert_eq!(
+            restored_family.active_id, active_id,
+            "restoring history must not switch away from a still-usable active branch"
+        );
+
+        set_archived_with_lock(
+            Some("codex".to_string()),
+            codex.to_string_lossy().into_owned(),
+            active_id.to_string(),
+            true,
+            &lock,
+        )?;
+
+        let store = family::load(&codex)?;
+        let family = store
+            .families
+            .get(family_id)
+            .expect("family remains after archive transition");
+        assert_eq!(family.active_id, historical_id);
+        assert!(matches!(
+            family
+                .chain
+                .iter()
+                .find(|branch| branch.id == historical_id)
+                .expect("historical branch remains")
+                .status,
+            BranchStatus::Active
+        ));
+        assert!(matches!(
+            family
+                .chain
+                .iter()
+                .find(|branch| branch.id == active_id)
+                .expect("former active branch remains")
+                .status,
+            BranchStatus::Archived
+        ));
+
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        for (id, expected_archived) in [(historical_id, 0_i64), (active_id, 1_i64)] {
+            let archived: i64 = state.query_row(
+                "SELECT CAST(archived AS INTEGER) FROM threads WHERE id = ?",
+                [id],
+                |row| row.get(0),
+            )?;
+            assert_eq!(archived, expected_archived, "{id}");
+        }
+        let index_ids = crate::repair::read_session_index_ids(&codex)?;
+        assert!(index_ids.contains(historical_id));
+        assert!(!index_ids.contains(active_id));
+
+        drop(state);
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn unarchiving_newer_provider_branch_aligns_family_active_with_list() -> AppResult<()> {
+        let codex = temp_dir("codex-unarchive-family-representative");
+        let family_id = "family-unarchive-representative";
+        let active_id = "019d-family-unarchive-representative-active";
+        let restored_id = "019d-family-unarchive-representative-restored";
+        codex_family_fixture(
+            &codex,
+            family_id,
+            active_id,
+            &[
+                FamilyBranchFixture {
+                    id: active_id,
+                    archived: false,
+                },
+                FamilyBranchFixture {
+                    id: restored_id,
+                    archived: true,
+                },
+            ],
+        )?;
+
+        let mut fixture_store = family::load(&codex)?;
+        for branch in &mut fixture_store
+            .families
+            .get_mut(family_id)
+            .expect("family fixture")
+            .chain
+        {
+            branch.provider = "openai".to_string();
+        }
+        family::save(&codex, &fixture_store)?;
+
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        state.execute(
+            "UPDATE threads SET updated_at = ?1 WHERE id = ?2",
+            params![1770000200_i64, active_id],
+        )?;
+        state.execute(
+            "UPDATE threads SET updated_at = ?1 WHERE id = ?2",
+            params![1770000600_i64, restored_id],
+        )?;
+        drop(state);
+
+        let lock = family::FamilyLock::default();
+        set_archived_with_lock(
+            Some("codex".to_string()),
+            codex.to_string_lossy().into_owned(),
+            restored_id.to_string(),
+            false,
+            &lock,
+        )?;
+
+        let store = family::load(&codex)?;
+        let family = store
+            .families
+            .get(family_id)
+            .expect("family remains after restoring branch");
+        assert_eq!(family.active_id, restored_id);
+        assert!(matches!(
+            family
+                .chain
+                .iter()
+                .find(|branch| branch.id == restored_id)
+                .expect("restored branch remains")
+                .status,
+            BranchStatus::Active
+        ));
+        assert!(matches!(
+            family
+                .chain
+                .iter()
+                .find(|branch| branch.id == active_id)
+                .expect("former active branch remains")
+                .status,
+            BranchStatus::Archived
+        ));
+
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        for id in [active_id, restored_id] {
+            let archived: i64 = state.query_row(
+                "SELECT CAST(archived AS INTEGER) FROM threads WHERE id = ?",
+                [id],
+                |row| row.get(0),
+            )?;
+            assert_eq!(archived, 0, "{id}");
+        }
+        let index_ids = crate::repair::read_session_index_ids(&codex)?;
+        assert!(index_ids.contains(active_id));
+        assert!(index_ids.contains(restored_id));
+
+        drop(state);
         fs::remove_dir_all(codex).ok();
         Ok(())
     }
