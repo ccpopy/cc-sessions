@@ -93,6 +93,13 @@ type Props = {
   backupDir?: string;
   onForked?: () => void | Promise<void>;
   onEdited?: () => void | Promise<void>;
+  initialJump?: PreviewJump | null;
+};
+
+export type PreviewJump = {
+  eventIndex: number;
+  eventOffset: number;
+  query: string;
 };
 
 type DiffCommentPrompt = {
@@ -138,6 +145,7 @@ export function PreviewDialog({
   backupDir,
   onForked,
   onEdited,
+  initialJump,
 }: Props) {
   const rolloutPath = customRolloutPath ?? session?.rollout_path ?? "";
   const provider = session?.provider ?? "codex";
@@ -456,6 +464,13 @@ export function PreviewDialog({
     el.classList.add("preview-jump-flash");
     window.setTimeout(() => el.classList.remove("preview-jump-flash"), 1700);
   }, []);
+
+  useEffect(() => {
+    if (!open || !rolloutPath || !initialJump) return;
+    setFilter(initialJump.query);
+    pendingJumpRef.current = initialJump.eventIndex;
+    void loadUpTo(initialJump.eventOffset).then(() => scrollPendingIntoView());
+  }, [initialJump, loadUpTo, open, rolloutPath, scrollPendingIntoView]);
 
   /** 滚动跟随：视口上沿 1/3 处上方最近的一条用户提问视为当前时间线位置。 */
   const updateActiveFromScroll = useCallback(() => {

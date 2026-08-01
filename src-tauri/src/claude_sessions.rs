@@ -2,11 +2,12 @@ use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use chrono::{DateTime, FixedOffset};
 use serde_json::Value;
 
-use crate::error::AppResult;
+use crate::error::{ensure_not_cancelled, AppResult};
 use crate::models::{PreviewEvent, SessionMetaBrief, SessionSummary};
 use crate::{fs_ops, paths};
 
@@ -16,17 +17,33 @@ const TITLE_MAX_CHARS: usize = 80;
 const PREVIEW_CAPACITY_HINT_MAX: usize = 1024;
 
 pub fn scan_sessions(claude_dir: &Path) -> AppResult<Vec<SessionSummary>> {
+    scan_sessions_impl(claude_dir, None)
+}
+
+pub fn scan_sessions_cancellable(
+    claude_dir: &Path,
+    cancel: &AtomicBool,
+) -> AppResult<Vec<SessionSummary>> {
+    scan_sessions_impl(claude_dir, Some(cancel))
+}
+
+fn scan_sessions_impl(
+    claude_dir: &Path,
+    cancel: Option<&AtomicBool>,
+) -> AppResult<Vec<SessionSummary>> {
+    ensure_not_cancelled(cancel)?;
     let root = paths::claude_projects_dir(claude_dir);
     if !root.is_dir() {
         return Ok(Vec::new());
     }
 
     let mut files = Vec::new();
-    collect_jsonl_files(&root, &mut files)?;
+    collect_jsonl_files(&root, &mut files, cancel)?;
 
     let mut sessions = Vec::new();
     for file in files {
-        if let Some(session) = parse_session(&file)? {
+        ensure_not_cancelled(cancel)?;
+        if let Some(session) = parse_session(&file, cancel)? {
             sessions.push(session);
         }
     }
@@ -139,7 +156,7 @@ pub fn sidecar_path_for(source_path: &Path) -> Option<PathBuf> {
     Some(source_path.with_file_name(stem))
 }
 
-fn parse_session(path: &Path) -> AppResult<Option<SessionSummary>> {
+fn parse_session(path: &Path, cancel: Option<&AtomicBool>) -> AppResult<Option<SessionSummary>> {
     let is_subagent = is_agent_session(path);
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -161,6 +178,7 @@ fn parse_session(path: &Path) -> AppResult<Option<SessionSummary>> {
     let mut reasoning_effort: Option<String> = None;
 
     for line in reader.lines() {
+        ensure_not_cancelled(cancel)?;
         let line = line?;
         if line.trim().is_empty() {
             continue;
@@ -402,12 +420,17 @@ fn claude_non_message_summary(raw: &Value) -> String {
         .to_string()
 }
 
-fn collect_jsonl_files(root: &Path, files: &mut Vec<PathBuf>) -> AppResult<()> {
+fn collect_jsonl_files(
+    root: &Path,
+    files: &mut Vec<PathBuf>,
+    cancel: Option<&AtomicBool>,
+) -> AppResult<()> {
     for entry in fs::read_dir(root)? {
+        ensure_not_cancelled(cancel)?;
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
-            collect_jsonl_files(&path, files)?;
+            collect_jsonl_files(&path, files, cancel)?;
         } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
             files.push(path);
         }

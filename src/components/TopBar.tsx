@@ -1,5 +1,5 @@
 import { useLocation } from "react-router-dom";
-import { Archive, ArrowDown10, Clock, FolderKanban, RefreshCw, Trash2, X } from "lucide-react";
+import { Archive, ArrowDown10, Clock, FileSearch, FolderKanban, RefreshCw, Trash2, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { SearchInput } from "@/components/SearchInput";
@@ -17,6 +17,7 @@ type Props = {
   refreshing?: boolean;
   onBulkBackup?: () => void;
   onBulkDelete?: () => void;
+  onContentSearch?: () => void;
   showListTools?: boolean;
   children?: React.ReactNode;
 };
@@ -28,6 +29,7 @@ export function TopBar({
   refreshing = false,
   onBulkBackup,
   onBulkDelete,
+  onContentSearch,
   showListTools,
   children,
 }: Props) {
@@ -73,6 +75,22 @@ export function TopBar({
               onChange={setQuery}
               className="min-w-0 flex-1 basis-64 sm:max-w-96 lg:min-w-48 xl:max-w-[30rem]"
             />
+            {onContentSearch && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    onClick={onContentSearch}
+                    className="h-9 w-9 shrink-0 text-muted-foreground hover:text-foreground active:scale-95"
+                    aria-label="搜索对话全文"
+                  >
+                    <FileSearch className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>搜索对话全文</TooltipContent>
+              </Tooltip>
+            )}
             <Tabs value={view} onValueChange={(v) => setView(v as View)} className="shrink-0">
               <TabsList className="h-9">
                 <TabsTrigger value="time" className="gap-1.5 px-2.5 text-xs">

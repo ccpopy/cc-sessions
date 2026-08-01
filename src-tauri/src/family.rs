@@ -10,13 +10,13 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::error::{AppError, AppResult};
+use crate::error::{ensure_not_cancelled, AppError, AppResult};
 use crate::models::{
     BranchStatus, Family, FamilyBranch, FamilyIntegrityItem, FamilyIntegrityReport, FamilyOverlay,
     FamilyStore,
@@ -795,8 +795,9 @@ pub fn read_session_meta(rollout: &Path) -> AppResult<Value> {
     Ok(v)
 }
 
-fn scan_rollouts_in(root: PathBuf) -> AppResult<Vec<PathBuf>> {
+fn scan_rollouts_in(root: PathBuf, cancel: Option<&AtomicBool>) -> AppResult<Vec<PathBuf>> {
     let mut out = Vec::new();
+    ensure_not_cancelled(cancel)?;
     let metadata = match fs::symlink_metadata(&root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(out),
@@ -809,6 +810,7 @@ fn scan_rollouts_in(root: PathBuf) -> AppResult<Vec<PathBuf>> {
         )));
     }
     for entry in walkdir::WalkDir::new(&root).follow_links(false) {
+        ensure_not_cancelled(cancel)?;
         let entry = entry.map_err(|error| {
             AppError::Other(format!(
                 "扫描 rollout 目录失败 {}: {error}",
@@ -835,12 +837,19 @@ fn scan_rollouts_in(root: PathBuf) -> AppResult<Vec<PathBuf>> {
 
 /// 扫描 sessions/ 目录下所有 active `rollout-*.jsonl`。
 pub fn scan_rollouts(codex_dir: &Path) -> AppResult<Vec<PathBuf>> {
-    scan_rollouts_in(paths::sessions_dir(codex_dir))
+    scan_rollouts_in(paths::sessions_dir(codex_dir), None)
 }
 
 /// 扫描 archived_sessions/ 目录下所有 archived `rollout-*.jsonl`。
 pub fn scan_archived_rollouts(codex_dir: &Path) -> AppResult<Vec<PathBuf>> {
-    scan_rollouts_in(paths::archived_sessions_dir(codex_dir))
+    scan_rollouts_in(paths::archived_sessions_dir(codex_dir), None)
+}
+
+pub(crate) fn scan_archived_rollouts_cancellable(
+    codex_dir: &Path,
+    cancel: &AtomicBool,
+) -> AppResult<Vec<PathBuf>> {
+    scan_rollouts_in(paths::archived_sessions_dir(codex_dir), Some(cancel))
 }
 
 pub fn get_family_store_with_lock(codex_dir: String, lock: &FamilyLock) -> AppResult<FamilyStore> {

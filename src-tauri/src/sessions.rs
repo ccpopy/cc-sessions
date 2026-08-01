@@ -2,11 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use rusqlite::{params, OptionalExtension};
 
 use crate::atomic_file;
-use crate::error::{AppError, AppResult};
+use crate::error::{ensure_not_cancelled, AppError, AppResult};
 use crate::family;
 use crate::history;
 use crate::logs_db;
@@ -27,14 +28,19 @@ fn provider_or_codex(provider: Option<String>) -> String {
 /// state_5.sqlite 的 threads.title 可能仍停留在首条用户消息，即使 Codex App 已经
 /// 为会话生成了简短标题。索引不是核心数据库，单行损坏时跳过该行并回退数据库
 /// 标题，避免因为可选缓存损坏导致整个会话列表不可用。
-fn read_session_index_titles(codex_dir: &Path) -> AppResult<HashMap<String, String>> {
+fn read_session_index_titles(
+    codex_dir: &Path,
+    cancel: Option<&AtomicBool>,
+) -> AppResult<HashMap<String, String>> {
     let path = paths::session_index_path(codex_dir);
     let mut titles = HashMap::new();
+    ensure_not_cancelled(cancel)?;
     if !path.is_file() {
         return Ok(titles);
     }
 
     for line in BufReader::new(File::open(path)?).lines() {
+        ensure_not_cancelled(cancel)?;
         let line = line?;
         if line.trim().is_empty() {
             continue;
@@ -67,7 +73,7 @@ fn read_session_index_titles(codex_dir: &Path) -> AppResult<HashMap<String, Stri
 
 /// 返回 Codex 当前对外展示的会话标题：显式 name 优先，活跃索引其次，title 兜底。
 pub(crate) fn codex_display_title(codex_dir: &Path, id: &str) -> AppResult<Option<String>> {
-    let index_title = read_session_index_titles(codex_dir)?.remove(id);
+    let index_title = read_session_index_titles(codex_dir, None)?.remove(id);
     if !paths::state_db_path(codex_dir).is_file() {
         return Ok(index_title);
     }
@@ -134,10 +140,16 @@ fn query_summaries(
     codex_dir: &Path,
     where_clause: &str,
     params: &[&dyn rusqlite::ToSql],
+    cancel: Option<&AtomicBool>,
 ) -> AppResult<Vec<SessionSummary>> {
+    ensure_not_cancelled(cancel)?;
     let state = state_db::open_ro(codex_dir)?;
-    let logs_conn = logs_db::open_ro(codex_dir).ok();
-    let index_titles = read_session_index_titles(codex_dir)?;
+    let logs_conn = cancel
+        .is_none()
+        .then(|| logs_db::open_ro(codex_dir).ok())
+        .flatten();
+    let index_titles = read_session_index_titles(codex_dir, cancel)?;
+    ensure_not_cancelled(cancel)?;
     let has_name = crate::repair::threads_table_columns(&state)?
         .iter()
         .any(|column| column == "name");
@@ -152,78 +164,76 @@ fn query_summaries(
          ORDER BY updated_at DESC"
     );
     let mut stmt = state.prepare(&sql)?;
+    let mut rows = stmt.query(params)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        ensure_not_cancelled(cancel)?;
+        let id: String = row.get(0)?;
+        let rollout_path_raw: String = row.get(1)?;
+        let cwd_raw: String = row.get(2)?;
+        let database_title: String = row.get(3)?;
+        let database_name: String = row.get(4)?;
+        let first_user_message: String = row.get(5)?;
+        let model: Option<String> = row.get(6)?;
+        let reasoning_effort: Option<String> = row.get(7)?;
+        let tokens_used: i64 = row.get(8)?;
+        let created_at: i64 = row.get(9)?;
+        let updated_at: i64 = row.get(10)?;
+        let archived: i64 = row.get(11)?;
+        let git_branch: Option<String> = row.get(12)?;
+        let source: Option<String> = row.get(13)?;
+        let agent_nickname: Option<String> = row.get(14)?;
+        let agent_role: Option<String> = row.get(15)?;
 
-    let rows: Vec<SessionSummary> = stmt
-        .query_map(params, |row| {
-            let id: String = row.get(0)?;
-            let rollout_path_raw: String = row.get(1)?;
-            let cwd_raw: String = row.get(2)?;
-            let database_title: String = row.get(3)?;
-            let database_name: String = row.get(4)?;
-            let first_user_message: String = row.get(5)?;
-            let model: Option<String> = row.get(6)?;
-            let reasoning_effort: Option<String> = row.get(7)?;
-            let tokens_used: i64 = row.get(8)?;
-            let created_at: i64 = row.get(9)?;
-            let updated_at: i64 = row.get(10)?;
-            let archived: i64 = row.get(11)?;
-            let git_branch: Option<String> = row.get(12)?;
-            let source: Option<String> = row.get(13)?;
-            let agent_nickname: Option<String> = row.get(14)?;
-            let agent_role: Option<String> = row.get(15)?;
-
-            let rollout_path =
-                paths::host_path_string_from_codex_record(codex_dir, &rollout_path_raw);
-            let cwd = paths::host_path_string_from_codex_record(codex_dir, &cwd_raw);
-            let cwd_display = paths::basename_display(&cwd);
-
-            let rollout_bytes = fs::metadata(&rollout_path).map(|m| m.len()).unwrap_or(0);
-
-            let resume_command = format!("codex resume {}", id);
-            let title = select_codex_title(
-                index_titles.get(&id).map(String::as_str),
-                &database_name,
-                database_title,
-                &first_user_message,
-                archived != 0,
-            );
-            Ok(SessionSummary {
-                provider: "codex".into(),
-                id,
-                resume_command,
-                rollout_path,
-                cwd,
-                cwd_display,
-                title,
-                first_user_message,
-                model,
-                reasoning_effort,
-                source,
-                agent_nickname,
-                agent_role,
-                conversion_origin: None,
-                tokens_used,
-                created_at,
-                updated_at,
-                archived: archived != 0,
-                git_branch,
-                rollout_bytes,
-                logs_count: 0,
-                has_backup: false,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+        let rollout_path = paths::host_path_string_from_codex_record(codex_dir, &rollout_path_raw);
+        let cwd = paths::host_path_string_from_codex_record(codex_dir, &cwd_raw);
+        let cwd_display = paths::basename_display(&cwd);
+        let rollout_bytes = fs::metadata(&rollout_path).map(|m| m.len()).unwrap_or(0);
+        let resume_command = format!("codex resume {}", id);
+        let title = select_codex_title(
+            index_titles.get(&id).map(String::as_str),
+            &database_name,
+            database_title,
+            &first_user_message,
+            archived != 0,
+        );
+        out.push(SessionSummary {
+            provider: "codex".into(),
+            id,
+            resume_command,
+            rollout_path,
+            cwd,
+            cwd_display,
+            title,
+            first_user_message,
+            model,
+            reasoning_effort,
+            source,
+            agent_nickname,
+            agent_role,
+            conversion_origin: None,
+            tokens_used,
+            created_at,
+            updated_at,
+            archived: archived != 0,
+            git_branch,
+            rollout_bytes,
+            logs_count: 0,
+            has_backup: false,
+        });
+    }
 
     // 补充 logs_count（批量预查，避免 N+1）
     // NOTE: 在 SQL 层过滤 NULL / 空 thread_id，避免 `r.get::<_, String>(0)` 在 NULL 上报
     // "Invalid column type Null"。某些历史数据里 logs.thread_id 存在 NULL 值。
-    let mut out = rows;
     for s in out.iter_mut() {
+        ensure_not_cancelled(cancel)?;
         if s.tokens_used <= 0 {
-            s.tokens_used = rollout_token_total(&s.rollout_path);
+            s.tokens_used = rollout_token_total(&s.rollout_path, cancel)?;
         }
     }
     if let Some(conn) = logs_conn {
+        ensure_not_cancelled(cancel)?;
         let mut counts: HashMap<String, i64> = HashMap::new();
         let mut stmt = conn.prepare(
             "SELECT thread_id, COUNT(*) FROM logs \
@@ -232,6 +242,7 @@ fn query_summaries(
         )?;
         let iter = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
         for it in iter {
+            ensure_not_cancelled(cancel)?;
             let (id, count) = it?;
             counts.insert(id, count);
         }
@@ -244,9 +255,19 @@ fn query_summaries(
     Ok(out)
 }
 
-fn rollout_token_total(rollout_path: &str) -> i64 {
+fn rollout_token_total(rollout_path: &str, cancel: Option<&AtomicBool>) -> AppResult<i64> {
     let cleaned = paths::strip_verbatim(rollout_path);
-    crate::rollout::read_rollout_token_total(Path::new(&cleaned)).unwrap_or(0)
+    let result = match cancel {
+        Some(cancel) => {
+            crate::rollout::read_rollout_token_total_cancellable(Path::new(&cleaned), cancel)
+        }
+        None => crate::rollout::read_rollout_token_total(Path::new(&cleaned)),
+    };
+    match result {
+        Err(AppError::Cancelled) => Err(AppError::Cancelled),
+        Ok(total) => Ok(total),
+        Err(_) => Ok(0),
+    }
 }
 
 pub fn list_sessions(
@@ -254,17 +275,38 @@ pub fn list_sessions(
     codex_dir: String,
     claude_dir: Option<String>,
 ) -> AppResult<Vec<SessionSummary>> {
+    list_sessions_impl(provider, codex_dir, claude_dir, None)
+}
+
+pub fn list_sessions_cancellable(
+    provider: Option<String>,
+    codex_dir: String,
+    claude_dir: Option<String>,
+    cancel: &AtomicBool,
+) -> AppResult<Vec<SessionSummary>> {
+    list_sessions_impl(provider, codex_dir, claude_dir, Some(cancel))
+}
+
+fn list_sessions_impl(
+    provider: Option<String>,
+    codex_dir: String,
+    claude_dir: Option<String>,
+    cancel: Option<&AtomicBool>,
+) -> AppResult<Vec<SessionSummary>> {
+    ensure_not_cancelled(cancel)?;
     let codex = PathBuf::from(&codex_dir);
     match provider_or_codex(provider).as_str() {
         "codex" => {
-            let mut list = query_summaries(&codex, "", &[])?;
+            let mut list = query_summaries(&codex, "", &[], cancel)?;
+            ensure_not_cancelled(cancel)?;
             // 官方 Codex app 归档会把 rollout 移到 archived_sessions/；
             // threads 记录缺失或漂移时，从归档目录补扫，保证归档会话可见。
-            let extra = supplement_archived_summaries(&codex, &list)?;
+            let extra = supplement_archived_summaries(&codex, &list, cancel)?;
             if !extra.is_empty() {
                 list.extend(extra);
                 list.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
             }
+            ensure_not_cancelled(cancel)?;
             provenance::annotate_sessions(&codex, &mut list);
             Ok(list)
         }
@@ -273,7 +315,11 @@ pub fn list_sessions(
                 claude_dir
                     .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
             );
-            let mut list = crate::claude_sessions::scan_sessions(&p)?;
+            let mut list = match cancel {
+                Some(cancel) => crate::claude_sessions::scan_sessions_cancellable(&p, cancel)?,
+                None => crate::claude_sessions::scan_sessions(&p)?,
+            };
+            ensure_not_cancelled(cancel)?;
             provenance::annotate_sessions(&codex, &mut list);
             Ok(list)
         }
@@ -285,6 +331,7 @@ pub fn list_sessions(
 fn supplement_archived_summaries(
     codex_dir: &Path,
     existing: &[SessionSummary],
+    cancel: Option<&AtomicBool>,
 ) -> AppResult<Vec<SessionSummary>> {
     let known_names: std::collections::HashSet<String> = existing
         .iter()
@@ -295,14 +342,23 @@ fn supplement_archived_summaries(
         })
         .collect();
     let mut out = Vec::new();
-    for p in crate::family::scan_archived_rollouts(codex_dir)? {
+    let archived_rollouts = match cancel {
+        Some(cancel) => crate::family::scan_archived_rollouts_cancellable(codex_dir, cancel)?,
+        None => crate::family::scan_archived_rollouts(codex_dir)?,
+    };
+    for p in archived_rollouts {
+        ensure_not_cancelled(cancel)?;
         let Some(name) = p.file_name().map(|n| n.to_string_lossy().into_owned()) else {
             continue;
         };
         if known_names.contains(&name) {
             continue;
         }
-        let Some(brief) = crate::repair::read_rollout_brief(codex_dir, &p)? else {
+        let brief = match cancel {
+            Some(cancel) => crate::repair::read_rollout_brief_cancellable(codex_dir, &p, cancel)?,
+            None => crate::repair::read_rollout_brief(codex_dir, &p)?,
+        };
+        let Some(brief) = brief else {
             continue;
         };
         if existing.iter().any(|s| s.id == brief.id) {

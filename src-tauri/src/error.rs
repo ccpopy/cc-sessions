@@ -1,4 +1,5 @@
 use serde::{Serialize, Serializer};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -15,6 +16,8 @@ pub enum AppError {
     InvalidCodexDir(String),
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("cancelled")]
+    Cancelled,
     #[error("{0}")]
     Other(String),
 }
@@ -32,3 +35,11 @@ impl Serialize for AppError {
 }
 
 pub type AppResult<T> = Result<T, AppError>;
+
+pub fn ensure_not_cancelled(cancel: Option<&AtomicBool>) -> AppResult<()> {
+    if cancel.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        Err(AppError::Cancelled)
+    } else {
+        Ok(())
+    }
+}

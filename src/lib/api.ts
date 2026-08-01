@@ -123,6 +123,33 @@ export type SessionSummary = {
   resume_command: string;
 };
 
+export type ContentSearchMatch = {
+  event_index: number;
+  event_offset: number;
+  timestamp: string;
+  role: string;
+  snippet: string;
+};
+
+export type ContentSearchResult = {
+  session: SessionSummary;
+  matches: ContentSearchMatch[];
+};
+
+export type ContentSearchStatus = {
+  job_id: number;
+  state: "running" | "completed" | "cancelled" | "failed";
+  query: string;
+  scanned_files: number;
+  total_files: number;
+  skipped_files: number;
+  scanned_bytes: number;
+  total_bytes: number;
+  results: ContentSearchResult[];
+  truncated: boolean;
+  error: string | null;
+};
+
 export type ProjectGroup = {
   cwd: string;
   cwd_display: string;
@@ -778,6 +805,20 @@ export const api = {
     invokeCommand<ProjectGroup[]>("group_sessions_by_project", { provider, codexDir, claudeDir }),
   searchSessions: (provider: SessionProvider, codexDir: string, claudeDir: string | undefined, query: string) =>
     invokeCommand<SessionSummary[]>("search_sessions", { provider, codexDir, claudeDir, query }),
+  startContentSearch: (p: {
+    provider: SessionProvider;
+    codexDir: string;
+    claudeDir: string;
+    query: string;
+    showSubagentSessions: boolean;
+    showArchivedSessions: boolean;
+  }) => invokeCommand<{ job_id: number }>("start_content_search", p),
+  contentSearchStatus: (jobId: number) =>
+    invokeCommand<ContentSearchStatus>("content_search_status", { jobId }),
+  activeContentSearch: () =>
+    invokeCommand<{ job_id: number } | null>("active_content_search"),
+  cancelContentSearch: (jobId: number) =>
+    invokeCommand<void>("cancel_content_search", { jobId }),
   setArchived: (provider: SessionProvider, codexDir: string, id: string, v: boolean) =>
     invokeCommand<void>("set_archived", { provider, codexDir, id, v }),
   renameSession: (provider: SessionProvider, codexDir: string, id: string, title: string) =>

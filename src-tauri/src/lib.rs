@@ -6,6 +6,7 @@ pub mod bundle;
 pub mod claude_sessions;
 #[cfg(feature = "desktop")]
 pub mod commands;
+pub mod content_search;
 pub mod convert;
 pub mod edit;
 pub mod error;
@@ -70,6 +71,10 @@ pub fn run() {
             commands::list_sessions,
             commands::group_sessions_by_project,
             commands::search_sessions,
+            commands::start_content_search,
+            commands::content_search_status,
+            commands::active_content_search,
+            commands::cancel_content_search,
             commands::set_archived,
             commands::rename_session,
             commands::move_session_cwd,
