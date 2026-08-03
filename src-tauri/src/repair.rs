@@ -10,11 +10,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use serde_json::Value;
 
 use crate::atomic_file;
-use crate::error::{AppError, AppResult};
+use crate::error::{ensure_not_cancelled, AppError, AppResult};
 use crate::family;
 use crate::models::{
     BranchStatus, BranchSyncReport, BranchSyncState, CloneReport, DiagnosticReport,
@@ -662,6 +663,23 @@ fn scan_active_rollout_identities(codex: &Path) -> AppResult<Vec<(PathBuf, Rollo
 }
 
 pub(crate) fn read_rollout_brief(codex_dir: &Path, path: &Path) -> AppResult<Option<RolloutBrief>> {
+    read_rollout_brief_impl(codex_dir, path, None)
+}
+
+pub(crate) fn read_rollout_brief_cancellable(
+    codex_dir: &Path,
+    path: &Path,
+    cancel: &AtomicBool,
+) -> AppResult<Option<RolloutBrief>> {
+    read_rollout_brief_impl(codex_dir, path, Some(cancel))
+}
+
+fn read_rollout_brief_impl(
+    codex_dir: &Path,
+    path: &Path,
+    cancel: Option<&AtomicBool>,
+) -> AppResult<Option<RolloutBrief>> {
+    ensure_not_cancelled(cancel)?;
     let f = fs::File::open(path)?;
     let reader = BufReader::new(f);
     let mut id: Option<String> = None;
@@ -678,6 +696,7 @@ pub(crate) fn read_rollout_brief(codex_dir: &Path, path: &Path) -> AppResult<Opt
     let mut created_ms: i64 = 0;
     let mut last_ms: i64 = 0;
     for (i, line) in reader.lines().enumerate() {
+        ensure_not_cancelled(cancel)?;
         let line = line?;
         if line.trim().is_empty() {
             continue;

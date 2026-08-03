@@ -1,10 +1,11 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use serde_json::Value;
 
-use crate::error::AppResult;
+use crate::error::{ensure_not_cancelled, AppResult};
 use crate::models::{
     PreviewEvent, SessionMetaBrief, TimelineMessageBrief, UserPromptBrief, UserPromptList,
 };
@@ -112,6 +113,10 @@ fn classify(index: usize, raw: Value) -> PreviewEvent {
     }
 }
 
+pub(crate) fn classify_preview(index: usize, raw: Value) -> PreviewEvent {
+    classify(index, raw)
+}
+
 fn subagent_activity_summary(raw: &Value) -> String {
     let payload = raw.get("payload");
     let agent = payload
@@ -202,6 +207,34 @@ pub fn preview_event_is_conversation(event: &PreviewEvent) -> bool {
     }
 
     raw_type(event) == "response_item" && payload_type(event) == "message"
+}
+
+pub(crate) fn preview_event_has_assistant_text_tool_use(event: &PreviewEvent) -> bool {
+    if event.role != "tool_call" {
+        return false;
+    }
+    let Some(message) = event.raw.get("message") else {
+        return false;
+    };
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return false;
+    }
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            let has_tool_use = items
+                .iter()
+                .any(|item| item.get("type").and_then(Value::as_str) == Some("tool_use"));
+            let has_text = items.iter().any(|item| {
+                item.get("type").and_then(Value::as_str) == Some("text")
+                    && item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.trim().is_empty())
+            });
+            has_tool_use && has_text
+        })
 }
 
 pub fn preview_event_is_conversation_or_reasoning(event: &PreviewEvent) -> bool {
@@ -619,14 +652,27 @@ fn timeline_user_text(text: &str) -> String {
 }
 
 pub fn read_rollout_token_total(path: &Path) -> AppResult<i64> {
+    read_rollout_token_total_impl(path, None)
+}
+
+pub(crate) fn read_rollout_token_total_cancellable(
+    path: &Path,
+    cancel: &AtomicBool,
+) -> AppResult<i64> {
+    read_rollout_token_total_impl(path, Some(cancel))
+}
+
+fn read_rollout_token_total_impl(path: &Path, cancel: Option<&AtomicBool>) -> AppResult<i64> {
     const REVERSE_SCAN_CHUNK_BYTES: usize = 64 * 1024;
 
+    ensure_not_cancelled(cancel)?;
     let mut file = File::open(path)?;
     let mut scan_end = file.metadata()?.len();
     let mut line_end = scan_end;
     let mut chunk = vec![0u8; REVERSE_SCAN_CHUNK_BYTES];
 
     while scan_end > 0 {
+        ensure_not_cancelled(cancel)?;
         let chunk_start = scan_end.saturating_sub(REVERSE_SCAN_CHUNK_BYTES as u64);
         let chunk_len = usize::try_from(scan_end - chunk_start).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "rollout 扫描窗口过大")
@@ -638,6 +684,7 @@ pub fn read_rollout_token_total(path: &Path) -> AppResult<i64> {
             if chunk[offset] != b'\n' {
                 continue;
             }
+            ensure_not_cancelled(cancel)?;
             let separator = chunk_start + offset as u64;
             if let Some(total) = read_token_total_from_range(&mut file, separator + 1, line_end)? {
                 return Ok(total);

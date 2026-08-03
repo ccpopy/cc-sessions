@@ -14,6 +14,8 @@ import {
 import { TopBar } from "@/components/TopBar";
 import { SessionList } from "@/components/SessionList";
 import { PreviewDialog } from "@/components/PreviewDialog";
+import type { PreviewJump } from "@/components/PreviewDialog";
+import { ContentSearchDialog } from "@/components/ContentSearchDialog";
 import { MarkdownExportDialog } from "@/components/MarkdownExportDialog";
 import { BackupCreateDialog } from "@/components/BackupCreateDialog";
 import { ConvertSessionDialog } from "@/components/ConvertSessionDialog";
@@ -39,6 +41,7 @@ import { useView } from "@/stores/view";
 import { useHotkeys } from "@/hooks/useHotkeys";
 import {
   api,
+  type ContentSearchMatch,
   type DeleteResult,
   type FamilyOverlay,
   type SessionProvider,
@@ -90,6 +93,8 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   );
 
   const [preview, setPreview] = useState<SessionSummary | null>(null);
+  const [previewJump, setPreviewJump] = useState<PreviewJump | null>(null);
+  const [contentSearchOpen, setContentSearchOpen] = useState(false);
   const [exportTarget, setExportTarget] = useState<SessionSummary | null>(null);
   const [renameTarget, setRenameTarget] = useState<SessionSummary | null>(null);
   const [moveTarget, setMoveTarget] = useState<SessionSummary | null>(null);
@@ -155,6 +160,8 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   useEffect(() => {
     clearSelection();
     setPreview(null);
+    setPreviewJump(null);
+    setContentSearchOpen(false);
     setExportTarget(null);
     setBackupTargets([]);
     setDeleteTargets([]);
@@ -488,6 +495,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         refreshing={loading}
         onBulkBackup={onBulkBackup}
         onBulkDelete={onBulkDelete}
+        onContentSearch={() => setContentSearchOpen(true)}
         showListTools
       >
         <DropdownMenu>
@@ -644,7 +652,10 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             syncingSessionIds={providerSyncState.sessionIds}
             syncActionsDisabled={providerSyncState.batchActive}
             duplicatingSessionIds={duplicatingSessionIds}
-            onPreview={setPreview}
+            onPreview={(session) => {
+              setPreviewJump(null);
+              setPreview(session);
+            }}
             onCopyResume={onCopyResume}
             onRevealCwd={onReveal}
             onArchiveToggle={isCodex ? onArchiveToggle : undefined}
@@ -661,10 +672,35 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         )}
       </ScrollArea>
 
+      <ContentSearchDialog
+        open={contentSearchOpen}
+        onOpenChange={setContentSearchOpen}
+        provider={provider}
+        codexDir={settings.codex_dir}
+        claudeDir={settings.claude_dir}
+        showSubagentSessions={showSubagentSessions}
+        showArchivedSessions={showArchivedSessions}
+        onOpenResult={(session, match: ContentSearchMatch, searchQuery) => {
+          setPreviewJump({
+            eventIndex: match.event_index,
+            eventOffset: match.event_offset,
+            query: searchQuery,
+          });
+          setContentSearchOpen(false);
+          setPreview(session);
+        }}
+      />
+
       <PreviewDialog
         open={!!preview}
-        onOpenChange={(v) => !v && setPreview(null)}
+        onOpenChange={(v) => {
+          if (!v) {
+            setPreview(null);
+            setPreviewJump(null);
+          }
+        }}
         session={preview}
+        initialJump={previewJump}
         allSessions={allSessions}
         codexDir={settings.codex_dir}
         backupDir={settings.backup_dir}

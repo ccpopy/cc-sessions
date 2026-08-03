@@ -27,6 +27,40 @@ where
 }
 
 #[tauri::command]
+pub fn start_content_search(
+    provider: String,
+    codex_dir: String,
+    claude_dir: String,
+    query: String,
+    show_subagent_sessions: bool,
+    show_archived_sessions: bool,
+) -> AppResult<ContentSearchStart> {
+    crate::content_search::start_content_search(
+        provider,
+        codex_dir,
+        claude_dir,
+        query,
+        show_subagent_sessions,
+        show_archived_sessions,
+    )
+}
+
+#[tauri::command]
+pub fn content_search_status(job_id: u64) -> AppResult<ContentSearchStatus> {
+    crate::content_search::content_search_status(job_id)
+}
+
+#[tauri::command]
+pub fn active_content_search() -> AppResult<Option<ContentSearchStart>> {
+    crate::content_search::active_content_search()
+}
+
+#[tauri::command]
+pub fn cancel_content_search(job_id: u64) -> AppResult<()> {
+    crate::content_search::cancel_content_search(job_id)
+}
+
+#[tauri::command]
 pub async fn create_backup(
     provider: Option<String>,
     codex_dir: String,

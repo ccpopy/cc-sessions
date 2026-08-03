@@ -82,6 +82,41 @@ pub struct SessionSummary {
     pub resume_command: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ContentSearchMatch {
+    pub event_index: usize,
+    pub event_offset: usize,
+    pub timestamp: String,
+    pub role: String,
+    pub snippet: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContentSearchResult {
+    pub session: SessionSummary,
+    pub matches: Vec<ContentSearchMatch>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContentSearchStart {
+    pub job_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContentSearchStatus {
+    pub job_id: u64,
+    pub state: String,
+    pub query: String,
+    pub scanned_files: usize,
+    pub total_files: usize,
+    pub skipped_files: usize,
+    pub scanned_bytes: u64,
+    pub total_bytes: u64,
+    pub results: Vec<ContentSearchResult>,
+    pub truncated: bool,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionConversionOrigin {
     pub source_provider: String,

@@ -13,8 +13,8 @@ use url::Url;
 use crate::error::{AppError, AppResult};
 use crate::models::{ImportMode, ProjectPathMapping, Settings, SwitchStrategy};
 use crate::{
-    backup, bundle, convert, edit, family, fs_ops, markdown_export, repair, rollout, sessions,
-    settings, stats,
+    backup, bundle, content_search, convert, edit, family, fs_ops, markdown_export, repair,
+    rollout, sessions, settings, stats,
 };
 
 const WEBUI_TOKEN_HEADER: &str = "X-CC-Sessions-Webui-Token";
@@ -179,6 +179,21 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "codexDir")?,
             opt_string_arg(&args, "claudeDir")?,
             string_arg(&args, "query")?,
+        )),
+        "start_content_search" => to_result_value(content_search::start_content_search(
+            string_arg(&args, "provider")?,
+            string_arg(&args, "codexDir")?,
+            string_arg(&args, "claudeDir")?,
+            string_arg(&args, "query")?,
+            bool_arg(&args, "showSubagentSessions")?,
+            bool_arg(&args, "showArchivedSessions")?,
+        )),
+        "content_search_status" => to_result_value(content_search::content_search_status(
+            usize_arg(&args, "jobId")? as u64,
+        )),
+        "active_content_search" => to_result_value(content_search::active_content_search()),
+        "cancel_content_search" => to_result_value(content_search::cancel_content_search(
+            usize_arg(&args, "jobId")? as u64,
         )),
         "set_archived" => to_result_value(sessions::set_archived_with_lock(
             opt_string_arg(&args, "provider")?,
