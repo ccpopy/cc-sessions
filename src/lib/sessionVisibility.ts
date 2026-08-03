@@ -1,4 +1,56 @@
 import type { FamilyOverlay, SessionSummary } from "./api";
+import { isSubagentSession } from "./sessionSource.ts";
+
+export type SessionVisibilityOptions = {
+  provider: SessionSummary["provider"];
+  showSubagentSessions: boolean;
+  showArchivedSessions: boolean;
+  includeHiddenRecords?: boolean;
+};
+
+/**
+ * Apply the same provider, subagent, archive and family visibility rules used by
+ * the sessions page. Full-text search reuses this selector so it cannot surface
+ * family branches that the current page deliberately hides.
+ */
+export function selectSessionsForView(
+  sessions: readonly SessionSummary[],
+  overlayBySession: ReadonlyMap<string, FamilyOverlay>,
+  currentProvider: string | null,
+  options: SessionVisibilityOptions,
+): SessionSummary[] {
+  const isCodex = options.provider === "codex";
+  const includeHiddenRecords = options.includeHiddenRecords ?? false;
+  const candidates: SessionSummary[] = [];
+
+  for (const session of sessions) {
+    const overlay = isCodex ? overlayBySession.get(session.id) : undefined;
+    if (isSubagentSession(session, overlay) !== options.showSubagentSessions) {
+      continue;
+    }
+    if (
+      isCodex
+      && !includeHiddenRecords
+      && session.archived !== options.showArchivedSessions
+    ) {
+      continue;
+    }
+    if (
+      isCodex
+      && !includeHiddenRecords
+      && options.showArchivedSessions
+      && isHiddenArchivedFamilyBranch(overlay, currentProvider)
+    ) {
+      continue;
+    }
+    candidates.push(session);
+  }
+
+  if (isCodex && !includeHiddenRecords && !options.showArchivedSessions) {
+    return selectNormalFamilySessions(candidates, overlayBySession, currentProvider);
+  }
+  return sortSessionsByActivity(candidates);
+}
 
 type FamilyCandidate = {
   session: SessionSummary;
@@ -88,4 +140,18 @@ function compareSessionActivityDesc(left: SessionSummary, right: SessionSummary)
   const createdDelta = right.created_at - left.created_at;
   if (createdDelta !== 0) return createdDelta;
   return left.id.localeCompare(right.id);
+}
+
+/**
+ * Archived view mirrors Codex App by showing the current provider's family
+ * branch. If provider metadata is unavailable, fall back to the stored active
+ * branch so one logical family still has one row.
+ */
+function isHiddenArchivedFamilyBranch(
+  overlay: FamilyOverlay | undefined,
+  currentProvider: string | null,
+): boolean {
+  if (!overlay?.family_id) return false;
+  if (currentProvider) return overlay.provider !== currentProvider;
+  return !overlay.is_active_branch;
 }

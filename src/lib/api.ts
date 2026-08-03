@@ -810,8 +810,7 @@ export const api = {
     codexDir: string;
     claudeDir: string;
     query: string;
-    showSubagentSessions: boolean;
-    showArchivedSessions: boolean;
+    rolloutPaths: readonly string[];
   }) => invokeCommand<{ job_id: number }>("start_content_search", p),
   contentSearchStatus: (jobId: number) =>
     invokeCommand<ContentSearchStatus>("content_search_status", { jobId }),

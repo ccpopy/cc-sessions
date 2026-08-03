@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { FamilyOverlay, SessionSummary } from "./api";
-import { selectNormalFamilySessions } from "./sessionVisibility.ts";
+import { selectNormalFamilySessions, selectSessionsForView } from "./sessionVisibility.ts";
 
 function session(id: string, updatedAt: number): SessionSummary {
   return {
@@ -131,5 +131,76 @@ test("selected family representatives and standalone sessions are sorted by last
       "openai",
     ).map((item) => item.id),
     ["standalone-newest", "standalone-middle", "family-old"],
+  );
+});
+
+test("content search scope uses the same normal-family representative as the page", () => {
+  const staleActive = session("custom-active", 500);
+  const currentBranch = session("openai-current", 100);
+  const overlay = new Map<string, FamilyOverlay>([
+    [staleActive.id, familyOverlay(staleActive.id, "family-1", "custom", true)],
+    [currentBranch.id, familyOverlay(currentBranch.id, "family-1", "openai", false)],
+  ]);
+
+  assert.deepEqual(
+    selectSessionsForView([staleActive, currentBranch], overlay, "openai", {
+      provider: "codex",
+      showSubagentSessions: false,
+      showArchivedSessions: false,
+    }).map((item) => item.id),
+    ["openai-current"],
+  );
+});
+
+test("archived search scope hides family branches from other providers", () => {
+  const currentBranch = { ...session("openai-current", 100), archived: true };
+  const otherBranch = { ...session("custom-history", 500), archived: true };
+  const overlay = new Map<string, FamilyOverlay>([
+    [currentBranch.id, familyOverlay(currentBranch.id, "family-1", "openai", true)],
+    [otherBranch.id, familyOverlay(otherBranch.id, "family-1", "custom", false)],
+  ]);
+
+  assert.deepEqual(
+    selectSessionsForView([otherBranch, currentBranch], overlay, "openai", {
+      provider: "codex",
+      showSubagentSessions: false,
+      showArchivedSessions: true,
+    }).map((item) => item.id),
+    ["openai-current"],
+  );
+});
+
+test("search scope honors overlay-only subagent classification", () => {
+  const main = session("main", 500);
+  const subagent = session("overlay-subagent", 100);
+  const overlay = new Map<string, FamilyOverlay>([
+    [
+      subagent.id,
+      {
+        session_id: subagent.id,
+        provider: "openai",
+        family_id: null,
+        branch_count: 1,
+        is_active_branch: false,
+        clone_state: "subagent",
+      },
+    ],
+  ]);
+
+  assert.deepEqual(
+    selectSessionsForView([subagent, main], overlay, "openai", {
+      provider: "codex",
+      showSubagentSessions: false,
+      showArchivedSessions: false,
+    }).map((item) => item.id),
+    ["main"],
+  );
+  assert.deepEqual(
+    selectSessionsForView([subagent, main], overlay, "openai", {
+      provider: "codex",
+      showSubagentSessions: true,
+      showArchivedSessions: false,
+    }).map((item) => item.id),
+    ["overlay-subagent"],
   );
 });

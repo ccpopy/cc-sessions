@@ -163,6 +163,15 @@ test("conversation-only view keeps user prompts while timeline data is unavailab
   assert.equal(isVisibleConversationEvent(event(0, "user"), null), true);
 });
 
+test("search jump keeps its target visible even when the timeline hides that turn", () => {
+  const visiblePromptIndexes = new Set([2]);
+
+  assert.equal(
+    isVisibleConversationEvent(event(0, "user"), visiblePromptIndexes, 0),
+    true,
+  );
+});
+
 test("process groups follow the global default and per-turn overrides", () => {
   const overrides = { 10: true, 20: false };
 

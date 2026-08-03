@@ -185,8 +185,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "codexDir")?,
             string_arg(&args, "claudeDir")?,
             string_arg(&args, "query")?,
-            bool_arg(&args, "showSubagentSessions")?,
-            bool_arg(&args, "showArchivedSessions")?,
+            arg(&args, "rolloutPaths")?,
         )),
         "content_search_status" => to_result_value(content_search::content_search_status(
             usize_arg(&args, "jobId")? as u64,

@@ -32,16 +32,14 @@ pub fn start_content_search(
     codex_dir: String,
     claude_dir: String,
     query: String,
-    show_subagent_sessions: bool,
-    show_archived_sessions: bool,
+    rollout_paths: Vec<String>,
 ) -> AppResult<ContentSearchStart> {
     crate::content_search::start_content_search(
         provider,
         codex_dir,
         claude_dir,
         query,
-        show_subagent_sessions,
-        show_archived_sessions,
+        rollout_paths,
     )
 }
 

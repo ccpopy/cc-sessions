@@ -406,7 +406,12 @@ export function PreviewDialog({
     return events.filter((e) => {
       if (
         onlyMsg &&
-        (!isConversationMessage(e) || !isVisibleConversationEvent(e, timelineIndexSet))
+        (!isConversationMessage(e)
+          || !isVisibleConversationEvent(
+            e,
+            timelineIndexSet,
+            initialJump?.eventIndex ?? null,
+          ))
       ) {
         return false;
       }
@@ -418,7 +423,7 @@ export function PreviewDialog({
         JSON.stringify(e.raw).toLowerCase().includes(low)
       );
     });
-  }, [events, filter, onlyMsg, timelineIndexSet]);
+  }, [events, filter, initialJump?.eventIndex, onlyMsg, timelineIndexSet]);
 
   /**
    * 有 phase 时仅 final_answer 作为最终答复，commentary 折叠为过程。

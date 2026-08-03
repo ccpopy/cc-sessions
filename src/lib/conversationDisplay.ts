@@ -139,8 +139,10 @@ export function summarizeProcessGroupExpansion(
 export function isVisibleConversationEvent(
   event: PreviewEvent,
   visiblePromptIndexes: ReadonlySet<number> | null,
+  forcedVisibleEventIndex: number | null = null,
 ): boolean {
   return (
+    event.index === forcedVisibleEventIndex ||
     event.role !== "user" ||
     visiblePromptIndexes === null ||
     visiblePromptIndexes.has(event.index)

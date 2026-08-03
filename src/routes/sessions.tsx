@@ -49,7 +49,6 @@ import {
 } from "@/lib/api";
 import { humanBytes, humanTokens } from "@/lib/format";
 import { basename } from "@/lib/cwd";
-import { isSubagentSession } from "@/lib/sessionSource";
 import { sessionIdentity } from "@/lib/sessionIdentity";
 import {
   ProviderSyncRegistry,
@@ -57,8 +56,7 @@ import {
 } from "@/lib/providerSyncRegistry";
 import { SessionActionRegistry } from "@/lib/sessionActionRegistry";
 import {
-  selectNormalFamilySessions,
-  sortSessionsByActivity,
+  selectSessionsForView,
 } from "@/lib/sessionVisibility";
 
 export default function SessionsRoute({ provider = "codex" }: { provider?: SessionProvider }) {
@@ -269,32 +267,12 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   }, [providerMaintenanceItems]);
 
   const visibleSessions = useMemo(() => {
-    const candidates: SessionSummary[] = [];
-    for (const session of sessions) {
-      const sessionOverlay = isCodex ? overlay.get(session.id) : undefined;
-      const isSubagent = isSubagentSession(session, sessionOverlay);
-      if (isSubagent !== showSubagentSessions) {
-        continue;
-      }
-      // 归档开关与子代理开关同语义：关=只看活跃，开=只看已归档；
-      // 显式 id:/archived: 查询时不再二次过滤
-      if (isCodex && !showHiddenRecords && session.archived !== showArchivedSessions) {
-        continue;
-      }
-      if (
-        isCodex &&
-        !showHiddenRecords &&
-        showArchivedSessions &&
-        isHiddenArchivedFamilyBranch(sessionOverlay, currentProvider)
-      ) {
-        continue;
-      }
-      candidates.push(session);
-    }
-    if (isCodex && !showHiddenRecords && !showArchivedSessions) {
-      return selectNormalFamilySessions(candidates, overlay, currentProvider);
-    }
-    return sortSessionsByActivity(candidates);
+    return selectSessionsForView(sessions, overlay, currentProvider, {
+      provider,
+      showSubagentSessions,
+      showArchivedSessions,
+      includeHiddenRecords: showHiddenRecords,
+    });
   }, [
     sessions,
     overlay,
@@ -303,6 +281,23 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     showSubagentSessions,
     showArchivedSessions,
     currentProvider,
+  ]);
+
+  const contentSearchRolloutPaths = useMemo(() => {
+    return selectSessionsForView(allSessions, overlay, currentProvider, {
+      provider,
+      showSubagentSessions,
+      showArchivedSessions,
+    })
+      .map((session) => session.rollout_path)
+      .sort((left, right) => left.localeCompare(right));
+  }, [
+    allSessions,
+    currentProvider,
+    overlay,
+    provider,
+    showArchivedSessions,
+    showSubagentSessions,
   ]);
 
   useEffect(() => {
@@ -680,6 +675,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         claudeDir={settings.claude_dir}
         showSubagentSessions={showSubagentSessions}
         showArchivedSessions={showArchivedSessions}
+        rolloutPaths={contentSearchRolloutPaths}
         onOpenResult={(session, match: ContentSearchMatch, searchQuery) => {
           setPreviewJump({
             eventIndex: match.event_index,
@@ -884,21 +880,6 @@ function deleteResultHasMutation(result: DeleteResult): boolean {
     || result.threads_rows_deleted > 0
     || result.logs_rows_deleted > 0
     || result.history_rows_deleted > 0;
-}
-
-/**
- * 已归档视图与 Codex App 一致：家族分支按当前 provider 显示。
- * provider 信息不可用时回退到 family store 的 active 分支，避免重复。
- */
-function isHiddenArchivedFamilyBranch(
-  overlay: FamilyOverlay | undefined,
-  currentProvider: string | null,
-): boolean {
-  if (!overlay?.family_id) return false;
-  if (currentProvider) {
-    return overlay.provider !== currentProvider;
-  }
-  return !overlay.is_active_branch;
 }
 
 function isExplicitHiddenRecordQuery(query: string): boolean {

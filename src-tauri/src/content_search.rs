@@ -6,6 +6,7 @@
 //! 3. Existing preview classifiers decide which JSONL rows are real conversation messages.
 //! 4. The UI polls a bounded status snapshot and may cancel the active job.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -45,8 +46,7 @@ struct SearchRequest {
     codex_dir: String,
     claude_dir: String,
     query: String,
-    show_subagent_sessions: bool,
-    show_archived_sessions: bool,
+    rollout_paths: Vec<String>,
 }
 
 struct FileScanOutcome {
@@ -161,16 +161,14 @@ pub fn start_content_search(
     codex_dir: String,
     claude_dir: String,
     query: String,
-    show_subagent_sessions: bool,
-    show_archived_sessions: bool,
+    rollout_paths: Vec<String>,
 ) -> AppResult<ContentSearchStart> {
     manager().start(SearchRequest {
         provider,
         codex_dir,
         claude_dir,
         query: query.trim().to_string(),
-        show_subagent_sessions,
-        show_archived_sessions,
+        rollout_paths,
     })
 }
 
@@ -238,6 +236,11 @@ fn run_job(job: SearchJob, request: SearchRequest) {
 }
 
 fn execute_search(job: &SearchJob, request: &SearchRequest) -> AppResult<()> {
+    let rollout_paths = request
+        .rollout_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
     let sessions = sessions::list_sessions_cancellable(
         Some(request.provider.clone()),
         request.codex_dir.clone(),
@@ -245,10 +248,7 @@ fn execute_search(job: &SearchJob, request: &SearchRequest) -> AppResult<()> {
         &job.cancel,
     )?
     .into_iter()
-    .filter(|session| {
-        sessions::session_is_subagent(session) == request.show_subagent_sessions
-            && (request.provider != "codex" || session.archived == request.show_archived_sessions)
-    })
+    .filter(|session| session_matches_scope(session, &rollout_paths))
     .collect::<Vec<_>>();
 
     if job.cancel.load(Ordering::Acquire) {
@@ -296,6 +296,10 @@ fn execute_search(job: &SearchJob, request: &SearchRequest) -> AppResult<()> {
         }
     }
     Ok(())
+}
+
+fn session_matches_scope(session: &SessionSummary, rollout_paths: &HashSet<&str>) -> bool {
+    rollout_paths.contains(session.rollout_path.as_str())
 }
 
 fn scan_session(
@@ -422,6 +426,9 @@ fn json_string_content(text: &str) -> String {
 fn line_might_contain_query(line: &str, query: &str, escaped_query: &str) -> bool {
     find_query(line, query).is_some()
         || (escaped_query != query && find_query(line, escaped_query).is_some())
+        // A valid JSON string may encode any character as `\uXXXX`; parse such
+        // lines before deciding so the raw-byte prefilter cannot hide content.
+        || line.contains("\\u")
 }
 
 fn make_snippet(text: &str, query: &str) -> String {
@@ -587,6 +594,41 @@ mod tests {
     }
 
     #[test]
+    fn searches_unicode_escaped_json_content() {
+        let path = temp_file("unicode-escaped", &[]);
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"text":"\u4f60\u597d"}]}}"#,
+                "\n"
+            ),
+        )
+        .expect("fixture");
+
+        let result =
+            scan_session(&test_job(), &session("codex", &path), "你好", 0).expect("search");
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].snippet, "你好");
+        fs::remove_dir_all(path.parent().expect("parent")).ok();
+    }
+
+    #[test]
+    fn requested_rollout_paths_are_the_authoritative_backend_scope() {
+        let included_path = temp_file("scope-included", &[json!({"type":"session_meta"})]);
+        let excluded_path = temp_file("scope-excluded", &[json!({"type":"session_meta"})]);
+        let mut included = session("codex", &included_path);
+        included.archived = true;
+        included.agent_role = Some("worker".to_string());
+        let excluded = session("codex", &excluded_path);
+        let rollout_paths = HashSet::from([included.rollout_path.as_str()]);
+
+        assert!(session_matches_scope(&included, &rollout_paths));
+        assert!(!session_matches_scope(&excluded, &rollout_paths));
+        fs::remove_dir_all(included_path.parent().expect("parent")).ok();
+        fs::remove_dir_all(excluded_path.parent().expect("parent")).ok();
+    }
+
+    #[test]
     fn marks_missing_rollout_without_failing_the_search() {
         let path = temp_file("missing", &[json!({"type":"session_meta"})]);
         let missing_session = session("codex", &path);
@@ -620,8 +662,7 @@ mod tests {
             codex_dir: root.join("codex").to_string_lossy().into_owned(),
             claude_dir: claude_dir.to_string_lossy().into_owned(),
             query: "needle".to_string(),
-            show_subagent_sessions: false,
-            show_archived_sessions: false,
+            rollout_paths: Vec::new(),
         };
 
         let result = execute_search(&job, &request);

@@ -9,6 +9,7 @@ import {
   type SessionSummary,
 } from "@/lib/api";
 import { formatTimeString, highlight, humanBytes } from "@/lib/format";
+import { sessionIdentity } from "@/lib/sessionIdentity";
 import { sessionDisplayTitle } from "@/lib/sessionText";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -30,6 +31,7 @@ type Props = {
   claudeDir: string;
   showSubagentSessions: boolean;
   showArchivedSessions: boolean;
+  rolloutPaths: readonly string[];
   onOpenResult: (
     session: SessionSummary,
     match: ContentSearchMatch,
@@ -45,6 +47,7 @@ export function ContentSearchDialog({
   claudeDir,
   showSubagentSessions,
   showArchivedSessions,
+  rolloutPaths,
   onOpenResult,
 }: Props) {
   const [query, setQuery] = useState("");
@@ -60,7 +63,14 @@ export function ContentSearchDialog({
   const openRef = useRef(open);
   const requestGenerationRef = useRef(0);
   const pendingStartGenerationRef = useRef<number | null>(null);
-  const scopeKey = `${provider}\u0000${codexDir}\u0000${claudeDir}\u0000${showSubagentSessions}\u0000${showArchivedSessions}`;
+  const scopeKey = JSON.stringify([
+    provider,
+    codexDir,
+    claudeDir,
+    showSubagentSessions,
+    showArchivedSessions,
+    rolloutPaths,
+  ]);
   const scopeKeyRef = useRef(scopeKey);
   const previousScopeKeyRef = useRef(scopeKey);
 
@@ -211,8 +221,7 @@ export function ContentSearchDialog({
         codexDir,
         claudeDir,
         query: normalized,
-        showSubagentSessions,
-        showArchivedSessions,
+        rolloutPaths,
       });
       if (
         !mountedRef.current
@@ -371,7 +380,7 @@ export function ContentSearchDialog({
           ) : (
             <div className="divide-y divide-border/60">
               {status.results.map((result) => (
-                <section key={`${result.session.provider}:${result.session.id}`} className="px-4 py-4 sm:px-6">
+                <section key={sessionIdentity(result.session)} className="px-4 py-4 sm:px-6">
                   <div className="mb-2.5 flex min-w-0 items-center gap-2">
                     <h3 className="min-w-0 flex-1 truncate text-sm font-semibold">
                       {sessionDisplayTitle(result.session.title, result.session.first_user_message)}
