@@ -1367,6 +1367,9 @@ pub fn plan_session_event_deletion(
     rollout_path: String,
     line_nos: Vec<usize>,
 ) -> AppResult<DeletePlan> {
+    if provider == "opencode" {
+        return crate::opencode_edit::plan_delete(&rollout_path, &line_nos);
+    }
     plan_delete(&provider, &rollout_path, &line_nos)
 }
 
@@ -1380,6 +1383,15 @@ pub fn edit_session_event_text_with_lock(
     lock: &crate::family::FamilyLock,
 ) -> AppResult<EditApplyReport> {
     crate::family::with_lock(lock, |_g| {
+        if provider == "opencode" {
+            return crate::opencode_edit::apply_edit_text(
+                &rollout_path,
+                &session_id,
+                &backup_dir,
+                line_no,
+                &new_text,
+            );
+        }
         apply_edit_text(
             &provider,
             &rollout_path,
@@ -1400,6 +1412,14 @@ pub fn delete_session_events_with_lock(
     lock: &crate::family::FamilyLock,
 ) -> AppResult<EditApplyReport> {
     crate::family::with_lock(lock, |_g| {
+        if provider == "opencode" {
+            return crate::opencode_edit::apply_delete(
+                &rollout_path,
+                &session_id,
+                &backup_dir,
+                &line_nos,
+            );
+        }
         apply_delete(
             &provider,
             &rollout_path,
@@ -1418,6 +1438,9 @@ pub fn undo_last_session_edit_with_lock(
     lock: &crate::family::FamilyLock,
 ) -> AppResult<EditApplyReport> {
     crate::family::with_lock(lock, |_g| {
+        if provider == "opencode" {
+            return crate::opencode_edit::undo_last(&rollout_path, &session_id, &backup_dir);
+        }
         undo_last(&provider, &rollout_path, &session_id, &backup_dir)
     })
 }
@@ -1431,6 +1454,14 @@ pub fn restore_session_edit_snapshot_with_lock(
     lock: &crate::family::FamilyLock,
 ) -> AppResult<EditApplyReport> {
     crate::family::with_lock(lock, |_g| {
+        if provider == "opencode" {
+            return crate::opencode_edit::restore_snapshot(
+                &rollout_path,
+                &session_id,
+                &backup_dir,
+                &snapshot_name,
+            );
+        }
         restore_snapshot(
             &provider,
             &rollout_path,
@@ -1447,6 +1478,9 @@ pub fn session_edit_history(
     session_id: String,
     backup_dir: String,
 ) -> AppResult<EditHistory> {
+    if provider == "opencode" {
+        return crate::opencode_edit::history(&rollout_path, &session_id, &backup_dir);
+    }
     history(&provider, &rollout_path, &session_id, &backup_dir)
 }
 

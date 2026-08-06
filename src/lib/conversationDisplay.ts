@@ -51,6 +51,21 @@ export function toConversationDisplayEvent(event: PreviewEvent): PreviewEvent {
 }
 
 /**
+ * 与 Codex 的对话视图保持一致：只保留用户消息、assistant 文本和真实推理；
+ * tool part 即使继承了父 assistant 消息的 commentary phase，也仍是工具事件。
+ */
+export function isOpenCodeConversationEvent(event: PreviewEvent): boolean {
+  const raw = event.raw as {
+    message?: { role?: unknown };
+    opencode?: unknown;
+  } | null;
+  if (!raw?.opencode) return false;
+  if (raw.message?.role === "user") return event.role === "user";
+  if (raw.message?.role !== "assistant") return false;
+  return event.role === "assistant" || event.role === "reasoning";
+}
+
+/**
  * Codex 会明确标记 assistant 消息是过程播报（commentary）还是最终答复
  * （final_answer）。旧版 Codex 与 Claude 没有 phase，此时退回到“一轮最后一条”。
  */
@@ -59,6 +74,8 @@ export function buildConversationPreviewRows(
 ): ConversationPreviewRow[] {
   const rows: ConversationPreviewRow[] = [];
   let assistantRun: PreviewEvent[] = [];
+  let openCodeRun: PreviewEvent[] = [];
+  let openCodeTurnKey: string | null = null;
 
   const flushAssistantRun = () => {
     if (assistantRun.length === 0) return;
@@ -88,7 +105,54 @@ export function buildConversationPreviewRows(
     assistantRun = [];
   };
 
+  const flushOpenCodeRun = () => {
+    if (openCodeRun.length === 0) return;
+
+    const finalIndexes = new Set<number>();
+    openCodeRun.forEach((event, index) => {
+      if (openCodeMessagePhase(event) === "final_answer") {
+        finalIndexes.add(index);
+      }
+    });
+    if (finalIndexes.size === 0) {
+      const finalIndex = findLastIndex(
+        openCodeRun,
+        (event) => event.role === "assistant" && openCodeMessagePhase(event) === null,
+      );
+      if (finalIndex >= 0) finalIndexes.add(finalIndex);
+    }
+
+    const intermediate = openCodeRun.filter(
+      (event, index) =>
+        !finalIndexes.has(index) && isOpenCodeConversationEvent(event),
+    );
+    if (intermediate.length > 0) {
+      rows.push({
+        type: "process",
+        key: intermediate[0].index,
+        events: intermediate,
+        hasFinalResponse: finalIndexes.size > 0,
+      });
+    }
+    openCodeRun.forEach((event, index) => {
+      if (finalIndexes.has(index)) rows.push({ type: "event", event });
+    });
+    openCodeRun = [];
+    openCodeTurnKey = null;
+  };
+
   for (const event of events) {
+    const openCode = openCodeAssistantTurn(event);
+    if (openCode) {
+      flushAssistantRun();
+      if (openCodeRun.length > 0 && openCode.turnKey !== openCodeTurnKey) {
+        flushOpenCodeRun();
+      }
+      openCodeTurnKey = openCode.turnKey;
+      openCodeRun.push(event);
+      continue;
+    }
+    flushOpenCodeRun();
     if (event.role === "assistant") {
       assistantRun.push(event);
       continue;
@@ -96,6 +160,7 @@ export function buildConversationPreviewRows(
     flushAssistantRun();
     rows.push({ type: "event", event });
   }
+  flushOpenCodeRun();
   flushAssistantRun();
   return rows;
 }
@@ -157,6 +222,31 @@ function assistantMessagePhase(event: PreviewEvent): string | null {
   } | null;
   const phase = raw?.payload?.phase ?? raw?.message?.phase;
   return typeof phase === "string" ? phase : null;
+}
+
+function openCodeAssistantTurn(event: PreviewEvent): { turnKey: string } | null {
+  const raw = event.raw as {
+    message?: { role?: unknown };
+    opencode?: {
+      message_id?: unknown;
+      parent_id?: unknown;
+    };
+  } | null;
+  if (raw?.message?.role !== "assistant" || !raw.opencode) return null;
+  const parentId = raw.opencode.parent_id;
+  const messageId = raw.opencode.message_id;
+  const turnKey =
+    typeof parentId === "string" && parentId.length > 0
+      ? parentId
+      : typeof messageId === "string" && messageId.length > 0
+        ? messageId
+        : null;
+  return turnKey ? { turnKey } : null;
+}
+
+function openCodeMessagePhase(event: PreviewEvent): string | null {
+  const raw = event.raw as { opencode?: { phase?: unknown } } | null;
+  return typeof raw?.opencode?.phase === "string" ? raw.opencode.phase : null;
 }
 
 function findLastIndex<T>(items: readonly T[], predicate: (item: T) => boolean): number {

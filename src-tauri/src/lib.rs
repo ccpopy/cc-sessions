@@ -17,6 +17,7 @@ pub mod history;
 pub mod logs_db;
 pub mod markdown_export;
 pub mod models;
+pub mod opencode_edit;
 pub mod opencode_sessions;
 pub mod path_safety;
 pub mod paths;

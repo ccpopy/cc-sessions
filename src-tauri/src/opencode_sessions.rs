@@ -35,6 +35,8 @@ struct MessageRow {
     id: String,
     session_id: String,
     role: String,
+    parent_id: Option<String>,
+    finish: Option<String>,
     model: Option<String>,
     tokens: i64,
     created_at_ms: i64,
@@ -332,33 +334,37 @@ fn load_session_details(connection: &Connection) -> AppResult<HashMap<String, Se
     Ok(details)
 }
 
-fn load_preview_events(connection: &Connection, session_id: &str) -> AppResult<Vec<PreviewEvent>> {
+pub(crate) fn load_preview_events(
+    connection: &Connection,
+    session_id: &str,
+) -> AppResult<Vec<PreviewEvent>> {
     let messages = load_messages(connection, Some(session_id))?;
     let message_map = messages
         .into_iter()
         .map(|message| (message.id.clone(), message))
         .collect::<HashMap<_, _>>();
     let mut statement = connection.prepare(
-        "SELECT message_id, time_created, data FROM part
+        "SELECT id, message_id, time_created, data FROM part
          WHERE session_id = ?1 ORDER BY time_created ASC, id ASC",
     )?;
     let rows = statement.query_map([session_id], |row| {
         Ok((
             row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, String>(2)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
         ))
     })?;
     let mut events = Vec::new();
     for row in rows {
-        let (message_id, created, data) = row?;
+        let (part_id, message_id, created, data) = row?;
         let Some(message) = message_map.get(&message_id) else {
             continue;
         };
         let Ok(part) = serde_json::from_str::<Value>(&data) else {
             continue;
         };
-        let raw = opencode_part_to_preview_raw(message, created, part);
+        let raw = opencode_part_to_preview_raw(message, &part_id, created, part);
         if let Some(event) = crate::claude_sessions::classify_preview(events.len(), raw) {
             events.push(event);
         }
@@ -394,6 +400,14 @@ fn load_messages(connection: &Connection, session_id: Option<&str>) -> AppResult
                 .and_then(Value::as_str)
                 .unwrap_or("other")
                 .to_string(),
+            parent_id: value
+                .get("parentID")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            finish: value
+                .get("finish")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             model: value
                 .get("modelID")
                 .or_else(|| value.get("model").and_then(|model| model.get("modelID")))
@@ -406,9 +420,34 @@ fn load_messages(connection: &Connection, session_id: Option<&str>) -> AppResult
     Ok(out)
 }
 
-fn opencode_part_to_preview_raw(message: &MessageRow, created: i64, part: Value) -> Value {
+fn opencode_part_to_preview_raw(
+    message: &MessageRow,
+    part_id: &str,
+    created: i64,
+    part: Value,
+) -> Value {
     let part_type = part.get("type").and_then(Value::as_str).unwrap_or("part");
     let timestamp = timestamp(created.or_else_ms(message.created_at_ms));
+    let phase = if message.role == "assistant" {
+        match message.finish.as_deref() {
+            Some("tool-calls") => Some("commentary"),
+            Some(_) if part_type == "text" => Some("final_answer"),
+            Some(_) => Some("commentary"),
+            None if matches!(part_type, "reasoning" | "tool") => Some("commentary"),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let opencode = json!({
+        "part_id": part_id,
+        "message_id": message.id,
+        "parent_id": message.parent_id,
+        "finish": message.finish,
+        "part_type": part_type,
+        "phase": phase,
+        "part": part
+    });
     let content = match part_type {
         "text" => {
             json!({"type":"text","text":part.get("text").and_then(Value::as_str).unwrap_or("")})
@@ -427,16 +466,26 @@ fn opencode_part_to_preview_raw(message: &MessageRow, created: i64, part: Value)
             return json!({
                 "type": part_type,
                 "timestamp": timestamp,
-                "opencode": {"message_id":message.id,"part":part}
+                "opencode": opencode
             })
         }
     };
     json!({
         "type": message.role,
         "timestamp": timestamp,
-        "message": {"role":message.role,"content":[content],"model":message.model},
-        "opencode": {"message_id":message.id,"part":part}
+        "message": {
+            "role":message.role,
+            "phase":phase,
+            "content":[content],
+            "model":message.model
+        },
+        "opencode": opencode
     })
+}
+
+pub(crate) fn resolve_locator(value: &str) -> AppResult<(PathBuf, String)> {
+    let locator = decode_locator(value)?;
+    Ok((PathBuf::from(locator.db), locator.session))
 }
 
 trait MillisFallback {
@@ -562,7 +611,14 @@ mod tests {
         )?;
         connection.execute(
             "INSERT INTO message VALUES ('msg_assistant', 'ses_test', 2000, 2000, ?1)",
-            [json!({"role":"assistant","modelID":"gpt-test","tokens":{"total":12}}).to_string()],
+            [json!({
+                "role":"assistant",
+                "parentID":"msg_user",
+                "finish":"stop",
+                "modelID":"gpt-test",
+                "tokens":{"total":12}
+            })
+            .to_string()],
         )?;
         connection.execute(
             "INSERT INTO part VALUES ('part_user', 'msg_user', 'ses_test', 1000, 1000, ?1)",
@@ -624,6 +680,57 @@ mod tests {
         )?;
         assert_eq!(updated, 4000);
         assert!(archived.is_some());
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn preview_preserves_turn_and_process_metadata() -> AppResult<()> {
+        let root = fixture()?;
+        let connection = Connection::open(database_path(&root))?;
+        connection.execute(
+            "INSERT INTO message VALUES ('msg_process', 'ses_test', 1500, 1500, ?1)",
+            [json!({
+                "role":"assistant",
+                "parentID":"msg_user",
+                "finish":"tool-calls",
+                "modelID":"gpt-test"
+            })
+            .to_string()],
+        )?;
+        connection.execute(
+            "INSERT INTO part VALUES ('part_reasoning', 'msg_process', 'ses_test', 1500, 1500, ?1)",
+            [json!({"type":"reasoning","text":"先检查工作区"}).to_string()],
+        )?;
+        connection.execute(
+            "INSERT INTO part VALUES ('part_tool', 'msg_process', 'ses_test', 1600, 1600, ?1)",
+            [json!({
+                "type":"tool",
+                "callID":"call_1",
+                "tool":"read",
+                "state":{"input":{"path":"README.md"}}
+            })
+            .to_string()],
+        )?;
+        drop(connection);
+
+        let locator = list_sessions(&root)?[0].rollout_path.clone();
+        let preview = preview_range(&locator, 0, 20)?;
+        assert_eq!(preview.len(), 4);
+        assert_eq!(preview[1].role, "reasoning");
+        assert_eq!(preview[2].role, "tool_call");
+
+        for event in &preview[1..=2] {
+            assert_eq!(event.raw["opencode"]["parent_id"], "msg_user");
+            assert_eq!(event.raw["opencode"]["finish"], "tool-calls");
+            assert_eq!(event.raw["opencode"]["phase"], "commentary");
+            assert!(event.raw["opencode"]["part_id"].is_string());
+            assert!(event.raw["opencode"]["message_id"].is_string());
+        }
+        assert_eq!(preview[3].raw["opencode"]["finish"], "stop");
+        assert_eq!(preview[3].raw["opencode"]["phase"], "final_answer");
+        assert_eq!(preview[3].raw["message"]["phase"], "final_answer");
 
         fs::remove_dir_all(root).ok();
         Ok(())

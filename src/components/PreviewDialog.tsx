@@ -79,6 +79,7 @@ import { parseEmbeddedTranscriptPrompt, type EmbeddedTranscriptPrompt } from "@/
 import {
   buildConversationPreviewRows,
   isAssistantTextToolUseEvent,
+  isOpenCodeConversationEvent,
   isProcessGroupExpanded,
   isVisibleConversationEvent,
   summarizeProcessGroupExpansion,
@@ -192,7 +193,7 @@ export function PreviewDialog({
   const canForkSession = provider === "codex" && !customRolloutPath && !!session && !!codexDir;
   // 备份/导入预览（customRolloutPath）不允许编辑，只能编辑真实会话文件
   const canMutateSession =
-    provider !== "opencode" && !customRolloutPath && !!session && !!backupDir && !!rolloutPath;
+    !customRolloutPath && !!session && !!backupDir && !!rolloutPath;
   const relatedSubagents = useMemo(() => {
     if (!session || session.provider !== "codex" || customRolloutPath) return [];
     return collectRelatedSubagents(session.id, allSessions);
@@ -676,11 +677,16 @@ export function PreviewDialog({
         line_no: editTarget.index,
         new_text: editText,
       });
-      toast.success(`已改写消息（含镜像共 ${report.changed_lines} 行）`, {
-        description: report.snapshot_created
-          ? `编辑前已自动保存原始快照 ${report.snapshot_created}`
-          : "本次编辑已记入编辑历史，可随时撤销",
-      });
+      toast.success(
+        provider === "opencode"
+          ? `已改写 OpenCode 消息（${report.changed_lines} 个内容块）`
+          : `已改写消息（含镜像共 ${report.changed_lines} 行）`,
+        {
+          description: report.snapshot_created
+            ? `编辑前已自动保存原始快照 ${report.snapshot_created}`
+            : "本次编辑已记入编辑历史，可随时撤销",
+        },
+      );
       setEditTarget(null);
       resetAndReload();
       await onEdited?.();
@@ -1269,8 +1275,17 @@ export function PreviewDialog({
           <div className="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
             <span className="font-mono">line {editTarget ? editTarget.index + 1 : ""}</span>
             <span className="mx-2 text-muted-foreground/50">·</span>
-            会话文件会原地改写（会话 ID 不变，可直接 resume 续聊）；Codex 镜像行会同步更新，
-            思考/推理与工具块保持原样。编辑前会自动保存原始快照，可在「编辑历史」中撤销或还原。
+            {provider === "opencode" ? (
+              <>
+                只更新 opencode.db 中当前会话的 text 内容块（会话 ID 与时间戳不变，可直接续聊）；
+                推理、工具调用及其他会话保持原样。编辑前会保存会话级快照，可在「编辑历史」中撤销或还原。
+              </>
+            ) : (
+              <>
+                会话文件会原地改写（会话 ID 不变，可直接 resume 续聊）；Codex 镜像行会同步更新，
+                思考/推理与工具块保持原样。编辑前会自动保存原始快照，可在「编辑历史」中撤销或还原。
+              </>
+            )}
           </div>
           <Textarea
             value={editText}
@@ -1305,8 +1320,17 @@ export function PreviewDialog({
         <AlertDialogHeader>
           <AlertDialogTitle>删除会话事件</AlertDialogTitle>
           <AlertDialogDescription>
-            为保证续聊不报错，配对的工具调用/返回、镜像行与关联推理会一起删除。
-            删除前会自动保存原始快照，可在「编辑历史」中撤销或还原。
+            {provider === "opencode" ? (
+              <>
+                OpenCode 会按同轮消息安全删除：选择用户消息会同时删除本轮完整响应；选择推理、工具或回答时，
+                会删除该轮完整 assistant 响应链并保留用户提问。只快照当前会话，不会覆盖整个数据库。
+              </>
+            ) : (
+              <>
+                为保证续聊不报错，配对的工具调用/返回、镜像行与关联推理会一起删除。
+                删除前会自动保存原始快照，可在「编辑历史」中撤销或还原。
+              </>
+            )}
           </AlertDialogDescription>
         </AlertDialogHeader>
         {!deletePlan && (
@@ -1372,8 +1396,18 @@ export function PreviewDialog({
         <AlertDialogHeader>
           <AlertDialogTitle>删除选中事件</AlertDialogTitle>
           <AlertDialogDescription>
-            将删除选取范围内的事件（含首尾）。为保证续聊不报错，配对的工具调用/返回、镜像行与关联推理会一起删除。
-            删除前会自动保存原始快照，可在「编辑历史」中撤销或还原。
+            {provider === "opencode" ? (
+              <>
+                将删除选取范围内的事件（含首尾），并按同轮消息补全安全删除范围；
+                用户消息会连同本轮响应删除，assistant 过程或回答会删除本轮完整响应链。
+                删除前会保存当前会话快照，不影响数据库中的其他会话。
+              </>
+            ) : (
+              <>
+                将删除选取范围内的事件（含首尾）。为保证续聊不报错，配对的工具调用/返回、镜像行与关联推理会一起删除。
+                删除前会自动保存原始快照，可在「编辑历史」中撤销或还原。
+              </>
+            )}
           </AlertDialogDescription>
         </AlertDialogHeader>
         {!deletePlan && (
@@ -2299,7 +2333,11 @@ function isConversationMessage(e: PreviewEvent): boolean {
   if (e.role === "subagent") return false;
   if (isInternalCodexContextMessage(e)) return false;
   if (isAssistantTextToolUseEvent(e)) return true;
-  const raw = e.raw as { message?: { role?: unknown } } | null;
+  const raw = e.raw as {
+    message?: { role?: unknown };
+    opencode?: unknown;
+  } | null;
+  if (raw?.opencode) return isOpenCodeConversationEvent(e);
   if (typeof raw?.message?.role === "string") {
     return e.role === "user" || e.role === "assistant";
   }
@@ -2434,6 +2472,15 @@ function canEditEventText(provider: string, e: PreviewEvent): boolean {
     }
     return false;
   }
+  if (provider === "opencode") {
+    const raw = e.raw as any;
+    return (
+      typeof raw?.opencode?.part_id === "string" &&
+      raw?.opencode?.part_type === "text" &&
+      (raw?.message?.role === "user" || raw?.message?.role === "assistant") &&
+      editableText(e).length > 0
+    );
+  }
   // Claude：user/assistant 消息且含文本块（thinking 带签名、工具块结构化，均不可改写）
   const raw = e.raw as any;
   if (!raw?.message || (raw?.type !== "user" && raw?.type !== "assistant")) return false;
@@ -2447,6 +2494,14 @@ function canDeleteEvent(provider: string, e: PreviewEvent): boolean {
     if (outer === "event_msg") return pt === "user_message" || pt === "agent_message";
     if (outer === "response_item") return CODEX_DELETABLE_RESPONSE_ITEMS.has(pt);
     return false;
+  }
+  if (provider === "opencode") {
+    const raw = e.raw as any;
+    return (
+      typeof raw?.opencode?.part_id === "string" &&
+      typeof raw?.opencode?.message_id === "string" &&
+      (raw?.message?.role === "user" || raw?.message?.role === "assistant")
+    );
   }
   const raw = e.raw as any;
   return (
@@ -2495,6 +2550,8 @@ function deleteReasonLabel(reason: string): string {
       return "镜像行";
     case "reasoning_attached":
       return "关联推理";
+    case "context_message":
+      return "同轮消息";
     default:
       return reason;
   }

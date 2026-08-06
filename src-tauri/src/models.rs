@@ -881,7 +881,7 @@ pub struct DeletePlanLine {
     pub kind: String,
     pub summary: String,
     /// selected（用户选中）/ tool_pair（工具调用配对）/ mirror（Codex 镜像行）
-    /// / reasoning_attached（推理块随所属回复联动）
+    /// / reasoning_attached（推理块随所属回复联动）/ context_message（OpenCode 同轮消息）
     pub reason: String,
 }
 

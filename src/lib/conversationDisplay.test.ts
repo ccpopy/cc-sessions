@@ -53,6 +53,46 @@ function claudeToolEvent(index: number, text: string | null): PreviewEvent {
   };
 }
 
+function openCodeEvent(
+  index: number,
+  role: "user" | "assistant" | "reasoning" | "tool_call",
+  options: {
+    messageId: string;
+    parentId?: string;
+    phase?: "commentary" | "final_answer";
+    finish?: string;
+    partType?: string;
+  },
+): PreviewEvent {
+  const messageRole = role === "user" ? "user" : "assistant";
+  const partType =
+    options.partType ??
+    (role === "tool_call" ? "tool" : role === "reasoning" ? "reasoning" : "text");
+  return {
+    index,
+    timestamp: "",
+    role,
+    kind: messageRole,
+    text_summary: `${role}-${index}`,
+    raw: {
+      type: messageRole,
+      message: {
+        role: messageRole,
+        ...(options.phase ? { phase: options.phase } : {}),
+        content: [],
+      },
+      opencode: {
+        part_id: `part_${index}`,
+        message_id: options.messageId,
+        parent_id: options.parentId ?? null,
+        finish: options.finish ?? null,
+        part_type: partType,
+        phase: options.phase ?? null,
+      },
+    },
+  };
+}
+
 test("Claude text plus tool_use is projected as an assistant process message", () => {
   const mixed = claudeToolEvent(1, "正在检查代理配置");
   const projected = toConversationDisplayEvent(mixed);
@@ -125,6 +165,128 @@ test("a commentary-only interrupted turn is not presented as having a final answ
     [
       ["event", 0],
       ["process", [1], false],
+      ["event", 2],
+    ],
+  );
+});
+
+test("OpenCode process groups keep reasoning but exclude tool calls", () => {
+  const rows = buildConversationPreviewRows([
+    openCodeEvent(0, "user", { messageId: "user_1" }),
+    openCodeEvent(1, "reasoning", {
+      messageId: "assistant_process",
+      parentId: "user_1",
+      phase: "commentary",
+      finish: "tool-calls",
+    }),
+    openCodeEvent(2, "tool_call", {
+      messageId: "assistant_process",
+      parentId: "user_1",
+      phase: "commentary",
+      finish: "tool-calls",
+    }),
+    openCodeEvent(3, "assistant", {
+      messageId: "assistant_final",
+      parentId: "user_1",
+      phase: "final_answer",
+      finish: "stop",
+    }),
+  ]);
+
+  assert.deepEqual(
+    rows.map((row) =>
+      row.type === "event"
+        ? [row.type, row.event.index]
+        : [row.type, row.events.map((item) => item.index), row.hasFinalResponse],
+    ),
+    [
+      ["event", 0],
+      ["process", [1], true],
+      ["event", 3],
+    ],
+  );
+});
+
+test("OpenCode tool-only activity does not create a process group", () => {
+  const rows = buildConversationPreviewRows([
+    openCodeEvent(0, "user", { messageId: "user_1" }),
+    openCodeEvent(1, "tool_call", {
+      messageId: "assistant_process",
+      parentId: "user_1",
+      phase: "commentary",
+      finish: "tool-calls",
+    }),
+    openCodeEvent(2, "assistant", {
+      messageId: "assistant_final",
+      parentId: "user_1",
+      phase: "final_answer",
+      finish: "stop",
+    }),
+  ]);
+
+  assert.deepEqual(
+    rows.map((row) =>
+      row.type === "event"
+        ? [row.type, row.event.index]
+        : [row.type, row.events.map((item) => item.index), row.hasFinalResponse],
+    ),
+    [
+      ["event", 0],
+      ["event", 2],
+    ],
+  );
+});
+
+test("OpenCode interrupted process chain does not invent a final answer", () => {
+  const rows = buildConversationPreviewRows([
+    openCodeEvent(0, "user", { messageId: "user_1" }),
+    openCodeEvent(1, "reasoning", {
+      messageId: "assistant_process",
+      parentId: "user_1",
+      phase: "commentary",
+      finish: "tool-calls",
+    }),
+    openCodeEvent(2, "user", { messageId: "user_2" }),
+  ]);
+
+  assert.deepEqual(
+    rows.map((row) =>
+      row.type === "event"
+        ? [row.type, row.event.index]
+        : [row.type, row.events.map((item) => item.index), row.hasFinalResponse],
+    ),
+    [
+      ["event", 0],
+      ["process", [1], false],
+      ["event", 2],
+    ],
+  );
+});
+
+test("phase-less OpenCode text falls back to the final response after real process events", () => {
+  const rows = buildConversationPreviewRows([
+    openCodeEvent(0, "user", { messageId: "user_1" }),
+    openCodeEvent(1, "reasoning", {
+      messageId: "assistant_process",
+      parentId: "user_1",
+      phase: "commentary",
+      finish: "tool-calls",
+    }),
+    openCodeEvent(2, "assistant", {
+      messageId: "assistant_legacy_final",
+      parentId: "user_1",
+    }),
+  ]);
+
+  assert.deepEqual(
+    rows.map((row) =>
+      row.type === "event"
+        ? [row.type, row.event.index]
+        : [row.type, row.events.map((item) => item.index), row.hasFinalResponse],
+    ),
+    [
+      ["event", 0],
+      ["process", [1], true],
       ["event", 2],
     ],
   );
