@@ -155,10 +155,10 @@ async function createSourcePackage() {
 
 async function createPortablePackage() {
   if (buildProduct) {
-    run("npx", ["tauri", "build", "--no-bundle", "--ci"]);
+    run("npx", ["tauri", "build", "--no-bundle", "--ci"], tauriBuildOptions());
   }
 
-  const exePath = path.join(repoRoot, "src-tauri", "target", "release", executableName());
+  const exePath = path.join(cargoTargetRoot, "release", executableName());
   if (!(await exists(exePath))) {
     throw new Error(`Release executable was not found: ${exePath}. Run with --build-product first.`);
   }
@@ -174,10 +174,6 @@ async function createPortablePackage() {
   await cleanDir(stage);
   await fs.copyFile(exePath, path.join(stage, executableName()));
   await fs.writeFile(path.join(stage, "cc-session-manager.portable"), "portable\n", "utf8");
-  if (executableOutputPath) {
-    await fs.copyFile(exePath, executableOutputPath);
-  }
-
   const readme = [
     "CC Sessions Portable",
     "",
@@ -201,16 +197,26 @@ async function createPortablePackage() {
 
   await writeZipFromDirectory(stage, archivePath);
   if (executableOutputPath) {
-    console.log(`Portable executable: ${executableOutputPath}`);
+    let writtenPath = executableOutputPath;
+    try {
+      await fs.copyFile(exePath, writtenPath);
+    } catch (error) {
+      if (error?.code !== "EBUSY" && error?.code !== "EPERM") throw error;
+      // Windows 正在运行的便携版无法被覆盖；仍然产出 ZIP，并给新 EXE 一个可验证的备用名称。
+      writtenPath = path.join(outputRoot, `cc-session-manager-portable-v${version}-windows-refresh.exe`);
+      await fs.copyFile(exePath, writtenPath);
+      console.warn(`Portable executable is running and could not be replaced: ${executableOutputPath}`);
+    }
+    console.log(`Portable executable: ${writtenPath}`);
   }
   console.log(`Portable package: ${archivePath}`);
 }
 
 async function createProductPackage() {
-  const bundleDir = path.join(repoRoot, "src-tauri", "target", "release", "bundle");
+  const bundleDir = path.join(cargoTargetRoot, "release", "bundle");
   if (buildProduct) {
     await fs.rm(bundleDir, { recursive: true, force: true });
-    run("npx", ["tauri", "build", "--ci"]);
+    run("npx", ["tauri", "build", "--ci"], tauriBuildOptions());
   }
 
   if (!(await exists(bundleDir))) {
@@ -322,11 +328,21 @@ async function createCliPackage() {
   console.log(`CLI package: ${archivePath}`);
 }
 
-function run(command, args) {
+function tauriBuildOptions() {
+  return {
+    env: {
+      ...process.env,
+      CARGO_TARGET_DIR: cargoTargetRoot,
+    },
+  };
+}
+
+function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
     cwd: repoRoot,
     shell: process.platform === "win32",
     stdio: "inherit",
+    ...options,
   });
   if (result.status !== 0) {
     throw new Error(`${command} ${args.join(" ")} failed with exit code ${result.status}.`);

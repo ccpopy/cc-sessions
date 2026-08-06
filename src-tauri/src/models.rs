@@ -5,6 +5,8 @@ pub struct Settings {
     pub codex_dir: String,
     #[serde(default = "default_claude_dir")]
     pub claude_dir: String,
+    #[serde(default = "default_opencode_dir")]
+    pub opencode_dir: String,
     pub backup_dir: String,
     #[serde(default = "default_open_cmd")]
     pub open_command: String,
@@ -27,6 +29,12 @@ fn default_claude_dir() -> String {
         .into_owned()
 }
 
+fn default_opencode_dir() -> String {
+    crate::paths::default_opencode_dir()
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn default_refresh_ms() -> u64 {
     5000
 }
@@ -35,10 +43,12 @@ impl Default for Settings {
     fn default() -> Self {
         let codex = crate::paths::default_codex_dir();
         let claude = crate::paths::default_claude_dir();
+        let opencode = crate::paths::default_opencode_dir();
         let backup = crate::paths::default_backup_dir();
         Self {
             codex_dir: codex.to_string_lossy().into_owned(),
             claude_dir: claude.to_string_lossy().into_owned(),
+            opencode_dir: opencode.to_string_lossy().into_owned(),
             backup_dir: backup.to_string_lossy().into_owned(),
             open_command: "auto".into(),
             refresh_interval_ms: 5000,
@@ -218,6 +228,38 @@ pub struct SessionMetaBrief {
     pub cli_version: Option<String>,
     pub source: Option<String>,
     pub model_provider: Option<String>,
+}
+
+// ========================= Claude Memory =========================
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClaudeMemoryProject {
+    pub project_key: String,
+    pub project_path: String,
+    pub memory_dir: String,
+    pub file_count: u32,
+    pub total_bytes: u64,
+    pub updated_at: i64,
+    pub has_index: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClaudeMemoryFile {
+    pub project_key: String,
+    pub file_name: String,
+    pub path: String,
+    pub title: String,
+    pub preview: String,
+    pub bytes: u64,
+    pub updated_at: i64,
+    pub is_index: bool,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClaudeMemoryDocument {
+    pub file: ClaudeMemoryFile,
+    pub content: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -691,6 +733,8 @@ pub struct OrphanPruneReport {
     pub threads_removed: u32,
     pub family_branches_removed: u32,
     pub families_removed: u32,
+    pub families_recovered: u32,
+    pub families_normalized: u32,
     pub families_skipped: Vec<String>,
     pub dry_run: bool,
 }

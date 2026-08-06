@@ -46,6 +46,7 @@ export function TopBar({
     (loc.pathname.startsWith("/sessions") ||
       loc.pathname.startsWith("/codex/sessions") ||
       loc.pathname.startsWith("/claude/sessions") ||
+      loc.pathname.startsWith("/opencode/sessions") ||
       loc.pathname.startsWith("/backups/") ||
       loc.pathname.startsWith("/codex/backups/") ||
       loc.pathname.startsWith("/claude/backups/"));

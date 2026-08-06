@@ -37,6 +37,14 @@
     --chart-3: 43.3 96.4% 56.3%;
     --chart-4: 262.1 83.3% 57.8%;
     --chart-5: 346.8 77.2% 49.8%;
+    /* Agent 品牌色：只用于区分 provider，不参与主色/选中态。
+       -fg 是同色系里能压在浅底上的正文色。 */
+    --provider-codex: 165 82% 35%;
+    --provider-codex-fg: 166 88% 25%;
+    --provider-claude: 15 63% 60%;
+    --provider-claude-fg: 14 50% 47%;
+    --provider-opencode: 217 91% 60%;
+    --provider-opencode-fg: 221 83% 53%;
   }
 
   .dark {
@@ -72,6 +80,12 @@
     --chart-3: 43.3 92% 60%;
     --chart-4: 262.1 75% 65%;
     --chart-5: 346.8 70% 55%;
+    --provider-codex: 165 72% 45%;
+    --provider-codex-fg: 162 72% 67%;
+    --provider-claude: 16 75% 65%;
+    --provider-claude-fg: 16 81% 74%;
+    --provider-opencode: 217 91% 64%;
+    --provider-opencode-fg: 212 96% 78%;
   }
 }
 
@@ -316,6 +330,135 @@ mark {
 
 .chat-md img {
   @apply max-w-full rounded-md;
+}
+
+/* --- Memory 文档阅读样式 --- */
+.memory-md {
+  @apply min-w-0 text-[14px] leading-7 text-foreground/90;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.memory-md > :first-child {
+  margin-top: 0;
+}
+.memory-md > :last-child {
+  margin-bottom: 0;
+}
+.memory-md p {
+  @apply my-3;
+}
+.memory-md h1,
+.memory-md h2,
+.memory-md h3,
+.memory-md h4,
+.memory-md h5,
+.memory-md h6 {
+  @apply mb-3 mt-7 scroll-mt-4 font-semibold leading-tight tracking-tight text-foreground;
+}
+.memory-md h1 {
+  @apply border-b border-border/70 pb-3 text-2xl;
+}
+.memory-md h2 {
+  @apply border-b border-border/50 pb-2 text-xl;
+}
+.memory-md h3 {
+  @apply text-lg;
+}
+.memory-md h4,
+.memory-md h5,
+.memory-md h6 {
+  @apply text-base;
+}
+.memory-md ul,
+.memory-md ol {
+  @apply my-3 pl-6;
+}
+.memory-md ul {
+  list-style: disc;
+}
+.memory-md ol {
+  list-style: decimal;
+}
+.memory-md li {
+  @apply my-1 pl-0.5;
+}
+.memory-md li > ul,
+.memory-md li > ol {
+  @apply my-1;
+}
+.memory-md blockquote {
+  @apply my-4 border-l-[3px] border-provider-claude/45 bg-provider-claude/[0.05] py-1 pl-4 pr-3 text-muted-foreground;
+}
+.memory-md code {
+  @apply rounded border border-border/60 bg-muted/60 px-1.5 py-0.5 font-mono text-[12.5px] text-foreground;
+  white-space: break-spaces;
+}
+.memory-md pre {
+  @apply my-4 max-w-full overflow-auto rounded-lg border border-border/70 bg-muted/45 p-4 shadow-sm;
+}
+.memory-md pre code {
+  @apply border-0 bg-transparent p-0 text-[12.5px] leading-6;
+  color: inherit;
+  white-space: pre;
+}
+.memory-md table {
+  @apply my-4 block max-w-full overflow-x-auto text-sm;
+  border-collapse: collapse;
+}
+.memory-md th,
+.memory-md td {
+  @apply whitespace-nowrap border border-border px-3 py-1.5 text-left;
+}
+.memory-md th {
+  @apply bg-muted/60 font-semibold text-foreground;
+}
+.memory-md tr:nth-child(even) td {
+  @apply bg-muted/20;
+}
+.memory-md a {
+  @apply font-medium text-provider-claude-fg underline decoration-provider-claude/45 underline-offset-2;
+}
+.memory-md a:hover {
+  @apply decoration-provider-claude-fg;
+}
+.memory-md hr {
+  @apply my-7 border-border;
+}
+.memory-md img {
+  @apply my-4 max-w-full rounded-lg border border-border/70 shadow-sm;
+}
+.memory-md input[type="checkbox"] {
+  @apply mr-1.5 align-middle accent-[hsl(var(--provider-claude-fg))];
+}
+
+/* textarea 必须自己持有滚动，避免破坏光标、选区和中文输入法；
+   视觉尺寸与 Radix ScrollArea 的 10px 轨道、8px 滑块保持一致。 */
+.memory-source-scrollbar {
+  scrollbar-gutter: stable;
+}
+.memory-source-scrollbar::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.memory-source-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.memory-source-scrollbar::-webkit-scrollbar-thumb {
+  min-height: 28px;
+  border: 1px solid transparent;
+  border-radius: 9999px;
+  background: hsl(var(--border));
+  background-clip: padding-box;
+}
+.memory-source-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--muted-foreground) / 0.5);
+  background-clip: padding-box;
+}
+.memory-source-scrollbar::-webkit-scrollbar-button {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+  background: transparent !important;
 }
 
 .chat-md.bg-primary code,

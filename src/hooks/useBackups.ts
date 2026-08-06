@@ -4,7 +4,7 @@ import { joinPath } from "@/lib/cwd";
 import { sessionIdentityFromPath } from "@/lib/sessionIdentity";
 import { useSettings } from "@/stores/settings";
 
-export function useBackups(provider?: SessionProvider) {
+export function useBackups(provider?: SessionProvider, enabled = true) {
   const settings = useSettings((s) => s.settings);
   const [backups, setBackups] = useState<BackupSummary[]>([]);
   const [loading, setLoading] = useState(false);
@@ -14,7 +14,7 @@ export function useBackups(provider?: SessionProvider) {
   const refresh = useCallback(async () => {
     const request = ++requestSeq.current;
     setBackups([]);
-    if (!settings?.backup_dir) {
+    if (!enabled || !settings?.backup_dir) {
       setLoading(false);
       setError(null);
       return;
@@ -31,7 +31,7 @@ export function useBackups(provider?: SessionProvider) {
     } finally {
       if (request === requestSeq.current) setLoading(false);
     }
-  }, [settings?.backup_dir, provider]);
+  }, [enabled, settings?.backup_dir, provider]);
 
   useEffect(() => {
     void refresh();
@@ -40,12 +40,12 @@ export function useBackups(provider?: SessionProvider) {
   return { backups, loading, error, refresh };
 }
 
-export function useBackupIndex(provider?: SessionProvider) {
+export function useBackupIndex(provider?: SessionProvider, enabled = true) {
   const settings = useSettings((s) => s.settings);
   const backupDir = settings?.backup_dir ?? "";
   const codexDir = settings?.codex_dir ?? "";
   const claudeDir = settings?.claude_dir ?? "";
-  const { backups } = useBackups(provider);
+  const { backups } = useBackups(provider, enabled);
   const [index, setIndex] = useState<Record<string, string[]>>({});
   const [error, setError] = useState<string | null>(null);
   const requestSeq = useRef(0);
@@ -54,7 +54,7 @@ export function useBackupIndex(provider?: SessionProvider) {
     const request = ++requestSeq.current;
     setIndex({});
     setError(null);
-    if (!backupDir) return;
+    if (!enabled || !backupDir) return;
     (async () => {
       const map: Record<string, string[]> = {};
       const errors: string[] = [];
@@ -83,7 +83,7 @@ export function useBackupIndex(provider?: SessionProvider) {
         setError(errors.length > 0 ? errors.slice(0, 3).join("\n") : null);
       }
     })();
-  }, [backupDir, backups, claudeDir, codexDir, provider]);
+  }, [backupDir, backups, claudeDir, codexDir, enabled, provider]);
 
   return { index, error };
 }

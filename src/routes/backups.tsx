@@ -12,6 +12,7 @@ import { useBackups } from "@/hooks/useBackups";
 import { useSettings } from "@/stores/settings";
 import { api, type BackupSummary, type SessionProvider } from "@/lib/api";
 import { humanBytes } from "@/lib/format";
+import { providerLabel } from "@/lib/providerTheme";
 import { format } from "date-fns";
 import { toast } from "sonner";
 
@@ -22,12 +23,12 @@ export default function BackupsRoute({ provider = "codex" }: { provider?: Sessio
   const [restoreTarget, setRestoreTarget] = useState<BackupSummary | null>(null);
 
   const totalSize = useMemo(() => backups.reduce((a, b) => a + b.total_bytes, 0), [backups]);
-  const providerLabel = provider === "codex" ? "Codex" : "Claude";
+  const providerName = providerLabel(provider);
 
   return (
     <>
       <TopBar
-        title={`${providerLabel} 备份`}
+        title={`${providerName} 备份`}
         stats={backups.length > 0 ? `${backups.length} 份 · ${humanBytes(totalSize)}` : undefined}
         onRefresh={refresh}
       />
@@ -182,7 +183,7 @@ export default function BackupsRoute({ provider = "codex" }: { provider?: Sessio
           }
         }}
       >
-        将把备份中的所有会话回写至 {providerLabel} 目录。已存在的 session id 会自动跳过（不覆盖）；
+        将把备份中的所有会话回写至 {providerName} 目录。已存在的 session id 会自动跳过（不覆盖）；
         如需覆盖请到备份详情页按条还原。
       </DangerDialog>
     </>

@@ -62,6 +62,8 @@ struct CliContext {
     codex_dir_explicit: bool,
     claude_dir: String,
     claude_dir_explicit: bool,
+    opencode_dir: String,
+    opencode_dir_explicit: bool,
     family_lock: family::FamilyLock,
 }
 
@@ -112,6 +114,10 @@ fn run_cli() -> CliResult<()> {
     let claude_dir_explicit = claude_dir_arg.is_some();
     let claude_dir = claude_dir_arg
         .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned());
+    let opencode_dir_arg = take_value(&mut args, "--opencode-dir")?;
+    let opencode_dir_explicit = opencode_dir_arg.is_some();
+    let opencode_dir = opencode_dir_arg
+        .unwrap_or_else(|| paths::default_opencode_dir().to_string_lossy().into_owned());
 
     if help {
         print_help();
@@ -125,6 +131,8 @@ fn run_cli() -> CliResult<()> {
         codex_dir_explicit,
         claude_dir,
         claude_dir_explicit,
+        opencode_dir,
+        opencode_dir_explicit,
         family_lock: family::FamilyLock::default(),
     };
 
@@ -133,6 +141,7 @@ fn run_cli() -> CliResult<()> {
             ctx.provider.clone(),
             ctx.codex_dir.clone(),
             ctx.claude_dir.clone(),
+            ctx.opencode_dir.clone(),
         )
         .map_err(CliError::message);
     };
@@ -144,6 +153,7 @@ fn run_cli() -> CliResult<()> {
                 ctx.provider.clone(),
                 ctx.codex_dir.clone(),
                 ctx.claude_dir.clone(),
+                ctx.opencode_dir.clone(),
             )
             .map_err(CliError::message)
         }
@@ -179,9 +189,10 @@ fn print_help() {
 
 全局选项:
   --json                    输出 JSON
-  --provider <codex|claude|all>
+  --provider <codex|claude|opencode|all>  会话、统计与 webui 使用的 provider
   --codex-dir <路径>         默认读取 ~/.codex
   --claude-dir <路径>        默认读取 ~/.claude
+  --opencode-dir <路径>      默认读取 ~/.local/share/opencode
   -h, --help                显示帮助
 
 常用命令:
@@ -214,6 +225,7 @@ fn print_help() {
   cc-sessions preview ~/.codex/sessions/.../rollout-xxx.jsonl --mode all --limit 40
   cc-sessions webui --host 127.0.0.1 --port 17888
   cc-sessions --provider claude webui --host 127.0.0.1 --port 17888
+  cc-sessions --provider opencode webui --host 127.0.0.1 --port 17888
   cc-sessions --provider codex convert ~/.codex/sessions/.../rollout-xxx.jsonl --mode native
   cc-sessions --provider claude convert ~/.claude/projects/.../<session-id>.jsonl --mode simple
   cc-sessions repair diagnose --json
@@ -252,24 +264,27 @@ fn cmd_search(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
 
     let provider = session_provider(ctx)?;
     let mut hits = if provider == "all" {
-        let mut codex_hits = sessions::search_sessions(
-            Some("codex".to_string()),
-            ctx.codex_dir.clone(),
-            Some(ctx.claude_dir.clone()),
-            query.clone(),
-        )?;
-        codex_hits.extend(sessions::search_sessions(
-            Some("claude".to_string()),
-            ctx.codex_dir.clone(),
-            Some(ctx.claude_dir.clone()),
-            query,
-        )?);
-        codex_hits
+        let mut providers = vec!["codex", "claude"];
+        if Path::new(&ctx.opencode_dir).join("opencode.db").is_file() {
+            providers.push("opencode");
+        }
+        let mut all_hits = Vec::new();
+        for current in providers {
+            all_hits.extend(sessions::search_sessions_with_opencode(
+                Some(current.to_string()),
+                ctx.codex_dir.clone(),
+                Some(ctx.claude_dir.clone()),
+                Some(ctx.opencode_dir.clone()),
+                query.clone(),
+            )?);
+        }
+        all_hits
     } else {
-        sessions::search_sessions(
+        sessions::search_sessions_with_opencode(
             Some(provider),
             ctx.codex_dir.clone(),
             Some(ctx.claude_dir.clone()),
+            Some(ctx.opencode_dir.clone()),
             query,
         )?
     };
@@ -322,15 +337,15 @@ fn cmd_webui(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
     webui::validate_host(&host)?;
     let default_provider = match ctx.provider.as_deref() {
         None => None,
-        Some("codex" | "claude") => ctx.provider.clone(),
+        Some("codex" | "claude" | "opencode") => ctx.provider.clone(),
         Some("all") => {
             return Err(CliError::message(
-                "webui 不支持 --provider all；请使用 codex 或 claude",
+                "webui 不支持 --provider all；请使用 codex、claude 或 opencode",
             ))
         }
         Some(other) => {
             return Err(CliError::message(format!(
-                "webui 不支持的 provider: {other}；请使用 codex 或 claude"
+                "webui 不支持的 provider: {other}；请使用 codex、claude 或 opencode"
             )))
         }
     };
@@ -342,6 +357,8 @@ fn cmd_webui(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
         codex_dir_explicit: ctx.codex_dir_explicit,
         claude_dir: ctx.claude_dir.clone(),
         claude_dir_explicit: ctx.claude_dir_explicit,
+        opencode_dir: ctx.opencode_dir.clone(),
+        opencode_dir_explicit: ctx.opencode_dir_explicit,
     })?;
     Ok(())
 }
@@ -524,6 +541,9 @@ fn cmd_convert(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
     let rollout_path = conversion_path_arg(&mut args)?;
     ensure_no_args(&args)?;
     let source_provider = concrete_provider(ctx)?;
+    if source_provider == "opencode" {
+        return Err(CliError::message("OpenCode 会话暂不支持转换"));
+    }
     let report = convert::convert_session_with_lock(
         ctx.codex_dir.clone(),
         ctx.claude_dir.clone(),
@@ -552,6 +572,7 @@ fn cmd_stats(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
                 Some(provider),
                 ctx.codex_dir.clone(),
                 Some(ctx.claude_dir.clone()),
+                Some(ctx.opencode_dir.clone()),
                 from_ts,
                 to_ts,
                 cwd_filter,
@@ -571,6 +592,7 @@ fn cmd_stats(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
                 Some(provider),
                 ctx.codex_dir.clone(),
                 Some(ctx.claude_dir.clone()),
+                Some(ctx.opencode_dir.clone()),
                 from_ts,
                 to_ts,
                 limit,
@@ -596,6 +618,7 @@ fn cmd_stats(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
                 Some(provider),
                 ctx.codex_dir.clone(),
                 Some(ctx.claude_dir.clone()),
+                Some(ctx.opencode_dir.clone()),
                 from_ts,
                 to_ts,
                 cwd_filter,
@@ -622,6 +645,7 @@ fn cmd_stats(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
                 Some(provider),
                 ctx.codex_dir.clone(),
                 Some(ctx.claude_dir.clone()),
+                Some(ctx.opencode_dir.clone()),
                 from_ts,
                 to_ts,
                 bucket,
@@ -641,6 +665,7 @@ fn cmd_stats(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
                 Some(provider),
                 ctx.codex_dir.clone(),
                 Some(ctx.claude_dir.clone()),
+                Some(ctx.opencode_dir.clone()),
                 from_ts,
                 to_ts,
                 cwd_filter,
@@ -1056,11 +1081,13 @@ fn cmd_repair(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             )?;
             output(ctx, &report, |report| {
                 println!(
-                    "index_removed={}\tthreads_removed={}\tfamily_branches_removed={}\tfamilies_removed={}\tfamilies_skipped={}\tdry_run={}",
+                    "index_removed={}\tthreads_removed={}\tfamily_branches_removed={}\tfamilies_removed={}\tfamilies_recovered={}\tfamilies_normalized={}\tfamilies_skipped={}\tdry_run={}",
                     report.index_removed,
                     report.threads_removed,
                     report.family_branches_removed,
                     report.families_removed,
+                    report.families_recovered,
+                    report.families_normalized,
                     report.families_skipped.len(),
                     report.dry_run
                 );
@@ -1398,6 +1425,7 @@ fn cmd_settings(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             output(ctx, &defaults, |settings| {
                 println!("codex_dir\t{}", settings.codex_dir);
                 println!("claude_dir\t{}", settings.claude_dir);
+                println!("opencode_dir\t{}", settings.opencode_dir);
                 println!("backup_dir\t{}", settings.backup_dir);
                 println!("refresh_interval_ms\t{}", settings.refresh_interval_ms);
             })
@@ -1409,6 +1437,7 @@ fn cmd_settings(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             output(ctx, &settings, |settings| {
                 println!("codex_dir\t{}", settings.codex_dir);
                 println!("claude_dir\t{}", settings.claude_dir);
+                println!("opencode_dir\t{}", settings.opencode_dir);
                 println!("backup_dir\t{}", settings.backup_dir);
                 println!("refresh_interval_ms\t{}", settings.refresh_interval_ms);
             })
@@ -1417,9 +1446,11 @@ fn cmd_settings(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             ensure_no_args(&args)?;
             let codex = settings::validate_codex_dir(ctx.codex_dir.clone())?;
             let claude = settings::validate_claude_dir(ctx.claude_dir.clone())?;
+            let opencode = settings::validate_opencode_dir(ctx.opencode_dir.clone())?;
             let report = HashMap::from([
                 ("codex", serde_json::to_value(codex)?),
                 ("claude", serde_json::to_value(claude)?),
+                ("opencode", serde_json::to_value(opencode)?),
             ]);
             output(ctx, &report, |report| {
                 for (name, value) in report {
@@ -1433,22 +1464,26 @@ fn cmd_settings(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
 
 fn load_sessions(ctx: &CliContext, provider: String) -> CliResult<Vec<SessionSummary>> {
     match provider.as_str() {
-        "codex" | "claude" => Ok(sessions::list_sessions(
+        "codex" | "claude" | "opencode" => Ok(sessions::list_sessions_with_opencode(
             Some(provider),
             ctx.codex_dir.clone(),
             Some(ctx.claude_dir.clone()),
+            Some(ctx.opencode_dir.clone()),
         )?),
         "all" => {
-            let mut list = sessions::list_sessions(
-                Some("codex".to_string()),
-                ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
-            )?;
-            list.extend(sessions::list_sessions(
-                Some("claude".to_string()),
-                ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
-            )?);
+            let mut providers = vec!["codex", "claude"];
+            if Path::new(&ctx.opencode_dir).join("opencode.db").is_file() {
+                providers.push("opencode");
+            }
+            let mut list = Vec::new();
+            for current in providers {
+                list.extend(sessions::list_sessions_with_opencode(
+                    Some(current.to_string()),
+                    ctx.codex_dir.clone(),
+                    Some(ctx.claude_dir.clone()),
+                    Some(ctx.opencode_dir.clone()),
+                )?);
+            }
             list.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
             Ok(list)
         }
@@ -1505,7 +1540,7 @@ fn group_projects(list: Vec<SessionSummary>, include_archived: bool) -> Vec<Proj
 fn session_provider(ctx: &CliContext) -> CliResult<String> {
     let provider = ctx.provider.clone().unwrap_or_else(|| "codex".to_string());
     match provider.as_str() {
-        "codex" | "claude" | "all" => Ok(provider),
+        "codex" | "claude" | "opencode" | "all" => Ok(provider),
         other => Err(CliError::message(format!("不支持的 provider: {other}"))),
     }
 }
@@ -1514,7 +1549,7 @@ fn concrete_provider(ctx: &CliContext) -> CliResult<String> {
     let provider = session_provider(ctx)?;
     if provider == "all" {
         Err(CliError::message(
-            "此命令只支持 --provider codex 或 --provider claude",
+            "此命令只支持 --provider codex、claude 或 opencode",
         ))
     } else {
         Ok(provider)
@@ -1835,6 +1870,27 @@ fn normalize_path(value: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_context(provider: &str) -> CliContext {
+        CliContext {
+            json: false,
+            provider: Some(provider.into()),
+            codex_dir: "codex".into(),
+            codex_dir_explicit: false,
+            claude_dir: "claude".into(),
+            claude_dir_explicit: false,
+            opencode_dir: "opencode".into(),
+            opencode_dir_explicit: false,
+            family_lock: family::FamilyLock::default(),
+        }
+    }
+
+    #[test]
+    fn session_commands_accept_opencode_provider() {
+        let ctx = test_context("opencode");
+        assert_eq!(session_provider(&ctx).unwrap(), "opencode");
+        assert_eq!(concrete_provider(&ctx).unwrap(), "opencode");
+    }
 
     #[test]
     fn conversion_mode_defaults_to_simple_and_accepts_native() {

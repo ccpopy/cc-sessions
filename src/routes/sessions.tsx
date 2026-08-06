@@ -50,6 +50,7 @@ import {
 import { humanBytes, humanTokens } from "@/lib/format";
 import { basename } from "@/lib/cwd";
 import { sessionIdentity } from "@/lib/sessionIdentity";
+import { providerLabel } from "@/lib/providerTheme";
 import {
   ProviderSyncRegistry,
   type ProviderSyncSnapshot,
@@ -64,7 +65,10 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const settings = useSettings((s) => s.settings);
   const query = useView((s) => s.query);
   const { sessions, allSessions, loading, error, refresh } = useSessions(provider, query);
-  const { index: backupIndex, error: backupIndexError } = useBackupIndex(provider);
+  const isCodex = provider === "codex";
+  const isOpenCode = provider === "opencode";
+  const supportsArchive = isCodex || isOpenCode;
+  const { index: backupIndex, error: backupIndexError } = useBackupIndex(provider, !isOpenCode);
   const selected = useSelection((s) => s.selected);
   const setSelection = useSelection((s) => s.set);
   const clearSelection = useSelection((s) => s.clear);
@@ -122,13 +126,13 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const cloning =
     providerSyncState.batchActive || providerSyncState.sessionIds.size > 0;
   const showHiddenRecords = useMemo(() => isExplicitHiddenRecordQuery(query), [query]);
-  const isCodex = provider === "codex";
-  const hasActiveVisibilityFilter = showSubagentSessions || (isCodex && showArchivedSessions);
+  const hasActiveVisibilityFilter = showSubagentSessions || (supportsArchive && showArchivedSessions);
   const overlayScope = JSON.stringify([provider, settings?.codex_dir ?? ""]);
   const refreshScope = JSON.stringify([
     provider,
     settings?.codex_dir ?? "",
     settings?.claude_dir ?? "",
+    settings?.opencode_dir ?? "",
     query,
   ]);
   const overlayScopeRef = useRef(overlayScope);
@@ -451,7 +455,13 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const onArchiveToggle = async (s: SessionSummary) => {
     if (!settings) return;
     try {
-      await api.setArchived(provider, settings.codex_dir, s.id, !s.archived);
+      await api.setArchived(
+        provider,
+        settings.codex_dir,
+        s.id,
+        !s.archived,
+        settings.opencode_dir,
+      );
       toast.success(s.archived ? "已取消归档" : "已归档");
       await refresh();
     } catch (e: any) {
@@ -484,13 +494,13 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   return (
     <>
       <TopBar
-        title={provider === "codex" ? "Codex 会话" : "Claude 会话"}
+        title={`${providerLabel(provider)} 会话`}
         stats={loading ? "加载中…" : `${visibleSessions.length} 条`}
         onRefresh={refreshAll}
         refreshing={loading}
-        onBulkBackup={onBulkBackup}
+        onBulkBackup={isOpenCode ? undefined : onBulkBackup}
         onBulkDelete={onBulkDelete}
-        onContentSearch={() => setContentSearchOpen(true)}
+        onContentSearch={isOpenCode ? undefined : () => setContentSearchOpen(true)}
         showListTools
       >
         <DropdownMenu>
@@ -521,7 +531,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
               className="gap-1.5 px-2 [&>span:first-child]:hidden"
             >
               <Network className="h-3.5 w-3.5 text-muted-foreground" />
-              <span className="whitespace-nowrap">子代理</span>
+              <span className="whitespace-nowrap">{isOpenCode ? "子会话" : "子代理"}</span>
               <span
                 aria-hidden="true"
                 data-state={showSubagentSessions ? "checked" : "unchecked"}
@@ -534,7 +544,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
                 />
               </span>
             </DropdownMenuCheckboxItem>
-            {isCodex && (
+            {supportsArchive && (
               <DropdownMenuCheckboxItem
                 checked={showArchivedSessions}
                 onCheckedChange={(checked) => setArchivedView(checked === true)}
@@ -626,15 +636,27 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
           </div>
         ) : visibleSessions.length === 0 ? (
           <EmptyState
-            title={query ? "无匹配结果" : showSubagentSessions ? "尚无子代理会话" : "尚无会话"}
+            title={
+              query
+                ? "无匹配结果"
+                : showSubagentSessions
+                  ? isOpenCode
+                    ? "尚无子会话"
+                    : "尚无子代理会话"
+                  : "尚无会话"
+            }
             description={
               query
                 ? "尝试清除搜索或换个关键字"
                 : showSubagentSessions
-                  ? "产生子代理后会自动出现在此"
+                  ? isOpenCode
+                    ? "OpenCode 产生子会话后会自动出现在此"
+                    : "产生子代理后会自动出现在此"
                 : provider === "codex"
                   ? "打开 Codex 后会自动出现在此"
-                  : "打开 Claude Code 后会自动出现在此"
+                  : provider === "claude"
+                    ? "打开 Claude Code 后会自动出现在此"
+                    : "在 OpenCode 中创建会话后会自动出现在此"
             }
             icon={<MessageSquare className="h-10 w-10" />}
           />
@@ -653,15 +675,15 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             }}
             onCopyResume={onCopyResume}
             onRevealCwd={onReveal}
-            onArchiveToggle={isCodex ? onArchiveToggle : undefined}
-            onBackup={(s) => setBackupTargets([s])}
+            onArchiveToggle={supportsArchive ? onArchiveToggle : undefined}
+            onBackup={isOpenCode ? undefined : (s) => setBackupTargets([s])}
             onDelete={(s) => setDeleteTargets([s])}
             onClone={isCodex ? onCloneOne : undefined}
             onDuplicate={isCodex ? setDuplicateTarget : undefined}
             onOpenFamily={isCodex ? (s) => setFamilySheetId(s.id) : undefined}
             onExportMarkdown={setExportTarget}
-            onConvert={setConvertTarget}
-            onRename={isCodex ? setRenameTarget : undefined}
+            onConvert={isOpenCode ? undefined : setConvertTarget}
+            onRename={isCodex || isOpenCode ? setRenameTarget : undefined}
             onMoveCwd={isCodex ? setMoveTarget : undefined}
           />
         )}
@@ -729,6 +751,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
               settings.codex_dir,
               renameTarget.id,
               title,
+              settings.opencode_dir,
             );
             toast.success(renamed > 1 ? `已重命名（同步 ${renamed} 个分支）` : "已重命名");
             await refresh();
@@ -824,6 +847,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
               id: session.id,
               rollout_path: session.rollout_path,
             })),
+            settings.opencode_dir,
           );
           const okCount = r.filter((x) => x.ok).length;
           const failed = r.filter((x) => !x.ok);
@@ -935,13 +959,18 @@ function DeleteSummary({
             将删除 <b>{targets.length}</b> 个所选会话或历史分支对应的 threads、日志、rollout 与索引。
             非 active 历史分支只删除自身，不会影响同一 family 的当前 active 会话。
           </>
-        ) : (
+        ) : provider === "claude" ? (
           <>
             将删除 <b>{targets.length}</b> 个 jsonl 会话文件
             （共 <b>{humanBytes(totalBytes)}</b>，
             <b>{humanTokens(totalTokens)}</b> token）及同名 sidecar。删除最后一个同 ID 副本时，还会清理
             history.jsonl 匹配行、tasks/&lt;id&gt; 与 file-history/&lt;id&gt;；仍有同 ID 副本时这些共享数据会保留。
             项目 memory、.claude.json、session-env 和 shell-snapshots 不会被删除。
+          </>
+        ) : (
+          <>
+            将从 <code>opencode.db</code> 删除 <b>{targets.length}</b> 个会话及其消息、片段和关联记录。
+            OpenCode 使用 SQLite 外键级联清理，不会触碰项目工作区文件。
           </>
         )}
       </div>

@@ -275,7 +275,16 @@ pub fn list_sessions(
     codex_dir: String,
     claude_dir: Option<String>,
 ) -> AppResult<Vec<SessionSummary>> {
-    list_sessions_impl(provider, codex_dir, claude_dir, None)
+    list_sessions_with_opencode(provider, codex_dir, claude_dir, None)
+}
+
+pub fn list_sessions_with_opencode(
+    provider: Option<String>,
+    codex_dir: String,
+    claude_dir: Option<String>,
+    opencode_dir: Option<String>,
+) -> AppResult<Vec<SessionSummary>> {
+    list_sessions_impl(provider, codex_dir, claude_dir, opencode_dir, None)
 }
 
 pub fn list_sessions_cancellable(
@@ -284,13 +293,14 @@ pub fn list_sessions_cancellable(
     claude_dir: Option<String>,
     cancel: &AtomicBool,
 ) -> AppResult<Vec<SessionSummary>> {
-    list_sessions_impl(provider, codex_dir, claude_dir, Some(cancel))
+    list_sessions_impl(provider, codex_dir, claude_dir, None, Some(cancel))
 }
 
 fn list_sessions_impl(
     provider: Option<String>,
     codex_dir: String,
     claude_dir: Option<String>,
+    opencode_dir: Option<String>,
     cancel: Option<&AtomicBool>,
 ) -> AppResult<Vec<SessionSummary>> {
     ensure_not_cancelled(cancel)?;
@@ -320,6 +330,15 @@ fn list_sessions_impl(
                 None => crate::claude_sessions::scan_sessions(&p)?,
             };
             ensure_not_cancelled(cancel)?;
+            provenance::annotate_sessions(&codex, &mut list);
+            Ok(list)
+        }
+        "opencode" => {
+            let data_dir =
+                PathBuf::from(opencode_dir.unwrap_or_else(|| {
+                    paths::default_opencode_dir().to_string_lossy().into_owned()
+                }));
+            let mut list = crate::opencode_sessions::list_sessions(&data_dir)?;
             provenance::annotate_sessions(&codex, &mut list);
             Ok(list)
         }
@@ -400,7 +419,16 @@ pub fn group_sessions_by_project(
     codex_dir: String,
     claude_dir: Option<String>,
 ) -> AppResult<Vec<ProjectGroup>> {
-    let list = list_sessions(provider, codex_dir, claude_dir)?;
+    group_sessions_by_project_with_opencode(provider, codex_dir, claude_dir, None)
+}
+
+pub fn group_sessions_by_project_with_opencode(
+    provider: Option<String>,
+    codex_dir: String,
+    claude_dir: Option<String>,
+    opencode_dir: Option<String>,
+) -> AppResult<Vec<ProjectGroup>> {
+    let list = list_sessions_with_opencode(provider, codex_dir, claude_dir, opencode_dir)?;
     let mut groups: HashMap<String, ProjectGroup> = HashMap::new();
     for s in list {
         let key = s.cwd.clone();
@@ -429,11 +457,21 @@ pub fn search_sessions(
     claude_dir: Option<String>,
     query: String,
 ) -> AppResult<Vec<SessionSummary>> {
+    search_sessions_with_opencode(provider, codex_dir, claude_dir, None, query)
+}
+
+pub fn search_sessions_with_opencode(
+    provider: Option<String>,
+    codex_dir: String,
+    claude_dir: Option<String>,
+    opencode_dir: Option<String>,
+    query: String,
+) -> AppResult<Vec<SessionSummary>> {
     let q = query.trim();
     if q.is_empty() {
-        return list_sessions(provider, codex_dir, claude_dir);
+        return list_sessions_with_opencode(provider, codex_dir, claude_dir, opencode_dir);
     }
-    let all = list_sessions(provider, codex_dir, claude_dir)?;
+    let all = list_sessions_with_opencode(provider, codex_dir, claude_dir, opencode_dir)?;
     let low = q.to_lowercase();
 
     // 前缀/过滤：id: cwd: model: archived:
@@ -517,10 +555,29 @@ pub fn set_archived_with_lock(
     v: bool,
     lock: &family::FamilyLock,
 ) -> AppResult<()> {
-    if provider_or_codex(provider) != "codex" {
-        return Err(AppError::Other("Claude 会话不支持归档".into()));
+    set_archived_with_provider_dir(provider, codex_dir, None, id, v, lock)
+}
+
+pub fn set_archived_with_provider_dir(
+    provider: Option<String>,
+    codex_dir: String,
+    opencode_dir: Option<String>,
+    id: String,
+    v: bool,
+    lock: &family::FamilyLock,
+) -> AppResult<()> {
+    match provider_or_codex(provider).as_str() {
+        "codex" => family::with_lock(lock, |_guard| set_archived_codex_locked(codex_dir, id, v)),
+        "opencode" => {
+            let data_dir =
+                PathBuf::from(opencode_dir.unwrap_or_else(|| {
+                    paths::default_opencode_dir().to_string_lossy().into_owned()
+                }));
+            crate::opencode_sessions::set_archived(&data_dir, &id, v)
+        }
+        "claude" => Err(AppError::Other("Claude 会话不支持归档".into())),
+        other => Err(AppError::Other(format!("不支持的 provider: {other}"))),
     }
-    family::with_lock(lock, |_guard| set_archived_codex_locked(codex_dir, id, v))
 }
 
 /// 重命名会话：新版写 threads.name，同时兼容更新旧版 threads.title。
@@ -534,6 +591,24 @@ pub fn rename_session_with_lock(
     title: String,
     lock: &family::FamilyLock,
 ) -> AppResult<u32> {
+    rename_session_with_provider_dir(provider, codex_dir, None, id, title, lock)
+}
+
+pub fn rename_session_with_provider_dir(
+    provider: Option<String>,
+    codex_dir: String,
+    opencode_dir: Option<String>,
+    id: String,
+    title: String,
+    lock: &family::FamilyLock,
+) -> AppResult<u32> {
+    if provider_or_codex(provider.clone()) == "opencode" {
+        let data_dir = PathBuf::from(
+            opencode_dir
+                .unwrap_or_else(|| paths::default_opencode_dir().to_string_lossy().into_owned()),
+        );
+        return crate::opencode_sessions::rename_session(&data_dir, &id, &title);
+    }
     if provider_or_codex(provider) != "codex" {
         return Err(AppError::Other("Claude 会话暂不支持重命名".into()));
     }
@@ -1322,6 +1397,18 @@ pub fn delete_session_with_lock(
     target: Option<DeleteTarget>,
     lock: &family::FamilyLock,
 ) -> AppResult<DeleteResult> {
+    delete_session_with_provider_dir(provider, codex_dir, claude_dir, None, id, target, lock)
+}
+
+pub fn delete_session_with_provider_dir(
+    provider: Option<String>,
+    codex_dir: String,
+    claude_dir: Option<String>,
+    opencode_dir: Option<String>,
+    id: String,
+    target: Option<DeleteTarget>,
+    lock: &family::FamilyLock,
+) -> AppResult<DeleteResult> {
     let target = match target {
         Some(target) if target.id != id => {
             return Err(AppError::Other(format!(
@@ -1348,6 +1435,13 @@ pub fn delete_session_with_lock(
                 .pop()
                 .ok_or_else(|| AppError::Other("Claude 删除未返回结果".to_string()))
         }
+        "opencode" => {
+            let dir =
+                PathBuf::from(opencode_dir.unwrap_or_else(|| {
+                    paths::default_opencode_dir().to_string_lossy().into_owned()
+                }));
+            crate::opencode_sessions::delete_session(&dir, &target.id)
+        }
         other => Err(AppError::Other(format!("不支持的 provider: {other}"))),
     }
 }
@@ -1356,6 +1450,18 @@ pub fn delete_sessions_with_lock(
     provider: Option<String>,
     codex_dir: String,
     claude_dir: Option<String>,
+    ids: Vec<String>,
+    targets: Option<Vec<DeleteTarget>>,
+    lock: &family::FamilyLock,
+) -> AppResult<Vec<DeleteResult>> {
+    delete_sessions_with_provider_dir(provider, codex_dir, claude_dir, None, ids, targets, lock)
+}
+
+pub fn delete_sessions_with_provider_dir(
+    provider: Option<String>,
+    codex_dir: String,
+    claude_dir: Option<String>,
+    opencode_dir: Option<String>,
     ids: Vec<String>,
     targets: Option<Vec<DeleteTarget>>,
     lock: &family::FamilyLock,
@@ -1393,6 +1499,19 @@ pub fn delete_sessions_with_lock(
                     .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
             );
             delete_claude_targets(&dir, targets)
+        }
+        "opencode" => {
+            let dir =
+                PathBuf::from(opencode_dir.unwrap_or_else(|| {
+                    paths::default_opencode_dir().to_string_lossy().into_owned()
+                }));
+            Ok(targets
+                .into_iter()
+                .map(|target| {
+                    crate::opencode_sessions::delete_session(&dir, &target.id)
+                        .unwrap_or_else(|error| failed_delete_result(&target, error.to_string()))
+                })
+                .collect())
         }
         other => Err(AppError::Other(format!("不支持的 provider: {other}"))),
     }

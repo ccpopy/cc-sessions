@@ -7,7 +7,8 @@ export function useSessions(provider: SessionProvider, query: string) {
   const settingsReady = settings !== null;
   const codexDir = settings?.codex_dir ?? "";
   const claudeDir = settings?.claude_dir ?? "";
-  const scope = JSON.stringify([settingsReady, provider, codexDir, claudeDir]);
+  const opencodeDir = settings?.opencode_dir ?? "";
+  const scope = JSON.stringify([settingsReady, provider, codexDir, claudeDir, opencodeDir]);
   const [allSessions, setAllSessions] = useState<SessionSummary[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -35,9 +36,9 @@ export function useSessions(provider: SessionProvider, query: string) {
           setError(null);
           return;
         }
-        const providerDir = provider === "claude" ? claudeDir : codexDir;
+        const providerDir = provider === "claude" ? claudeDir : provider === "opencode" ? opencodeDir : codexDir;
         if (!providerDir) {
-          setError(provider === "claude" ? "尚未配置 Claude 目录" : "尚未配置 Codex 目录");
+          setError(provider === "claude" ? "尚未配置 Claude 目录" : provider === "opencode" ? "尚未配置 OpenCode 数据目录" : "尚未配置 Codex 目录");
           setLoading(false);
           return;
         }
@@ -45,7 +46,7 @@ export function useSessions(provider: SessionProvider, query: string) {
         setLoading(true);
         setError(null);
         try {
-          const list = await api.listSessions(provider, codexDir, claudeDir);
+          const list = await api.listSessions(provider, codexDir, claudeDir, opencodeDir);
           if (!isCurrent()) return;
           setAllSessions(list);
         } catch (error) {
@@ -63,7 +64,7 @@ export function useSessions(provider: SessionProvider, query: string) {
     });
     inFlight.current = { scope, requestId, promise };
     return promise;
-  }, [claudeDir, codexDir, provider, scope, settingsReady]);
+  }, [claudeDir, codexDir, opencodeDir, provider, scope, settingsReady]);
 
   useEffect(() => {
     requestSeq.current += 1;
@@ -140,7 +141,7 @@ export function useProjectGroups(provider: SessionProvider) {
       setError(null);
       return;
     }
-    const providerDir = provider === "claude" ? settings.claude_dir : settings.codex_dir;
+    const providerDir = provider === "claude" ? settings.claude_dir : provider === "opencode" ? settings.opencode_dir : settings.codex_dir;
     if (!providerDir) {
       setGroups([]);
       setLoading(false);
@@ -149,7 +150,7 @@ export function useProjectGroups(provider: SessionProvider) {
     setLoading(true);
     setError(null);
     try {
-      const next = await api.groupByProject(provider, settings.codex_dir, settings.claude_dir);
+      const next = await api.groupByProject(provider, settings.codex_dir, settings.claude_dir, settings.opencode_dir);
       if (request === requestSeq.current) setGroups(next);
     } catch (error) {
       if (request === requestSeq.current) {
@@ -158,7 +159,7 @@ export function useProjectGroups(provider: SessionProvider) {
     } finally {
       if (request === requestSeq.current) setLoading(false);
     }
-  }, [settings?.codex_dir, settings?.claude_dir, provider]);
+  }, [settings?.codex_dir, settings?.claude_dir, settings?.opencode_dir, provider]);
 
   useEffect(() => {
     void refresh();

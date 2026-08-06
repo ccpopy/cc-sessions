@@ -131,6 +131,12 @@ pub fn default_claude_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".claude"))
 }
 
+pub fn default_opencode_dir() -> PathBuf {
+    dirs::home_dir()
+        .map(|home| home.join(".local").join("share").join("opencode"))
+        .unwrap_or_else(|| PathBuf::from(".local/share/opencode"))
+}
+
 pub fn default_backup_dir() -> PathBuf {
     let cc_root = default_codex_dir();
     cc_root

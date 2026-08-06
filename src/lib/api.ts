@@ -40,15 +40,19 @@ function resumeCommandText(provider: SessionProvider, sessionId: string, cwd?: s
       }
       return `claude --resume ${sessionId}`;
     }
+    case "opencode":
+      return `opencode --session ${sessionId}`;
   }
 }
 
-export type SessionProvider = "codex" | "claude";
+export type CoreSessionProvider = "codex" | "claude";
+export type SessionProvider = CoreSessionProvider | "opencode";
 export type StatsProvider = "all" | SessionProvider;
 
 export type Settings = {
   codex_dir: string;
   claude_dir: string;
+  opencode_dir: string;
   backup_dir: string;
   open_command: string;
   refresh_interval_ms: number;
@@ -194,6 +198,33 @@ export type SessionMetaBrief = {
   cli_version: string | null;
   source: string | null;
   model_provider: string | null;
+};
+
+export type ClaudeMemoryProject = {
+  project_key: string;
+  project_path: string;
+  memory_dir: string;
+  file_count: number;
+  total_bytes: number;
+  updated_at: number;
+  has_index: boolean;
+};
+
+export type ClaudeMemoryFile = {
+  project_key: string;
+  file_name: string;
+  path: string;
+  title: string;
+  preview: string;
+  bytes: number;
+  updated_at: number;
+  is_index: boolean;
+  sha256: string;
+};
+
+export type ClaudeMemoryDocument = {
+  file: ClaudeMemoryFile;
+  content: string;
 };
 
 export type DeleteResult = {
@@ -417,6 +448,8 @@ export type OrphanPruneReport = {
   threads_removed: number;
   family_branches_removed: number;
   families_removed: number;
+  families_recovered: number;
+  families_normalized: number;
   families_skipped: string[];
   dry_run: boolean;
 };
@@ -796,15 +829,17 @@ export const api = {
   },
   defaultCodexDir: () => invokeCommand<string>("default_codex_dir"),
   defaultClaudeDir: () => invokeCommand<string>("default_claude_dir"),
+  defaultOpenCodeDir: () => invokeCommand<string>("default_opencode_dir"),
   validateCodexDir: (path: string) => invokeCommand<DirValidation>("validate_codex_dir", { path }),
   validateClaudeDir: (path: string) => invokeCommand<DirValidation>("validate_claude_dir", { path }),
+  validateOpenCodeDir: (path: string) => invokeCommand<DirValidation>("validate_opencode_dir", { path }),
 
-  listSessions: (provider: SessionProvider, codexDir: string, claudeDir?: string) =>
-    invokeCommand<SessionSummary[]>("list_sessions", { provider, codexDir, claudeDir }),
-  groupByProject: (provider: SessionProvider, codexDir: string, claudeDir?: string) =>
-    invokeCommand<ProjectGroup[]>("group_sessions_by_project", { provider, codexDir, claudeDir }),
-  searchSessions: (provider: SessionProvider, codexDir: string, claudeDir: string | undefined, query: string) =>
-    invokeCommand<SessionSummary[]>("search_sessions", { provider, codexDir, claudeDir, query }),
+  listSessions: (provider: SessionProvider, codexDir: string, claudeDir?: string, opencodeDir?: string) =>
+    invokeCommand<SessionSummary[]>("list_sessions", { provider, codexDir, claudeDir, opencodeDir }),
+  groupByProject: (provider: SessionProvider, codexDir: string, claudeDir?: string, opencodeDir?: string) =>
+    invokeCommand<ProjectGroup[]>("group_sessions_by_project", { provider, codexDir, claudeDir, opencodeDir }),
+  searchSessions: (provider: SessionProvider, codexDir: string, claudeDir: string | undefined, opencodeDir: string | undefined, query: string) =>
+    invokeCommand<SessionSummary[]>("search_sessions", { provider, codexDir, claudeDir, opencodeDir, query }),
   startContentSearch: (p: {
     provider: SessionProvider;
     codexDir: string;
@@ -818,10 +853,10 @@ export const api = {
     invokeCommand<{ job_id: number } | null>("active_content_search"),
   cancelContentSearch: (jobId: number) =>
     invokeCommand<void>("cancel_content_search", { jobId }),
-  setArchived: (provider: SessionProvider, codexDir: string, id: string, v: boolean) =>
-    invokeCommand<void>("set_archived", { provider, codexDir, id, v }),
-  renameSession: (provider: SessionProvider, codexDir: string, id: string, title: string) =>
-    invokeCommand<number>("rename_session", { provider, codexDir, id, title }),
+  setArchived: (provider: SessionProvider, codexDir: string, id: string, v: boolean, opencodeDir?: string) =>
+    invokeCommand<void>("set_archived", { provider, codexDir, id, v, opencodeDir }),
+  renameSession: (provider: SessionProvider, codexDir: string, id: string, title: string, opencodeDir?: string) =>
+    invokeCommand<number>("rename_session", { provider, codexDir, id, title, opencodeDir }),
   moveSessionCwd: (provider: SessionProvider, codexDir: string, id: string, targetCwd: string) =>
     invokeCommand<MoveSessionCwdReport>("move_session_cwd", { provider, codexDir, id, targetCwd }),
   deleteSession: (
@@ -830,18 +865,21 @@ export const api = {
     id: string,
     claudeDir?: string,
     target?: DeleteTarget,
-  ) => invokeCommand<DeleteResult>("delete_session", { provider, codexDir, claudeDir, id, target }),
+    opencodeDir?: string,
+  ) => invokeCommand<DeleteResult>("delete_session", { provider, codexDir, claudeDir, opencodeDir, id, target }),
   deleteSessions: (
     provider: SessionProvider,
     codexDir: string,
     ids: string[],
     claudeDir?: string,
     targets?: DeleteTarget[],
+    opencodeDir?: string,
   ) =>
     invokeCommand<DeleteResult[]>("delete_sessions", {
       provider,
       codexDir,
       claudeDir,
+      opencodeDir,
       ids,
       targets,
     }),
@@ -854,6 +892,56 @@ export const api = {
     invokeCommand<UserPromptList>("preview_session_user_prompts", { provider, rolloutPath }),
   previewMeta: (provider: SessionProvider, rolloutPath: string) =>
     invokeCommand<SessionMetaBrief>("preview_session_meta", { provider, rolloutPath }),
+  listClaudeMemoryProjects: (claudeDir: string) =>
+    invokeCommand<ClaudeMemoryProject[]>("list_claude_memory_projects", { claudeDir }),
+  listClaudeMemoryFiles: (claudeDir: string, projectKey: string) =>
+    invokeCommand<ClaudeMemoryFile[]>("list_claude_memory_files", { claudeDir, projectKey }),
+  readClaudeMemoryFile: (claudeDir: string, projectKey: string, fileName: string) =>
+    invokeCommand<ClaudeMemoryDocument>("read_claude_memory_file", {
+      claudeDir,
+      projectKey,
+      fileName,
+    }),
+  saveClaudeMemoryFile: (p: {
+    claude_dir: string;
+    project_key: string;
+    file_name: string;
+    content: string;
+    expected_sha256?: string | null;
+  }) =>
+    invokeCommand<ClaudeMemoryDocument>("save_claude_memory_file", {
+      claudeDir: p.claude_dir,
+      projectKey: p.project_key,
+      fileName: p.file_name,
+      content: p.content,
+      expectedSha256: p.expected_sha256 ?? null,
+    }),
+  renameClaudeMemoryFile: (p: {
+    claude_dir: string;
+    project_key: string;
+    file_name: string;
+    new_file_name: string;
+    expected_sha256: string;
+  }) =>
+    invokeCommand<ClaudeMemoryDocument>("rename_claude_memory_file", {
+      claudeDir: p.claude_dir,
+      projectKey: p.project_key,
+      fileName: p.file_name,
+      newFileName: p.new_file_name,
+      expectedSha256: p.expected_sha256,
+    }),
+  deleteClaudeMemoryFile: (p: {
+    claude_dir: string;
+    project_key: string;
+    file_name: string;
+    expected_sha256: string;
+  }) =>
+    invokeCommand<boolean>("delete_claude_memory_file", {
+      claudeDir: p.claude_dir,
+      projectKey: p.project_key,
+      fileName: p.file_name,
+      expectedSha256: p.expected_sha256,
+    }),
   readPreviewImage: (path: string) =>
     invokeCommand<PreviewImageData>("read_preview_image", { path }),
 
@@ -941,6 +1029,7 @@ export const api = {
     provider: StatsProvider;
     codex_dir: string;
     claude_dir?: string;
+    opencode_dir?: string;
     from_ts: number | null;
     to_ts: number | null;
     cwd_filter: string[];
@@ -950,6 +1039,7 @@ export const api = {
       provider: p.provider,
       codexDir: p.codex_dir,
       claudeDir: p.claude_dir,
+      opencodeDir: p.opencode_dir,
       fromTs: p.from_ts,
       toTs: p.to_ts,
       cwdFilter: p.cwd_filter,
@@ -959,6 +1049,7 @@ export const api = {
     provider: StatsProvider;
     codex_dir: string;
     claude_dir?: string;
+    opencode_dir?: string;
     from_ts: number | null;
     to_ts: number | null;
     bucket: "day" | "week";
@@ -969,6 +1060,7 @@ export const api = {
       provider: p.provider,
       codexDir: p.codex_dir,
       claudeDir: p.claude_dir,
+      opencodeDir: p.opencode_dir,
       fromTs: p.from_ts,
       toTs: p.to_ts,
       bucket: p.bucket,
@@ -979,6 +1071,7 @@ export const api = {
     provider: StatsProvider;
     codex_dir: string;
     claude_dir?: string;
+    opencode_dir?: string;
     from_ts: number | null;
     to_ts: number | null;
     limit: number;
@@ -989,6 +1082,7 @@ export const api = {
       provider: p.provider,
       codexDir: p.codex_dir,
       claudeDir: p.claude_dir,
+      opencodeDir: p.opencode_dir,
       fromTs: p.from_ts,
       toTs: p.to_ts,
       limit: p.limit,
@@ -999,6 +1093,7 @@ export const api = {
     provider: StatsProvider;
     codex_dir: string;
     claude_dir?: string;
+    opencode_dir?: string;
     from_ts: number | null;
     to_ts: number | null;
     cwd_filter: string[];
@@ -1008,6 +1103,7 @@ export const api = {
       provider: p.provider,
       codexDir: p.codex_dir,
       claudeDir: p.claude_dir,
+      opencodeDir: p.opencode_dir,
       fromTs: p.from_ts,
       toTs: p.to_ts,
       cwdFilter: p.cwd_filter,
@@ -1017,6 +1113,7 @@ export const api = {
     provider: StatsProvider;
     codex_dir: string;
     claude_dir?: string;
+    opencode_dir?: string;
     from_ts: number | null;
     to_ts: number | null;
     cwd_filter: string[];
@@ -1026,6 +1123,7 @@ export const api = {
       provider: p.provider,
       codexDir: p.codex_dir,
       claudeDir: p.claude_dir,
+      opencodeDir: p.opencode_dir,
       fromTs: p.from_ts,
       toTs: p.to_ts,
       cwdFilter: p.cwd_filter,

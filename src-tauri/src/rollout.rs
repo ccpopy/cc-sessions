@@ -432,6 +432,7 @@ fn preview_range_by_provider(
     match provider.as_deref().unwrap_or("codex") {
         "codex" => preview_range_impl(path, offset, limit),
         "claude" => crate::claude_sessions::preview_range(path, offset, limit),
+        "opencode" => crate::opencode_sessions::preview_range(path, offset, limit),
         other => Err(crate::error::AppError::Other(format!(
             "不支持的 provider: {other}"
         ))),
@@ -491,6 +492,7 @@ pub fn preview_session_user_prompts(
             crate::claude_sessions::classify_preview,
             claude_event_is_agent_activity,
         ),
+        "opencode" => crate::opencode_sessions::preview_user_prompts(&rollout_path),
         other => Err(crate::error::AppError::Other(format!(
             "不支持的 provider: {other}"
         ))),
@@ -520,11 +522,7 @@ fn user_prompts_impl(
 ) -> AppResult<UserPromptList> {
     let f = File::open(PathBuf::from(path))?;
     let reader = BufReader::new(f);
-    let mut prompts = Vec::new();
-    let mut total_events = 0usize;
-    let mut current_has_agent_activity = false;
-    let mut current_has_explicit_assistant_phase = false;
-    let mut current_has_final_answer = false;
+    let mut events = Vec::new();
     for (i, line) in reader.lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
@@ -536,10 +534,21 @@ fn user_prompts_impl(
         let Some(event) = classify_line(i, raw) else {
             continue;
         };
-        // offset 必须与 preview_session_range 的事件计数保持一致，前端靠它分页加载到目标
-        let offset = total_events;
-        total_events += 1;
+        events.push(event);
+    }
+    Ok(user_prompts_from_events(events, event_is_agent_activity))
+}
 
+pub(crate) fn user_prompts_from_events(
+    events: Vec<PreviewEvent>,
+    event_is_agent_activity: impl Fn(&PreviewEvent) -> bool,
+) -> UserPromptList {
+    let total_events = events.len();
+    let mut prompts = Vec::new();
+    let mut current_has_agent_activity = false;
+    let mut current_has_explicit_assistant_phase = false;
+    let mut current_has_final_answer = false;
+    for (offset, event) in events.into_iter().enumerate() {
         let is_conversation = preview_event_is_conversation(&event);
         if is_conversation && event.role == "user" {
             discard_inactive_current_prompt(&mut prompts, current_has_agent_activity);
@@ -601,10 +610,10 @@ fn user_prompts_impl(
             _ => {}
         }
     }
-    Ok(UserPromptList {
+    UserPromptList {
         prompts,
         total_events,
-    })
+    }
 }
 
 fn discard_inactive_current_prompt(
@@ -767,8 +776,15 @@ pub fn preview_session_meta(
     provider: Option<String>,
     rollout_path: String,
 ) -> AppResult<SessionMetaBrief> {
-    if provider.as_deref().unwrap_or("codex") == "claude" {
-        return crate::claude_sessions::preview_meta(&rollout_path);
+    match provider.as_deref().unwrap_or("codex") {
+        "claude" => return crate::claude_sessions::preview_meta(&rollout_path),
+        "opencode" => return crate::opencode_sessions::preview_meta(&rollout_path),
+        "codex" => {}
+        other => {
+            return Err(crate::error::AppError::Other(format!(
+                "不支持的 provider: {other}"
+            )))
+        }
     }
     let f = File::open(PathBuf::from(&rollout_path))?;
     let mut reader = BufReader::new(f);

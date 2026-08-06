@@ -83,6 +83,7 @@ function CodexRepairRoute() {
   const [provider, setProvider] = useState<ProviderInfo | null>(null);
   const [projectConfig, setProjectConfig] = useState<ProjectConfigReport | null>(null);
   const [integrity, setIntegrity] = useState<FamilyIntegrityReport | null>(null);
+  const [familyPrunePreview, setFamilyPrunePreview] = useState<OrphanPruneReport | null>(null);
   const [loading, setLoading] = useState(false);
   const [strategy, setStrategy] = useState<SwitchStrategy>("continuous");
   const [confirmBatch, setConfirmBatch] = useState(false);
@@ -98,22 +99,35 @@ function CodexRepairRoute() {
     diag == null
       ? undefined
       : `threads 表包含 ${diag.threads_active_count} 条活跃会话和 ${diag.threads_archived_count} 条本工具归档备份；归档备份存放在 archived_sessions/，不等同于 Codex 官方设置页的“已归档对话”。`;
-  const missingFamilyBranches = integrity?.items.filter((item) => item.missing).length ?? 0;
+  const familyCleanupCount = familyPrunePreview
+    ? familyPrunePreview.family_branches_removed +
+      familyPrunePreview.families_removed +
+      familyPrunePreview.families_recovered +
+      familyPrunePreview.families_normalized
+    : 0;
 
   const refresh = useCallback(async () => {
     if (!codexDir) return;
     setLoading(true);
     try {
-      const [d, p, c, i] = await Promise.all([
+      const [d, p, c, i, familyPreview] = await Promise.all([
         api.diagnoseCodexState(codexDir),
         api.getProviderInfo(codexDir),
         api.diagnoseProjectConfigs(codexDir),
         api.verifyFamilyIntegrity(codexDir),
+        api.pruneOrphanEntries({
+          codex_dir: codexDir,
+          prune_index: false,
+          prune_threads: false,
+          prune_family: true,
+          dry_run: true,
+        }),
       ]);
       setDiag(d);
       setProvider(p);
       setProjectConfig(c);
       setIntegrity(i);
+      setFamilyPrunePreview(familyPreview);
     } catch (e) {
       toast.error(`诊断失败：${String((e as Error)?.message ?? e)}`);
     } finally {
@@ -138,7 +152,13 @@ function CodexRepairRoute() {
 
   const showFamilyPruneResult = (report: OrphanPruneReport, preview: boolean) => {
     const action = preview ? "预览：将移除" : "已移除";
-    const message = `${action} ${report.family_branches_removed} 个孤儿分支、${report.families_removed} 个空 family`;
+    const recovery = report.families_recovered > 0
+      ? `，${preview ? "将恢复" : "已恢复"} ${report.families_recovered} 个可确定当前分支的 family`
+      : "";
+    const normalization = report.families_normalized > 0
+      ? `，${preview ? "将校正" : "已校正"} ${report.families_normalized} 个 family 的 active 状态`
+      : "";
+    const message = `${action} ${report.family_branches_removed} 个孤儿分支、${report.families_removed} 个空 family${recovery}${normalization}`;
     if (report.families_skipped.length > 0) {
       toast.warning(`${message}；跳过 ${report.families_skipped.length} 个需人工确认的 family`, {
         description: report.families_skipped.slice(0, 3).join("\n"),
@@ -698,16 +718,16 @@ function CodexRepairRoute() {
                   </CardTitle>
                 </CardHeader>
                 <CardContent className="min-w-0 space-y-2">
-                  {integrity == null ? (
+                  {integrity == null || familyPrunePreview == null ? (
                     <div className="text-xs text-muted-foreground">—</div>
-                  ) : integrity.items.length === 0 ? (
-                    <div className="text-xs text-muted-foreground">
-                      尚无已固化校验信息（归档分支后会自动记录 sha256 + 行数）
-                    </div>
                   ) : (
                     <div className="space-y-1.5">
                       <div className="flex flex-wrap items-center gap-2 text-xs">
-                        {integrity.all_ok ? (
+                        {integrity.items.length === 0 ? (
+                          <span className="text-muted-foreground">
+                            尚无已固化校验信息（归档分支后会自动记录 sha256 + 行数）
+                          </span>
+                        ) : integrity.all_ok ? (
                           <>
                             <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
                             <span>全部 {integrity.items.length} 条校验通过</span>
@@ -736,34 +756,47 @@ function CodexRepairRoute() {
                                       prune_family: true,
                                       dry_run: true,
                                     });
+                                    setFamilyPrunePreview(report);
                                     showFamilyPruneResult(report, true);
                                   });
                                 } else {
                                   setConfirmPrune("family");
                                 }
                               }}
-                              disabled={!!running || missingFamilyBranches === 0}
+                              disabled={!!running || familyCleanupCount === 0}
                               className="ml-auto gap-1.5"
                             >
                               <Eraser className="h-3.5 w-3.5" />
                               清理 family 残留
-                              {missingFamilyBranches > 0 && (
+                              {familyCleanupCount > 0 && (
                                 <Badge
                                   variant="outline"
                                   className="ml-0.5 h-4 border-current/30 bg-background/20 px-1 text-[10px] font-normal"
                                 >
-                                  {missingFamilyBranches}
+                                  {familyCleanupCount}
                                 </Badge>
                               )}
                             </Button>
                           </TooltipTrigger>
                           <TooltipContent className="max-w-sm text-xs">
-                            清理 <code>session_family.json</code> 中已确认没有 rollout
-                            的空 family 或非 active 历史分支。若 active 文件缺失但仍有历史分支，会保留并提示人工确认。
+                            修复 <code>session_family.json</code> 中可安全确定的残留：移除缺失分支或空
+                            family，并在唯一可判断时恢复 active_id、root 与分支状态。不会改写任何现存
+                            rollout JSONL；无法唯一判断的 family 只会报告。
                           </TooltipContent>
                         </Tooltip>
                       </div>
-                      <div className="max-h-64 max-w-full overflow-auto rounded-md border">
+                      {(familyCleanupCount > 0 || familyPrunePreview.families_skipped.length > 0) && (
+                        <div className="rounded-md border border-border/60 bg-muted/20 px-3 py-2 text-[11px] leading-5 text-muted-foreground">
+                          可自动处理：{familyPrunePreview.family_branches_removed} 个缺失分支、
+                          {familyPrunePreview.families_removed} 个空 family、恢复 {familyPrunePreview.families_recovered} 个
+                          active_id、校正 {familyPrunePreview.families_normalized} 个状态
+                          {familyPrunePreview.families_skipped.length > 0 && (
+                            <>；另有 {familyPrunePreview.families_skipped.length} 个 family 无法唯一判断，需人工检查</>
+                          )}
+                        </div>
+                      )}
+                      {integrity.items.length > 0 && (
+                        <div className="max-h-64 max-w-full overflow-auto rounded-md border">
                         <table className="w-full text-xs">
                           <thead className="bg-muted/40 text-left">
                             <tr>
@@ -821,6 +854,7 @@ function CodexRepairRoute() {
                           </tbody>
                         </table>
                       </div>
+                      )}
                     </div>
                   )}
                 </CardContent>
@@ -944,10 +978,12 @@ function CodexRepairRoute() {
                 </>
               ) : (
                 <>
-                  即将检查 <code>session_family.json</code> 中的{" "}
-                  <b>{missingFamilyBranches}</b> 个缺失分支。只会自动删除没有任何 rollout 的空 family，
-                  或 active 文件仍存在时缺失的非 active 历史分支；active 文件缺失但仍有历史分支的
-                  family 会保留并报告，避免自动改变当前分支。
+                  即将按预览修复 <code>session_family.json</code>：移除{" "}
+                  <b>{familyPrunePreview?.family_branches_removed ?? 0}</b> 个缺失分支和{" "}
+                  <b>{familyPrunePreview?.families_removed ?? 0}</b> 个空 family，恢复{" "}
+                  <b>{familyPrunePreview?.families_recovered ?? 0}</b> 个可唯一确定的 active_id，并校正{" "}
+                  <b>{familyPrunePreview?.families_normalized ?? 0}</b> 个 family 的 active/root/状态元数据。
+                  无法唯一判断的 family 会跳过；现存 rollout JSONL 不会被改写。
                 </>
               )}
             </AlertDialogDescription>

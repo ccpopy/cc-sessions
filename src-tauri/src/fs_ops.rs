@@ -195,6 +195,7 @@ pub fn resume_command_text(
     let text = match provider.as_deref().unwrap_or("codex") {
         "codex" => format!("codex resume {}", session_id),
         "claude" => claude_resume_command(&session_id, cwd.as_deref()),
+        "opencode" => format!("opencode --session {}", session_id),
         other => return Err(AppError::Other(format!("不支持的 provider: {other}"))),
     };
     Ok(text)
@@ -221,7 +222,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{claude_resume_command, read_preview_image};
+    use super::{claude_resume_command, read_preview_image, resume_command_text};
 
     struct TestDir(PathBuf);
 
@@ -356,6 +357,15 @@ mod tests {
         assert_eq!(
             command,
             "cd -- 'F:\\demo\\it'\"'\"'s-project' && claude --resume 019f8e89-c687-7ce5-9e82-5434fcc9f133"
+        );
+    }
+
+    #[test]
+    fn opencode_resume_command_uses_session_flag() {
+        assert_eq!(
+            resume_command_text(Some("opencode".into()), "ses_test".into(), None)
+                .expect("OpenCode resume command"),
+            "opencode --session ses_test"
         );
     }
 }

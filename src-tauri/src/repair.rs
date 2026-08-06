@@ -879,6 +879,11 @@ pub(crate) fn is_subagent_source(source: Option<&str>) -> bool {
     if source.eq_ignore_ascii_case("subagent") {
         return true;
     }
+    if source.split_once(':').is_some_and(|(kind, parent_id)| {
+        kind.eq_ignore_ascii_case("parent") && !parent_id.trim().is_empty()
+    }) {
+        return true;
+    }
     serde_json::from_str::<Value>(source)
         .ok()
         .is_some_and(|v| v.get("subagent").is_some())
@@ -1131,7 +1136,20 @@ pub fn prune_orphan_entries_with_lock(
 struct FamilyOrphanPrunePlan {
     family_ids: Vec<String>,
     branches: Vec<(String, String)>,
+    recoveries: Vec<FamilyActiveRecovery>,
+    normalizations: Vec<FamilyActiveNormalization>,
     skipped_family_ids: Vec<String>,
+}
+
+struct FamilyActiveRecovery {
+    family_id: String,
+    active_id: String,
+    missing_branch_ids: Vec<String>,
+}
+
+struct FamilyActiveNormalization {
+    family_id: String,
+    active_id: String,
 }
 
 fn family_branch_rollout_exists(
@@ -1173,6 +1191,39 @@ fn family_metadata_is_consistent(
     )
 }
 
+fn family_structure_is_safe_to_repair(
+    store: &crate::models::FamilyStore,
+    family_id: &str,
+    family_record: &Family,
+) -> bool {
+    if family_record.family_id != family_id || family_record.chain.is_empty() {
+        return false;
+    }
+    let mut chain_ids = BTreeSet::new();
+    for branch in &family_record.chain {
+        if !chain_ids.insert(branch.id.as_str())
+            || store.index.get(&branch.id).map(String::as_str) != Some(family_id)
+        {
+            return false;
+        }
+    }
+    if store.index.iter().any(|(branch_id, mapped_family_id)| {
+        mapped_family_id == family_id && !chain_ids.contains(branch_id.as_str())
+    }) {
+        return false;
+    }
+    !store
+        .families
+        .iter()
+        .any(|(other_family_id, other_family)| {
+            other_family_id != family_id
+                && other_family
+                    .chain
+                    .iter()
+                    .any(|branch| chain_ids.contains(branch.id.as_str()))
+        })
+}
+
 fn existing_family_branch_ids(
     codex: &Path,
     family_record: &Family,
@@ -1195,10 +1246,7 @@ fn plan_family_orphan_prune(
     let mut plan = FamilyOrphanPrunePlan::default();
 
     for (family_id, family_record) in &store.families {
-        if !family_metadata_is_consistent(store, family_id, family_record) {
-            plan.skipped_family_ids.push(family_id.clone());
-            continue;
-        }
+        let metadata_consistent = family_metadata_is_consistent(store, family_id, family_record);
         let Some(existing_branch_ids) =
             existing_family_branch_ids(codex, family_record, rollout_ids)
         else {
@@ -1207,7 +1255,11 @@ fn plan_family_orphan_prune(
         };
 
         if existing_branch_ids.is_empty() {
-            plan.family_ids.push(family_id.clone());
+            if metadata_consistent {
+                plan.family_ids.push(family_id.clone());
+            } else {
+                plan.skipped_family_ids.push(family_id.clone());
+            }
             continue;
         }
 
@@ -1217,8 +1269,44 @@ fn plan_family_orphan_prune(
             .find(|branch| branch.id == family_record.active_id)
             .is_some_and(|branch| existing_branch_ids.contains(&branch.id));
         if !active_exists {
+            let existing_active_ids = family_record
+                .chain
+                .iter()
+                .filter(|branch| {
+                    existing_branch_ids.contains(&branch.id)
+                        && matches!(branch.status, crate::models::BranchStatus::Active)
+                })
+                .map(|branch| branch.id.clone())
+                .collect::<Vec<_>>();
+            if existing_active_ids.len() == 1
+                && family_structure_is_safe_to_repair(store, family_id, family_record)
+            {
+                plan.recoveries.push(FamilyActiveRecovery {
+                    family_id: family_id.clone(),
+                    active_id: existing_active_ids[0].clone(),
+                    missing_branch_ids: family_record
+                        .chain
+                        .iter()
+                        .filter(|branch| !existing_branch_ids.contains(&branch.id))
+                        .map(|branch| branch.id.clone())
+                        .collect(),
+                });
+                continue;
+            }
             plan.skipped_family_ids.push(family_id.clone());
             continue;
+        }
+
+        if !metadata_consistent {
+            if family_structure_is_safe_to_repair(store, family_id, family_record) {
+                plan.normalizations.push(FamilyActiveNormalization {
+                    family_id: family_id.clone(),
+                    active_id: family_record.active_id.clone(),
+                });
+            } else {
+                plan.skipped_family_ids.push(family_id.clone());
+                continue;
+            }
         }
 
         let missing_branch_ids = family_record
@@ -1269,6 +1357,8 @@ fn prune_orphan_entries_locked(
     let mut threads_removed = 0u32;
     let mut family_branches_removed = 0u32;
     let mut families_removed = 0u32;
+    let mut families_recovered = 0u32;
+    let mut families_normalized = 0u32;
     let mut families_skipped = Vec::new();
 
     if prune_family {
@@ -1276,14 +1366,78 @@ fn prune_orphan_entries_locked(
         let plan = plan_family_orphan_prune(&codex, &store, &all_rollout_ids);
         family_branches_removed = plan.branches.len() as u32;
         families_removed = plan.family_ids.len() as u32;
+        families_recovered = plan.recoveries.len() as u32;
+        families_normalized = plan.normalizations.len() as u32;
+        family_branches_removed += plan
+            .recoveries
+            .iter()
+            .map(|recovery| recovery.missing_branch_ids.len() as u32)
+            .sum::<u32>();
         families_skipped = plan.skipped_family_ids;
 
-        if !dry_run && (family_branches_removed > 0 || families_removed > 0) {
+        if !dry_run
+            && (family_branches_removed > 0
+                || families_removed > 0
+                || families_recovered > 0
+                || families_normalized > 0)
+        {
             for family_id in &plan.family_ids {
                 family::remove_family(&mut store, family_id)?;
             }
+            for normalization in &plan.normalizations {
+                let family_record = store
+                    .families
+                    .get_mut(&normalization.family_id)
+                    .ok_or_else(|| {
+                        AppError::NotFound(format!(
+                            "family not found during normalization: {}",
+                            normalization.family_id
+                        ))
+                    })?;
+                for branch in &mut family_record.chain {
+                    if branch.id == normalization.active_id {
+                        branch.status = BranchStatus::Active;
+                    } else if matches!(branch.status, BranchStatus::Active) {
+                        branch.status = BranchStatus::Archived;
+                    }
+                }
+                family_record.updated_at = chrono::Utc::now().to_rfc3339();
+            }
             for (family_id, branch_id) in &plan.branches {
                 family::remove_non_active_branch(&mut store, family_id, branch_id)?;
+            }
+            for recovery in &plan.recoveries {
+                {
+                    let family_record =
+                        store.families.get_mut(&recovery.family_id).ok_or_else(|| {
+                            AppError::NotFound(format!(
+                                "family not found during recovery: {}",
+                                recovery.family_id
+                            ))
+                        })?;
+                    family_record
+                        .chain
+                        .retain(|branch| !recovery.missing_branch_ids.contains(&branch.id));
+                    for branch in &mut family_record.chain {
+                        branch.status = if branch.id == recovery.active_id {
+                            crate::models::BranchStatus::Active
+                        } else {
+                            crate::models::BranchStatus::Archived
+                        };
+                    }
+                    family_record.active_id = recovery.active_id.clone();
+                    if !family_record
+                        .chain
+                        .iter()
+                        .any(|branch| branch.id == family_record.root_id)
+                    {
+                        family_record.root_id = recovery.active_id.clone();
+                    }
+                    family_record.updated_at = chrono::Utc::now().to_rfc3339();
+                }
+                for branch_id in &recovery.missing_branch_ids {
+                    store.index.remove(branch_id);
+                }
             }
             family::save(&codex, &store)?;
         }
@@ -1343,6 +1497,8 @@ fn prune_orphan_entries_locked(
         threads_removed,
         family_branches_removed,
         families_removed,
+        families_recovered,
+        families_normalized,
         families_skipped,
         dry_run,
     })
@@ -5331,6 +5487,13 @@ mod tests {
     use crate::models::{BranchStatus, Family, FamilyBranch, FamilyStore};
     use std::collections::BTreeMap;
 
+    #[test]
+    fn opencode_parent_sources_are_subagent_sessions() {
+        assert!(is_subagent_source(Some("parent:ses_parent")));
+        assert!(is_subagent_source(Some("PARENT: ses_parent")));
+        assert!(!is_subagent_source(Some("parent:")));
+    }
+
     fn temp_codex_dir(name: &str) -> PathBuf {
         let unique = format!(
             "{}-{}-{}",
@@ -7785,6 +7948,67 @@ mod tests {
     }
 
     #[test]
+    fn prune_family_orphans_normalizes_duplicate_active_markers() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-prune-normalize-active-test");
+        write_rollout(&codex, "active-branch", DEFAULT_PROVIDER)?;
+        write_rollout_in(&codex, "archived_sessions", "history-branch", "custom")?;
+        save_two_branch_family(
+            &codex,
+            "active-branch",
+            DEFAULT_PROVIDER,
+            "sessions/2026/04/22/rollout-active-branch.jsonl",
+            "history-branch",
+            "custom",
+            "archived_sessions/rollout-history-branch.jsonl",
+        )?;
+        let mut store = family::load(&codex)?;
+        store
+            .families
+            .get_mut("active-branch")
+            .expect("family fixture")
+            .chain[1]
+            .status = BranchStatus::Active;
+        family::save(&codex, &store)?;
+        let before = serde_json::to_value(&store)?;
+        let lock = family::FamilyLock::default();
+
+        let preview = prune_orphan_entries_with_lock(
+            codex.to_string_lossy().into_owned(),
+            false,
+            false,
+            true,
+            true,
+            &lock,
+        )?;
+        assert_eq!(preview.families_normalized, 1);
+        assert_eq!(serde_json::to_value(family::load(&codex)?)?, before);
+
+        let report = prune_orphan_entries_with_lock(
+            codex.to_string_lossy().into_owned(),
+            false,
+            false,
+            true,
+            false,
+            &lock,
+        )?;
+        let restored = family::load(&codex)?;
+        let family_record = &restored.families["active-branch"];
+
+        assert_eq!(report.families_normalized, 1);
+        assert!(report.families_skipped.is_empty());
+        assert!(matches!(
+            family_record.chain[0].status,
+            BranchStatus::Active
+        ));
+        assert!(matches!(
+            family_record.chain[1].status,
+            BranchStatus::Archived
+        ));
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
     fn prune_family_orphans_preserves_partial_family_when_active_rollout_is_missing(
     ) -> AppResult<()> {
         let codex = temp_codex_dir("cc-session-manager-prune-missing-active-test");
@@ -7813,6 +8037,70 @@ mod tests {
         assert_eq!(report.families_removed, 0);
         assert_eq!(report.families_skipped, vec!["missing-active".to_string()]);
         assert_eq!(serde_json::to_value(family::load(&codex)?)?, before);
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn prune_family_orphans_recovers_unique_existing_active_branch() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-prune-recover-stale-active-test");
+        write_rollout(&codex, "surviving-active", DEFAULT_PROVIDER)?;
+        save_two_branch_family(
+            &codex,
+            "surviving-active",
+            DEFAULT_PROVIDER,
+            "sessions/2026/04/22/rollout-surviving-active.jsonl",
+            "missing-new-active",
+            "custom",
+            "sessions/2026/04/24/rollout-missing-new-active.jsonl",
+        )?;
+        let mut store = family::load(&codex)?;
+        let family_record = store
+            .families
+            .get_mut("surviving-active")
+            .expect("family fixture");
+        family_record.active_id = "missing-new-active".to_string();
+        family_record.chain[0].status = BranchStatus::Active;
+        family_record.chain[1].status = BranchStatus::Active;
+        family::save(&codex, &store)?;
+
+        let preview = prune_orphan_entries_with_lock(
+            codex.to_string_lossy().into_owned(),
+            false,
+            false,
+            true,
+            true,
+            &family::FamilyLock::default(),
+        )?;
+        assert_eq!(preview.families_recovered, 1);
+        assert_eq!(preview.family_branches_removed, 1);
+        assert_eq!(
+            family::load(&codex)?.families["surviving-active"]
+                .chain
+                .len(),
+            2
+        );
+
+        let report = prune_orphan_entries_with_lock(
+            codex.to_string_lossy().into_owned(),
+            false,
+            false,
+            true,
+            false,
+            &family::FamilyLock::default(),
+        )?;
+        let restored = family::load(&codex)?;
+        let family_record = &restored.families["surviving-active"];
+        assert_eq!(report.families_recovered, 1);
+        assert_eq!(report.family_branches_removed, 1);
+        assert!(report.families_skipped.is_empty());
+        assert_eq!(family_record.active_id, "surviving-active");
+        assert_eq!(family_record.chain.len(), 1);
+        assert!(matches!(
+            family_record.chain[0].status,
+            BranchStatus::Active
+        ));
+        assert!(!restored.index.contains_key("missing-new-active"));
         fs::remove_dir_all(&codex).ok();
         Ok(())
     }

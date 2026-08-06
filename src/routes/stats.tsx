@@ -5,7 +5,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 export default function StatsRoute() {
   return (
     <>
-      <TopBar title="统计" stats="Codex / Claude 本地数据" />
+      <TopBar title="统计" stats="Codex / Claude / OpenCode 本地数据" />
       <ScrollArea className="flex-1">
         <StatsDashboard />
       </ScrollArea>

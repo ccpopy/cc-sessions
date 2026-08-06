@@ -20,6 +20,7 @@ export function selectSessionsForView(
   options: SessionVisibilityOptions,
 ): SessionSummary[] {
   const isCodex = options.provider === "codex";
+  const supportsArchive = isCodex || options.provider === "opencode";
   const includeHiddenRecords = options.includeHiddenRecords ?? false;
   const candidates: SessionSummary[] = [];
 
@@ -29,7 +30,7 @@ export function selectSessionsForView(
       continue;
     }
     if (
-      isCodex
+      supportsArchive
       && !includeHiddenRecords
       && session.archived !== options.showArchivedSessions
     ) {

@@ -40,6 +40,7 @@ import {
   shortId,
 } from "@/lib/format";
 import { isSubagentSession } from "@/lib/sessionSource";
+import { accentBadgeFor, providerLabel } from "@/lib/providerTheme";
 import { sessionDisplayPreview, sessionDisplayTitle } from "@/lib/sessionText";
 import { cn } from "@/lib/utils";
 
@@ -51,7 +52,7 @@ type Props = {
   onCopyResume: (s: SessionSummary) => void;
   onRevealCwd: (s: SessionSummary) => void;
   onArchiveToggle?: (s: SessionSummary) => void;
-  onBackup: (s: SessionSummary) => void;
+  onBackup?: (s: SessionSummary) => void;
   onDelete?: (s: SessionSummary) => void;
   onClone?: (s: SessionSummary) => void;
   onDuplicate?: (s: SessionSummary) => void;
@@ -339,15 +340,17 @@ export const SessionCard = memo(function SessionCard({
                   {duplicating ? "Fork 中…" : "完整 Fork"}
                 </Button>
               )}
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => onBackup(s)}
-                className="h-7 gap-1.5 px-2.5 font-normal text-muted-foreground hover:text-foreground"
-              >
-                <Archive className="h-3.5 w-3.5" />
-                单条备份
-              </Button>
+              {onBackup && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => onBackup(s)}
+                  className="h-7 gap-1.5 px-2.5 font-normal text-muted-foreground hover:text-foreground"
+                >
+                  <Archive className="h-3.5 w-3.5" />
+                  单条备份
+                </Button>
+              )}
             </div>
 
             <div className="ml-auto flex shrink-0 items-center gap-1.5 font-mono text-[11px] tabular-nums text-muted-foreground">
@@ -495,24 +498,7 @@ function ConversionOriginBadge({ origin }: { origin: SessionConversionOrigin }) 
 }
 
 function providerPresentation(provider: string): { label: string; className: string } {
-  if (provider === "codex") {
-    return {
-      label: "Codex",
-      className:
-        "border-[#10A37F]/35 bg-[#10A37F]/10 text-[#087A60] dark:text-[#6EE7C2]",
-    };
-  }
-  if (provider === "claude") {
-    return {
-      label: "Claude",
-      className:
-        "border-[#D97757]/40 bg-[#D97757]/10 text-[#B3563B] dark:text-[#F2A386]",
-    };
-  }
-  return {
-    label: provider || "未知",
-    className: "border-border text-muted-foreground",
-  };
+  return accentBadgeFor(provider);
 }
 
 function formatConversionTime(value: string): string {
@@ -528,15 +514,22 @@ function subagentLabel(
   if (!isSubagent) {
     return null;
   }
+  const openCodeParent = s.provider === "opencode" && s.source?.trim().match(/^parent\s*:\s*(.+)$/i);
+  if (openCodeParent) {
+    return {
+      label: "子会话",
+      title: `OpenCode 子会话 · 父会话 ${openCodeParent[1]}`,
+    };
+  }
   const role = s.agent_role?.trim();
   const nickname = s.agent_nickname?.trim();
-  const providerLabel = s.provider === "claude" ? "Claude" : "Codex";
+  const agentLabel = providerLabel(s.provider);
   return {
     label: role ? `子代理 · ${role}` : "子代理",
     title: nickname
-      ? `${providerLabel} 子代理线程：${nickname}${role ? `（${role}）` : ""}`
+      ? `${agentLabel} 子代理线程：${nickname}${role ? `（${role}）` : ""}`
       : role
-        ? `${providerLabel} 子代理线程：${role}`
-        : `${providerLabel} 子代理线程`,
+        ? `${agentLabel} 子代理线程：${role}`
+        : `${agentLabel} 子代理线程`,
   };
 }

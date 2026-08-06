@@ -5,9 +5,9 @@ import {
   Download,
   ExternalLink,
   FolderOpen,
-  Home,
   Loader2,
   RefreshCw,
+  RotateCcw,
   Settings as SettingsIcon,
 } from "lucide-react";
 import {
@@ -20,6 +20,7 @@ import {
   SheetFooter,
 } from "@/components/ui/sheet";
 import { Button } from "@/components/ui/button";
+import { DangerDialog } from "@/components/DangerDialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
@@ -28,6 +29,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { api, type DirValidation, type UpdateCheckResult } from "@/lib/api";
 import { pickDirectoryPath } from "@/lib/dialog";
 import { useSettings } from "@/stores/settings";
+import { useMemoryDraft } from "@/stores/memoryDraft";
 import { toast } from "sonner";
 
 type Props = {
@@ -38,19 +40,24 @@ export function SettingsSheet({ trigger }: Props) {
   const settings = useSettings((s) => s.settings);
   const save = useSettings((s) => s.save);
   const load = useSettings((s) => s.load);
+  const memoryDirty = useMemoryDraft((state) => state.dirty);
   const [codex, setCodex] = useState("");
   const [claude, setClaude] = useState("");
+  const [opencode, setOpenCode] = useState("");
   const [backup, setBackup] = useState("");
   const [codexValidation, setCodexValidation] = useState<DirValidation | null>(null);
   const [claudeValidation, setClaudeValidation] = useState<DirValidation | null>(null);
+  const [opencodeValidation, setOpenCodeValidation] = useState<DirValidation | null>(null);
   const [updateState, setUpdateState] = useState<UpdateCheckResult>({ state: "idle" });
   const [currentVersion, setCurrentVersion] = useState("");
   const [currentVersionError, setCurrentVersionError] = useState("");
+  const [confirmClaudeDirChange, setConfirmClaudeDirChange] = useState(false);
 
   useEffect(() => {
     if (!settings) return;
     setCodex(settings.codex_dir);
     setClaude(settings.claude_dir);
+    setOpenCode(settings.opencode_dir);
     setBackup(settings.backup_dir);
   }, [settings]);
 
@@ -92,29 +99,49 @@ export function SettingsSheet({ trigger }: Props) {
     return () => window.clearTimeout(id);
   }, [claude]);
 
+  useEffect(() => {
+    if (!opencode) return;
+    const id = window.setTimeout(async () => {
+      try {
+        setOpenCodeValidation(await api.validateOpenCodeDir(opencode));
+      } catch {
+        setOpenCodeValidation(null);
+      }
+    }, 200);
+    return () => window.clearTimeout(id);
+  }, [opencode]);
+
   const pick = async (setter: (s: string) => void, cur: string) => {
     const picked = await pickDirectoryPath({ defaultPath: cur });
     if (picked) setter(picked);
   };
 
-  const useDefault = async () => {
-    const d = await api.defaultCodexDir();
-    setCodex(d);
+  const restoreCodexDefault = async () => {
+    setCodex(await api.defaultCodexDir());
   };
 
-  const useDefaultClaude = async () => {
-    const d = await api.defaultClaudeDir();
-    setClaude(d);
+  const restoreClaudeDefault = async () => {
+    setClaude(await api.defaultClaudeDir());
   };
 
-  const onSave = async () => {
-    try {
-      await save({ codex_dir: codex, claude_dir: claude, backup_dir: backup });
-      toast.success("设置已保存");
-      await load();
-    } catch (e: any) {
-      toast.error("保存失败: " + String(e?.message ?? e));
+  const restoreOpenCodeDefault = async () => {
+    setOpenCode(await api.defaultOpenCodeDir());
+  };
+
+  const persistSettings = async () => {
+    await save({ codex_dir: codex, claude_dir: claude, opencode_dir: opencode, backup_dir: backup });
+    toast.success("设置已保存");
+    await load();
+  };
+
+  const onSave = () => {
+    if (memoryDirty && settings && claude !== settings.claude_dir) {
+      setConfirmClaudeDirChange(true);
+      return;
     }
+    void persistSettings().catch((e: any) => {
+      toast.error("保存失败: " + String(e?.message ?? e));
+    });
   };
 
   const checkUpdate = async () => {
@@ -168,6 +195,7 @@ export function SettingsSheet({ trigger }: Props) {
   );
 
   return (
+    <>
     <Sheet>
       {trigger ? <SheetTrigger asChild>{trigger}</SheetTrigger> : defaultTrigger}
       <SheetContent
@@ -183,64 +211,55 @@ export function SettingsSheet({ trigger }: Props) {
 
         <div className="thin-scrollbar min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain px-6">
           <div className="space-y-6 py-6">
-          <div className="space-y-2">
-            <Label className="text-sm font-medium">Codex 目录</Label>
-            <div className="flex gap-2">
-              <Input
-                value={codex}
-                onChange={(e) => setCodex(e.target.value)}
-                placeholder={"C:\\Users\\<me>\\.codex"}
-                className="font-mono text-xs"
-              />
-              <Button variant="outline" size="icon" onClick={() => pick(setCodex, codex)} title="选择目录">
-                <FolderOpen className="h-4 w-4" />
-              </Button>
-              <Button variant="outline" size="icon" onClick={useDefault} title="使用默认">
-                <Home className="h-4 w-4" />
-              </Button>
-            </div>
+          <DirField
+            label="Codex 目录"
+            value={codex}
+            onChange={setCodex}
+            placeholder={"C:\\Users\\<me>\\.codex"}
+            onPick={() => pick(setCodex, codex)}
+            onRestoreDefault={restoreCodexDefault}
+          >
             <ValidationBadge v={codexValidation} provider="codex" />
-          </div>
+          </DirField>
 
           <Separator />
 
-          <div className="space-y-2">
-            <Label className="text-sm font-medium">Claude 目录</Label>
-            <div className="flex gap-2">
-              <Input
-                value={claude}
-                onChange={(e) => setClaude(e.target.value)}
-                placeholder={"C:\\Users\\<me>\\.claude"}
-                className="font-mono text-xs"
-              />
-              <Button variant="outline" size="icon" onClick={() => pick(setClaude, claude)} title="选择目录">
-                <FolderOpen className="h-4 w-4" />
-              </Button>
-              <Button variant="outline" size="icon" onClick={useDefaultClaude} title="使用默认">
-                <Home className="h-4 w-4" />
-              </Button>
-            </div>
+          <DirField
+            label="OpenCode 数据目录"
+            value={opencode}
+            onChange={setOpenCode}
+            placeholder={"C:\\Users\\<me>\\.local\\share\\opencode"}
+            onPick={() => pick(setOpenCode, opencode)}
+            onRestoreDefault={restoreOpenCodeDefault}
+          >
+            <ValidationBadge v={opencodeValidation} provider="opencode" />
+          </DirField>
+
+          <Separator />
+
+          <DirField
+            label="Claude 目录"
+            value={claude}
+            onChange={setClaude}
+            placeholder={"C:\\Users\\<me>\\.claude"}
+            onPick={() => pick(setClaude, claude)}
+            onRestoreDefault={restoreClaudeDefault}
+          >
             <ValidationBadge v={claudeValidation} provider="claude" />
-          </div>
+          </DirField>
 
           <Separator />
 
-          <div className="space-y-2">
-            <Label className="text-sm font-medium">备份目录</Label>
-            <div className="flex gap-2">
-              <Input
-                value={backup}
-                onChange={(e) => setBackup(e.target.value)}
-                className="font-mono text-xs"
-              />
-              <Button variant="outline" size="icon" onClick={() => pick(setBackup, backup)} title="选择目录">
-                <FolderOpen className="h-4 w-4" />
-              </Button>
-            </div>
+          <DirField
+            label="备份目录"
+            value={backup}
+            onChange={setBackup}
+            onPick={() => pick(setBackup, backup)}
+          >
             <p className="text-xs text-muted-foreground">
               推荐放在 Codex 或 Claude 目录外，避免把备份目录再次纳入备份。
             </p>
-          </div>
+          </DirField>
 
           <Separator />
 
@@ -281,6 +300,76 @@ export function SettingsSheet({ trigger }: Props) {
         </SheetFooter>
       </SheetContent>
     </Sheet>
+    <DangerDialog
+      open={confirmClaudeDirChange}
+      onOpenChange={setConfirmClaudeDirChange}
+      title="更改 Claude 目录"
+      confirmText="放弃修改并保存设置"
+      onConfirm={persistSettings}
+    >
+      <div className="min-w-0 whitespace-normal">
+        Claude Memory 当前有尚未保存的内容。更改 Claude 目录会重新载入项目并丢弃这些修改；
+        取消后先保存 Memory 即可保留。
+      </div>
+    </DangerDialog>
+    </>
+  );
+}
+
+function DirField({
+  label,
+  value,
+  onChange,
+  placeholder,
+  onPick,
+  onRestoreDefault,
+  children,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+  onPick: () => void;
+  onRestoreDefault?: () => void;
+  children?: ReactNode;
+}) {
+  return (
+    <div className="space-y-2">
+      <Label className="text-sm font-medium">{label}</Label>
+      <div className="flex gap-2">
+        <Input
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={placeholder}
+          className="font-mono text-xs"
+          aria-label={label}
+        />
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button variant="outline" size="icon" onClick={onPick} aria-label={`选择 ${label}`}>
+              <FolderOpen className="h-4 w-4" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>选择目录</TooltipContent>
+        </Tooltip>
+        {onRestoreDefault && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="outline"
+                size="icon"
+                onClick={onRestoreDefault}
+                aria-label={`恢复默认 ${label}`}
+              >
+                <RotateCcw className="h-4 w-4" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>恢复默认</TooltipContent>
+          </Tooltip>
+        )}
+      </div>
+      {children}
+    </div>
   );
 }
 
@@ -374,7 +463,7 @@ function UpdateStatus({
   );
 }
 
-function ValidationBadge({ v, provider }: { v: DirValidation | null; provider: "codex" | "claude" }) {
+function ValidationBadge({ v, provider }: { v: DirValidation | null; provider: "codex" | "claude" | "opencode" }) {
   if (!v) return null;
   if (v.valid) {
     return (
@@ -386,7 +475,10 @@ function ValidationBadge({ v, provider }: { v: DirValidation | null; provider: "
   }
   const reasons: string[] = [];
   if (provider === "codex" && !v.has_state_db) reasons.push("缺 state_5.sqlite");
-  if (!v.has_sessions) reasons.push(provider === "codex" ? "缺 sessions/" : "缺 projects/");
+  if (provider === "opencode" && !v.has_state_db) reasons.push("缺 opencode.db");
+  if (!v.has_sessions) {
+    reasons.push(provider === "codex" ? "缺 sessions/" : provider === "claude" ? "缺 projects/" : "数据库不可用");
+  }
   return (
     <Badge variant="outline" className="gap-1 border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400">
       <AlertTriangle className="h-3 w-3" />

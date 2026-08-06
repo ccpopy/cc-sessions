@@ -3,6 +3,7 @@ pub mod app_update;
 pub mod atomic_file;
 pub mod backup;
 pub mod bundle;
+pub mod claude_memory;
 pub mod claude_sessions;
 #[cfg(feature = "desktop")]
 pub mod commands;
@@ -16,6 +17,7 @@ pub mod history;
 pub mod logs_db;
 pub mod markdown_export;
 pub mod models;
+pub mod opencode_sessions;
 pub mod path_safety;
 pub mod paths;
 pub mod provenance;
@@ -63,8 +65,10 @@ pub fn run() {
             app_update::install_app_update,
             settings::default_codex_dir,
             settings::default_claude_dir,
+            settings::default_opencode_dir,
             settings::validate_codex_dir,
             settings::validate_claude_dir,
+            settings::validate_opencode_dir,
             fs_ops::reveal_cwd,
             fs_ops::open_latest_release_page,
             fs_ops::copy_resume_command,
@@ -84,6 +88,12 @@ pub fn run() {
             commands::preview_session_range,
             commands::preview_session_user_prompts,
             commands::preview_session_meta,
+            commands::list_claude_memory_projects,
+            commands::list_claude_memory_files,
+            commands::read_claude_memory_file,
+            commands::save_claude_memory_file,
+            commands::rename_claude_memory_file,
+            commands::delete_claude_memory_file,
             commands::plan_session_event_deletion,
             commands::edit_session_event_text,
             commands::delete_session_events,

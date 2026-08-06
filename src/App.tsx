@@ -16,6 +16,7 @@ const BackupDetailRoute = lazy(() => import("@/routes/backup-detail"));
 const StatsRoute = lazy(() => import("@/routes/stats"));
 const RepairRoute = lazy(() => import("@/routes/repair"));
 const TransferRoute = lazy(() => import("@/routes/transfer"));
+const MemoryRoute = lazy(() => import("@/routes/memory"));
 
 export default function App() {
   const load = useSettings((s) => s.load);
@@ -25,10 +26,11 @@ export default function App() {
   const initTheme = useTheme((s) => s.init);
   const toggleTheme = useTheme((s) => s.toggle);
   const defaultProvider = webuiDefaultProvider();
+  const defaultCoreProvider = defaultProvider === "opencode" ? "codex" : defaultProvider;
   const defaultSessionsPath = `/${defaultProvider}/sessions`;
-  const defaultRepairPath = `/${defaultProvider}/repair`;
-  const defaultBackupsPath = `/${defaultProvider}/backups`;
-  const defaultTransferPath = `/${defaultProvider}/transfer`;
+  const defaultRepairPath = `/${defaultCoreProvider}/repair`;
+  const defaultBackupsPath = `/${defaultCoreProvider}/backups`;
+  const defaultTransferPath = `/${defaultCoreProvider}/transfer`;
 
   useEffect(() => {
     void load().catch(() => {
@@ -70,10 +72,12 @@ export default function App() {
             <Route path="/claude/backups" element={<BackupsRoute key="claude-backups" provider="claude" />} />
             <Route path="/claude/backups/:name" element={<BackupDetailRoute key="claude-backup-detail" provider="claude" />} />
             <Route path="/claude/transfer" element={<TransferRoute key="claude-transfer" provider="claude" />} />
+            <Route path="/claude/memory" element={<MemoryRoute />} />
+            <Route path="/opencode/sessions" element={<SessionsRoute key="opencode-sessions" provider="opencode" />} />
             <Route path="/sessions" element={<Navigate to={defaultSessionsPath} replace />} />
             <Route path="/repair" element={<Navigate to={defaultRepairPath} replace />} />
             <Route path="/backups" element={<Navigate to={defaultBackupsPath} replace />} />
-            <Route path="/backups/:name" element={<BackupDetailRoute provider={defaultProvider} />} />
+            <Route path="/backups/:name" element={<BackupDetailRoute provider={defaultCoreProvider} />} />
             <Route path="/transfer" element={<Navigate to={defaultTransferPath} replace />} />
             <Route path="/stats" element={<StatsRoute />} />
             <Route path="*" element={<Navigate to="/codex/sessions" replace />} />

@@ -189,6 +189,11 @@ pub fn default_claude_dir() -> String {
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
+pub fn default_opencode_dir() -> String {
+    paths::default_opencode_dir().to_string_lossy().into_owned()
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn validate_codex_dir(path: String) -> AppResult<DirValidation> {
     let p = PathBuf::from(&path);
     let (exists, has_state, has_sessions) = paths::validate_codex_dir(&p);
@@ -222,6 +227,19 @@ pub fn validate_claude_dir(path: String) -> AppResult<DirValidation> {
     })
 }
 
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn validate_opencode_dir(path: String) -> AppResult<DirValidation> {
+    let data_dir = PathBuf::from(&path);
+    let database = crate::opencode_sessions::database_path(&data_dir);
+    let count = crate::opencode_sessions::validate_data_dir(&data_dir)?;
+    Ok(DirValidation {
+        valid: data_dir.is_dir() && database.is_file(),
+        has_state_db: database.is_file(),
+        has_sessions: database.is_file(),
+        threads_count: count,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,11 +264,13 @@ mod tests {
         let mut second = first.clone();
         second.codex_dir = "second-codex".into();
         second.claude_dir = "second-claude".into();
+        second.opencode_dir = "second-opencode".into();
         write_settings_file(&file, &second)?;
 
         let restored = read_settings_file(&file)?;
         assert_eq!(restored.codex_dir, "second-codex");
         assert_eq!(restored.claude_dir, "second-claude");
+        assert_eq!(restored.opencode_dir, "second-opencode");
         let entries = fs::read_dir(&root)?.collect::<Result<Vec<_>, _>>()?;
         let leftovers = entries
             .iter()
@@ -290,6 +310,10 @@ mod tests {
 
         assert!(settings.preview_only_messages);
         assert!(settings.preview_collapse_process);
+        assert_eq!(
+            settings.opencode_dir,
+            paths::default_opencode_dir().to_string_lossy()
+        );
         fs::remove_dir_all(root)?;
         Ok(())
     }

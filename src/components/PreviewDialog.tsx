@@ -24,7 +24,13 @@ import remarkGfm from "remark-gfm";
 import { JsonView, defaultStyles } from "react-json-view-lite";
 import "react-json-view-lite/dist/index.css";
 
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { LocalImageAttachments } from "@/components/LocalImageAttachments";
 import {
   AlertDialog,
@@ -185,7 +191,8 @@ export function PreviewDialog({
   const appSettings = useSettings((state) => state.settings);
   const canForkSession = provider === "codex" && !customRolloutPath && !!session && !!codexDir;
   // 备份/导入预览（customRolloutPath）不允许编辑，只能编辑真实会话文件
-  const canMutateSession = !customRolloutPath && !!session && !!backupDir && !!rolloutPath;
+  const canMutateSession =
+    provider !== "opencode" && !customRolloutPath && !!session && !!backupDir && !!rolloutPath;
   const relatedSubagents = useMemo(() => {
     if (!session || session.provider !== "codex" || customRolloutPath) return [];
     return collectRelatedSubagents(session.id, allSessions);
@@ -869,6 +876,9 @@ export function PreviewDialog({
               <DialogTitle className="truncate text-[15px] font-semibold tracking-tight">
                 {session?.title || "预览会话"}
               </DialogTitle>
+              <DialogDescription className="sr-only">
+                查看会话消息、过程事件和对话时间线。
+              </DialogDescription>
               {session && (
                 <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
                   <span className="font-mono text-foreground/70">{session.id.slice(0, 8)}</span>
@@ -1251,6 +1261,9 @@ export function PreviewDialog({
       <DialogContent className="sm:max-w-[640px]">
         <DialogHeader>
           <DialogTitle>改写消息文本</DialogTitle>
+          <DialogDescription className="sr-only">
+            修改当前会话事件中的可编辑文本。
+          </DialogDescription>
         </DialogHeader>
         <div className="space-y-3">
           <div className="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
@@ -1420,6 +1433,9 @@ export function PreviewDialog({
       <DialogContent className="sm:max-w-[640px]">
         <DialogHeader>
           <DialogTitle>编辑历史</DialogTitle>
+          <DialogDescription className="sr-only">
+            查看、撤销或还原当前会话的编辑记录。
+          </DialogDescription>
         </DialogHeader>
         {!editHistory ? (
           <div className="py-6 text-center text-xs text-muted-foreground">加载中…</div>

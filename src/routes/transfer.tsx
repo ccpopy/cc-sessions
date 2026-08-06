@@ -52,24 +52,25 @@ import { copyText } from "@/lib/clipboard";
 import { sessionIdentity } from "@/lib/sessionIdentity";
 import { pickDirectoryPath, pickFilePath, saveFilePath } from "@/lib/dialog";
 import { humanBytes, humanTokens } from "@/lib/format";
+import { providerLabel } from "@/lib/providerTheme";
 import { basename, dirname, joinPath } from "@/lib/cwd";
 
 export default function TransferRoute({ provider = "codex" }: { provider?: SessionProvider }) {
   const settings = useSettings((s) => s.settings);
   const codexDir = settings?.codex_dir ?? "";
   const claudeDir = settings?.claude_dir ?? "";
-  const providerLabel = provider === "codex" ? "Codex" : "Claude";
+  const providerName = providerLabel(provider);
   const providerDir = provider === "codex" ? codexDir : claudeDir;
 
   return (
     <>
-      <TopBar title={`${providerLabel} 导出 / 导入`} showListTools={false} />
+      <TopBar title={`${providerName} 导出 / 导入`} showListTools={false} />
       <ScrollArea className="flex-1">
         <div className="p-6">
           {!providerDir ? (
             <EmptyState
               icon={<Package className="h-10 w-10" />}
-              title={`尚未配置 ${providerLabel} 目录`}
+              title={`尚未配置 ${providerName} 目录`}
             />
           ) : (
             <Tabs defaultValue="export" className="space-y-4">

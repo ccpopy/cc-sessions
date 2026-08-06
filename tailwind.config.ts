@@ -48,6 +48,14 @@ const config: Config = {
           "4": "hsl(var(--chart-4))",
           "5": "hsl(var(--chart-5))",
         },
+        provider: {
+          codex: "hsl(var(--provider-codex) / <alpha-value>)",
+          "codex-fg": "hsl(var(--provider-codex-fg) / <alpha-value>)",
+          claude: "hsl(var(--provider-claude) / <alpha-value>)",
+          "claude-fg": "hsl(var(--provider-claude-fg) / <alpha-value>)",
+          opencode: "hsl(var(--provider-opencode) / <alpha-value>)",
+          "opencode-fg": "hsl(var(--provider-opencode-fg) / <alpha-value>)",
+        },
         sidebar: {
           DEFAULT: "hsl(var(--sidebar-background))",
           foreground: "hsl(var(--sidebar-foreground))",

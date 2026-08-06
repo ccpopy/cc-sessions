@@ -11,30 +11,42 @@ fn provider_or_codex(provider: Option<String>) -> String {
     provider.unwrap_or_else(|| "codex".to_string())
 }
 
+fn claude_root(claude_dir: Option<String>) -> PathBuf {
+    PathBuf::from(
+        claude_dir.unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
+    )
+}
+
+fn opencode_root(opencode_dir: Option<String>) -> PathBuf {
+    PathBuf::from(
+        opencode_dir
+            .unwrap_or_else(|| paths::default_opencode_dir().to_string_lossy().into_owned()),
+    )
+}
+
 fn load_sessions(
     provider: &str,
     codex_dir: &str,
     claude_dir: Option<String>,
+    opencode_dir: Option<String>,
 ) -> AppResult<Vec<SessionSummary>> {
     match provider {
         "codex" => {
             crate::sessions::list_sessions(Some("codex".into()), codex_dir.to_string(), claude_dir)
         }
-        "claude" => {
-            let claude = PathBuf::from(
-                claude_dir
-                    .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
-            );
-            crate::claude_sessions::scan_sessions(&claude)
-        }
+        "claude" => crate::claude_sessions::scan_sessions(&claude_root(claude_dir)),
+        "opencode" => crate::opencode_sessions::list_sessions(&opencode_root(opencode_dir)),
         "all" => {
             let mut out =
                 crate::sessions::list_sessions(Some("codex".into()), codex_dir.to_string(), None)?;
-            let claude = PathBuf::from(
-                claude_dir
-                    .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
-            );
-            out.extend(crate::claude_sessions::scan_sessions(&claude)?);
+            out.extend(crate::claude_sessions::scan_sessions(&claude_root(
+                claude_dir,
+            ))?);
+            // 没装 / 没配 OpenCode 时按"零会话"处理，不让缺少 opencode.db 拖垮整块统计。
+            let opencode = opencode_root(opencode_dir);
+            if crate::opencode_sessions::database_path(&opencode).is_file() {
+                out.extend(crate::opencode_sessions::list_sessions(&opencode)?);
+            }
             Ok(out)
         }
         other => Err(AppError::Other(format!("不支持的 provider: {other}"))),
@@ -93,13 +105,14 @@ fn stat_sessions(
     provider: Option<String>,
     codex_dir: String,
     claude_dir: Option<String>,
+    opencode_dir: Option<String>,
     from_ts: Option<i64>,
     to_ts: Option<i64>,
     cwd_filter: Vec<String>,
     include_archived: bool,
 ) -> AppResult<Vec<SessionSummary>> {
     let provider = provider_or_codex(provider);
-    let sessions = load_sessions(&provider, &codex_dir, claude_dir)?;
+    let sessions = load_sessions(&provider, &codex_dir, claude_dir, opencode_dir)?;
     let sessions = filter_family_active_sessions(sessions, &codex_dir)?;
     Ok(filter_sessions(
         sessions,
@@ -114,6 +127,7 @@ pub fn stats_kpi(
     provider: Option<String>,
     codex_dir: String,
     claude_dir: Option<String>,
+    opencode_dir: Option<String>,
     from_ts: Option<i64>,
     to_ts: Option<i64>,
     cwd_filter: Vec<String>,
@@ -123,6 +137,7 @@ pub fn stats_kpi(
         provider,
         codex_dir,
         claude_dir,
+        opencode_dir,
         from_ts,
         to_ts,
         cwd_filter,
@@ -152,6 +167,7 @@ pub fn stats_timeseries(
     provider: Option<String>,
     codex_dir: String,
     claude_dir: Option<String>,
+    opencode_dir: Option<String>,
     from_ts: Option<i64>,
     to_ts: Option<i64>,
     bucket: String,
@@ -162,6 +178,7 @@ pub fn stats_timeseries(
         provider,
         codex_dir,
         claude_dir,
+        opencode_dir,
         from_ts,
         to_ts,
         cwd_filter,
@@ -188,6 +205,7 @@ pub fn stats_by_project(
     provider: Option<String>,
     codex_dir: String,
     claude_dir: Option<String>,
+    opencode_dir: Option<String>,
     from_ts: Option<i64>,
     to_ts: Option<i64>,
     limit: usize,
@@ -198,6 +216,7 @@ pub fn stats_by_project(
         provider,
         codex_dir,
         claude_dir,
+        opencode_dir,
         from_ts,
         to_ts,
         cwd_filter,
@@ -230,6 +249,7 @@ pub fn stats_by_model(
     provider: Option<String>,
     codex_dir: String,
     claude_dir: Option<String>,
+    opencode_dir: Option<String>,
     from_ts: Option<i64>,
     to_ts: Option<i64>,
     cwd_filter: Vec<String>,
@@ -239,6 +259,7 @@ pub fn stats_by_model(
         provider,
         codex_dir,
         claude_dir,
+        opencode_dir,
         from_ts,
         to_ts,
         cwd_filter,
@@ -275,6 +296,7 @@ pub fn stats_heatmap(
     provider: Option<String>,
     codex_dir: String,
     claude_dir: Option<String>,
+    opencode_dir: Option<String>,
     from_ts: Option<i64>,
     to_ts: Option<i64>,
     cwd_filter: Vec<String>,
@@ -284,6 +306,7 @@ pub fn stats_heatmap(
         provider,
         codex_dir,
         claude_dir,
+        opencode_dir,
         from_ts,
         to_ts,
         cwd_filter,
@@ -408,31 +431,55 @@ mod tests {
         Ok(())
     }
 
+    fn create_opencode_session(opencode: &Path) -> AppResult<()> {
+        fs::create_dir_all(opencode)?;
+        let conn = rusqlite::Connection::open(crate::opencode_sessions::database_path(opencode))?;
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT, slug TEXT NOT NULL, directory TEXT NOT NULL, title TEXT NOT NULL, version TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, time_archived INTEGER);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);",
+        )?;
+        conn.execute(
+            "INSERT INTO session VALUES ('ses_stats', 'global', NULL, 'slug', 'F:\\work\\opencode-project', 'OpenCode title', '1.0', 1770000000000, 1770000900000, NULL)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO message VALUES ('msg_stats', 'ses_stats', 1770000000000, 1770000000000, ?1)",
+            [serde_json::json!({"role":"assistant","modelID":"opencode-model","tokens":{"total":23}})
+                .to_string()],
+        )?;
+        Ok(())
+    }
+
     #[test]
-    fn aggregates_codex_and_claude_stats() -> AppResult<()> {
+    fn aggregates_codex_claude_and_opencode_stats() -> AppResult<()> {
         let root = temp_dir("cc-session-manager-stats-test");
         let codex = root.join("codex");
         let claude = root.join("claude");
+        let opencode = root.join("opencode");
         create_codex_session(&codex)?;
         create_claude_session(&claude)?;
+        create_opencode_session(&opencode)?;
 
         let kpi = stats_kpi(
             Some("all".to_string()),
             codex.to_string_lossy().into_owned(),
             Some(claude.to_string_lossy().into_owned()),
+            Some(opencode.to_string_lossy().into_owned()),
             None,
             None,
             Vec::new(),
             false,
         )?;
-        assert_eq!(kpi.sessions_total, 2);
-        assert_eq!(kpi.tokens_total, 18);
-        assert_eq!(kpi.active_projects, 2);
+        assert_eq!(kpi.sessions_total, 3);
+        assert_eq!(kpi.tokens_total, 41);
+        assert_eq!(kpi.active_projects, 3);
 
         let projects = stats_by_project(
             Some("all".to_string()),
             codex.to_string_lossy().into_owned(),
             Some(claude.to_string_lossy().into_owned()),
+            Some(opencode.to_string_lossy().into_owned()),
             None,
             None,
             10,
@@ -445,11 +492,15 @@ mod tests {
         assert!(projects
             .iter()
             .any(|p| p.provider.as_deref() == Some("claude")));
+        assert!(projects
+            .iter()
+            .any(|p| p.provider.as_deref() == Some("opencode")));
 
         let models = stats_by_model(
             Some("all".to_string()),
             codex.to_string_lossy().into_owned(),
             Some(claude.to_string_lossy().into_owned()),
+            Some(opencode.to_string_lossy().into_owned()),
             None,
             None,
             Vec::new(),
@@ -461,6 +512,48 @@ mod tests {
         assert!(models
             .iter()
             .any(|m| m.provider.as_deref() == Some("claude")));
+        assert!(models
+            .iter()
+            .any(|m| m.model == "opencode-model" && m.tokens == 23));
+
+        // 只看 OpenCode 时不应混入其他 Agent 的会话。
+        let opencode_only = stats_kpi(
+            Some("opencode".to_string()),
+            codex.to_string_lossy().into_owned(),
+            Some(claude.to_string_lossy().into_owned()),
+            Some(opencode.to_string_lossy().into_owned()),
+            None,
+            None,
+            Vec::new(),
+            false,
+        )?;
+        assert_eq!(opencode_only.sessions_total, 1);
+        assert_eq!(opencode_only.tokens_total, 23);
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn all_provider_stats_survive_missing_opencode_database() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-stats-no-opencode");
+        let codex = root.join("codex");
+        let claude = root.join("claude");
+        create_codex_session(&codex)?;
+        create_claude_session(&claude)?;
+
+        let kpi = stats_kpi(
+            Some("all".to_string()),
+            codex.to_string_lossy().into_owned(),
+            Some(claude.to_string_lossy().into_owned()),
+            Some(root.join("opencode").to_string_lossy().into_owned()),
+            None,
+            None,
+            Vec::new(),
+            false,
+        )?;
+        assert_eq!(kpi.sessions_total, 2);
+        assert_eq!(kpi.tokens_total, 18);
 
         fs::remove_dir_all(root).ok();
         Ok(())
@@ -538,6 +631,7 @@ mod tests {
             let kpi = stats_kpi(
                 Some("codex".to_string()),
                 codex.to_string_lossy().into_owned(),
+                None,
                 None,
                 None,
                 None,

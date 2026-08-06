@@ -39,6 +39,14 @@ export function isSubagentSource(source: string | null | undefined): boolean {
   const normalized = source?.trim();
   if (!normalized) return false;
   if (normalized.toLowerCase() === "subagent") return true;
+  const separator = normalized.indexOf(":");
+  if (
+    separator > 0 &&
+    normalized.slice(0, separator).toLowerCase() === "parent" &&
+    normalized.slice(separator + 1).trim()
+  ) {
+    return true;
+  }
   try {
     const parsed = JSON.parse(normalized);
     return !!parsed && typeof parsed === "object" && "subagent" in parsed;

@@ -52,14 +52,21 @@ struct MenuContext {
     provider: Option<String>,
     codex_dir: String,
     claude_dir: String,
+    opencode_dir: String,
     family_lock: family::FamilyLock,
 }
 
-pub fn run(provider: Option<String>, codex_dir: String, claude_dir: String) -> MenuResult<()> {
+pub fn run(
+    provider: Option<String>,
+    codex_dir: String,
+    claude_dir: String,
+    opencode_dir: String,
+) -> MenuResult<()> {
     let mut ctx = MenuContext {
         provider,
         codex_dir,
         claude_dir,
+        opencode_dir,
         family_lock: family::FamilyLock::default(),
     };
 
@@ -77,27 +84,30 @@ fn main_menu(ctx: &mut MenuContext) -> MenuResult<Flow> {
         &[
             ("Codex 目录", ctx.codex_dir.as_str()),
             ("Claude 目录", ctx.claude_dir.as_str()),
+            ("OpenCode 目录", ctx.opencode_dir.as_str()),
         ],
     );
     println!("1. Codex 会话");
     println!("2. Claude 会话");
-    println!("3. 统计");
-    println!("4. 备份");
-    println!("5. 导入 / 导出 Bundle");
-    println!("6. 修复 / 诊断");
-    println!("7. 设置与路径检查");
-    println!("8. 帮助");
+    println!("3. OpenCode 会话");
+    println!("4. 统计");
+    println!("5. 备份");
+    println!("6. 导入 / 导出 Bundle");
+    println!("7. 修复 / 诊断");
+    println!("8. 设置与路径检查");
+    println!("9. 帮助");
     println!("0. 退出");
 
     match prompt("请选择: ")?.as_str() {
         "1" => run_child(|| sessions_menu(ctx, "codex")),
         "2" => run_child(|| sessions_menu(ctx, "claude")),
-        "3" => run_child(|| stats_menu(ctx)),
-        "4" => run_child(|| backup_menu(ctx)),
-        "5" => run_child(|| bundle_menu(ctx)),
-        "6" => run_child(|| repair_menu(ctx)),
-        "7" => run_child(|| settings_menu(ctx)),
-        "8" => {
+        "3" => run_child(|| sessions_menu(ctx, "opencode")),
+        "4" => run_child(|| stats_menu(ctx)),
+        "5" => run_child(|| backup_menu(ctx)),
+        "6" => run_child(|| bundle_menu(ctx)),
+        "7" => run_child(|| repair_menu(ctx)),
+        "8" => run_child(|| settings_menu(ctx)),
+        "9" => {
             show_interactive_help()?;
             Ok(Flow::Main)
         }
@@ -135,7 +145,7 @@ fn sessions_menu(ctx: &mut MenuContext, provider: &str) -> MenuResult<Flow> {
         match prompt("请选择: ")?.as_str() {
             "1" => {
                 let include_archived = confirm_default_no("是否包含已归档会话？")?;
-                let scope = prompt_session_scope()?;
+                let scope = prompt_session_scope(provider)?;
                 let sessions = load_sessions(ctx, provider, include_archived, scope)?;
                 match browse_sessions(ctx, provider, sessions, "会话列表")? {
                     Flow::Back => {}
@@ -145,11 +155,12 @@ fn sessions_menu(ctx: &mut MenuContext, provider: &str) -> MenuResult<Flow> {
             "2" => {
                 let query = prompt_required("请输入搜索关键词: ")?;
                 let include_archived = confirm_default_no("是否包含已归档会话？")?;
-                let scope = prompt_session_scope()?;
-                let mut hits = sessions::search_sessions(
+                let scope = prompt_session_scope(provider)?;
+                let mut hits = sessions::search_sessions_with_opencode(
                     Some(provider.to_string()),
                     ctx.codex_dir.clone(),
                     Some(ctx.claude_dir.clone()),
+                    Some(ctx.opencode_dir.clone()),
                     query,
                 )
                 .map_err(to_string)?;
@@ -168,7 +179,7 @@ fn sessions_menu(ctx: &mut MenuContext, provider: &str) -> MenuResult<Flow> {
             },
             "4" => {
                 let include_archived = confirm_default_no("是否包含已归档会话？")?;
-                let scope = prompt_session_scope()?;
+                let scope = prompt_session_scope(provider)?;
                 let mut sessions = load_sessions(ctx, provider, include_archived, scope)?;
                 sort_sessions_by_size(&mut sessions);
                 match browse_sessions(ctx, provider, sessions, "按大小：token 从小到大")? {
@@ -204,7 +215,7 @@ fn sessions_menu(ctx: &mut MenuContext, provider: &str) -> MenuResult<Flow> {
 
 fn projects_menu(ctx: &mut MenuContext, provider: &str) -> MenuResult<Flow> {
     let include_archived = confirm_default_no("是否包含已归档会话？")?;
-    let scope = prompt_session_scope()?;
+    let scope = prompt_session_scope(provider)?;
     let sessions = load_sessions(ctx, provider, include_archived, scope)?;
     let projects = group_projects(sessions);
     if projects.is_empty() {
@@ -263,10 +274,11 @@ fn refresh_browsed_sessions(
     provider: &str,
     current: &[SessionSummary],
 ) -> MenuResult<Vec<SessionSummary>> {
-    let refreshed = sessions::list_sessions(
+    let refreshed = sessions::list_sessions_with_opencode(
         Some(provider.to_string()),
         ctx.codex_dir.clone(),
         Some(ctx.claude_dir.clone()),
+        Some(ctx.opencode_dir.clone()),
     )
     .map_err(to_string)?;
     let mut refreshed_by_key = refreshed
@@ -451,6 +463,9 @@ fn session_action_menu(
     provider: &str,
     session: SessionSummary,
 ) -> MenuResult<SessionActionResult> {
+    if provider == "opencode" {
+        return opencode_session_action_menu(ctx, session);
+    }
     loop {
         let target_provider = conversion_target_provider(provider)?;
         let conversion_suffix = if sessions::session_is_subagent(&session) {
@@ -508,6 +523,76 @@ fn session_action_menu(
             }
         }
     }
+}
+
+fn opencode_session_action_menu(
+    ctx: &mut MenuContext,
+    session: SessionSummary,
+) -> MenuResult<SessionActionResult> {
+    loop {
+        print_header(
+            "OpenCode 会话操作",
+            &[
+                ("ID", session.id.as_str()),
+                ("标题", session.title.as_str()),
+                ("目录", session.cwd.as_str()),
+            ],
+        );
+        println!("1. 预览会话内容");
+        println!("2. 查看元信息");
+        println!("3. 显示 resume 命令");
+        println!("4. 重命名会话");
+        println!("5. 归档 / 取消归档");
+        println!("6. 删除会话（包含全部子会话）");
+        println!("7. 返回上一层");
+        println!("8. 返回主菜单");
+        println!("0. 退出");
+
+        match prompt("请选择: ")?.as_str() {
+            "1" => preview_session("opencode", &session)?,
+            "2" => show_session_meta("opencode", &session)?,
+            "3" => show_resume_command("opencode", &session)?,
+            "4" => {
+                rename_opencode_session(ctx, &session)?;
+                return Ok(SessionActionResult::Refresh);
+            }
+            "5" => {
+                toggle_archived(ctx, "opencode", &session)?;
+                return Ok(SessionActionResult::Refresh);
+            }
+            "6" => {
+                delete_session(ctx, "opencode", &session)?;
+                return Ok(SessionActionResult::Refresh);
+            }
+            "7" => return Ok(SessionActionResult::Back),
+            "8" => return Ok(SessionActionResult::Main),
+            "0" => return Ok(SessionActionResult::Exit),
+            _ => {
+                println!("无效选择。");
+                pause()?;
+            }
+        }
+    }
+}
+
+fn rename_opencode_session(ctx: &MenuContext, session: &SessionSummary) -> MenuResult<()> {
+    let title = prompt_default("新标题", &session.title)?;
+    if title.trim() == session.title.trim() {
+        println!("标题未变化。");
+        return pause().map(|_| ());
+    }
+    sessions::rename_session_with_provider_dir(
+        Some("opencode".to_string()),
+        ctx.codex_dir.clone(),
+        Some(ctx.opencode_dir.clone()),
+        session.id.clone(),
+        title,
+        &ctx.family_lock,
+    )
+    .map_err(to_string)?;
+    println!("已重命名 OpenCode 会话。");
+    pause()?;
+    Ok(())
 }
 
 fn preview_session(provider: &str, session: &SessionSummary) -> MenuResult<()> {
@@ -864,7 +949,7 @@ fn print_convert_report(report: &ConvertReport) {
 }
 
 fn toggle_archived(ctx: &MenuContext, provider: &str, session: &SessionSummary) -> MenuResult<()> {
-    if provider != "codex" {
+    if provider == "claude" {
         println!("Claude 会话不支持归档。");
         return pause().map(|_| ());
     }
@@ -874,9 +959,10 @@ fn toggle_archived(ctx: &MenuContext, provider: &str, session: &SessionSummary) 
         println!("已取消。");
         return pause().map(|_| ());
     }
-    sessions::set_archived_with_lock(
-        Some("codex".to_string()),
+    sessions::set_archived_with_provider_dir(
+        Some(provider.to_string()),
         ctx.codex_dir.clone(),
+        Some(ctx.opencode_dir.clone()),
         session.id.clone(),
         target,
         &ctx.family_lock,
@@ -893,21 +979,24 @@ fn delete_session(ctx: &MenuContext, provider: &str, session: &SessionSummary) -
         println!(
             "若该会话属于 provider/历史分支组，将删除整个会话组。单分支删除请使用家族分支菜单。"
         );
-    } else {
+    } else if provider == "claude" {
         println!("将删除当前选中的 Claude 会话文件及其同名 sidecar。");
         println!(
             "若这是最后一个同 ID 副本，还会清理 history.jsonl、tasks/<id> 与 file-history/<id>；否则保留这些共享数据。"
         );
+    } else {
+        println!("将从 opencode.db 删除该会话、全部子会话及其消息、片段和关联事件。");
     }
     if !confirm_yes("这是破坏性操作。请输入 yes 确认删除。")? {
         println!("已取消。");
         pause()?;
         return Ok(());
     }
-    let result = sessions::delete_session_with_lock(
+    let result = sessions::delete_session_with_provider_dir(
         Some(provider.to_string()),
         ctx.codex_dir.clone(),
         Some(ctx.claude_dir.clone()),
+        Some(ctx.opencode_dir.clone()),
         session.id.clone(),
         Some(DeleteTarget {
             id: session.id.clone(),
@@ -951,11 +1040,13 @@ fn delete_selected_sessions(
     );
     if provider == "codex" {
         println!("所选 Codex 会话若属于分支组，将连同组内全部 provider/历史分支一起删除。");
-    } else {
+    } else if provider == "claude" {
         println!("每条 Claude 会话将按当前选中的文件路径删除，并清理其同名 sidecar。");
         println!(
             "仅当同 ID 的最后一个副本被删除时，才会清理 history.jsonl、tasks/<id> 与 file-history/<id>。"
         );
+    } else {
+        println!("每条 OpenCode 会话会连同其全部子会话和数据库关联记录一起删除。");
     }
     for session in selected.iter().take(10) {
         println!(
@@ -986,10 +1077,11 @@ fn delete_selected_sessions(
             rollout_path: Some(session.rollout_path.clone()),
         })
         .collect::<Vec<_>>();
-    let results = sessions::delete_sessions_with_lock(
+    let results = sessions::delete_sessions_with_provider_dir(
         Some(provider.to_string()),
         ctx.codex_dir.clone(),
         Some(ctx.claude_dir.clone()),
+        Some(ctx.opencode_dir.clone()),
         ids,
         Some(targets),
         &ctx.family_lock,
@@ -1054,10 +1146,12 @@ fn stats_provider(ctx: &MenuContext) -> MenuResult<String> {
     println!("1. 全部");
     println!("2. Codex");
     println!("3. Claude");
+    println!("4. OpenCode");
     match prompt("请选择: ")?.as_str() {
         "1" => Ok("all".to_string()),
         "2" => Ok("codex".to_string()),
         "3" => Ok("claude".to_string()),
+        "4" => Ok("opencode".to_string()),
         _ => Err("无效统计范围。".to_string()),
     }
 }
@@ -1068,6 +1162,7 @@ fn stats_kpi(ctx: &MenuContext) -> MenuResult<()> {
         Some(provider),
         ctx.codex_dir.clone(),
         Some(ctx.claude_dir.clone()),
+        Some(ctx.opencode_dir.clone()),
         None,
         None,
         Vec::new(),
@@ -1092,6 +1187,7 @@ fn stats_projects(ctx: &MenuContext) -> MenuResult<()> {
         Some(provider),
         ctx.codex_dir.clone(),
         Some(ctx.claude_dir.clone()),
+        Some(ctx.opencode_dir.clone()),
         None,
         None,
         limit,
@@ -1119,6 +1215,7 @@ fn stats_models(ctx: &MenuContext) -> MenuResult<()> {
         Some(provider),
         ctx.codex_dir.clone(),
         Some(ctx.claude_dir.clone()),
+        Some(ctx.opencode_dir.clone()),
         None,
         None,
         Vec::new(),
@@ -1147,6 +1244,7 @@ fn stats_timeseries(ctx: &MenuContext) -> MenuResult<()> {
         Some(provider),
         ctx.codex_dir.clone(),
         Some(ctx.claude_dir.clone()),
+        Some(ctx.opencode_dir.clone()),
         None,
         None,
         bucket,
@@ -1173,6 +1271,7 @@ fn stats_heatmap(ctx: &MenuContext) -> MenuResult<()> {
         Some(provider),
         ctx.codex_dir.clone(),
         Some(ctx.claude_dir.clone()),
+        Some(ctx.opencode_dir.clone()),
         None,
         None,
         Vec::new(),
@@ -2022,8 +2121,9 @@ fn settings_menu(ctx: &mut MenuContext) -> MenuResult<Flow> {
         println!("2. 校验当前路径");
         println!("3. 修改本次运行的 Codex 目录");
         println!("4. 修改本次运行的 Claude 目录");
-        println!("5. 返回上一层");
-        println!("6. 返回主菜单");
+        println!("5. 修改本次运行的 OpenCode 目录");
+        println!("6. 返回上一层");
+        println!("7. 返回主菜单");
         println!("0. 退出");
 
         match prompt("请选择: ")?.as_str() {
@@ -2035,8 +2135,11 @@ fn settings_menu(ctx: &mut MenuContext) -> MenuResult<Flow> {
             "4" => {
                 ctx.claude_dir = prompt_default("Claude 目录", &ctx.claude_dir)?;
             }
-            "5" => return Ok(Flow::Back),
-            "6" => return Ok(Flow::Main),
+            "5" => {
+                ctx.opencode_dir = prompt_default("OpenCode 目录", &ctx.opencode_dir)?;
+            }
+            "6" => return Ok(Flow::Back),
+            "7" => return Ok(Flow::Main),
             "0" => return Ok(Flow::Exit),
             _ => {
                 println!("无效选择。");
@@ -2050,6 +2153,7 @@ fn settings_defaults() -> MenuResult<()> {
     let defaults = cc_session_manager_lib::models::Settings::default();
     println!("codex_dir              {}", defaults.codex_dir);
     println!("claude_dir             {}", defaults.claude_dir);
+    println!("opencode_dir           {}", defaults.opencode_dir);
     println!("backup_dir             {}", defaults.backup_dir);
     println!("refresh_interval_ms    {}", defaults.refresh_interval_ms);
     pause()?;
@@ -2059,6 +2163,7 @@ fn settings_defaults() -> MenuResult<()> {
 fn settings_validate(ctx: &MenuContext) -> MenuResult<()> {
     let codex = settings::validate_codex_dir(ctx.codex_dir.clone()).map_err(to_string)?;
     let claude = settings::validate_claude_dir(ctx.claude_dir.clone()).map_err(to_string)?;
+    let opencode = settings::validate_opencode_dir(ctx.opencode_dir.clone()).map_err(to_string)?;
     println!(
         "codex   valid={} state_db={} sessions={} threads={}",
         codex.valid, codex.has_state_db, codex.has_sessions, codex.threads_count
@@ -2066,6 +2171,10 @@ fn settings_validate(ctx: &MenuContext) -> MenuResult<()> {
     println!(
         "claude  valid={} projects={} sessions={}",
         claude.valid, claude.has_sessions, claude.threads_count
+    );
+    println!(
+        "opencode valid={} db={} sessions={}",
+        opencode.valid, opencode.has_state_db, opencode.threads_count
     );
     pause()?;
     Ok(())
@@ -2091,10 +2200,11 @@ fn load_sessions(
     include_archived: bool,
     scope: SessionScope,
 ) -> MenuResult<Vec<SessionSummary>> {
-    let mut list = sessions::list_sessions(
+    let mut list = sessions::list_sessions_with_opencode(
         Some(provider.to_string()),
         ctx.codex_dir.clone(),
         Some(ctx.claude_dir.clone()),
+        Some(ctx.opencode_dir.clone()),
     )
     .map_err(to_string)?;
     if !include_archived {
@@ -2104,8 +2214,13 @@ fn load_sessions(
     Ok(list)
 }
 
-fn prompt_session_scope() -> MenuResult<SessionScope> {
-    if confirm_default_no("是否只查看子代理会话？")? {
+fn prompt_session_scope(provider: &str) -> MenuResult<SessionScope> {
+    let label = if provider == "opencode" {
+        "是否只查看子会话？"
+    } else {
+        "是否只查看子代理会话？"
+    };
+    if confirm_default_no(label)? {
         Ok(SessionScope::Subagent)
     } else {
         Ok(SessionScope::Main)
@@ -2339,6 +2454,7 @@ fn provider_label(provider: &str) -> &'static str {
     match provider {
         "codex" => "Codex",
         "claude" => "Claude",
+        "opencode" => "OpenCode",
         _ => "未知",
     }
 }

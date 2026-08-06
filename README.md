@@ -5,14 +5,26 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 ![Tauri](https://img.shields.io/badge/Tauri-2-ff9900)
 
-CC Sessions 是一个本地会话管理工具，用来查看、搜索、备份、迁移和修复 Codex 与 Claude Code 的会话。桌面版基于 Tauri、React、TypeScript 和 Rust 构建，默认读取本机的 `.codex` 和 `.claude` 目录。
+CC Sessions 是一个本地 Agent 会话管理工具，用来查看、搜索、备份、迁移和修复 Codex、Claude Code 与 OpenCode 的会话。桌面版基于 Tauri、React、TypeScript 和 Rust 构建，默认读取本机的 `.codex`、`.claude` 和 OpenCode 数据目录。
 
 ![CC Sessions 模拟数据截图](img/readme-screenshot.png)
 
+## 0.5.0 焕新
+
+- 左侧导航改为顶部 Agent 切换器，下方只展示当前 Agent 的功能。视觉风格保持原有低饱和配色与细边框，同时为后续接入更多 Agent 留出空间。
+- 新增 Claude Memory 管理，读取 `~/.claude/projects/*/memory/*.md`，支持项目与文件浏览、新建、编辑、重命名和删除。保存使用原子替换与 SHA-256 版本校验，避免覆盖其他 Claude 实例刚写入的内容。
+- 新增 OpenCode 会话管理，直接读取当前版本的 `opencode.db`，支持项目分组、搜索、预览、对话时间线、归档、重命名、删除、Markdown 导出和复制 `opencode --session <id>` 续聊命令。旧版 `storage/` JSON 不与 SQLite 数据混合读取，OpenCode 会话也不支持消息级编辑。
+- 全局统计新增 OpenCode 维度：统计页可以单看 OpenCode，「全部」也会把 OpenCode 会话计入 KPI、趋势、项目 Top 10、模型分布和热力图。没有安装或未配置 OpenCode 时按零会话处理，不影响其他 Agent 的统计。
+- Family 清理从“删除残留”升级为安全恢复：当记录中的当前分支文件丢失、但只存在一个可确定的 active 候选时自动接管；当多个分支被误标为 active 时，以 `active_id` 为准校正状态。流程不会改写仍存在的会话 JSONL。
+
+Codex 目前也提供独立的本地 Memory：可通过 `/memories` 与“设置 → 个性化”控制，默认存储在 `~/.codex/memories/`。官方将这些文件定义为生成状态，不建议把手工编辑作为主要控制方式，因此 0.5.0 只为缺少同类管理界面的 Claude Memory 提供文件管理，不接管 Codex 自身的 Memory 生命周期。参见 [Codex Memories 官方说明](https://learn.chatgpt.com/docs/customization/memories)。
+
 ## 功能
 
-- 分别查看 Codex 和 Claude Code 会话，并按 ID、标题、首条消息或工作目录搜索。
+- 分别查看 Codex、Claude Code 和 OpenCode 会话，并按 ID、标题、首条消息或工作目录搜索。
 - 预览 JSONL 内容，区分用户消息、助手回复、推理过程、工具调用和工具返回。
+- 管理 Claude 项目 Memory Markdown 文件，提供并发冲突保护。
+- 管理 OpenCode SQLite 会话，并按 `project → session → message → part` 结构生成统一预览。
 - 在 Codex 与 Claude Code 之间转换会话。简洁续聊模式只保留稳定内容，原生实验模式会尽量保留过程消息和工具事件。转换会新建会话，不修改原文件。
 - 在预览中修改用户或助手文本，也可以删除单条上下文事件。删除时会同步处理配对的工具事件、Codex 镜像行和关联推理；Claude 会话会重新连接 `parentUuid` 链。
 - 每次编辑前保存原始快照并记录日志，可逐步撤销或一键还原。编辑后仍可通过 `resume` 续聊。Codex 的加密推理和 Claude 的签名思考只能删除，不能改写。
@@ -142,6 +154,7 @@ cc-sessions preview ~/.codex/sessions/.../rollout-xxx.jsonl --limit 40
 cc-sessions preview ~/.codex/sessions/.../rollout-xxx.jsonl --mode all --limit 40
 cc-sessions webui --host 127.0.0.1 --port 17888
 cc-sessions --provider claude webui --host 127.0.0.1 --port 17888
+cc-sessions --provider opencode webui --host 127.0.0.1 --port 17888
 cc-sessions --provider codex convert ~/.codex/sessions/.../rollout-xxx.jsonl --mode native
 cc-sessions --provider claude convert ~/.claude/projects/.../<session-id>.jsonl --mode simple
 cc-sessions backup create --backup-dir ./backups --id <session-id> --name first-backup
@@ -150,7 +163,7 @@ cc-sessions repair index --dry-run
 cc-sessions bundle export --out-dir ./bundles --id <session-id>
 ```
 
-默认路径与桌面端相同：Codex 读取 `~/.codex`，Claude Code 读取 `~/.claude`。可以用 `--codex-dir` 和 `--claude-dir` 指定其他位置。在 Windows 中读取 WSL 的 Codex 数据时，`--codex-dir` 可使用 `\\wsl.localhost\<发行版>\home\<用户>\.codex` 形式的 UNC 路径。
+默认路径与桌面端相同：Codex 读取 `~/.codex`，Claude Code 读取 `~/.claude`，OpenCode 读取 `~/.local/share/opencode/opencode.db`。CLI 子命令可以用 `--codex-dir`、`--claude-dir` 和 `--opencode-dir` 指定其他位置；`--opencode-dir` 作用于交互菜单与 `stats`，Web UI 的 OpenCode 路径仍在设置页修改。在 Windows 中读取 WSL 的 Codex 数据时，`--codex-dir` 可使用 `\\wsl.localhost\<发行版>\home\<用户>\.codex` 形式的 UNC 路径。
 
 `list`、`search` 和 `projects` 默认只处理主会话。加入 `--subagent` 后只处理子代理会话。`list` 和 `search` 支持 `--sort size`，会按 token 从小到大排序。
 
@@ -170,12 +183,13 @@ cc-sessions webui --host 127.0.0.1 --port 17888
 
 Web UI 会保存设置。官方 CLI 便携包包含 `cc-sessions.portable`，配置文件位于可执行文件旁的 `cc-sessions-webui-settings.json`。没有该标记的构建会使用系统用户配置目录下的 `cc-sessions/cc-sessions-webui-settings.json`。
 
-环境变量 `CC_SESSIONS_WEBUI_SETTINGS` 可以指定配置文件位置。首次启动会创建文件，以后沿用页面中保存的路径。只有在启动命令中明确传入 `--codex-dir` 或 `--claude-dir` 时，命令行路径才会覆盖并写回配置。配置目录不可写时，保存会报错。
+环境变量 `CC_SESSIONS_WEBUI_SETTINGS` 可以指定配置文件位置。首次启动会创建文件，以后沿用页面中保存的 Codex、Claude 与 OpenCode 数据路径。只有在启动命令中明确传入 `--codex-dir` 或 `--claude-dir` 时，命令行路径才会覆盖并写回配置；OpenCode 路径在设置页修改。配置目录不可写时，保存会报错。
 
-`--provider codex|claude` 决定根路径 `/` 默认打开哪组会话，例如：
+`--provider codex|claude|opencode` 决定根路径 `/` 默认打开哪组会话，例如：
 
 ```bash
 cc-sessions --provider claude webui --host 127.0.0.1 --port 17888
+cc-sessions --provider opencode webui --host 127.0.0.1 --port 17888
 ```
 
 在 WSL2 中启动后，Windows 通常可以通过 `http://localhost:17888` 访问。如果 localhost 转发不可用，可在 WSL 内查看 IP：
@@ -201,6 +215,7 @@ CLI 和桌面版的修复功能只处理 Codex 本地索引及可见性，不改
 - `修复 session_index.jsonl`：扫描 `~/.codex/sessions/` 中仍存在的 active rollout，重建 `session_index.jsonl`。适用于会话文件存在但索引缺失的情况。
 - `重建 threads 表`：根据 rollout 元数据更新 `~/.codex/state_5.sqlite` 中的 `threads` 表，修复列表、搜索、标题或工作目录记录缺失的问题。
 - `清理 orphan 记录`：删除 `session_index.jsonl` 或 `threads` 表中指向不存在 rollout 的记录，不会删除有效会话文件。
+- `清理 family 残留`：移除指向不存在 rollout 的分支；在只有一个现存 active 候选时恢复 `active_id`，并以 `active_id` 为准校正重复的 active 标记。它不会删除仍存在的 rollout，但会更新 `session_family.json` 和相关索引；建议先 dry-run 查看报告。
 - `克隆会话到 provider` / `批量克隆到当前 provider`：处理切换 Codex `model_provider` 后，历史会话 provider 与当前配置不一致的问题。
 - `从事件创建回溯分支`：从稳定事件复制新分支，并归档原 active 分支。执行前需要确认。
 - `Claude GUI 会话列表修复`（`repair claude-gui [--fix] [--dry-run]`）：Claude Code GUI（例如 VS Code 插件）读取会话文件头尾各 64KB 来推导标题。推导失败时，会话可能从历史列表中消失，但 `claude --resume` 不受影响。修复操作会在 JSONL 末尾补写 `custom-title`，不会改动原有记录。
@@ -213,12 +228,12 @@ CLI 和桌面版的修复功能只处理 Codex 本地索引及可见性，不改
 - `src-tauri/Cargo.toml`
 - `src-tauri/tauri.conf.json`
 
-推送 `v0.4.9` 形式的 tag 会触发 GitHub Actions，并创建 Release：
+推送 `v0.5.0` 形式的 tag 会触发 GitHub Actions，并创建 Release：
 
 ```bash
-git tag -a v0.4.9 -m "v0.4.9"
+git tag -a v0.5.0 -m "v0.5.0"
 git push origin main
-git push origin v0.4.9
+git push origin v0.5.0
 ```
 
 工作流分别为 Windows、macOS Apple Silicon、macOS Intel 和 Linux 构建 Tauri 产物。macOS 打包需要 `src-tauri/icons/icon.icns`，仓库中已包含 Tauri 生成的跨平台图标。

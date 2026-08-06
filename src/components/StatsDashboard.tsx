@@ -35,6 +35,7 @@ import {
   type TimeseriesPoint,
 } from "@/lib/api";
 import { humanTokens, relativeTime } from "@/lib/format";
+import { providerLabel } from "@/lib/providerTheme";
 import { cn } from "@/lib/utils";
 import { useNavigate } from "react-router-dom";
 import { useView } from "@/stores/view";
@@ -83,10 +84,21 @@ export function StatsDashboard() {
     setHeat([]);
     setError(null);
 
-    const requiredDir = provider === "claude" ? settings.claude_dir : settings.codex_dir;
+    const requiredDir =
+      provider === "claude"
+        ? settings.claude_dir
+        : provider === "opencode"
+          ? settings.opencode_dir
+          : settings.codex_dir;
     if (!requiredDir) {
       setLoading(false);
-      setError(provider === "claude" ? "尚未配置 Claude 目录" : "尚未配置 Codex 目录");
+      setError(
+        provider === "claude"
+          ? "尚未配置 Claude 目录"
+          : provider === "opencode"
+            ? "尚未配置 OpenCode 数据目录"
+            : "尚未配置 Codex 目录",
+      );
       return;
     }
     const [from, to] = rangeToTs(range);
@@ -94,6 +106,7 @@ export function StatsDashboard() {
       provider,
       codex_dir: settings.codex_dir,
       claude_dir: settings.claude_dir,
+      opencode_dir: settings.opencode_dir,
       from_ts: from,
       to_ts: to,
       cwd_filter: [] as string[],
@@ -124,7 +137,16 @@ export function StatsDashboard() {
     return () => {
       cancelled = true;
     };
-  }, [settings?.codex_dir, settings?.claude_dir, provider, range, bucket, includeArchived, tick]);
+  }, [
+    settings?.codex_dir,
+    settings?.claude_dir,
+    settings?.opencode_dir,
+    provider,
+    range,
+    bucket,
+    includeArchived,
+    tick,
+  ]);
 
   return (
     <div className="space-y-4 p-6">
@@ -134,6 +156,7 @@ export function StatsDashboard() {
             <TabsTrigger value="all">全部</TabsTrigger>
             <TabsTrigger value="codex">Codex</TabsTrigger>
             <TabsTrigger value="claude">Claude</TabsTrigger>
+            <TabsTrigger value="opencode">OpenCode</TabsTrigger>
           </TabsList>
         </Tabs>
         <Select value={range} onValueChange={(v) => setRange(v as Range)}>
@@ -429,22 +452,15 @@ function modelStatLabel(m: ModelStat): string {
   return m.reasoning_effort ? `${label} · ${m.reasoning_effort}` : label;
 }
 
-function providerLabel(provider: string): string {
-  return provider === "claude" ? "Claude" : "Codex";
-}
-
 function HeatmapCard({ data }: { data: number[][] }) {
   const dayNames = ["日", "一", "二", "三", "四", "五", "六"];
 
-  // 按最大值分 5 档（0 / 1-25% / 25-50% / 50-75% / 75-100%），更贴近 GitHub 的离散色阶
+  // 按最大值分 5 档（0 / 1-25% / 25-50% / 50-75% / 75-100%），更贴近 GitHub 的离散色阶。
+  // 色阶取图表主色，避免热力图和上面几张图分别用两套绿。
   const max = useMemo(() => Math.max(1, ...data.flat()), [data]);
-  const levelClasses = [
-    "bg-muted border border-border/60", // 0
-    "bg-emerald-200 dark:bg-emerald-900/70",
-    "bg-emerald-400 dark:bg-emerald-700/80",
-    "bg-emerald-500 dark:bg-emerald-500/90",
-    "bg-emerald-600 dark:bg-emerald-400",
-  ];
+  const levelAlpha = [0, 0.28, 0.5, 0.74, 1];
+  const levelStyle = (level: number) =>
+    level === 0 ? undefined : { backgroundColor: `hsl(var(--chart-1) / ${levelAlpha[level]})` };
   const levelFor = (v: number) => {
     if (v <= 0) return 0;
     const r = v / max;
@@ -461,8 +477,12 @@ function HeatmapCard({ data }: { data: number[][] }) {
           <CardTitle className="text-sm">活跃度热力图</CardTitle>
           <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
             <span>少</span>
-            {levelClasses.map((c, i) => (
-              <span key={i} className={cn("h-2.5 w-2.5 rounded-[3px]", c)} />
+            {levelAlpha.map((_, i) => (
+              <span
+                key={i}
+                className={cn("h-2.5 w-2.5 rounded-[3px]", i === 0 && "border border-border/60 bg-muted")}
+                style={levelStyle(i)}
+              />
             ))}
             <span>多</span>
           </div>
@@ -497,8 +517,9 @@ function HeatmapCard({ data }: { data: number[][] }) {
                         title={`周${dayNames[d]} ${h}:00 — ${v} 次`}
                         className={cn(
                           "h-[14px] w-[14px] rounded-[3px] transition-transform hover:scale-110",
-                          levelClasses[lv],
+                          lv === 0 && "border border-border/60 bg-muted",
                         )}
+                        style={levelStyle(lv)}
                       />
                     );
                   })}

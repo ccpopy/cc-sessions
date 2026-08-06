@@ -13,8 +13,8 @@ use url::Url;
 use crate::error::{AppError, AppResult};
 use crate::models::{ImportMode, ProjectPathMapping, Settings, SwitchStrategy};
 use crate::{
-    backup, bundle, content_search, convert, edit, family, fs_ops, markdown_export, repair,
-    rollout, sessions, settings, stats,
+    backup, bundle, claude_memory, content_search, convert, edit, family, fs_ops, markdown_export,
+    repair, rollout, sessions, settings, stats,
 };
 
 const WEBUI_TOKEN_HEADER: &str = "X-CC-Sessions-Webui-Token";
@@ -32,6 +32,8 @@ pub struct WebuiConfig {
     pub codex_dir_explicit: bool,
     pub claude_dir: String,
     pub claude_dir_explicit: bool,
+    pub opencode_dir: String,
+    pub opencode_dir_explicit: bool,
 }
 
 struct WebuiState {
@@ -58,7 +60,14 @@ pub fn run(config: WebuiConfig) -> AppResult<()> {
     if !settings_exists || config.claude_dir_explicit {
         initial_settings.claude_dir = config.claude_dir;
     }
-    if !settings_exists || config.codex_dir_explicit || config.claude_dir_explicit {
+    if !settings_exists || config.opencode_dir_explicit {
+        initial_settings.opencode_dir = config.opencode_dir;
+    }
+    if !settings_exists
+        || config.codex_dir_explicit
+        || config.claude_dir_explicit
+        || config.opencode_dir_explicit
+    {
         settings::write_settings_file(&settings_file, &initial_settings)?;
     }
 
@@ -158,26 +167,35 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
         }
         "default_codex_dir" => to_value(settings::default_codex_dir()),
         "default_claude_dir" => to_value(settings::default_claude_dir()),
+        "default_opencode_dir" => to_value(settings::default_opencode_dir()),
         "validate_codex_dir" => {
             to_result_value(settings::validate_codex_dir(string_arg(&args, "path")?))
         }
         "validate_claude_dir" => {
             to_result_value(settings::validate_claude_dir(string_arg(&args, "path")?))
         }
-        "list_sessions" => to_result_value(sessions::list_sessions(
+        "validate_opencode_dir" => {
+            to_result_value(settings::validate_opencode_dir(string_arg(&args, "path")?))
+        }
+        "list_sessions" => to_result_value(sessions::list_sessions_with_opencode(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "codexDir")?,
             opt_string_arg(&args, "claudeDir")?,
+            opt_string_arg(&args, "opencodeDir")?,
         )),
-        "group_sessions_by_project" => to_result_value(sessions::group_sessions_by_project(
+        "group_sessions_by_project" => {
+            to_result_value(sessions::group_sessions_by_project_with_opencode(
+                opt_string_arg(&args, "provider")?,
+                string_arg(&args, "codexDir")?,
+                opt_string_arg(&args, "claudeDir")?,
+                opt_string_arg(&args, "opencodeDir")?,
+            ))
+        }
+        "search_sessions" => to_result_value(sessions::search_sessions_with_opencode(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "codexDir")?,
             opt_string_arg(&args, "claudeDir")?,
-        )),
-        "search_sessions" => to_result_value(sessions::search_sessions(
-            opt_string_arg(&args, "provider")?,
-            string_arg(&args, "codexDir")?,
-            opt_string_arg(&args, "claudeDir")?,
+            opt_string_arg(&args, "opencodeDir")?,
             string_arg(&args, "query")?,
         )),
         "start_content_search" => to_result_value(content_search::start_content_search(
@@ -194,16 +212,18 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
         "cancel_content_search" => to_result_value(content_search::cancel_content_search(
             usize_arg(&args, "jobId")? as u64,
         )),
-        "set_archived" => to_result_value(sessions::set_archived_with_lock(
+        "set_archived" => to_result_value(sessions::set_archived_with_provider_dir(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "codexDir")?,
+            opt_string_arg(&args, "opencodeDir")?,
             string_arg(&args, "id")?,
             bool_arg(&args, "v")?,
             &state.family_lock,
         )),
-        "rename_session" => to_result_value(sessions::rename_session_with_lock(
+        "rename_session" => to_result_value(sessions::rename_session_with_provider_dir(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "codexDir")?,
+            opt_string_arg(&args, "opencodeDir")?,
             string_arg(&args, "id")?,
             string_arg(&args, "title")?,
             &state.family_lock,
@@ -215,18 +235,20 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "targetCwd")?,
             &state.family_lock,
         )),
-        "delete_session" => to_result_value(sessions::delete_session_with_lock(
+        "delete_session" => to_result_value(sessions::delete_session_with_provider_dir(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "codexDir")?,
             opt_string_arg(&args, "claudeDir")?,
+            opt_string_arg(&args, "opencodeDir")?,
             string_arg(&args, "id")?,
             opt_arg(&args, "target")?,
             &state.family_lock,
         )),
-        "delete_sessions" => to_result_value(sessions::delete_sessions_with_lock(
+        "delete_sessions" => to_result_value(sessions::delete_sessions_with_provider_dir(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "codexDir")?,
             opt_string_arg(&args, "claudeDir")?,
+            opt_string_arg(&args, "opencodeDir")?,
             arg(&args, "ids")?,
             opt_arg(&args, "targets")?,
             &state.family_lock,
@@ -249,6 +271,39 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
         "preview_session_meta" => to_result_value(rollout::preview_session_meta(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "rolloutPath")?,
+        )),
+        "list_claude_memory_projects" => to_result_value(claude_memory::list_projects(string_arg(
+            &args,
+            "claudeDir",
+        )?)),
+        "list_claude_memory_files" => to_result_value(claude_memory::list_files(
+            string_arg(&args, "claudeDir")?,
+            string_arg(&args, "projectKey")?,
+        )),
+        "read_claude_memory_file" => to_result_value(claude_memory::read_file(
+            string_arg(&args, "claudeDir")?,
+            string_arg(&args, "projectKey")?,
+            string_arg(&args, "fileName")?,
+        )),
+        "save_claude_memory_file" => to_result_value(claude_memory::save_file(
+            string_arg(&args, "claudeDir")?,
+            string_arg(&args, "projectKey")?,
+            string_arg(&args, "fileName")?,
+            string_arg(&args, "content")?,
+            opt_string_arg(&args, "expectedSha256")?,
+        )),
+        "rename_claude_memory_file" => to_result_value(claude_memory::rename_file(
+            string_arg(&args, "claudeDir")?,
+            string_arg(&args, "projectKey")?,
+            string_arg(&args, "fileName")?,
+            string_arg(&args, "newFileName")?,
+            string_arg(&args, "expectedSha256")?,
+        )),
+        "delete_claude_memory_file" => to_result_value(claude_memory::delete_file(
+            string_arg(&args, "claudeDir")?,
+            string_arg(&args, "projectKey")?,
+            string_arg(&args, "fileName")?,
+            string_arg(&args, "expectedSha256")?,
         )),
         "plan_session_event_deletion" => to_result_value(edit::plan_session_event_deletion(
             string_arg(&args, "provider")?,
@@ -350,6 +405,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "codexDir")?,
             opt_string_arg(&args, "claudeDir")?,
+            opt_string_arg(&args, "opencodeDir")?,
             opt_i64_arg(&args, "fromTs")?,
             opt_i64_arg(&args, "toTs")?,
             arg(&args, "cwdFilter")?,
@@ -359,6 +415,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "codexDir")?,
             opt_string_arg(&args, "claudeDir")?,
+            opt_string_arg(&args, "opencodeDir")?,
             opt_i64_arg(&args, "fromTs")?,
             opt_i64_arg(&args, "toTs")?,
             string_arg(&args, "bucket")?,
@@ -369,6 +426,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "codexDir")?,
             opt_string_arg(&args, "claudeDir")?,
+            opt_string_arg(&args, "opencodeDir")?,
             opt_i64_arg(&args, "fromTs")?,
             opt_i64_arg(&args, "toTs")?,
             usize_arg(&args, "limit")?,
@@ -379,6 +437,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "codexDir")?,
             opt_string_arg(&args, "claudeDir")?,
+            opt_string_arg(&args, "opencodeDir")?,
             opt_i64_arg(&args, "fromTs")?,
             opt_i64_arg(&args, "toTs")?,
             arg(&args, "cwdFilter")?,
@@ -388,6 +447,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "codexDir")?,
             opt_string_arg(&args, "claudeDir")?,
+            opt_string_arg(&args, "opencodeDir")?,
             opt_i64_arg(&args, "fromTs")?,
             opt_i64_arg(&args, "toTs")?,
             arg(&args, "cwdFilter")?,
