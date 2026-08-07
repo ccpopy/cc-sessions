@@ -181,6 +181,14 @@ pub struct MoveSessionCwdReport {
     pub new_cwd: String,
     pub threads_updated: u32,
     pub rollout_rewritten: bool,
+    #[serde(default)]
+    pub artifacts_moved: u32,
+    #[serde(default)]
+    pub history_rows_updated: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_project_id: Option<String>,
+    #[serde(default)]
+    pub requires_project_open: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -284,6 +292,8 @@ pub struct Manifest {
     pub codex_dir: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_dir: Option<String>,
     pub note: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<ManifestArtifact>,
@@ -302,6 +312,14 @@ pub struct ManifestSession {
     pub sidecar_relpath: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sidecar_files: Vec<ManifestArtifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub companions_relpath: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub companion_files: Vec<ManifestArtifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tasks_relpath: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_files: Vec<ManifestArtifact>,
     pub title: String,
     pub cwd: String,
     pub created_at: i64,
@@ -602,6 +620,10 @@ pub struct BundleManifest {
     pub source_relpath: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidecar_relpath: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub companions_relpath: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tasks_relpath: Option<String>,
     pub exported_at: String,
     pub updated_at: i64,
     pub thread_name: String,

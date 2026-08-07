@@ -59,8 +59,9 @@ export default function TransferRoute({ provider = "codex" }: { provider?: Sessi
   const settings = useSettings((s) => s.settings);
   const codexDir = settings?.codex_dir ?? "";
   const claudeDir = settings?.claude_dir ?? "";
+  const opencodeDir = settings?.opencode_dir ?? "";
   const providerName = providerLabel(provider);
-  const providerDir = provider === "codex" ? codexDir : claudeDir;
+  const providerDir = provider === "codex" ? codexDir : provider === "claude" ? claudeDir : opencodeDir;
 
   return (
     <>
@@ -83,10 +84,20 @@ export default function TransferRoute({ provider = "codex" }: { provider?: Sessi
                 </TabsTrigger>
               </TabsList>
               <TabsContent value="export">
-                <ExportPanel provider={provider} codexDir={codexDir} claudeDir={claudeDir} />
+                <ExportPanel
+                  provider={provider}
+                  codexDir={codexDir}
+                  claudeDir={claudeDir}
+                  opencodeDir={opencodeDir}
+                />
               </TabsContent>
               <TabsContent value="import">
-                <ImportPanel provider={provider} codexDir={codexDir} claudeDir={claudeDir} />
+                <ImportPanel
+                  provider={provider}
+                  codexDir={codexDir}
+                  claudeDir={claudeDir}
+                  opencodeDir={opencodeDir}
+                />
               </TabsContent>
             </Tabs>
           )}
@@ -102,10 +113,12 @@ function ExportPanel({
   provider,
   codexDir,
   claudeDir,
+  opencodeDir,
 }: {
   provider: SessionProvider;
   codexDir: string;
   claudeDir: string;
+  opencodeDir: string;
 }) {
   const { sessions, loading: loadingSessions } = useSessions(provider, "");
   const [outDir, setOutDir] = useState("");
@@ -165,6 +178,10 @@ function ExportPanel({
       return terms.every((term) => haystack.includes(term));
     });
   }, [sessions, sessionSearch]);
+  const filteredArchivedCount = useMemo(
+    () => filteredSessions.filter((session) => session.archived).length,
+    [filteredSessions],
+  );
   const visibleSessions = useMemo(() => filteredSessions.slice(0, 500), [filteredSessions]);
   const selectedSessions = useMemo(
     () => sessions.filter((session) => selectedSessionKeys.has(sessionIdentity(session))),
@@ -204,6 +221,7 @@ function ExportPanel({
       provider,
       codex_dir: codexDir,
       claude_dir: claudeDir,
+      opencode_dir: opencodeDir,
       out_dir: outDir,
       ids: selected.map((session) => session.id),
       targets: selected.map((session) => ({
@@ -240,6 +258,7 @@ function ExportPanel({
         provider,
         codex_dir: codexDir,
         claude_dir: claudeDir,
+        opencode_dir: opencodeDir,
         out_dir: outDir,
         machine_label: machineLabel || undefined,
         export_group: exportGroup || undefined,
@@ -346,7 +365,7 @@ function ExportPanel({
           </div>
           <Separator />
           <div className="flex flex-wrap items-center gap-3">
-            {provider === "codex" && (
+            {provider !== "claude" && (
               <div className="flex items-center gap-2">
                 <Switch
                   id="active-only"
@@ -354,7 +373,9 @@ function ExportPanel({
                   onCheckedChange={setActiveOnly}
                 />
                 <Label htmlFor="active-only" className="text-xs">
-                  仅导出当前分支（分支记录）
+                  {provider === "codex"
+                    ? "导出全部时仅导出当前分支（分支记录）"
+                    : "导出全部时仅导出未归档会话"}
                 </Label>
               </div>
             )}
@@ -406,6 +427,12 @@ function ExportPanel({
             <Badge variant="secondary" className="h-5 px-1.5 font-normal">
               {sessionSearch.trim() ? `${filteredSessions.length}/${sessions.length}` : sessions.length}
             </Badge>
+            {filteredArchivedCount > 0 && (
+              <Badge variant="outline" className="h-5 gap-1 px-1.5 font-normal text-muted-foreground">
+                <Archive className="h-3 w-3" />
+                含已归档 {filteredArchivedCount}
+              </Badge>
+            )}
             {visibleSessions.length > 0 && (
               <span className="ml-auto text-xs font-normal text-muted-foreground">
                 已选 {visibleSelectedCount}/{visibleSessions.length}
@@ -481,9 +508,16 @@ function ExportPanel({
                               {s.id} · 点击复制
                             </TooltipContent>
                           </Tooltip>
-                          <span className="truncate" title={s.title || s.first_user_message || ""}>
-                            {s.title || s.first_user_message || "—"}
-                          </span>
+                          <div className="flex min-w-0 items-center gap-1.5">
+                            <span className="min-w-0 truncate" title={s.title || s.first_user_message || ""}>
+                              {s.title || s.first_user_message || "—"}
+                            </span>
+                            {s.archived && (
+                              <Badge variant="outline" className="h-5 shrink-0 px-1.5 text-[11px] font-normal">
+                                已归档
+                              </Badge>
+                            )}
+                          </div>
                           <span className="truncate text-muted-foreground" title={s.model ?? ""}>
                             {s.model ?? "—"}
                           </span>
@@ -538,10 +572,12 @@ function ImportPanel({
   provider,
   codexDir,
   claudeDir,
+  opencodeDir,
 }: {
   provider: SessionProvider;
   codexDir: string;
   claudeDir: string;
+  opencodeDir: string;
 }) {
   const [srcDir, setSrcDir] = useState("");
   const [items, setItems] = useState<BundleListItem[]>([]);
@@ -708,6 +744,7 @@ function ImportPanel({
         src_dir: sourceAtStart,
         codex_dir: codexDir,
         claude_dir: claudeDir,
+        opencode_dir: opencodeDir,
         mode,
         make_visible: providerAtStart === "codex" ? makeVisible : false,
         strict,
@@ -1050,8 +1087,8 @@ function ImportPanel({
         onConfirm={runImport}
       >
         <p>
-          将处理 <b>{items.length}</b> 条 {provider === "codex" ? "Codex" : "Claude"} 会话，
-          目标目录：<code>{provider === "codex" ? codexDir : claudeDir}</code>。
+          将处理 <b>{items.length}</b> 条 {providerLabel(provider)} 会话，目标目录：
+          <code>{provider === "codex" ? codexDir : provider === "claude" ? claudeDir : opencodeDir}</code>。
         </p>
         <p>
           {mode === "overwrite"

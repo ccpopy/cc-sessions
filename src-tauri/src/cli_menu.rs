@@ -485,37 +485,47 @@ fn session_action_menu(
         println!("1. 预览会话内容");
         println!("2. 查看元信息");
         println!("3. 显示 resume 命令");
-        println!("4. 创建备份");
-        println!("5. 导出 Bundle");
+        println!("4. 重命名会话");
+        println!("5. 移动会话目录");
+        println!("6. 创建备份");
+        println!("7. 导出 Bundle");
         println!(
-            "6. 转换为 {} 会话{}",
+            "8. 转换为 {} 会话{}",
             provider_label(target_provider),
             conversion_suffix
         );
         if provider == "codex" {
-            println!("7. 归档 / 取消归档");
+            println!("9. 归档 / 取消归档");
         } else {
-            println!("7. 归档 / 取消归档（Claude 不支持）");
+            println!("9. 归档 / 取消归档（Claude 不支持）");
         }
-        println!("8. 删除会话");
-        println!("9. 返回上一层");
-        println!("10. 返回主菜单");
+        println!("10. 删除会话");
+        println!("11. 返回上一层");
+        println!("12. 返回主菜单");
         println!("0. 退出");
 
         match prompt("请选择: ")?.as_str() {
             "1" => preview_session(provider, &session)?,
             "2" => show_session_meta(provider, &session)?,
             "3" => show_resume_command(provider, &session)?,
-            "4" => create_backup_for_session(ctx, provider, &session)?,
-            "5" => export_bundle_for_session(ctx, provider, &session)?,
-            "6" => convert_session(ctx, provider, &session)?,
-            "7" => toggle_archived(ctx, provider, &session)?,
-            "8" => {
+            "4" => {
+                rename_session(ctx, provider, &session)?;
+                return Ok(SessionActionResult::Refresh);
+            }
+            "5" => {
+                move_session_cwd(ctx, provider, &session)?;
+                return Ok(SessionActionResult::Refresh);
+            }
+            "6" => create_backup_for_session(ctx, provider, &session)?,
+            "7" => export_bundle_for_session(ctx, provider, &session)?,
+            "8" => convert_session(ctx, provider, &session)?,
+            "9" => toggle_archived(ctx, provider, &session)?,
+            "10" => {
                 delete_session(ctx, provider, &session)?;
                 return Ok(SessionActionResult::Refresh);
             }
-            "9" => return Ok(SessionActionResult::Back),
-            "10" => return Ok(SessionActionResult::Main),
+            "11" => return Ok(SessionActionResult::Back),
+            "12" => return Ok(SessionActionResult::Main),
             "0" => return Ok(SessionActionResult::Exit),
             _ => {
                 println!("无效选择。");
@@ -542,10 +552,13 @@ fn opencode_session_action_menu(
         println!("2. 查看元信息");
         println!("3. 显示 resume 命令");
         println!("4. 重命名会话");
-        println!("5. 归档 / 取消归档");
-        println!("6. 删除会话（包含全部子会话）");
-        println!("7. 返回上一层");
-        println!("8. 返回主菜单");
+        println!("5. 移动会话目录");
+        println!("6. 创建备份");
+        println!("7. 导出 Bundle");
+        println!("8. 归档 / 取消归档");
+        println!("9. 删除会话（包含全部子会话）");
+        println!("10. 返回上一层");
+        println!("11. 返回主菜单");
         println!("0. 退出");
 
         match prompt("请选择: ")?.as_str() {
@@ -553,19 +566,25 @@ fn opencode_session_action_menu(
             "2" => show_session_meta("opencode", &session)?,
             "3" => show_resume_command("opencode", &session)?,
             "4" => {
-                rename_opencode_session(ctx, &session)?;
+                rename_session(ctx, "opencode", &session)?;
                 return Ok(SessionActionResult::Refresh);
             }
             "5" => {
+                move_session_cwd(ctx, "opencode", &session)?;
+                return Ok(SessionActionResult::Refresh);
+            }
+            "6" => create_backup_for_session(ctx, "opencode", &session)?,
+            "7" => export_bundle_for_session(ctx, "opencode", &session)?,
+            "8" => {
                 toggle_archived(ctx, "opencode", &session)?;
                 return Ok(SessionActionResult::Refresh);
             }
-            "6" => {
+            "9" => {
                 delete_session(ctx, "opencode", &session)?;
                 return Ok(SessionActionResult::Refresh);
             }
-            "7" => return Ok(SessionActionResult::Back),
-            "8" => return Ok(SessionActionResult::Main),
+            "10" => return Ok(SessionActionResult::Back),
+            "11" => return Ok(SessionActionResult::Main),
             "0" => return Ok(SessionActionResult::Exit),
             _ => {
                 println!("无效选择。");
@@ -575,22 +594,54 @@ fn opencode_session_action_menu(
     }
 }
 
-fn rename_opencode_session(ctx: &MenuContext, session: &SessionSummary) -> MenuResult<()> {
+fn rename_session(ctx: &MenuContext, provider: &str, session: &SessionSummary) -> MenuResult<()> {
     let title = prompt_default("新标题", &session.title)?;
     if title.trim() == session.title.trim() {
         println!("标题未变化。");
         return pause().map(|_| ());
     }
-    sessions::rename_session_with_provider_dir(
-        Some("opencode".to_string()),
+    sessions::rename_session_with_provider_dirs(
+        Some(provider.to_string()),
         ctx.codex_dir.clone(),
+        Some(ctx.claude_dir.clone()),
         Some(ctx.opencode_dir.clone()),
         session.id.clone(),
+        Some(session.rollout_path.clone()),
         title,
         &ctx.family_lock,
     )
     .map_err(to_string)?;
-    println!("已重命名 OpenCode 会话。");
+    println!("已重命名 {} 会话。", provider_label(provider));
+    pause()?;
+    Ok(())
+}
+
+fn move_session_cwd(ctx: &MenuContext, provider: &str, session: &SessionSummary) -> MenuResult<()> {
+    let target_cwd = prompt_required("目标工作目录（必须已存在）: ")?;
+    let report = sessions::move_session_cwd_with_provider_dirs(
+        Some(provider.to_string()),
+        ctx.codex_dir.clone(),
+        Some(ctx.claude_dir.clone()),
+        Some(ctx.opencode_dir.clone()),
+        session.id.clone(),
+        Some(session.rollout_path.clone()),
+        target_cwd,
+        &ctx.family_lock,
+    )
+    .map_err(to_string)?;
+    println!("已移动: {} -> {}", report.old_cwd, report.new_cwd);
+    if report.threads_updated > 1 {
+        println!("同步更新 {} 条会话记录。", report.threads_updated);
+    }
+    if report.artifacts_moved > 0 {
+        println!("移动 {} 项会话资产。", report.artifacts_moved);
+    }
+    if report.history_rows_updated > 0 {
+        println!("更新 history.jsonl {} 行。", report.history_rows_updated);
+    }
+    if report.requires_project_open {
+        println!("提示：首次在目标目录启动 OpenCode 后，会自动登记真实项目 ID。");
+    }
     pause()?;
     Ok(())
 }
@@ -818,10 +869,11 @@ fn create_backup_for_session(
     let backup_dir = prompt_default("备份目录", &paths::default_backup_dir().to_string_lossy())?;
     let name = prompt_optional("备份名称（留空自动生成）: ")?;
     let note = prompt_optional("备注（可留空）: ")?;
-    let summary = backup::create_backup(
+    let summary = backup::create_backup_with_opencode(
         Some(provider.to_string()),
         ctx.codex_dir.clone(),
         Some(ctx.claude_dir.clone()),
+        Some(ctx.opencode_dir.clone()),
         backup_dir,
         vec![session.id.clone()],
         Some(vec![BundleExportTarget {
@@ -843,10 +895,11 @@ fn export_bundle_for_session(
     session: &SessionSummary,
 ) -> MenuResult<()> {
     let out_dir = prompt_required("导出目录: ")?;
-    let reports = bundle::export_session_bundles(
+    let reports = bundle::export_session_bundles_with_opencode(
         Some(provider.to_string()),
         ctx.codex_dir.clone(),
         Some(ctx.claude_dir.clone()),
+        Some(ctx.opencode_dir.clone()),
         out_dir,
         vec![session.id.clone()],
         Some(vec![BundleExportTarget {
@@ -1328,9 +1381,11 @@ fn backup_menu(ctx: &mut MenuContext) -> MenuResult<Flow> {
 fn choose_concrete_provider() -> MenuResult<String> {
     println!("1. Codex");
     println!("2. Claude");
+    println!("3. OpenCode");
     match prompt("请选择 provider: ")?.as_str() {
         "1" => Ok("codex".to_string()),
         "2" => Ok("claude".to_string()),
+        "3" => Ok("opencode".to_string()),
         _ => Err("无效 provider。".to_string()),
     }
 }
@@ -1341,10 +1396,11 @@ fn backup_create_by_id(ctx: &MenuContext) -> MenuResult<()> {
     let ids = prompt_ids()?;
     let name = prompt_optional("备份名称（留空自动生成）: ")?;
     let note = prompt_optional("备注（可留空）: ")?;
-    let summary = backup::create_backup(
+    let summary = backup::create_backup_with_opencode(
         Some(provider),
         ctx.codex_dir.clone(),
         Some(ctx.claude_dir.clone()),
+        Some(ctx.opencode_dir.clone()),
         backup_dir,
         ids,
         None,
@@ -1407,12 +1463,13 @@ fn backup_restore_one(ctx: &MenuContext) -> MenuResult<()> {
     let id = prompt_required("session id: ")?;
     let overwrite = confirm_yes("如目标已存在，是否允许覆盖？输入 yes 才会覆盖。")?;
     let backup_root = explicit_backup_root(&path)?;
-    let result = backup::restore_session(
+    let result = backup::restore_session_with_opencode(
         Some(provider),
         backup_root,
         path,
         ctx.codex_dir.clone(),
         Some(ctx.claude_dir.clone()),
+        Some(ctx.opencode_dir.clone()),
         id,
         None,
         overwrite,
@@ -1435,12 +1492,13 @@ fn backup_restore_all(ctx: &MenuContext) -> MenuResult<()> {
     }
     let overwrite = confirm_yes("如目标已存在，是否允许覆盖？输入 yes 才会覆盖。")?;
     let backup_root = explicit_backup_root(&path)?;
-    let results = backup::restore_all(
+    let results = backup::restore_all_with_opencode(
         Some(provider),
         backup_root,
         path,
         ctx.codex_dir.clone(),
         Some(ctx.claude_dir.clone()),
+        Some(ctx.opencode_dir.clone()),
         overwrite,
     )
     .map_err(to_string)?;
@@ -1513,10 +1571,11 @@ fn bundle_export(ctx: &MenuContext) -> MenuResult<()> {
     let out_dir = prompt_required("导出目录: ")?;
     let ids = prompt_ids()?;
     let targets = resolve_bundle_export_targets(ctx, &provider, &ids)?;
-    let reports = bundle::export_session_bundles(
+    let reports = bundle::export_session_bundles_with_opencode(
         Some(provider),
         ctx.codex_dir.clone(),
         Some(ctx.claude_dir.clone()),
+        Some(ctx.opencode_dir.clone()),
         out_dir,
         ids,
         targets,
@@ -1532,11 +1591,18 @@ fn bundle_export(ctx: &MenuContext) -> MenuResult<()> {
 fn bundle_export_all(ctx: &MenuContext) -> MenuResult<()> {
     let provider = choose_concrete_provider()?;
     let out_dir = prompt_required("导出目录: ")?;
-    let active_only = confirm_default_no("是否只导出 active 会话？")?;
-    let reports = bundle::export_all_bundles(
+    let active_only = if provider == "claude" {
+        false
+    } else if provider == "opencode" {
+        confirm_default_no("是否只导出未归档会话？")?
+    } else {
+        confirm_default_no("是否只导出 active 会话？")?
+    };
+    let reports = bundle::export_all_bundles_with_opencode(
         Some(provider),
         ctx.codex_dir.clone(),
         Some(ctx.claude_dir.clone()),
+        Some(ctx.opencode_dir.clone()),
         out_dir,
         None,
         None,
@@ -1565,13 +1631,18 @@ fn bundle_import(ctx: &MenuContext) -> MenuResult<()> {
     let provider = choose_concrete_provider()?;
     let src_dir = prompt_required("Bundle 目录: ")?;
     let mode = choose_import_mode()?;
-    let make_visible = confirm_default_no("是否导入后写入本地可见索引？")?;
+    let make_visible = if provider == "codex" {
+        confirm_default_no("是否导入后写入本地可见索引？")?
+    } else {
+        false
+    };
     let strict = confirm_default_no("是否启用严格校验？")?;
-    let reports = bundle::import_session_bundles(
+    let reports = bundle::import_session_bundles_with_opencode(
         Some(provider),
         src_dir,
         ctx.codex_dir.clone(),
         Some(ctx.claude_dir.clone()),
+        Some(ctx.opencode_dir.clone()),
         mode,
         make_visible,
         strict,

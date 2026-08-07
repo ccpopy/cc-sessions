@@ -19,6 +19,7 @@ use crate::state_db;
 
 const PROVIDER_CODEX: &str = "codex";
 const PROVIDER_CLAUDE: &str = "claude";
+const PROVIDER_OPENCODE: &str = "opencode";
 static RESTORE_SNAPSHOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,13 +186,37 @@ pub fn create_backup(
     name: Option<String>,
     note: Option<String>,
 ) -> AppResult<BackupSummary> {
+    create_backup_with_opencode(
+        provider, codex_dir, claude_dir, None, backup_dir, ids, targets, name, note,
+    )
+}
+
+pub fn create_backup_with_opencode(
+    provider: Option<String>,
+    codex_dir: String,
+    claude_dir: Option<String>,
+    opencode_dir: Option<String>,
+    backup_dir: String,
+    ids: Vec<String>,
+    targets: Option<Vec<BundleExportTarget>>,
+    name: Option<String>,
+    note: Option<String>,
+) -> AppResult<BackupSummary> {
     let targets = normalize_backup_targets(&ids, targets)?;
-    if provider.as_deref().unwrap_or(PROVIDER_CODEX) == PROVIDER_CLAUDE {
+    let provider_name = provider.as_deref().unwrap_or(PROVIDER_CODEX);
+    if provider_name == PROVIDER_CLAUDE {
         let claude = PathBuf::from(
             claude_dir
                 .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
         );
         return create_claude_backup(claude, PathBuf::from(backup_dir), targets, name, note);
+    }
+    if provider_name == PROVIDER_OPENCODE {
+        let data_dir = PathBuf::from(
+            opencode_dir
+                .unwrap_or_else(|| paths::default_opencode_dir().to_string_lossy().into_owned()),
+        );
+        return create_opencode_backup(data_dir, PathBuf::from(backup_dir), targets, name, note);
     }
 
     let codex = PathBuf::from(&codex_dir);
@@ -279,6 +304,7 @@ pub fn create_backup(
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         codex_dir: codex.to_string_lossy().into_owned(),
         claude_dir: None,
+        opencode_dir: None,
         note,
         artifacts: Vec::new(),
         sessions: Vec::new(),
@@ -342,6 +368,10 @@ pub fn create_backup(
             source_relpath: None,
             sidecar_relpath: None,
             sidecar_files: Vec::new(),
+            companions_relpath: None,
+            companion_files: Vec::new(),
+            tasks_relpath: None,
+            task_files: Vec::new(),
             title: thread.title.clone(),
             cwd: thread.cwd.clone(),
             created_at: thread.created_at,
@@ -428,12 +458,13 @@ fn create_claude_backup(
         crate::history::collect_lines_for_ids(&paths::history_path(&claude), &history_ids)?;
 
     let mut manifest = Manifest {
-        version: 4,
+        version: 5,
         provider: Some(PROVIDER_CLAUDE.to_string()),
         created_at: chrono::Utc::now().to_rfc3339(),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         codex_dir: String::new(),
         claude_dir: Some(claude.to_string_lossy().into_owned()),
+        opencode_dir: None,
         note,
         artifacts: Vec::new(),
         sessions: Vec::new(),
@@ -466,18 +497,19 @@ fn create_claude_backup(
         let sha = sha256_file(&dest)?;
         let bytes = fs::metadata(&dest)?.len();
 
+        let artifact_name = if id_counts.get(id.as_str()).copied().unwrap_or(0) > 1 {
+            exact_artifact_name(id, &source_rel_string)
+        } else {
+            paths::sanitize_slug(id)
+        };
+
         let mut sidecar_rel: Option<String> = None;
         let mut sidecar_files = Vec::new();
         if let Some(sidecar) = crate::claude_sessions::sidecar_path_for(&source) {
             match fs::symlink_metadata(&sidecar) {
                 Ok(_) => {
                     path_safety::validate_tree(&projects, &sidecar, "Claude sidecar 备份源")?;
-                    let sidecar_name = if id_counts.get(id.as_str()).copied().unwrap_or(0) > 1 {
-                        exact_artifact_name(id, &source_rel_string)
-                    } else {
-                        paths::sanitize_slug(id)
-                    };
-                    let sidecar_dest_rel = PathBuf::from("sidecars").join(sidecar_name);
+                    let sidecar_dest_rel = PathBuf::from("sidecars").join(&artifact_name);
                     let sidecar_dest = tmp.join(&sidecar_dest_rel);
                     copy_path_recursive(&sidecar, &sidecar_dest)?;
                     sidecar_files = collect_manifest_artifacts(&sidecar_dest)?;
@@ -486,6 +518,45 @@ fn create_claude_backup(
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
+        }
+
+        let companions = crate::claude_sessions::companion_files_for(&source)?;
+        let mut companions_rel = None;
+        let mut companion_files = Vec::new();
+        if !companions.is_empty() {
+            let relative = PathBuf::from("companions").join(&artifact_name);
+            let root = tmp.join(&relative);
+            fs::create_dir_all(&root)?;
+            for companion in companions {
+                path_safety::validate_descendant(
+                    &projects,
+                    &companion,
+                    EntryKind::File,
+                    false,
+                    "Claude companion 备份源",
+                )?;
+                let name = companion.file_name().ok_or_else(|| {
+                    AppError::Path(format!(
+                        "Claude companion 文件名无效: {}",
+                        companion.to_string_lossy()
+                    ))
+                })?;
+                fs::copy(&companion, root.join(name))?;
+            }
+            companion_files = collect_manifest_artifacts(&root)?;
+            companions_rel = Some(relative.to_string_lossy().replace('\\', "/"));
+        }
+
+        let task_source = crate::claude_sessions::task_path_for(&claude, id);
+        let mut tasks_rel = None;
+        let mut task_files = Vec::new();
+        if task_source.exists() {
+            path_safety::validate_tree(&claude, &task_source, "Claude tasks 备份源")?;
+            let relative = PathBuf::from("tasks").join(&artifact_name);
+            let root = tmp.join(&relative);
+            copy_path_recursive(&task_source, &root)?;
+            task_files = collect_manifest_artifacts(&root)?;
+            tasks_rel = Some(relative.to_string_lossy().replace('\\', "/"));
         }
 
         let history_rows = history_index
@@ -500,6 +571,10 @@ fn create_claude_backup(
             source_relpath: Some(source_rel_string),
             sidecar_relpath: sidecar_rel,
             sidecar_files,
+            companions_relpath: companions_rel,
+            companion_files,
+            tasks_relpath: tasks_rel,
+            task_files,
             title: session.title.clone(),
             cwd: session.cwd.clone(),
             created_at: session.created_at,
@@ -519,6 +594,112 @@ fn create_claude_backup(
     )?;
     manifest.artifacts = collect_backup_artifacts(&tmp, &["history.jsonl"])?;
 
+    fs::write(
+        tmp.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
+    fs::rename(&tmp, &final_path)?;
+    summarize_backup(&final_path)
+}
+
+fn create_opencode_backup(
+    data_dir: PathBuf,
+    backup_root: PathBuf,
+    targets: Vec<BundleExportTarget>,
+    name: Option<String>,
+    note: Option<String>,
+) -> AppResult<BackupSummary> {
+    fs::create_dir_all(&backup_root)?;
+    let final_name = name
+        .map(|name| name.trim().to_string())
+        .unwrap_or_else(|| format!("backup-{}", chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S")));
+    validate_backup_name(&final_name)?;
+    let tmp = backup_root.join(format!(".{final_name}.partial"));
+    let final_path = backup_root.join(&final_name);
+    path_safety::validate_descendant(
+        &backup_root,
+        &tmp,
+        EntryKind::Directory,
+        true,
+        "备份临时目录",
+    )?;
+    path_safety::validate_descendant(
+        &backup_root,
+        &final_path,
+        EntryKind::Directory,
+        true,
+        "备份目标目录",
+    )?;
+    if final_path.exists() {
+        return Err(AppError::Other(format!("备份已存在: {final_name}")));
+    }
+    if tmp.exists() {
+        return Err(AppError::Other(format!(
+            "存在未完成的临时备份目录，请先检查或移除: {}",
+            tmp.to_string_lossy()
+        )));
+    }
+
+    let sessions = crate::opencode_sessions::list_sessions(&data_dir)?
+        .into_iter()
+        .map(|session| (session.id.clone(), session))
+        .collect::<HashMap<_, _>>();
+    let mut manifest = Manifest {
+        version: 5,
+        provider: Some(PROVIDER_OPENCODE.to_string()),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        codex_dir: String::new(),
+        claude_dir: None,
+        opencode_dir: Some(data_dir.to_string_lossy().into_owned()),
+        note,
+        artifacts: Vec::new(),
+        sessions: Vec::new(),
+    };
+    for target in targets {
+        if let Some(locator) = target.rollout_path.as_deref() {
+            let (db, located_id) = crate::opencode_sessions::resolve_locator(locator)?;
+            if located_id != target.id || db != crate::opencode_sessions::database_path(&data_dir) {
+                return Err(AppError::Other(format!(
+                    "OpenCode 备份精确目标与当前数据库不一致: {}",
+                    target.id
+                )));
+            }
+        }
+        let summary = sessions
+            .get(&target.id)
+            .ok_or_else(|| AppError::NotFound(format!("OpenCode 会话不存在: {}", target.id)))?;
+        let snapshot = crate::opencode_transfer::export_snapshot(&data_dir, &target.id)?;
+        let relative = PathBuf::from(PROVIDER_OPENCODE)
+            .join("sessions")
+            .join(format!("{}.json", paths::sanitize_slug(&target.id)));
+        let destination = tmp.join(&relative);
+        crate::opencode_transfer::write_snapshot(&destination, &snapshot)?;
+        let sha = sha256_file(&destination)?;
+        let bytes = fs::metadata(&destination)?.len();
+        manifest.sessions.push(ManifestSession {
+            provider: Some(PROVIDER_OPENCODE.to_string()),
+            id: target.id,
+            rollout_relpath: relative.to_string_lossy().replace('\\', "/"),
+            source_relpath: None,
+            sidecar_relpath: None,
+            sidecar_files: Vec::new(),
+            companions_relpath: None,
+            companion_files: Vec::new(),
+            tasks_relpath: None,
+            task_files: Vec::new(),
+            title: summary.title.clone(),
+            cwd: snapshot.source_cwd.clone(),
+            created_at: summary.created_at,
+            updated_at: snapshot.source_updated_at / 1000,
+            tokens_used: summary.tokens_used,
+            model: summary.model.clone(),
+            bytes_rollout: bytes,
+            logs_count: 0,
+            history_rows: 0,
+            sha256_rollout: sha,
+        });
+    }
     fs::write(
         tmp.join("manifest.json"),
         serde_json::to_vec_pretty(&manifest)?,
@@ -788,6 +969,19 @@ fn validate_claude_source_relpath(raw: &str, id: &str) -> AppResult<PathBuf> {
     Ok(relative)
 }
 
+fn validate_opencode_snapshot_relpath(raw: &str, id: &str) -> AppResult<PathBuf> {
+    let relative = paths::checked_relative_path(raw)?;
+    let expected = PathBuf::from(PROVIDER_OPENCODE)
+        .join("sessions")
+        .join(format!("{}.json", paths::sanitize_slug(id)));
+    if relative != expected {
+        return Err(AppError::Path(format!(
+            "OpenCode 备份快照路径与会话 ID 不匹配: id={id} path={raw}"
+        )));
+    }
+    Ok(relative)
+}
+
 fn validate_manifest_paths(manifest: &Manifest) -> AppResult<()> {
     let allowed_artifacts = ["history.jsonl", "logs.ndjson", "threads.json"]
         .into_iter()
@@ -817,12 +1011,12 @@ fn validate_manifest_paths(manifest: &Manifest) -> AppResult<()> {
                 .map(|session| manifest_session_provider(manifest, session))
                 .unwrap_or(PROVIDER_CODEX)
         });
-        let expected = if provider == PROVIDER_CLAUDE {
-            ["history.jsonl"].into_iter().collect::<HashSet<_>>()
-        } else {
-            ["history.jsonl", "logs.ndjson", "threads.json"]
+        let expected = match provider {
+            PROVIDER_CLAUDE => ["history.jsonl"].into_iter().collect::<HashSet<_>>(),
+            PROVIDER_OPENCODE => HashSet::new(),
+            _ => ["history.jsonl", "logs.ndjson", "threads.json"]
                 .into_iter()
-                .collect::<HashSet<_>>()
+                .collect::<HashSet<_>>(),
         };
         let actual = artifact_paths
             .iter()
@@ -837,27 +1031,48 @@ fn validate_manifest_paths(manifest: &Manifest) -> AppResult<()> {
     }
 
     for session in &manifest.sessions {
-        let mut artifact_paths = HashSet::new();
-        for artifact in &session.sidecar_files {
-            let relative = paths::checked_relative_path(&artifact.relpath)?;
-            if !artifact_paths.insert(relative) {
+        for (label, root, artifacts) in [
+            (
+                "sidecar",
+                session.sidecar_relpath.as_deref(),
+                session.sidecar_files.as_slice(),
+            ),
+            (
+                "companions",
+                session.companions_relpath.as_deref(),
+                session.companion_files.as_slice(),
+            ),
+            (
+                "tasks",
+                session.tasks_relpath.as_deref(),
+                session.task_files.as_slice(),
+            ),
+        ] {
+            let mut artifact_paths = HashSet::new();
+            for artifact in artifacts {
+                let relative = paths::checked_relative_path(&artifact.relpath)?;
+                if !artifact_paths.insert(relative) {
+                    return Err(AppError::Path(format!(
+                        "{label} manifest 包含重复路径: {}",
+                        artifact.relpath
+                    )));
+                }
+            }
+            if root.is_none() && !artifacts.is_empty() {
                 return Err(AppError::Path(format!(
-                    "sidecar manifest 包含重复路径: {}",
-                    artifact.relpath
+                    "会话未声明 {label} 目录却包含文件清单: {}",
+                    session.id
                 )));
             }
-        }
-        if session.sidecar_relpath.is_none() && !session.sidecar_files.is_empty() {
-            return Err(AppError::Path(format!(
-                "会话未声明 sidecar 目录却包含 sidecar 文件清单: {}",
-                session.id
-            )));
         }
         let provider = manifest_session_provider(manifest, session);
         match provider {
             PROVIDER_CODEX => {
                 validate_codex_rollout_relpath(&session.rollout_relpath, &session.id)?;
-                if session.sidecar_relpath.is_some() {
+                if session.sidecar_relpath.is_some()
+                    || session.companions_relpath.is_some()
+                    || session.tasks_relpath.is_some()
+                {
                     return Err(AppError::Path(format!(
                         "Codex 备份不应声明 Claude sidecar: {}",
                         session.id
@@ -892,6 +1107,45 @@ fn validate_manifest_paths(manifest: &Manifest) -> AppResult<()> {
                         )));
                     }
                 }
+                let normalized_source = source.to_string_lossy().replace('\\', "/");
+                let names = [
+                    paths::sanitize_slug(&session.id),
+                    exact_artifact_name(&session.id, &normalized_source),
+                ];
+                for (label, declared, root) in [
+                    (
+                        "companions",
+                        session.companions_relpath.as_deref(),
+                        "companions",
+                    ),
+                    ("tasks", session.tasks_relpath.as_deref(), "tasks"),
+                ] {
+                    if let Some(declared) = declared {
+                        let declared = paths::checked_relative_path(declared)?;
+                        if !names
+                            .iter()
+                            .any(|name| declared == PathBuf::from(root).join(name))
+                        {
+                            return Err(AppError::Path(format!(
+                                "Claude {label} 路径与会话 ID 不对应: {}",
+                                session.id
+                            )));
+                        }
+                    }
+                }
+            }
+            PROVIDER_OPENCODE => {
+                validate_opencode_snapshot_relpath(&session.rollout_relpath, &session.id)?;
+                if session.source_relpath.is_some()
+                    || session.sidecar_relpath.is_some()
+                    || session.companions_relpath.is_some()
+                    || session.tasks_relpath.is_some()
+                {
+                    return Err(AppError::Path(format!(
+                        "OpenCode 备份不应声明文件型附属资产: {}",
+                        session.id
+                    )));
+                }
             }
             other => {
                 return Err(AppError::Other(format!("备份包含未知 provider: {other}")));
@@ -902,6 +1156,9 @@ fn validate_manifest_paths(manifest: &Manifest) -> AppResult<()> {
 }
 
 fn verify_rollout_identity(source: &Path, expected_id: &str, provider: &str) -> AppResult<()> {
+    if provider == PROVIDER_OPENCODE {
+        return crate::opencode_transfer::verify_snapshot_file(source, expected_id);
+    }
     if provider == PROVIDER_CODEX {
         let brief = crate::repair::read_rollout_brief(source.parent().unwrap_or(source), source)?
             .ok_or_else(|| {
@@ -1061,6 +1318,38 @@ fn validate_backup_payload(
                         "Claude sidecar 文件清单或 sha256 校验失败: {}",
                         session.id
                     )));
+                }
+            }
+        }
+        for (label, root, expected) in [
+            (
+                "companions",
+                session.companions_relpath.as_deref(),
+                session.companion_files.as_slice(),
+            ),
+            (
+                "tasks",
+                session.tasks_relpath.as_deref(),
+                session.task_files.as_slice(),
+            ),
+        ] {
+            if let Some(root) = root {
+                let root = backup.join(paths::checked_relative_path(root)?);
+                path_safety::validate_tree(backup, &root, &format!("Claude 备份 {label}"))?;
+                if manifest.version >= 5 {
+                    let actual = collect_manifest_artifacts(&root)?;
+                    if actual.len() != expected.len()
+                        || actual.iter().zip(expected).any(|(left, right)| {
+                            left.relpath != right.relpath
+                                || left.bytes != right.bytes
+                                || left.sha256 != right.sha256
+                        })
+                    {
+                        return Err(AppError::Other(format!(
+                            "Claude {label} 文件清单或 sha256 校验失败: {}",
+                            session.id
+                        )));
+                    }
                 }
             }
         }
@@ -1272,10 +1561,38 @@ pub fn restore_session(
     backup_rollout_relpath: Option<String>,
     overwrite: bool,
 ) -> AppResult<RestoreResult> {
+    restore_session_with_opencode(
+        provider,
+        backup_dir,
+        backup_path,
+        codex_dir,
+        claude_dir,
+        None,
+        id,
+        backup_rollout_relpath,
+        overwrite,
+    )
+}
+
+pub fn restore_session_with_opencode(
+    provider: Option<String>,
+    backup_dir: String,
+    backup_path: String,
+    codex_dir: String,
+    claude_dir: Option<String>,
+    opencode_dir: Option<String>,
+    id: String,
+    backup_rollout_relpath: Option<String>,
+    overwrite: bool,
+) -> AppResult<RestoreResult> {
     let backup = validated_backup_path(Path::new(&backup_dir), Path::new(&backup_path))?;
     let codex = PathBuf::from(&codex_dir);
     let claude = PathBuf::from(
         claude_dir.unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
+    );
+    let opencode = PathBuf::from(
+        opencode_dir
+            .unwrap_or_else(|| paths::default_opencode_dir().to_string_lossy().into_owned()),
     );
     let manifest = load_backup_manifest(&backup)?;
     validate_backup_payload(&backup, &manifest, RolloutPresence::Required)?;
@@ -1320,10 +1637,10 @@ pub fn restore_session(
         }
     }
     let provider = provider.as_deref().unwrap_or(manifest_provider);
-    if provider == PROVIDER_CLAUDE {
-        restore_one_claude(&backup, &claude, target, overwrite)
-    } else {
-        restore_one(&backup, &codex, target, overwrite)
+    match provider {
+        PROVIDER_CLAUDE => restore_one_claude(&backup, &claude, target, overwrite),
+        PROVIDER_OPENCODE => restore_one_opencode(&backup, &opencode, target, overwrite),
+        _ => restore_one(&backup, &codex, target, overwrite),
     }
 }
 
@@ -1335,10 +1652,34 @@ pub fn restore_all(
     claude_dir: Option<String>,
     overwrite: bool,
 ) -> AppResult<Vec<RestoreResult>> {
+    restore_all_with_opencode(
+        provider,
+        backup_dir,
+        backup_path,
+        codex_dir,
+        claude_dir,
+        None,
+        overwrite,
+    )
+}
+
+pub fn restore_all_with_opencode(
+    provider: Option<String>,
+    backup_dir: String,
+    backup_path: String,
+    codex_dir: String,
+    claude_dir: Option<String>,
+    opencode_dir: Option<String>,
+    overwrite: bool,
+) -> AppResult<Vec<RestoreResult>> {
     let backup = validated_backup_path(Path::new(&backup_dir), Path::new(&backup_path))?;
     let codex = PathBuf::from(&codex_dir);
     let claude = PathBuf::from(
         claude_dir.unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
+    );
+    let opencode = PathBuf::from(
+        opencode_dir
+            .unwrap_or_else(|| paths::default_opencode_dir().to_string_lossy().into_owned()),
     );
     let manifest = load_backup_manifest(&backup)?;
     validate_backup_payload(&backup, &manifest, RolloutPresence::Required)?;
@@ -1359,10 +1700,10 @@ pub fn restore_all(
             .as_deref()
             .unwrap_or_else(|| manifest_session_provider(&manifest, s));
         out.push(
-            (if session_provider == PROVIDER_CLAUDE {
-                restore_one_claude(&backup, &claude, s, overwrite)
-            } else {
-                restore_one(&backup, &codex, s, overwrite)
+            (match session_provider {
+                PROVIDER_CLAUDE => restore_one_claude(&backup, &claude, s, overwrite),
+                PROVIDER_OPENCODE => restore_one_opencode(&backup, &opencode, s, overwrite),
+                _ => restore_one(&backup, &codex, s, overwrite),
             })
             .unwrap_or_else(|e| RestoreResult {
                 id: s.id.clone(),
@@ -1459,6 +1800,7 @@ fn restore_one_claude(
     let dest = paths::claude_projects_dir(claude).join(&target_rel);
     let sidecar_dest = crate::claude_sessions::sidecar_path_for(&dest)
         .ok_or_else(|| AppError::Path("Claude 会话路径无法计算 sidecar".into()))?;
+    let tasks_dest = crate::claude_sessions::task_path_for(claude, &target.id);
 
     fs::create_dir_all(claude)?;
     path_safety::validate_descendant(claude, &dest, EntryKind::File, true, "Claude 会话还原目标")?;
@@ -1469,9 +1811,26 @@ fn restore_one_claude(
         true,
         "Claude sidecar 还原目标",
     )?;
+    path_safety::validate_descendant(
+        claude,
+        &tasks_dest,
+        EntryKind::Directory,
+        true,
+        "Claude tasks 还原目标",
+    )?;
+    let companion_destinations = if dest.parent().is_some_and(Path::exists) {
+        crate::claude_sessions::companion_files_for(&dest)?
+    } else {
+        Vec::new()
+    };
     verify_restore_source(backup, &src, target, PROVIDER_CLAUDE)?;
 
-    if (dest.exists() || sidecar_dest.exists()) && !overwrite {
+    if (dest.exists()
+        || sidecar_dest.exists()
+        || !companion_destinations.is_empty()
+        || tasks_dest.exists())
+        && !overwrite
+    {
         result.conflict = true;
         return Ok(result);
     }
@@ -1481,11 +1840,26 @@ fn restore_one_claude(
         .map(paths::checked_relative_path)
         .transpose()?
         .map(|relative| backup.join(relative));
-    crate::bundle::replace_claude_snapshot_verified(
+    let companions_src = target
+        .companions_relpath
+        .as_deref()
+        .map(paths::checked_relative_path)
+        .transpose()?
+        .map(|relative| backup.join(relative));
+    let tasks_src = target
+        .tasks_relpath
+        .as_deref()
+        .map(paths::checked_relative_path)
+        .transpose()?
+        .map(|relative| backup.join(relative));
+    crate::bundle::replace_claude_snapshot_with_extras_verified(
         &src,
         &dest,
         None,
         sidecar_src.as_deref(),
+        companions_src.as_deref(),
+        tasks_src.as_deref(),
+        &tasks_dest,
         Some(&target.sha256_rollout),
     )?;
     result.rollout_copied = true;
@@ -1499,6 +1873,38 @@ fn restore_one_claude(
         }
     }
 
+    result.ok = true;
+    Ok(result)
+}
+
+fn restore_one_opencode(
+    backup: &Path,
+    data_dir: &Path,
+    target: &ManifestSession,
+    overwrite: bool,
+) -> AppResult<RestoreResult> {
+    let mut result = RestoreResult {
+        id: target.id.clone(),
+        ok: false,
+        threads_inserted: false,
+        logs_inserted: 0,
+        history_appended: 0,
+        rollout_copied: false,
+        conflict: false,
+        error: None,
+    };
+    let relative = validate_opencode_snapshot_relpath(&target.rollout_relpath, &target.id)?;
+    let source = backup.join(relative);
+    verify_restore_source(backup, &source, target, PROVIDER_OPENCODE)?;
+    let snapshot = crate::opencode_transfer::read_snapshot(&source, &target.id)?;
+    let outcome = crate::opencode_transfer::restore_snapshot(data_dir, &snapshot, overwrite)?;
+    if !outcome.written {
+        result.conflict = true;
+        result.error = outcome.skipped_reason;
+        return Ok(result);
+    }
+    result.rollout_copied = true;
+    result.threads_inserted = true;
     result.ok = true;
     Ok(result)
 }
@@ -2256,6 +2662,39 @@ mod tests {
         Ok(())
     }
 
+    fn write_opencode_database(root: &Path, cwd: &Path, title: &str) -> AppResult<()> {
+        fs::create_dir_all(root)?;
+        fs::create_dir_all(cwd)?;
+        let connection = rusqlite::Connection::open(crate::opencode_sessions::database_path(root))?;
+        connection.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL, vcs TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, sandboxes TEXT NOT NULL);
+             INSERT INTO project VALUES ('global','/',NULL,1,1,'[]');
+             CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES project(id), parent_id TEXT, slug TEXT NOT NULL, directory TEXT NOT NULL, title TEXT NOT NULL, version TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, time_archived INTEGER, path TEXT, workspace_id TEXT);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL REFERENCES message(id) ON DELETE CASCADE, session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+             CREATE TABLE todo (session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE, position INTEGER NOT NULL, content TEXT NOT NULL, PRIMARY KEY(session_id, position));
+             CREATE TABLE session_share (session_id TEXT PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE, id TEXT NOT NULL, secret TEXT NOT NULL, url TEXT NOT NULL);",
+        )?;
+        connection.execute(
+            "INSERT INTO session (id,project_id,parent_id,slug,directory,title,version,time_created,time_updated,time_archived,path,workspace_id) VALUES ('ses_backup','global',NULL,'backup',?1,?2,'1.0',1000,4000,NULL,NULL,NULL)",
+            rusqlite::params![cwd.to_string_lossy().as_ref(), title],
+        )?;
+        connection.execute(
+            "INSERT INTO message VALUES ('msg_backup','ses_backup',1000,1000,?1)",
+            [serde_json::json!({"role":"user"}).to_string()],
+        )?;
+        connection.execute(
+            "INSERT INTO part VALUES ('part_backup','msg_backup','ses_backup',1000,1000,?1)",
+            [serde_json::json!({"type":"text","text":"portable opencode content"}).to_string()],
+        )?;
+        connection.execute(
+            "INSERT INTO todo VALUES ('ses_backup',0,'portable task')",
+            [],
+        )?;
+        Ok(())
+    }
+
     #[test]
     fn backs_up_and_restores_claude_session() -> AppResult<()> {
         let root = temp_dir("cc-session-manager-claude-backup-test");
@@ -2272,6 +2711,16 @@ mod tests {
             source_sidecar.join("subagents").join("agent.jsonl"),
             "sidecar-content",
         )?;
+        fs::write(
+            source_claude
+                .join("projects")
+                .join("sample-project")
+                .join("claude-backup-1.claudinal.json"),
+            "companion-content",
+        )?;
+        let source_tasks = source_claude.join("tasks").join("claude-backup-1");
+        fs::create_dir_all(&source_tasks)?;
+        fs::write(source_tasks.join("task.json"), "task-content")?;
 
         let summary = create_backup(
             Some(PROVIDER_CLAUDE.to_string()),
@@ -2289,6 +2738,8 @@ mod tests {
         let detail = open_backup(backup_root.clone(), backup_path.clone())?;
         assert_eq!(detail.manifest.sessions[0].history_rows, 2);
         assert_eq!(detail.manifest.sessions[0].sidecar_files.len(), 1);
+        assert_eq!(detail.manifest.sessions[0].companion_files.len(), 1);
+        assert_eq!(detail.manifest.sessions[0].task_files.len(), 1);
         let backup_history = fs::read_to_string(PathBuf::from(&backup_path).join("history.jsonl"))?;
         assert!(backup_history.contains("keep one"));
         assert!(backup_history.contains("keep two"));
@@ -2321,6 +2772,23 @@ mod tests {
             )?,
             "sidecar-content"
         );
+        assert_eq!(
+            fs::read_to_string(
+                paths::claude_projects_dir(&restore_claude)
+                    .join("sample-project")
+                    .join("claude-backup-1.claudinal.json")
+            )?,
+            "companion-content"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                restore_claude
+                    .join("tasks")
+                    .join("claude-backup-1")
+                    .join("task.json")
+            )?,
+            "task-content"
+        );
         let restored_history = fs::read_to_string(restore_claude.join("history.jsonl"))?;
         assert!(restored_history.contains("keep one"));
         assert!(restored_history.contains("keep two"));
@@ -2343,6 +2811,65 @@ mod tests {
         let error = verify_backup(backup_dir.to_string_lossy().into_owned(), backup_path)
             .expect_err("support-file corruption must fail backup verification");
         assert!(error.to_string().contains("辅助文件"));
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn backs_up_verifies_and_restores_opencode_snapshot() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-opencode-backup-test");
+        let source = root.join("source-opencode");
+        let target = root.join("target-opencode");
+        let cwd = root.join("project");
+        let backup_dir = root.join("backups");
+        write_opencode_database(&source, &cwd, "OpenCode portable")?;
+        write_opencode_database(&target, &cwd, "placeholder")?;
+        let target_connection =
+            rusqlite::Connection::open(crate::opencode_sessions::database_path(&target))?;
+        target_connection.execute_batch("PRAGMA foreign_keys=ON")?;
+        target_connection.execute("DELETE FROM session WHERE id='ses_backup'", [])?;
+        drop(target_connection);
+
+        let summary = create_backup_with_opencode(
+            Some(PROVIDER_OPENCODE.to_string()),
+            String::new(),
+            None,
+            Some(source.to_string_lossy().into_owned()),
+            backup_dir.to_string_lossy().into_owned(),
+            vec!["ses_backup".to_string()],
+            None,
+            Some("opencode-backup".to_string()),
+            Some("portable sqlite snapshot".to_string()),
+        )?;
+        assert_eq!(summary.provider.as_deref(), Some(PROVIDER_OPENCODE));
+        let verified = verify_backup(
+            backup_dir.to_string_lossy().into_owned(),
+            summary.path.clone(),
+        )?;
+        assert!(verified.all_ok);
+
+        let restored = restore_session_with_opencode(
+            Some(PROVIDER_OPENCODE.to_string()),
+            backup_dir.to_string_lossy().into_owned(),
+            summary.path,
+            String::new(),
+            None,
+            Some(target.to_string_lossy().into_owned()),
+            "ses_backup".to_string(),
+            None,
+            false,
+        )?;
+        assert!(restored.ok);
+        let sessions = crate::opencode_sessions::list_sessions(&target)?;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title, "OpenCode portable");
+        let preview = crate::opencode_sessions::preview_range(&sessions[0].rollout_path, 0, 10)?;
+        assert_eq!(preview.len(), 1);
+        assert_eq!(
+            crate::rollout::preview_event_text(&preview[0]),
+            "portable opencode content"
+        );
+
         fs::remove_dir_all(root).ok();
         Ok(())
     }
@@ -2514,6 +3041,10 @@ mod tests {
             source_relpath: None,
             sidecar_relpath: None,
             sidecar_files: Vec::new(),
+            companions_relpath: None,
+            companion_files: Vec::new(),
+            tasks_relpath: None,
+            task_files: Vec::new(),
             title: "orphan".to_string(),
             cwd: String::new(),
             created_at: 0,
@@ -2628,6 +3159,10 @@ mod tests {
             source_relpath: None,
             sidecar_relpath: None,
             sidecar_files: Vec::new(),
+            companions_relpath: None,
+            companion_files: Vec::new(),
+            tasks_relpath: None,
+            task_files: Vec::new(),
             title: "new thread".to_string(),
             cwd: "F:\\work\\restored".to_string(),
             created_at: 0,
@@ -2714,6 +3249,7 @@ mod tests {
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             codex_dir: codex.to_string_lossy().into_owned(),
             claude_dir: None,
+            opencode_dir: None,
             note: None,
             artifacts: Vec::new(),
             sessions: vec![ManifestSession {
@@ -2723,6 +3259,10 @@ mod tests {
                 source_relpath: None,
                 sidecar_relpath: None,
                 sidecar_files: Vec::new(),
+                companions_relpath: None,
+                companion_files: Vec::new(),
+                tasks_relpath: None,
+                task_files: Vec::new(),
                 title: String::new(),
                 cwd: String::new(),
                 created_at: 0,
@@ -2777,6 +3317,7 @@ mod tests {
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             codex_dir: String::new(),
             claude_dir: None,
+            opencode_dir: None,
             note: None,
             artifacts: Vec::new(),
             sessions: vec![ManifestSession {
@@ -2786,6 +3327,10 @@ mod tests {
                 source_relpath: None,
                 sidecar_relpath: None,
                 sidecar_files: Vec::new(),
+                companions_relpath: None,
+                companion_files: Vec::new(),
+                tasks_relpath: None,
+                task_files: Vec::new(),
                 title: "missing rollout".to_string(),
                 cwd: String::new(),
                 created_at: 0,
@@ -2861,6 +3406,7 @@ mod tests {
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             codex_dir: String::new(),
             claude_dir: None,
+            opencode_dir: None,
             note: None,
             artifacts: Vec::new(),
             sessions: vec![ManifestSession {
@@ -2870,6 +3416,10 @@ mod tests {
                 source_relpath: None,
                 sidecar_relpath: None,
                 sidecar_files: Vec::new(),
+                companions_relpath: None,
+                companion_files: Vec::new(),
+                tasks_relpath: None,
+                task_files: Vec::new(),
                 title: String::new(),
                 cwd: String::new(),
                 created_at: 0,

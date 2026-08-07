@@ -45,6 +45,7 @@ struct SearchRequest {
     provider: String,
     codex_dir: String,
     claude_dir: String,
+    opencode_dir: String,
     query: String,
     rollout_paths: Vec<String>,
 }
@@ -160,6 +161,7 @@ pub fn start_content_search(
     provider: String,
     codex_dir: String,
     claude_dir: String,
+    opencode_dir: String,
     query: String,
     rollout_paths: Vec<String>,
 ) -> AppResult<ContentSearchStart> {
@@ -167,6 +169,7 @@ pub fn start_content_search(
         provider,
         codex_dir,
         claude_dir,
+        opencode_dir,
         query: query.trim().to_string(),
         rollout_paths,
     })
@@ -185,7 +188,7 @@ pub fn cancel_content_search(job_id: u64) -> AppResult<()> {
 }
 
 fn validate_request(request: &SearchRequest) -> AppResult<()> {
-    if !matches!(request.provider.as_str(), "codex" | "claude") {
+    if !matches!(request.provider.as_str(), "codex" | "claude" | "opencode") {
         return Err(AppError::Other(format!(
             "不支持的 provider: {}",
             request.provider
@@ -201,11 +204,14 @@ fn validate_request(request: &SearchRequest) -> AppResult<()> {
             "全文搜索关键词不能超过 {MAX_QUERY_CHARS} 个字符"
         )));
     }
-    if request.codex_dir.trim().is_empty() {
+    if request.provider == "codex" && request.codex_dir.trim().is_empty() {
         return Err(AppError::Other("Codex 目录不能为空".to_string()));
     }
-    if request.claude_dir.trim().is_empty() {
+    if request.provider == "claude" && request.claude_dir.trim().is_empty() {
         return Err(AppError::Other("Claude 目录不能为空".to_string()));
+    }
+    if request.provider == "opencode" && request.opencode_dir.trim().is_empty() {
+        return Err(AppError::Other("OpenCode 目录不能为空".to_string()));
     }
     if request.query.chars().any(char::is_control) {
         return Err(AppError::Other(
@@ -241,10 +247,11 @@ fn execute_search(job: &SearchJob, request: &SearchRequest) -> AppResult<()> {
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
-    let sessions = sessions::list_sessions_cancellable(
+    let sessions = sessions::list_sessions_cancellable_with_opencode(
         Some(request.provider.clone()),
         request.codex_dir.clone(),
         Some(request.claude_dir.clone()),
+        Some(request.opencode_dir.clone()),
         &job.cancel,
     )?
     .into_iter()
@@ -308,6 +315,9 @@ fn scan_session(
     query: &str,
     completed_bytes: u64,
 ) -> AppResult<FileScanOutcome> {
+    if session.provider == "opencode" {
+        return scan_opencode_session(job, session, query, completed_bytes);
+    }
     let file = match File::open(&session.rollout_path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -395,6 +405,65 @@ fn scan_session(
     Ok(FileScanOutcome {
         matches,
         bytes_read,
+        cancelled: false,
+        missing: false,
+    })
+}
+
+fn scan_opencode_session(
+    job: &SearchJob,
+    session: &SessionSummary,
+    query: &str,
+    completed_bytes: u64,
+) -> AppResult<FileScanOutcome> {
+    let events = crate::opencode_sessions::load_preview_events_from_locator(&session.rollout_path)?;
+    let total_events = events.len().max(1);
+    let mut matches = Vec::new();
+
+    for (event_offset, event) in events.into_iter().enumerate() {
+        if job.cancel.load(Ordering::Acquire) {
+            return Ok(FileScanOutcome {
+                matches,
+                bytes_read: 0,
+                cancelled: true,
+                missing: false,
+            });
+        }
+        if event_offset % 128 == 0 {
+            let approximate =
+                session.rollout_bytes.saturating_mul(event_offset as u64) / total_events as u64;
+            let mut status = job.status.lock().unwrap_or_else(|error| error.into_inner());
+            status.scanned_bytes = completed_bytes
+                .saturating_add(approximate)
+                .min(status.total_bytes);
+        }
+        if matches.len() >= MAX_MATCHES_PER_SESSION {
+            continue;
+        }
+        let mixed_assistant_text = rollout::preview_event_has_assistant_text_tool_use(&event);
+        if !rollout::preview_event_is_conversation(&event) && !mixed_assistant_text {
+            continue;
+        }
+        let text = rollout::preview_event_text(&event);
+        if find_query(&text, query).is_none() {
+            continue;
+        }
+        matches.push(ContentSearchMatch {
+            event_index: event.index,
+            event_offset,
+            timestamp: event.timestamp,
+            role: if mixed_assistant_text {
+                "assistant".to_string()
+            } else {
+                event.role
+            },
+            snippet: make_snippet(&text, query),
+        });
+    }
+
+    Ok(FileScanOutcome {
+        matches,
+        bytes_read: session.rollout_bytes,
         cancelled: false,
         missing: false,
     })
@@ -579,6 +648,86 @@ mod tests {
     }
 
     #[test]
+    fn searches_opencode_sqlite_conversation_text_only() -> AppResult<()> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("cc-sessions-search-opencode-{unique}"));
+        fs::create_dir_all(&root)?;
+        let connection =
+            rusqlite::Connection::open(crate::opencode_sessions::database_path(&root))?;
+        connection.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT, slug TEXT NOT NULL, directory TEXT NOT NULL, title TEXT NOT NULL, version TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, time_archived INTEGER);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL REFERENCES message(id) ON DELETE CASCADE, session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);",
+        )?;
+        connection.execute(
+            "INSERT INTO session VALUES ('ses_search', 'global', NULL, 'slug', 'F:\\project', 'Search', '1.0', 1000, 4000, NULL)",
+            [],
+        )?;
+        connection.execute(
+            "INSERT INTO message VALUES ('msg_user', 'ses_search', 1000, 1000, ?1)",
+            [json!({"role":"user"}).to_string()],
+        )?;
+        connection.execute(
+            "INSERT INTO message VALUES ('msg_process', 'ses_search', 2000, 2000, ?1)",
+            [json!({"role":"assistant","parentID":"msg_user","finish":"tool-calls"}).to_string()],
+        )?;
+        connection.execute(
+            "INSERT INTO message VALUES ('msg_final', 'ses_search', 3000, 3000, ?1)",
+            [json!({"role":"assistant","parentID":"msg_user","finish":"stop"}).to_string()],
+        )?;
+        for (id, message, created, data) in [
+            (
+                "part_user",
+                "msg_user",
+                1000,
+                json!({"type":"text","text":"visible needle prompt"}),
+            ),
+            (
+                "part_reasoning",
+                "msg_process",
+                2000,
+                json!({"type":"reasoning","text":"hidden needle reasoning"}),
+            ),
+            (
+                "part_tool",
+                "msg_process",
+                2100,
+                json!({"type":"tool","callID":"call_1","tool":"needle_tool","state":{"input":{"query":"needle"}}}),
+            ),
+            (
+                "part_final",
+                "msg_final",
+                3000,
+                json!({"type":"text","text":"visible needle answer"}),
+            ),
+        ] {
+            connection.execute(
+                "INSERT INTO part VALUES (?1, ?2, 'ses_search', ?3, ?3, ?4)",
+                rusqlite::params![id, message, created, data.to_string()],
+            )?;
+        }
+        drop(connection);
+
+        let session = crate::opencode_sessions::list_sessions(&root)?
+            .into_iter()
+            .next()
+            .expect("OpenCode fixture session");
+        let result = scan_session(&test_job(), &session, "needle", 0)?;
+
+        assert_eq!(result.matches.len(), 2);
+        assert_eq!(result.matches[0].role, "user");
+        assert_eq!(result.matches[0].snippet, "visible needle prompt");
+        assert_eq!(result.matches[1].role, "assistant");
+        assert_eq!(result.matches[1].snippet, "visible needle answer");
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
     fn searches_text_that_is_escaped_in_json() {
         let path = temp_file(
             "escaped",
@@ -661,6 +810,7 @@ mod tests {
             provider: "claude".to_string(),
             codex_dir: root.join("codex").to_string_lossy().into_owned(),
             claude_dir: claude_dir.to_string_lossy().into_owned(),
+            opencode_dir: root.join("opencode").to_string_lossy().into_owned(),
             query: "needle".to_string(),
             rollout_paths: Vec::new(),
         };

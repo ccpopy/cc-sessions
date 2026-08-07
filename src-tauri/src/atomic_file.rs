@@ -225,13 +225,37 @@ fn cleanup_after_error(temp_path: &Path, original: AppError) -> AppError {
 }
 
 #[cfg(windows)]
+fn move_file_api_path(path: &Path) -> std::io::Result<Vec<u16>> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    const BACKSLASH: u16 = b'\\' as u16;
+    let absolute = std::path::absolute(path)?;
+    let raw = absolute.as_os_str().encode_wide().collect::<Vec<_>>();
+    let is_verbatim = raw.starts_with(&[BACKSLASH, BACKSLASH, b'?' as u16, BACKSLASH]);
+    let is_device = raw.starts_with(&[BACKSLASH, BACKSLASH, b'.' as u16, BACKSLASH]);
+
+    let mut wide = if is_verbatim || is_device {
+        raw
+    } else if raw.starts_with(&[BACKSLASH, BACKSLASH]) {
+        let mut prefixed = OsStr::new(r"\\?\UNC\").encode_wide().collect::<Vec<_>>();
+        prefixed.extend_from_slice(&raw[2..]);
+        prefixed
+    } else {
+        let mut prefixed = OsStr::new(r"\\?\").encode_wide().collect::<Vec<_>>();
+        prefixed.extend_from_slice(&raw);
+        prefixed
+    };
+    wide.push(0);
+    Ok(wide)
+}
+
+#[cfg(windows)]
 fn replace_file_atomically(
     temp_path: &Path,
     final_path: &Path,
     replace_existing: bool,
 ) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
     const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
 
@@ -240,16 +264,11 @@ fn replace_file_atomically(
         fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
     }
 
-    let existing = temp_path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let replacement = final_path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
+    // Raw Win32 APIs still enforce the legacy MAX_PATH limit unless absolute paths use the
+    // extended-length namespace. Claude project directory encoding can easily push a transcript
+    // beyond that boundary after a cwd move, even though Rust's normal filesystem APIs can open it.
+    let existing = move_file_api_path(temp_path)?;
+    let replacement = move_file_api_path(final_path)?;
     let flags = MOVEFILE_WRITE_THROUGH
         | if replace_existing {
             MOVEFILE_REPLACE_EXISTING
@@ -402,6 +421,33 @@ mod tests {
             .count();
         assert_eq!(leftovers, 0);
         fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replaces_an_unchanged_file_beyond_legacy_max_path() -> AppResult<()> {
+        let cleanup_root = std::env::temp_dir().join(format!(
+            "cc-session-manager-atomic-long-path-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let mut root = cleanup_root.clone();
+        while root.to_string_lossy().encode_utf16().count() < 280 {
+            root.push("claude-project-directory-segment-0123456789");
+        }
+        fs::create_dir_all(&root)?;
+        let path = root.join("session.jsonl");
+        fs::write(&path, b"before\n")?;
+        let expected = fingerprint(&path)?;
+
+        replace_with_writer_if_unchanged(&path, &expected, |temp| {
+            temp.write_all(b"replacement\n")?;
+            Ok(())
+        })?;
+
+        assert_eq!(fs::read(&path)?, b"replacement\n");
+        fs::remove_dir_all(cleanup_root).ok();
         Ok(())
     }
 }

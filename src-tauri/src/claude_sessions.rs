@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 use chrono::{DateTime, FixedOffset};
 use serde_json::Value;
 
-use crate::error::{ensure_not_cancelled, AppResult};
+use crate::error::{ensure_not_cancelled, AppError, AppResult};
 use crate::models::{PreviewEvent, SessionMetaBrief, SessionSummary};
 use crate::{fs_ops, paths};
 
@@ -154,6 +154,133 @@ pub fn session_relpath(claude_dir: &Path, source_path: &Path) -> PathBuf {
 pub fn sidecar_path_for(source_path: &Path) -> Option<PathBuf> {
     let stem = source_path.file_stem()?;
     Some(source_path.with_file_name(stem))
+}
+
+/// Claude Code 的项目目录名编码：路径中的每个非 ASCII 字母数字字符都替换为 `-`。
+pub fn encode_project_dir(cwd: &str) -> String {
+    let encoded = cwd
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    if encoded.is_empty() {
+        "-".to_string()
+    } else {
+        encoded
+    }
+}
+
+pub fn project_dir_for_cwd(claude_dir: &Path, cwd: &str) -> PathBuf {
+    paths::claude_projects_dir(claude_dir).join(encode_project_dir(cwd))
+}
+
+pub fn task_path_for(claude_dir: &Path, session_id: &str) -> PathBuf {
+    claude_dir.join("tasks").join(session_id)
+}
+
+/// 找到与主 transcript 同名的 companion 文件，例如 `<id>.claudinal.json`。
+pub fn companion_files_for(source_path: &Path) -> AppResult<Vec<PathBuf>> {
+    let parent = source_path.parent().ok_or_else(|| {
+        AppError::Path(format!(
+            "Claude transcript 缺少父目录: {}",
+            source_path.to_string_lossy()
+        ))
+    })?;
+    let id = source_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| AppError::Path("Claude transcript 文件名无效".into()))?;
+    let prefix = format!("{id}.");
+    let mut out = Vec::new();
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path == source_path {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        if crate::path_safety::metadata_is_link_or_reparse(&metadata) || !metadata.is_file() {
+            return Err(AppError::Path(format!(
+                "Claude companion 不是普通文件: {}",
+                path.to_string_lossy()
+            )));
+        }
+        out.push(path);
+    }
+    out.sort();
+    Ok(out)
+}
+
+pub fn resolve_session_summary(
+    claude_dir: &Path,
+    session_id: &str,
+    requested_path: Option<&str>,
+) -> AppResult<SessionSummary> {
+    let sessions = scan_sessions(claude_dir)?;
+    let matches = sessions
+        .into_iter()
+        .filter(|session| session.id == session_id)
+        .collect::<Vec<_>>();
+    if let Some(requested_path) = requested_path {
+        let requested = paths::strip_verbatim(requested_path);
+        return matches
+            .into_iter()
+            .find(|session| paths::strip_verbatim(&session.rollout_path) == requested)
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "Claude 会话精确目标不存在或 ID 不匹配: id={session_id} rollout_path={requested_path}"
+                ))
+            });
+    }
+    match matches.as_slice() {
+        [session] => Ok((*session).clone()),
+        [] => Err(AppError::NotFound(format!(
+            "Claude 会话不存在: {session_id}"
+        ))),
+        duplicates => Err(AppError::Other(format!(
+            "发现 {} 个同 ID Claude 会话，操作必须提供精确 rollout_path: {session_id}",
+            duplicates.len()
+        ))),
+    }
+}
+
+pub fn validate_main_transcript(
+    claude_dir: &Path,
+    source_path: &Path,
+    session_id: &str,
+) -> AppResult<()> {
+    let projects = paths::claude_projects_dir(claude_dir);
+    crate::path_safety::validate_descendant(
+        &projects,
+        source_path,
+        crate::path_safety::EntryKind::File,
+        false,
+        "Claude 主 transcript",
+    )?;
+    let relative = source_path.strip_prefix(&projects).map_err(|_| {
+        AppError::Path(format!(
+            "Claude transcript 不在 projects 目录内: {}",
+            source_path.to_string_lossy()
+        ))
+    })?;
+    let expected_name = format!("{session_id}.jsonl");
+    if relative.components().count() != 2
+        || source_path.file_name().and_then(|value| value.to_str()) != Some(expected_name.as_str())
+    {
+        return Err(AppError::Other(
+            "移动项目目录只支持 Claude 主会话；子代理会随主会话 sidecar 一起移动".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_session(path: &Path, cancel: Option<&AtomicBool>) -> AppResult<Option<SessionSummary>> {

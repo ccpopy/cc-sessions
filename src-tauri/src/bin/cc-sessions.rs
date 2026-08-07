@@ -230,7 +230,9 @@ fn print_help() {
   cc-sessions --provider claude convert ~/.claude/projects/.../<session-id>.jsonl --mode simple
   cc-sessions repair diagnose --json
   cc-sessions backup create --backup-dir ./backups --id <session-id> --name first-backup
+  cc-sessions --provider opencode backup create --backup-dir ./backups --id <session-id>
   cc-sessions --provider claude bundle export --out-dir ./bundles --id <session-id> --rollout-path <transcript.jsonl>
+  cc-sessions --provider opencode bundle export --out-dir ./bundles --id <session-id>
 "#
     );
 }
@@ -698,10 +700,11 @@ fn cmd_backup(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             let name = take_value(&mut args, "--name")?;
             let note = take_value(&mut args, "--note")?;
             ensure_no_args(&args)?;
-            let summary = backup::create_backup(
+            let summary = backup::create_backup_with_opencode(
                 Some(concrete_provider(ctx)?),
                 ctx.codex_dir.clone(),
                 Some(ctx.claude_dir.clone()),
+                Some(ctx.opencode_dir.clone()),
                 backup_dir,
                 ids,
                 None,
@@ -766,12 +769,13 @@ fn cmd_backup(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             let overwrite = take_flag(&mut args, "--overwrite");
             ensure_no_args(&args)?;
             let backup_root = explicit_backup_root(&backup_path)?;
-            let result = backup::restore_session(
+            let result = backup::restore_session_with_opencode(
                 Some(concrete_provider(ctx)?),
                 backup_root,
                 backup_path,
                 ctx.codex_dir.clone(),
                 Some(ctx.claude_dir.clone()),
+                Some(ctx.opencode_dir.clone()),
                 id,
                 None,
                 overwrite,
@@ -791,12 +795,13 @@ fn cmd_backup(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             let overwrite = take_flag(&mut args, "--overwrite");
             ensure_no_args(&args)?;
             let backup_root = explicit_backup_root(&backup_path)?;
-            let results = backup::restore_all(
+            let results = backup::restore_all_with_opencode(
                 Some(concrete_provider(ctx)?),
                 backup_root,
                 backup_path,
                 ctx.codex_dir.clone(),
                 Some(ctx.claude_dir.clone()),
+                Some(ctx.opencode_dir.clone()),
                 overwrite,
             )?;
             output(ctx, &results, |items| {
@@ -848,10 +853,11 @@ fn cmd_bundle(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
                         .collect(),
                 )
             };
-            let reports = bundle::export_session_bundles(
+            let reports = bundle::export_session_bundles_with_opencode(
                 Some(concrete_provider(ctx)?),
                 ctx.codex_dir.clone(),
                 Some(ctx.claude_dir.clone()),
+                Some(ctx.opencode_dir.clone()),
                 out_dir,
                 ids,
                 targets,
@@ -869,10 +875,11 @@ fn cmd_bundle(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             let export_group = take_value(&mut args, "--export-group")?;
             let active_only = take_flag(&mut args, "--active-only");
             ensure_no_args(&args)?;
-            let reports = bundle::export_all_bundles(
+            let reports = bundle::export_all_bundles_with_opencode(
                 Some(concrete_provider(ctx)?),
                 ctx.codex_dir.clone(),
                 Some(ctx.claude_dir.clone()),
+                Some(ctx.opencode_dir.clone()),
                 out_dir,
                 machine_label,
                 export_group,
@@ -898,11 +905,12 @@ fn cmd_bundle(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             let make_visible = take_flag(&mut args, "--make-visible");
             let strict = take_flag(&mut args, "--strict");
             ensure_no_args(&args)?;
-            let reports = bundle::import_session_bundles(
+            let reports = bundle::import_session_bundles_with_opencode(
                 Some(concrete_provider(ctx)?),
                 src_dir,
                 ctx.codex_dir.clone(),
                 Some(ctx.claude_dir.clone()),
+                Some(ctx.opencode_dir.clone()),
                 mode,
                 make_visible,
                 strict,

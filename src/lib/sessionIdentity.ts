@@ -16,6 +16,7 @@ export function sessionIdentityFromPath(
   rolloutPath: string,
   fallbackId: string,
 ): string {
+  if (provider === "opencode") return `${provider}\u0000${fallbackId}`;
   return `${provider}\u0000${normalizedIdentityPath(rolloutPath) || fallbackId}`;
 }
 

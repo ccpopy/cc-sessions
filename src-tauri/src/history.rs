@@ -156,6 +156,74 @@ pub fn append_from_file(history_path: &Path, source_path: &Path, id: &str) -> Ap
     append_lines(history_path, id, &lines)
 }
 
+/// 追加 Claude history 行，并把匹配会话的项目路径映射到目标目录。
+pub fn append_from_file_with_project(
+    history_path: &Path,
+    source_path: &Path,
+    id: &str,
+    target_project: Option<&str>,
+) -> AppResult<u32> {
+    if !regular_file_exists(source_path, "history source")? {
+        return Ok(0);
+    }
+    let mut lines = Vec::new();
+    for line in BufReader::new(File::open(source_path)?).lines() {
+        let line = line?;
+        if !line_matches_session(&line, id) {
+            continue;
+        }
+        lines.push(match target_project {
+            Some(project) => history_line_with_project(&line, project)?,
+            None => line,
+        });
+    }
+    append_lines(history_path, id, &lines)
+}
+
+/// 原子更新 Claude history 中指定会话的 `project` 字段。
+pub fn rewrite_project_for_session(path: &Path, id: &str, project: &str) -> AppResult<u32> {
+    if !regular_file_exists(path, "history")? {
+        return Ok(0);
+    }
+    let expected = atomic_file::fingerprint(path)?;
+    let mut output = Vec::new();
+    let mut updated = 0u32;
+    for line in BufReader::new(File::open(path)?).lines() {
+        let line = line?;
+        if line_matches_session(&line, id) {
+            let next = history_line_with_project(&line, project)?;
+            if next != line {
+                updated = updated.saturating_add(1);
+            }
+            output.push(next);
+        } else {
+            output.push(line);
+        }
+    }
+    if updated == 0 {
+        return Ok(0);
+    }
+    atomic_file::replace_with_writer_if_unchanged(path, &expected, |file| {
+        let mut writer = BufWriter::new(file);
+        for line in &output {
+            writeln!(writer, "{line}")?;
+        }
+        writer.flush()?;
+        Ok(())
+    })?;
+    Ok(updated)
+}
+
+fn history_line_with_project(line: &str, project: &str) -> AppResult<String> {
+    let mut value: Value = serde_json::from_str(line)
+        .map_err(|error| AppError::Other(format!("Claude history 行不是有效 JSON: {error}")))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| AppError::Other("Claude history 行不是 JSON 对象".into()))?;
+    object.insert("project".into(), Value::String(project.to_string()));
+    Ok(serde_json::to_string(&value)?)
+}
+
 pub fn filter_file(path: &Path, id: &str) -> AppResult<u32> {
     let ids = HashSet::from([id.to_string()]);
     let mut removed = filter_file_for_ids(path, &ids)?;

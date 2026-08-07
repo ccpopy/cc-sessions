@@ -13,7 +13,7 @@ CC Sessions 是一个本地 Agent 会话管理工具，用来查看、搜索、�
 
 - 左侧导航改为顶部 Agent 切换器，下方只展示当前 Agent 的功能。视觉风格保持原有低饱和配色与细边框，同时为后续接入更多 Agent 留出空间。
 - 新增 Claude Memory 管理，读取 `~/.claude/projects/*/memory/*.md`，支持项目与文件浏览、新建、编辑、重命名和删除。保存使用原子替换与 SHA-256 版本校验，避免覆盖其他 Claude 实例刚写入的内容。
-- 新增 OpenCode 会话管理，直接读取当前版本的 `opencode.db`，支持项目分组、搜索、预览、对话时间线、归档、重命名、删除、Markdown 导出和复制 `opencode --session <id>` 续聊命令。旧版 `storage/` JSON 不与 SQLite 数据混合读取，OpenCode 会话也不支持消息级编辑。
+- 新增 OpenCode 会话管理，直接读取当前版本的 `opencode.db`，支持项目分组、搜索、全文搜索、预览、对话时间线、归档、重命名、移动工作目录、消息级编辑、备份恢复、Bundle 导入导出、Markdown 导出和复制 `opencode --session <id>` 续聊命令。旧版 `storage/` JSON 不与 SQLite 数据混合读取。
 - 全局统计新增 OpenCode 维度：统计页可以单看 OpenCode，「全部」也会把 OpenCode 会话计入 KPI、趋势、项目 Top 10、模型分布和热力图。没有安装或未配置 OpenCode 时按零会话处理，不影响其他 Agent 的统计。
 - Family 清理从“删除残留”升级为安全恢复：当记录中的当前分支文件丢失、但只存在一个可确定的 active 候选时自动接管；当多个分支被误标为 active 时，以 `active_id` 为准校正状态。流程不会改写仍存在的会话 JSONL。
 
@@ -29,10 +29,30 @@ Codex 目前也提供独立的本地 Memory：可通过 `/memories` 与“设置
 - 在预览中修改用户或助手文本，也可以删除单条上下文事件。删除时会同步处理配对的工具事件、Codex 镜像行和关联推理；Claude 会话会重新连接 `parentUuid` 链。
 - 每次编辑前保存原始快照并记录日志，可逐步撤销或一键还原。编辑后仍可通过 `resume` 续聊。Codex 的加密推理和 Claude 的签名思考只能删除，不能改写。
 - 管理 Codex 归档会话。归档时把 rollout 移入 `archived_sessions/`，同步 `threads` 表和 `session_index.jsonl`；取消归档时按文件名日期移回 `sessions/YYYY/MM/DD/`。列表也会显示缺少 `threads` 记录的归档文件。
-- 备份、恢复、导入和导出会话包，也可导出 Markdown。
+- 为 Codex、Claude Code 和 OpenCode 备份、恢复、导入和导出会话包，也可导出 Markdown。
+- 移动会话工作目录：Codex 同步 rollout 与本地索引，Claude Code 移动项目 transcript 及关联资产，OpenCode 在共享 SQLite 中重绑定项目与目录。
+- 桌面版和 CLI Web UI 支持会话正文全文搜索；OpenCode 搜索直接解析 SQLite 中的统一预览事件，不会把数据库定位符当作普通文件读取。
 - 修复 Codex 本地索引、重建 `threads` 表并清理 orphan 记录。
 - 管理 Codex provider 分支，或从稳定的对话节点创建回溯分支。
 - 检查 GitHub Release 更新。桌面版可下载、校验并安装更新，CLI Web UI 提供手动下载入口。
+
+## 会话数据、备份与目录迁移
+
+| Agent | 原生会话数据 | 备份 / 恢复 | Bundle 导入 / 导出 | 移动会话目录 | 迁移后续聊 |
+| --- | --- | --- | --- | --- | --- |
+| Codex | rollout JSONL、`state_5.sqlite`、`session_index.jsonl` 等本地索引 | 支持 | 支持 | 支持 | 支持 |
+| Claude Code | `projects/<编码目录>/<id>.jsonl`、同名 sidecar、`<id>.*` companion、`tasks/<id>`、`history.jsonl` | 支持，并包含关联资产 | 支持，并包含关联资产 | 支持 | 支持 |
+| OpenCode | 共享 `opencode.db` 中的 `session`、`message`、`part` 等会话拥有行 | 支持会话级快照 | 支持会话级快照 | 支持 | 支持，命令为 `opencode --session <id>` |
+
+Claude Code 的项目目录名不是直接使用原路径，而是把路径中的每个非 ASCII 字母数字字符替换为 `-`。移动目录时，CC Sessions 会使用同一规则创建目标项目目录，移动主 transcript、同名 sidecar 和 companion 文件，重写 JSONL 中的 `cwd`，并把 `history.jsonl` 对应记录的 `project` 改为新目录。`tasks/<id>` 以会话 ID 关联，不随项目目录改名。操作使用暂存和回滚；目标存在同名资产或写后校验失败时，不会把一次不完整迁移当成成功。
+
+OpenCode 的会话存放在共享 SQLite 中，因此备份和 Bundle 不会复制整个数据库。快照按实际 schema 动态提取目标会话拥有的行，导入时使用源库与目标库的列交集，并在事务内启用外键检查和写后校验。账号、token、共享 project/workspace 数据以及 `session_share.secret` 不进入快照；覆盖导入也不会用其他机器的 share secret 覆盖本机值。
+
+移动 OpenCode 会话时，会同步更新选中会话及其子会话的 `project_id`、`directory`，并兼容存在时的 `path`、`workspace_id` 列。如果目标目录已由 OpenCode 登记，会复用对应 project；尚未登记时先使用 `global`。若目标是 Git 项目，第一次在该目录启动 OpenCode 后会由 OpenCode 补齐真实 project 记录。迁移完成后仍可在 CC Sessions 中预览，并可用 `opencode --session <id>` 续聊。
+
+Claude 的覆盖恢复采用“完整快照”语义：源快照中不存在的 sidecar、companion 或 tasks 会删除目标端同会话的陈旧副本，避免正文已经回退但辅助状态仍来自较新会话。OpenCode 覆盖导入会完整替换该会话拥有的数据库行。Codex 的 provider 分支仍是 Codex 专属能力，不会套用到 Claude Code 或 OpenCode。
+
+跨机器导入 Bundle 时，桌面版和 CLI Web UI 会列出源项目路径并允许映射到本机已有目录。纯 CLI 子命令不提供可视化路径映射，会沿用 Bundle 中的原路径；路径不同的场景请使用 Web UI，或先确保原路径在目标环境可访问。
 
 ## 快捷键
 
@@ -106,7 +126,7 @@ src-tauri/target/release/cc-sessions
 
 Windows 下文件名为 `cc-sessions.exe`。
 
-直接运行 CLI 会进入交互菜单。菜单包含会话列表、搜索、项目分组、预览、Codex/Claude 互转、备份、导入导出和修复诊断：
+直接运行 CLI 会进入交互菜单。菜单包含会话列表、搜索、项目分组、预览、重命名、移动会话目录、Codex/Claude 互转、备份、导入导出和修复诊断。OpenCode 同样可在菜单中执行移动目录、备份和 Bundle 操作：
 
 ```bash
 npm run cli:run
@@ -158,12 +178,15 @@ cc-sessions --provider opencode webui --host 127.0.0.1 --port 17888
 cc-sessions --provider codex convert ~/.codex/sessions/.../rollout-xxx.jsonl --mode native
 cc-sessions --provider claude convert ~/.claude/projects/.../<session-id>.jsonl --mode simple
 cc-sessions backup create --backup-dir ./backups --id <session-id> --name first-backup
+cc-sessions --provider opencode backup create --backup-dir ./backups --id <session-id> --name opencode-backup
 cc-sessions repair diagnose --json
 cc-sessions repair index --dry-run
 cc-sessions bundle export --out-dir ./bundles --id <session-id>
+cc-sessions --provider opencode bundle export --out-dir ./bundles --id <session-id>
+cc-sessions --provider opencode bundle import --src-dir ./bundles --mode overwrite --strict
 ```
 
-默认路径与桌面端相同：Codex 读取 `~/.codex`，Claude Code 读取 `~/.claude`，OpenCode 读取 `~/.local/share/opencode/opencode.db`。CLI 子命令可以用 `--codex-dir`、`--claude-dir` 和 `--opencode-dir` 指定其他位置；`--opencode-dir` 作用于交互菜单与 `stats`，Web UI 的 OpenCode 路径仍在设置页修改。在 Windows 中读取 WSL 的 Codex 数据时，`--codex-dir` 可使用 `\\wsl.localhost\<发行版>\home\<用户>\.codex` 形式的 UNC 路径。
+默认路径与桌面端相同：Codex 读取 `~/.codex`，Claude Code 读取 `~/.claude`，OpenCode 读取 `~/.local/share/opencode/opencode.db`。CLI 子命令可以用 `--codex-dir`、`--claude-dir` 和 `--opencode-dir` 指定其他位置，这三个参数也会传给交互菜单和 CLI Web UI。在 Windows 中读取 WSL 的 Codex 数据时，`--codex-dir` 可使用 `\\wsl.localhost\<发行版>\home\<用户>\.codex` 形式的 UNC 路径。
 
 `list`、`search` 和 `projects` 默认只处理主会话。加入 `--subagent` 后只处理子代理会话。`list` 和 `search` 支持 `--sort size`，会按 token 从小到大排序。
 
@@ -183,7 +206,7 @@ cc-sessions webui --host 127.0.0.1 --port 17888
 
 Web UI 会保存设置。官方 CLI 便携包包含 `cc-sessions.portable`，配置文件位于可执行文件旁的 `cc-sessions-webui-settings.json`。没有该标记的构建会使用系统用户配置目录下的 `cc-sessions/cc-sessions-webui-settings.json`。
 
-环境变量 `CC_SESSIONS_WEBUI_SETTINGS` 可以指定配置文件位置。首次启动会创建文件，以后沿用页面中保存的 Codex、Claude 与 OpenCode 数据路径。只有在启动命令中明确传入 `--codex-dir` 或 `--claude-dir` 时，命令行路径才会覆盖并写回配置；OpenCode 路径在设置页修改。配置目录不可写时，保存会报错。
+环境变量 `CC_SESSIONS_WEBUI_SETTINGS` 可以指定配置文件位置。首次启动会创建文件，以后沿用页面中保存的 Codex、Claude 与 OpenCode 数据路径。在启动命令中明确传入 `--codex-dir`、`--claude-dir` 或 `--opencode-dir` 时，命令行路径会覆盖并写回配置。配置目录不可写时，保存会报错。
 
 `--provider codex|claude|opencode` 决定根路径 `/` 默认打开哪组会话，例如：
 

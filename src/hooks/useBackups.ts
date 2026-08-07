@@ -63,6 +63,11 @@ export function useBackupIndex(provider?: SessionProvider, enabled = true) {
           const detail = await api.openBackup(backupDir, b.path);
           for (const s of detail.manifest.sessions) {
             const itemProvider = s.provider ?? detail.manifest.provider ?? provider ?? "codex";
+            if (itemProvider === "opencode") {
+              const identity = sessionIdentityFromPath(itemProvider, "", s.id);
+              (map[identity] ||= []).push(b.path);
+              continue;
+            }
             const rolloutPath = itemProvider === "claude"
               ? s.source_relpath && claudeDir
                 ? joinPath(joinPath(claudeDir, "projects"), s.source_relpath)

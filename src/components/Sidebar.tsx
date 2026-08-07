@@ -90,7 +90,11 @@ const providers: ProviderDefinition[] = [
     id: "opencode",
     label: "OpenCode",
     icon: Braces,
-    items: [{ to: "/opencode/sessions", icon: MessageSquare, label: "会话" }],
+    items: [
+      { to: "/opencode/sessions", icon: MessageSquare, label: "会话" },
+      { to: "/opencode/backups", icon: Archive, label: "备份" },
+      { to: "/opencode/transfer", icon: Package, label: "导出 / 导入" },
+    ],
   },
 ];
 

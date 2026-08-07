@@ -31,6 +31,7 @@ pub fn start_content_search(
     provider: String,
     codex_dir: String,
     claude_dir: String,
+    opencode_dir: String,
     query: String,
     rollout_paths: Vec<String>,
 ) -> AppResult<ContentSearchStart> {
@@ -38,6 +39,7 @@ pub fn start_content_search(
         provider,
         codex_dir,
         claude_dir,
+        opencode_dir,
         query,
         rollout_paths,
     )
@@ -63,6 +65,7 @@ pub async fn create_backup(
     provider: Option<String>,
     codex_dir: String,
     claude_dir: Option<String>,
+    opencode_dir: Option<String>,
     backup_dir: String,
     ids: Vec<String>,
     targets: Option<Vec<BundleExportTarget>>,
@@ -70,8 +73,16 @@ pub async fn create_backup(
     note: Option<String>,
 ) -> AppResult<BackupSummary> {
     run_blocking(move || {
-        crate::backup::create_backup(
-            provider, codex_dir, claude_dir, backup_dir, ids, targets, name, note,
+        crate::backup::create_backup_with_opencode(
+            provider,
+            codex_dir,
+            claude_dir,
+            opencode_dir,
+            backup_dir,
+            ids,
+            targets,
+            name,
+            note,
         )
     })
     .await
@@ -107,17 +118,19 @@ pub async fn restore_session(
     backup_path: String,
     codex_dir: String,
     claude_dir: Option<String>,
+    opencode_dir: Option<String>,
     id: String,
     backup_rollout_relpath: Option<String>,
     overwrite: bool,
 ) -> AppResult<RestoreResult> {
     run_blocking(move || {
-        crate::backup::restore_session(
+        crate::backup::restore_session_with_opencode(
             provider,
             backup_dir,
             backup_path,
             codex_dir,
             claude_dir,
+            opencode_dir,
             id,
             backup_rollout_relpath,
             overwrite,
@@ -133,15 +146,17 @@ pub async fn restore_all(
     backup_path: String,
     codex_dir: String,
     claude_dir: Option<String>,
+    opencode_dir: Option<String>,
     overwrite: bool,
 ) -> AppResult<Vec<RestoreResult>> {
     run_blocking(move || {
-        crate::backup::restore_all(
+        crate::backup::restore_all_with_opencode(
             provider,
             backup_dir,
             backup_path,
             codex_dir,
             claude_dir,
+            opencode_dir,
             overwrite,
         )
     })
@@ -153,6 +168,7 @@ pub async fn export_session_bundles(
     provider: Option<String>,
     codex_dir: String,
     claude_dir: Option<String>,
+    opencode_dir: Option<String>,
     out_dir: String,
     ids: Vec<String>,
     targets: Option<Vec<BundleExportTarget>>,
@@ -160,10 +176,11 @@ pub async fn export_session_bundles(
     export_group: Option<String>,
 ) -> AppResult<Vec<ExportReport>> {
     run_blocking(move || {
-        crate::bundle::export_session_bundles(
+        crate::bundle::export_session_bundles_with_opencode(
             provider,
             codex_dir,
             claude_dir,
+            opencode_dir,
             out_dir,
             ids,
             targets,
@@ -179,16 +196,18 @@ pub async fn export_all_bundles(
     provider: Option<String>,
     codex_dir: String,
     claude_dir: Option<String>,
+    opencode_dir: Option<String>,
     out_dir: String,
     machine_label: Option<String>,
     export_group: Option<String>,
     active_only: bool,
 ) -> AppResult<Vec<ExportReport>> {
     run_blocking(move || {
-        crate::bundle::export_all_bundles(
+        crate::bundle::export_all_bundles_with_opencode(
             provider,
             codex_dir,
             claude_dir,
+            opencode_dir,
             out_dir,
             machine_label,
             export_group,
@@ -220,17 +239,19 @@ pub async fn import_session_bundles(
     src_dir: String,
     codex_dir: String,
     claude_dir: Option<String>,
+    opencode_dir: Option<String>,
     mode: ImportMode,
     make_visible: bool,
     strict: bool,
     project_mappings: Vec<ProjectPathMapping>,
 ) -> AppResult<Vec<ImportReport>> {
     run_blocking(move || {
-        crate::bundle::import_session_bundles(
+        crate::bundle::import_session_bundles_with_opencode(
             provider,
             src_dir,
             codex_dir,
             claude_dir,
+            opencode_dir,
             mode,
             make_visible,
             strict,
@@ -945,18 +966,22 @@ pub async fn delete_sessions(
 pub async fn rename_session(
     provider: Option<String>,
     codex_dir: String,
+    claude_dir: Option<String>,
     opencode_dir: Option<String>,
     id: String,
+    rollout_path: Option<String>,
     title: String,
     lock: SharedLock<'_>,
 ) -> AppResult<u32> {
     let lock = lock.inner().clone();
     run_blocking(move || {
-        crate::sessions::rename_session_with_provider_dir(
+        crate::sessions::rename_session_with_provider_dirs(
             provider,
             codex_dir,
+            claude_dir,
             opencode_dir,
             id,
+            rollout_path,
             title,
             &lock,
         )
@@ -968,13 +993,25 @@ pub async fn rename_session(
 pub async fn move_session_cwd(
     provider: Option<String>,
     codex_dir: String,
+    claude_dir: Option<String>,
+    opencode_dir: Option<String>,
     id: String,
+    rollout_path: Option<String>,
     target_cwd: String,
     lock: SharedLock<'_>,
 ) -> AppResult<MoveSessionCwdReport> {
     let lock = lock.inner().clone();
     run_blocking(move || {
-        crate::sessions::move_session_cwd_with_lock(provider, codex_dir, id, target_cwd, &lock)
+        crate::sessions::move_session_cwd_with_provider_dirs(
+            provider,
+            codex_dir,
+            claude_dir,
+            opencode_dir,
+            id,
+            rollout_path,
+            target_cwd,
+            &lock,
+        )
     })
     .await
 }

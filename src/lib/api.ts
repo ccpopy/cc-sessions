@@ -297,6 +297,10 @@ export type MoveSessionCwdReport = {
   new_cwd: string;
   threads_updated: number;
   rollout_rewritten: boolean;
+  artifacts_moved: number;
+  history_rows_updated: number;
+  target_project_id?: string | null;
+  requires_project_open: boolean;
 };
 
 export type BackupSummary = {
@@ -320,6 +324,18 @@ export type ManifestSession = {
     bytes: number;
     sha256: string;
   }>;
+  companions_relpath?: string | null;
+  companion_files?: Array<{
+    relpath: string;
+    bytes: number;
+    sha256: string;
+  }>;
+  tasks_relpath?: string | null;
+  task_files?: Array<{
+    relpath: string;
+    bytes: number;
+    sha256: string;
+  }>;
   title: string;
   cwd: string;
   created_at: number;
@@ -339,6 +355,7 @@ export type Manifest = {
   app_version: string;
   codex_dir: string;
   claude_dir: string | null;
+  opencode_dir?: string | null;
   note: string | null;
   artifacts?: Array<{
     relpath: string;
@@ -667,6 +684,8 @@ export type BundleManifest = {
   rollout_relpath: string;
   source_relpath: string | null;
   sidecar_relpath: string | null;
+  companions_relpath?: string | null;
+  tasks_relpath?: string | null;
   exported_at: string;
   updated_at: number;
   thread_name: string;
@@ -844,6 +863,7 @@ export const api = {
     provider: SessionProvider;
     codexDir: string;
     claudeDir: string;
+    opencodeDir: string;
     query: string;
     rolloutPaths: readonly string[];
   }) => invokeCommand<{ job_id: number }>("start_content_search", p),
@@ -855,10 +875,40 @@ export const api = {
     invokeCommand<void>("cancel_content_search", { jobId }),
   setArchived: (provider: SessionProvider, codexDir: string, id: string, v: boolean, opencodeDir?: string) =>
     invokeCommand<void>("set_archived", { provider, codexDir, id, v, opencodeDir }),
-  renameSession: (provider: SessionProvider, codexDir: string, id: string, title: string, opencodeDir?: string) =>
-    invokeCommand<number>("rename_session", { provider, codexDir, id, title, opencodeDir }),
-  moveSessionCwd: (provider: SessionProvider, codexDir: string, id: string, targetCwd: string) =>
-    invokeCommand<MoveSessionCwdReport>("move_session_cwd", { provider, codexDir, id, targetCwd }),
+  renameSession: (p: {
+    provider: SessionProvider;
+    codex_dir: string;
+    claude_dir?: string;
+    opencode_dir?: string;
+    id: string;
+    rollout_path?: string;
+    title: string;
+  }) => invokeCommand<number>("rename_session", {
+    provider: p.provider,
+    codexDir: p.codex_dir,
+    claudeDir: p.claude_dir,
+    opencodeDir: p.opencode_dir,
+    id: p.id,
+    rolloutPath: p.rollout_path,
+    title: p.title,
+  }),
+  moveSessionCwd: (p: {
+    provider: SessionProvider;
+    codex_dir: string;
+    claude_dir?: string;
+    opencode_dir?: string;
+    id: string;
+    rollout_path?: string;
+    target_cwd: string;
+  }) => invokeCommand<MoveSessionCwdReport>("move_session_cwd", {
+    provider: p.provider,
+    codexDir: p.codex_dir,
+    claudeDir: p.claude_dir,
+    opencodeDir: p.opencode_dir,
+    id: p.id,
+    rolloutPath: p.rollout_path,
+    targetCwd: p.target_cwd,
+  }),
   deleteSession: (
     provider: SessionProvider,
     codexDir: string,
@@ -964,6 +1014,7 @@ export const api = {
     provider: SessionProvider;
     codex_dir: string;
     claude_dir?: string;
+    opencode_dir?: string;
     backup_dir: string;
     ids: string[];
     targets?: BundleExportTarget[];
@@ -974,6 +1025,7 @@ export const api = {
       provider: p.provider,
       codexDir: p.codex_dir,
       claudeDir: p.claude_dir,
+      opencodeDir: p.opencode_dir,
       backupDir: p.backup_dir,
       ids: p.ids,
       targets: p.targets,
@@ -990,6 +1042,7 @@ export const api = {
     backup_path: string;
     codex_dir: string;
     claude_dir?: string;
+    opencode_dir?: string;
     id: string;
     backup_rollout_relpath?: string;
     overwrite: boolean;
@@ -1000,6 +1053,7 @@ export const api = {
       backupPath: p.backup_path,
       codexDir: p.codex_dir,
       claudeDir: p.claude_dir,
+      opencodeDir: p.opencode_dir,
       id: p.id,
       backupRolloutRelpath: p.backup_rollout_relpath,
       overwrite: p.overwrite,
@@ -1010,6 +1064,7 @@ export const api = {
     backup_path: string;
     codex_dir: string;
     claude_dir?: string;
+    opencode_dir?: string;
     overwrite: boolean;
   }) =>
     invokeCommand<RestoreResult[]>("restore_all", {
@@ -1018,6 +1073,7 @@ export const api = {
       backupPath: p.backup_path,
       codexDir: p.codex_dir,
       claudeDir: p.claude_dir,
+      opencodeDir: p.opencode_dir,
       overwrite: p.overwrite,
     }),
   deleteBackup: (backupDir: string, backupPath: string) =>
@@ -1345,6 +1401,7 @@ export const api = {
     provider: SessionProvider;
     codex_dir: string;
     claude_dir?: string;
+    opencode_dir?: string;
     out_dir: string;
     ids: string[];
     targets?: BundleExportTarget[];
@@ -1355,6 +1412,7 @@ export const api = {
       provider: p.provider,
       codexDir: p.codex_dir,
       claudeDir: p.claude_dir,
+      opencodeDir: p.opencode_dir,
       outDir: p.out_dir,
       ids: p.ids,
       targets: p.targets,
@@ -1365,6 +1423,7 @@ export const api = {
     provider: SessionProvider;
     codex_dir: string;
     claude_dir?: string;
+    opencode_dir?: string;
     out_dir: string;
     machine_label?: string;
     export_group?: string;
@@ -1374,6 +1433,7 @@ export const api = {
       provider: p.provider,
       codexDir: p.codex_dir,
       claudeDir: p.claude_dir,
+      opencodeDir: p.opencode_dir,
       outDir: p.out_dir,
       machineLabel: p.machine_label,
       exportGroup: p.export_group,
@@ -1388,6 +1448,7 @@ export const api = {
     src_dir: string;
     codex_dir: string;
     claude_dir?: string;
+    opencode_dir?: string;
     mode: ImportMode;
     make_visible: boolean;
     strict: boolean;
@@ -1398,6 +1459,7 @@ export const api = {
       srcDir: p.src_dir,
       codexDir: p.codex_dir,
       claudeDir: p.claude_dir,
+      opencodeDir: p.opencode_dir,
       mode: p.mode,
       makeVisible: p.make_visible,
       strict: p.strict,

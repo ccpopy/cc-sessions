@@ -26,11 +26,11 @@ export default function App() {
   const initTheme = useTheme((s) => s.init);
   const toggleTheme = useTheme((s) => s.toggle);
   const defaultProvider = webuiDefaultProvider();
-  const defaultCoreProvider = defaultProvider === "opencode" ? "codex" : defaultProvider;
+  const defaultRepairProvider = defaultProvider === "opencode" ? "codex" : defaultProvider;
   const defaultSessionsPath = `/${defaultProvider}/sessions`;
-  const defaultRepairPath = `/${defaultCoreProvider}/repair`;
-  const defaultBackupsPath = `/${defaultCoreProvider}/backups`;
-  const defaultTransferPath = `/${defaultCoreProvider}/transfer`;
+  const defaultRepairPath = `/${defaultRepairProvider}/repair`;
+  const defaultBackupsPath = `/${defaultProvider}/backups`;
+  const defaultTransferPath = `/${defaultProvider}/transfer`;
 
   useEffect(() => {
     void load().catch(() => {
@@ -74,13 +74,16 @@ export default function App() {
             <Route path="/claude/transfer" element={<TransferRoute key="claude-transfer" provider="claude" />} />
             <Route path="/claude/memory" element={<MemoryRoute />} />
             <Route path="/opencode/sessions" element={<SessionsRoute key="opencode-sessions" provider="opencode" />} />
+            <Route path="/opencode/backups" element={<BackupsRoute key="opencode-backups" provider="opencode" />} />
+            <Route path="/opencode/backups/:name" element={<BackupDetailRoute key="opencode-backup-detail" provider="opencode" />} />
+            <Route path="/opencode/transfer" element={<TransferRoute key="opencode-transfer" provider="opencode" />} />
             <Route path="/sessions" element={<Navigate to={defaultSessionsPath} replace />} />
             <Route path="/repair" element={<Navigate to={defaultRepairPath} replace />} />
             <Route path="/backups" element={<Navigate to={defaultBackupsPath} replace />} />
-            <Route path="/backups/:name" element={<BackupDetailRoute provider={defaultCoreProvider} />} />
+            <Route path="/backups/:name" element={<BackupDetailRoute provider={defaultProvider} />} />
             <Route path="/transfer" element={<Navigate to={defaultTransferPath} replace />} />
             <Route path="/stats" element={<StatsRoute />} />
-            <Route path="*" element={<Navigate to="/codex/sessions" replace />} />
+            <Route path="*" element={<Navigate to={defaultSessionsPath} replace />} />
           </Routes>
         </Suspense>
       </main>

@@ -59,6 +59,7 @@ export function BackupCreateDialog({ open, onOpenChange, provider, sessions, onD
         provider,
         codex_dir: settings.codex_dir,
         claude_dir: settings.claude_dir,
+        opencode_dir: settings.opencode_dir,
         backup_dir: settings.backup_dir,
         ids: sessions.map((s) => s.id),
         targets: sessions.map((s) => ({ id: s.id, rollout_path: s.rollout_path })),

@@ -2000,7 +2000,7 @@ pub fn repair_claude_gui_visibility(
 
 /// 与 VS Code 插件"重命名会话"的写入格式一致：
 /// 在 jsonl 末尾追加一行 `{"type":"custom-title","sessionId":...,"customTitle":...}`。
-fn append_custom_title(path: &Path, session_id: &str, title: &str) -> AppResult<()> {
+pub(crate) fn append_custom_title(path: &Path, session_id: &str, title: &str) -> AppResult<()> {
     use std::io::{Read, Seek, SeekFrom};
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() || crate::path_safety::metadata_is_link_or_reparse(&metadata) {

@@ -246,6 +246,8 @@ export default function BackupDetailRoute({ provider = "codex" }: { provider?: S
                         variant="outline"
                         size="sm"
                         className="gap-1.5"
+                        disabled={itemProvider === "opencode"}
+                        title={itemProvider === "opencode" ? "OpenCode 备份是数据库快照，请还原后预览" : undefined}
                         onClick={() =>
                           setPreview({
                             session: sess,
@@ -320,6 +322,7 @@ export default function BackupDetailRoute({ provider = "codex" }: { provider?: S
             backup_path: backupPath,
             codex_dir: settings.codex_dir,
             claude_dir: settings.claude_dir,
+            opencode_dir: settings.opencode_dir,
             id: restoreTarget.id,
             backup_rollout_relpath: restoreTarget.rollout_relpath,
             overwrite: overwrite === "overwrite",
@@ -382,7 +385,11 @@ function toSessionSummary(m: ManifestSession, backupPath: string, provider: Sess
     rollout_bytes: m.bytes_rollout,
     logs_count: m.logs_count,
     has_backup: true,
-    resume_command: provider === "claude" ? `claude --resume ${m.id}` : `codex resume ${m.id}`,
+    resume_command: provider === "claude"
+      ? `claude --resume ${m.id}`
+      : provider === "opencode"
+        ? `opencode --session ${m.id}`
+        : `codex resume ${m.id}`,
   };
 }
 

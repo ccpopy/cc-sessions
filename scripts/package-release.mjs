@@ -116,6 +116,7 @@ async function createSourcePackage() {
   await cleanDir(stage);
 
   const directories = [
+    "img",
     "src",
     "src-tauri/capabilities",
     "src-tauri/icons",
@@ -125,13 +126,16 @@ async function createSourcePackage() {
   ];
 
   const files = [
+    ".gitattributes",
     ".gitignore",
+    "LICENSE",
+    "README.md",
+    "app-icon.svg",
     "components.json",
     "index.html",
     "package-lock.json",
     "package.json",
     "postcss.config.js",
-    "RELEASE.md",
     "tailwind.config.ts",
     "tsconfig.json",
     "tsconfig.node.json",
@@ -351,7 +355,9 @@ function run(command, args, options = {}) {
 
 async function copyRepoItem(relativePath, destinationRoot) {
   const source = path.join(repoRoot, relativePath);
-  if (!(await exists(source))) return;
+  if (!(await exists(source))) {
+    throw new Error(`Required source package item was not found: ${source}`);
+  }
   const destination = path.join(destinationRoot, relativePath);
   await ensureDir(path.dirname(destination));
   await fs.cp(source, destination, { recursive: true });

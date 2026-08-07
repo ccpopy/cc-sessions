@@ -42,6 +42,7 @@ use crate::state_db;
 const BUNDLE_VERSION: u32 = 2;
 const PROVIDER_CODEX: &str = "codex";
 const PROVIDER_CLAUDE: &str = "claude";
+const PROVIDER_OPENCODE: &str = "opencode";
 const DEFAULT_SANDBOX_POLICY: &str = "read-only";
 const DEFAULT_APPROVAL_MODE: &str = "on-request";
 const DEFAULT_MEMORY_MODE: &str = "enabled";
@@ -81,30 +82,39 @@ fn collect_bundle_artifacts(
     bundle_root: &Path,
     has_history: bool,
     sidecar_relpath: Option<&str>,
+    companions_relpath: Option<&str>,
+    tasks_relpath: Option<&str>,
 ) -> AppResult<Vec<ManifestArtifact>> {
     let mut files = Vec::new();
     if has_history {
         files.push(bundle_root.join("history.jsonl"));
     }
-    if let Some(sidecar_relpath) = sidecar_relpath {
-        let relative = paths::checked_relative_path(sidecar_relpath)?;
-        let sidecar = bundle_root.join(relative);
-        crate::path_safety::validate_tree(bundle_root, &sidecar, "Bundle sidecar")?;
-        let metadata = fs::symlink_metadata(&sidecar)?;
+    for (label, root) in [
+        ("sidecar", sidecar_relpath),
+        ("companions", companions_relpath),
+        ("tasks", tasks_relpath),
+    ] {
+        let Some(root) = root else {
+            continue;
+        };
+        let relative = paths::checked_relative_path(root)?;
+        let root = bundle_root.join(relative);
+        crate::path_safety::validate_tree(bundle_root, &root, &format!("Bundle {label}"))?;
+        let metadata = fs::symlink_metadata(&root)?;
         if metadata.is_file() {
-            files.push(sidecar);
+            files.push(root);
         } else {
-            for entry in walkdir::WalkDir::new(&sidecar).follow_links(false) {
+            for entry in walkdir::WalkDir::new(&root).follow_links(false) {
                 let entry = entry.map_err(|error| {
                     AppError::Other(format!(
-                        "遍历 Bundle sidecar 失败 {}: {error}",
-                        sidecar.to_string_lossy()
+                        "遍历 Bundle {label} 失败 {}: {error}",
+                        root.to_string_lossy()
                     ))
                 })?;
                 let metadata = fs::symlink_metadata(entry.path())?;
                 if crate::path_safety::metadata_is_link_or_reparse(&metadata) {
                     return Err(AppError::Path(format!(
-                        "Bundle sidecar 包含链接或 junction: {}",
+                        "Bundle {label} 包含链接或 junction: {}",
                         entry.path().to_string_lossy()
                     )));
                 }
@@ -439,14 +449,52 @@ pub fn export_session_bundles(
     machine_label: Option<String>,
     export_group: Option<String>,
 ) -> AppResult<Vec<ExportReport>> {
+    export_session_bundles_with_opencode(
+        provider,
+        codex_dir,
+        claude_dir,
+        None,
+        out_dir,
+        ids,
+        targets,
+        machine_label,
+        export_group,
+    )
+}
+
+pub fn export_session_bundles_with_opencode(
+    provider: Option<String>,
+    codex_dir: String,
+    claude_dir: Option<String>,
+    opencode_dir: Option<String>,
+    out_dir: String,
+    ids: Vec<String>,
+    targets: Option<Vec<BundleExportTarget>>,
+    machine_label: Option<String>,
+    export_group: Option<String>,
+) -> AppResult<Vec<ExportReport>> {
     let targets = normalize_bundle_export_targets(&ids, targets)?;
-    if provider.as_deref().unwrap_or(PROVIDER_CODEX) == PROVIDER_CLAUDE {
+    let provider_name = provider.as_deref().unwrap_or(PROVIDER_CODEX);
+    if provider_name == PROVIDER_CLAUDE {
         let claude = PathBuf::from(
             claude_dir
                 .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
         );
         return export_claude_session_bundles(
             &claude,
+            &PathBuf::from(out_dir),
+            &targets,
+            machine_label.as_deref(),
+            export_group.as_deref(),
+        );
+    }
+    if provider_name == PROVIDER_OPENCODE {
+        let data_dir = PathBuf::from(
+            opencode_dir
+                .unwrap_or_else(|| paths::default_opencode_dir().to_string_lossy().into_owned()),
+        );
+        return export_opencode_session_bundles(
+            &data_dir,
             &PathBuf::from(out_dir),
             &targets,
             machine_label.as_deref(),
@@ -665,7 +713,7 @@ fn export_one(
     // 从索引里查该会话的 history 行（O(1) 查询 + O(k) 写）
     let has_history =
         write_history_from_index(history_index, id, &bundle_dir.join("history.jsonl"))?;
-    let artifacts = collect_bundle_artifacts(&bundle_dir, has_history, None)?;
+    let artifacts = collect_bundle_artifacts(&bundle_dir, has_history, None, None, None)?;
 
     let manifest = BundleManifest {
         version: BUNDLE_VERSION,
@@ -674,6 +722,8 @@ fn export_one(
         rollout_relpath: rollout_source.rel.to_string_lossy().replace('\\', "/"),
         source_relpath: None,
         sidecar_relpath: None,
+        companions_relpath: None,
+        tasks_relpath: None,
         exported_at: chrono::Utc::now().to_rfc3339(),
         updated_at,
         thread_name: title,
@@ -888,9 +938,49 @@ fn export_one_claude(
         }
     }
 
+    let companions = crate::claude_sessions::companion_files_for(&source)?;
+    let mut companions_rel = None;
+    if !companions.is_empty() {
+        let relative = PathBuf::from("companions").join(paths::sanitize_slug(id));
+        let root = bundle_dir.join(&relative);
+        fs::create_dir_all(&root)?;
+        for companion in companions {
+            crate::path_safety::validate_descendant(
+                projects,
+                &companion,
+                crate::path_safety::EntryKind::File,
+                false,
+                "Claude Bundle companion",
+            )?;
+            let name = companion.file_name().ok_or_else(|| {
+                AppError::Path(format!(
+                    "Claude companion 文件名无效: {}",
+                    companion.to_string_lossy()
+                ))
+            })?;
+            fs::copy(&companion, root.join(name))?;
+        }
+        companions_rel = Some(relative.to_string_lossy().replace('\\', "/"));
+    }
+
+    let task_source = crate::claude_sessions::task_path_for(claude, id);
+    let mut tasks_rel = None;
+    if path_exists_no_follow(&task_source)? {
+        crate::path_safety::validate_tree(claude, &task_source, "Claude Bundle tasks")?;
+        let relative = PathBuf::from("tasks").join(paths::sanitize_slug(id));
+        copy_path_recursive(&task_source, &bundle_dir.join(&relative))?;
+        tasks_rel = Some(relative.to_string_lossy().replace('\\', "/"));
+    }
+
     let has_history =
         write_history_from_index(history_index, id, &bundle_dir.join("history.jsonl"))?;
-    let artifacts = collect_bundle_artifacts(&bundle_dir, has_history, sidecar_rel.as_deref())?;
+    let artifacts = collect_bundle_artifacts(
+        &bundle_dir,
+        has_history,
+        sidecar_rel.as_deref(),
+        companions_rel.as_deref(),
+        tasks_rel.as_deref(),
+    )?;
 
     let manifest = BundleManifest {
         version: BUNDLE_VERSION,
@@ -899,6 +989,8 @@ fn export_one_claude(
         rollout_relpath: source_rel_string.clone(),
         source_relpath: Some(source_rel_string),
         sidecar_relpath: sidecar_rel,
+        companions_relpath: companions_rel,
+        tasks_relpath: tasks_rel,
         exported_at: chrono::Utc::now().to_rfc3339(),
         updated_at: session.updated_at,
         thread_name: session.title.clone(),
@@ -936,6 +1028,116 @@ fn claude_bundle_dir_name(id: &str, source_rel: &str) -> String {
     )
 }
 
+fn export_opencode_session_bundles(
+    data_dir: &Path,
+    out: &Path,
+    targets: &[BundleExportTarget],
+    machine_label: Option<&str>,
+    export_group: Option<&str>,
+) -> AppResult<Vec<ExportReport>> {
+    let machine = machine_label
+        .map(paths::sanitize_slug)
+        .unwrap_or_else(paths::machine_label);
+    let group = paths::sanitize_slug(export_group.unwrap_or("default"));
+    let sessions = crate::opencode_sessions::list_sessions(data_dir)?
+        .into_iter()
+        .map(|session| (session.id.clone(), session))
+        .collect::<HashMap<_, _>>();
+    let (batch_root, final_batch_root) = create_export_batch(out, &machine, &group)?;
+    let mut reports = Vec::with_capacity(targets.len());
+    for target in targets {
+        let result = (|| -> AppResult<ExportReport> {
+            if let Some(locator) = target.rollout_path.as_deref() {
+                let (db, located_id) = crate::opencode_sessions::resolve_locator(locator)?;
+                if located_id != target.id
+                    || db != crate::opencode_sessions::database_path(data_dir)
+                {
+                    return Err(AppError::Other(format!(
+                        "OpenCode Bundle 精确目标与当前数据库不一致: {}",
+                        target.id
+                    )));
+                }
+            }
+            let session = sessions
+                .get(&target.id)
+                .ok_or_else(|| AppError::NotFound(format!("OpenCode 会话不存在: {}", target.id)))?;
+            let snapshot = crate::opencode_transfer::export_snapshot(data_dir, &target.id)?;
+            let bundle_dir = batch_root.join(paths::sanitize_slug(&target.id));
+            crate::path_safety::validate_descendant(
+                &batch_root,
+                &bundle_dir,
+                crate::path_safety::EntryKind::Directory,
+                true,
+                "OpenCode Bundle 导出目录",
+            )?;
+            let relative = PathBuf::from("sessions")
+                .join(format!("{}.json", paths::sanitize_slug(&target.id)));
+            let destination = bundle_dir.join(PROVIDER_OPENCODE).join(&relative);
+            crate::opencode_transfer::write_snapshot(&destination, &snapshot)?;
+            let sha = sha256_file(&destination)?;
+            let row_count = snapshot
+                .tables
+                .iter()
+                .map(|table| table.rows.len() as u64)
+                .sum();
+            let manifest = BundleManifest {
+                version: BUNDLE_VERSION,
+                provider: Some(PROVIDER_OPENCODE.to_string()),
+                session_id: target.id.clone(),
+                rollout_relpath: relative.to_string_lossy().replace('\\', "/"),
+                source_relpath: None,
+                sidecar_relpath: None,
+                companions_relpath: None,
+                tasks_relpath: None,
+                exported_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: snapshot.source_updated_at / 1000,
+                thread_name: session.title.clone(),
+                session_cwd: snapshot.source_cwd.clone(),
+                session_source: Some(PROVIDER_OPENCODE.to_string()),
+                session_originator: Some("OpenCode".to_string()),
+                model_provider: session.model.clone(),
+                export_machine: machine.clone(),
+                export_group: group.clone(),
+                sha256_rollout: sha,
+                rollout_line_count: row_count,
+                has_history: false,
+                artifacts: Vec::new(),
+            };
+            fs::write(
+                bundle_dir.join("manifest.json"),
+                serde_json::to_vec_pretty(&manifest)?,
+            )?;
+            Ok(ExportReport {
+                session_id: target.id.clone(),
+                ok: true,
+                bundle_path: Some(bundle_dir.to_string_lossy().into_owned()),
+                error: None,
+                skipped_reason: None,
+            })
+        })();
+        reports.push(result.unwrap_or_else(|error| ExportReport {
+            session_id: target.id.clone(),
+            ok: false,
+            bundle_path: None,
+            error: Some(error.to_string()),
+            skipped_reason: None,
+        }));
+    }
+    if reports.iter().any(|report| report.ok) {
+        if let Err(error) = publish_export_batch(&batch_root, &final_batch_root, &mut reports) {
+            return Err(match remove_path_recursive(&batch_root) {
+                Ok(()) => error,
+                Err(cleanup_error) => AppError::Other(format!(
+                    "{error}; 清理 OpenCode Bundle 导出暂存批次失败: {cleanup_error}"
+                )),
+            });
+        }
+    } else {
+        remove_path_recursive(&batch_root)?;
+    }
+    Ok(reports)
+}
+
 pub fn export_all_bundles(
     provider: Option<String>,
     codex_dir: String,
@@ -945,7 +1147,30 @@ pub fn export_all_bundles(
     export_group: Option<String>,
     active_only: bool,
 ) -> AppResult<Vec<ExportReport>> {
-    if provider.as_deref().unwrap_or(PROVIDER_CODEX) == PROVIDER_CLAUDE {
+    export_all_bundles_with_opencode(
+        provider,
+        codex_dir,
+        claude_dir,
+        None,
+        out_dir,
+        machine_label,
+        export_group,
+        active_only,
+    )
+}
+
+pub fn export_all_bundles_with_opencode(
+    provider: Option<String>,
+    codex_dir: String,
+    claude_dir: Option<String>,
+    opencode_dir: Option<String>,
+    out_dir: String,
+    machine_label: Option<String>,
+    export_group: Option<String>,
+    active_only: bool,
+) -> AppResult<Vec<ExportReport>> {
+    let provider_name = provider.as_deref().unwrap_or(PROVIDER_CODEX);
+    if provider_name == PROVIDER_CLAUDE {
         let claude = PathBuf::from(
             claude_dir
                 .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
@@ -961,6 +1186,27 @@ pub fn export_all_bundles(
             .collect::<Vec<_>>();
         return export_claude_session_bundles(
             &claude,
+            &PathBuf::from(out_dir),
+            &targets,
+            machine_label.as_deref(),
+            export_group.as_deref(),
+        );
+    }
+    if provider_name == PROVIDER_OPENCODE {
+        let data_dir = PathBuf::from(
+            opencode_dir
+                .unwrap_or_else(|| paths::default_opencode_dir().to_string_lossy().into_owned()),
+        );
+        let targets = crate::opencode_sessions::list_sessions(&data_dir)?
+            .into_iter()
+            .filter(|session| !active_only || !session.archived)
+            .map(|session| BundleExportTarget {
+                id: session.id,
+                rollout_path: Some(session.rollout_path),
+            })
+            .collect::<Vec<_>>();
+        return export_opencode_session_bundles(
+            &data_dir,
             &PathBuf::from(out_dir),
             &targets,
             machine_label.as_deref(),
@@ -1078,31 +1324,31 @@ pub fn verify_bundles(src_dir: String, provider: Option<String>) -> AppResult<Ve
     let mut items = list_bundles(src_dir, provider)?;
     for it in items.iter_mut() {
         let bundle_root = validate_bundle_item_root(it)?;
-        let is_claude = bundle_provider(&it.manifest) == PROVIDER_CLAUDE;
-        let rel = if is_claude {
-            let rel = validate_claude_bundle_rollout_relpath(
+        let provider = bundle_provider(&it.manifest);
+        let rel = match provider {
+            PROVIDER_CLAUDE => {
+                let rel = validate_claude_bundle_rollout_relpath(
+                    &it.manifest.rollout_relpath,
+                    &it.manifest.session_id,
+                )?;
+                let source_rel = it
+                    .manifest
+                    .source_relpath
+                    .as_deref()
+                    .unwrap_or(&it.manifest.rollout_relpath);
+                validate_claude_bundle_rollout_relpath(source_rel, &it.manifest.session_id)?;
+                rel
+            }
+            PROVIDER_OPENCODE => validate_opencode_bundle_rollout_relpath(
                 &it.manifest.rollout_relpath,
                 &it.manifest.session_id,
-            )?;
-            let source_rel = it
-                .manifest
-                .source_relpath
-                .as_deref()
-                .unwrap_or(&it.manifest.rollout_relpath);
-            validate_claude_bundle_rollout_relpath(source_rel, &it.manifest.session_id)?;
-            rel
-        } else {
-            validate_codex_bundle_rollout_relpath(
+            )?,
+            _ => validate_codex_bundle_rollout_relpath(
                 &it.manifest.rollout_relpath,
                 &it.manifest.session_id,
-            )?
+            )?,
         };
-        let base = if is_claude {
-            PROVIDER_CLAUDE
-        } else {
-            PROVIDER_CODEX
-        };
-        let file = bundle_root.join(base).join(&rel);
+        let file = bundle_root.join(provider).join(&rel);
         if !crate::path_safety::validate_descendant(
             &bundle_root,
             &file,
@@ -1114,9 +1360,11 @@ pub fn verify_bundles(src_dir: String, provider: Option<String>) -> AppResult<Ve
             continue;
         }
         validate_bundle_history_source(&bundle_root)?;
-        if is_claude {
+        if provider == PROVIDER_CLAUDE {
             validate_claude_jsonl_identity(&file, &it.manifest.session_id)?;
             claude_bundle_sidecar(&bundle_root, &it.manifest)?;
+        } else if provider == PROVIDER_OPENCODE {
+            crate::opencode_transfer::verify_snapshot_file(&file, &it.manifest.session_id)?;
         }
         let actual = sha256_file(&file)?;
         let artifacts_ok = verify_bundle_artifacts(&bundle_root, &it.manifest)?;
@@ -1138,9 +1386,37 @@ pub fn import_session_bundles(
     strict: bool,
     project_mappings: Vec<ProjectPathMapping>,
 ) -> AppResult<Vec<ImportReport>> {
+    import_session_bundles_with_opencode(
+        provider,
+        src_dir,
+        codex_dir,
+        claude_dir,
+        None,
+        mode,
+        make_visible,
+        strict,
+        project_mappings,
+    )
+}
+
+pub fn import_session_bundles_with_opencode(
+    provider: Option<String>,
+    src_dir: String,
+    codex_dir: String,
+    claude_dir: Option<String>,
+    opencode_dir: Option<String>,
+    mode: ImportMode,
+    make_visible: bool,
+    strict: bool,
+    project_mappings: Vec<ProjectPathMapping>,
+) -> AppResult<Vec<ImportReport>> {
     let codex = PathBuf::from(&codex_dir);
     let claude = PathBuf::from(
         claude_dir.unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
+    );
+    let opencode = PathBuf::from(
+        opencode_dir
+            .unwrap_or_else(|| paths::default_opencode_dir().to_string_lossy().into_owned()),
     );
     let project_mappings = build_project_mapping(project_mappings)?;
     let items = list_bundles(src_dir, provider.clone())?;
@@ -1150,10 +1426,14 @@ pub fn import_session_bundles(
             .as_deref()
             .unwrap_or_else(|| bundle_provider(&it.manifest));
         reports.push(
-            (if item_provider == PROVIDER_CLAUDE {
-                import_one_claude(&claude, &it, &mode, strict, &project_mappings)
-            } else {
-                import_one(&codex, &it, &mode, make_visible, strict, &project_mappings)
+            (match item_provider {
+                PROVIDER_CLAUDE => {
+                    import_one_claude(&claude, &it, &mode, strict, &project_mappings)
+                }
+                PROVIDER_OPENCODE => {
+                    import_one_opencode(&opencode, &it, &mode, strict, &project_mappings)
+                }
+                _ => import_one(&codex, &it, &mode, make_visible, strict, &project_mappings),
             })
             .unwrap_or_else(|e| ImportReport {
                 session_id: it.manifest.session_id.clone(),
@@ -1214,11 +1494,15 @@ fn bundle_provider(manifest: &BundleManifest) -> &str {
 }
 
 fn validate_bundle_artifact_manifest(manifest: &BundleManifest) -> AppResult<()> {
-    let sidecar = manifest
-        .sidecar_relpath
-        .as_deref()
-        .map(paths::checked_relative_path)
-        .transpose()?;
+    let roots = [
+        manifest.sidecar_relpath.as_deref(),
+        manifest.companions_relpath.as_deref(),
+        manifest.tasks_relpath.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(paths::checked_relative_path)
+    .collect::<AppResult<Vec<_>>>()?;
     let mut seen = HashSet::new();
     let mut has_history_artifact = false;
     for artifact in &manifest.artifacts {
@@ -1238,12 +1522,12 @@ fn validate_bundle_artifact_manifest(manifest: &BundleManifest) -> AppResult<()>
             has_history_artifact = true;
             continue;
         }
-        if !sidecar
-            .as_ref()
-            .is_some_and(|sidecar| relative == *sidecar || relative.starts_with(sidecar))
+        if !roots
+            .iter()
+            .any(|root| relative == *root || relative.starts_with(root))
         {
             return Err(AppError::Path(format!(
-                "Bundle 辅助文件不在已声明的 history/sidecar 范围内: {}",
+                "Bundle 辅助文件不在已声明的 history/sidecar/companions/tasks 范围内: {}",
                 artifact.relpath
             )));
         }
@@ -1265,6 +1549,8 @@ fn verify_bundle_artifacts(bundle_root: &Path, manifest: &BundleManifest) -> App
         bundle_root,
         manifest.has_history,
         manifest.sidecar_relpath.as_deref(),
+        manifest.companions_relpath.as_deref(),
+        manifest.tasks_relpath.as_deref(),
     )?;
     if actual.len() != manifest.artifacts.len() {
         return Ok(false);
@@ -1395,6 +1681,18 @@ fn validate_claude_bundle_rollout_relpath(raw: &str, session_id: &str) -> AppRes
     {
         return Err(AppError::Path(format!(
             "Claude bundle JSONL 文件名必须与会话 ID 完全一致: id={session_id} path={raw}"
+        )));
+    }
+    Ok(relative)
+}
+
+fn validate_opencode_bundle_rollout_relpath(raw: &str, session_id: &str) -> AppResult<PathBuf> {
+    let relative = paths::checked_relative_path(raw)?;
+    let expected =
+        PathBuf::from("sessions").join(format!("{}.json", paths::sanitize_slug(session_id)));
+    if relative != expected {
+        return Err(AppError::Path(format!(
+            "OpenCode bundle 快照路径与会话 ID 不匹配: id={session_id} path={raw}"
         )));
     }
     Ok(relative)
@@ -1554,6 +1852,24 @@ fn import_one_claude(
         )?;
     }
     let sidecar_src = claude_bundle_sidecar(&bundle_root, &item.manifest)?;
+    let companions_src = claude_bundle_auxiliary(
+        &bundle_root,
+        item.manifest.companions_relpath.as_deref(),
+        "companions",
+    )?;
+    let tasks_src = claude_bundle_auxiliary(
+        &bundle_root,
+        item.manifest.tasks_relpath.as_deref(),
+        "tasks",
+    )?;
+    let tasks_dest = crate::claude_sessions::task_path_for(claude, &item.manifest.session_id);
+    crate::path_safety::validate_descendant(
+        claude,
+        &tasks_dest,
+        crate::path_safety::EntryKind::Directory,
+        true,
+        "Claude bundle tasks 导入目标",
+    )?;
     let history_src = validate_bundle_history_source(&bundle_root)?;
     crate::path_safety::validate_descendant(
         claude,
@@ -1572,6 +1888,7 @@ fn import_one_claude(
                     claude,
                     history_src.as_deref(),
                     &item.manifest.session_id,
+                    mapped_cwd,
                 )?;
                 return Ok(report);
             }
@@ -1583,6 +1900,7 @@ fn import_one_claude(
                         claude,
                         history_src.as_deref(),
                         &item.manifest.session_id,
+                        mapped_cwd,
                     )?;
                     return Ok(report);
                 }
@@ -1591,16 +1909,24 @@ fn import_one_claude(
         }
     }
 
-    replace_claude_snapshot_verified(
+    replace_claude_snapshot_with_extras_verified(
         &src_file,
         &dest_abs,
         mapped_cwd,
         sidecar_src.as_deref(),
+        companions_src.as_deref(),
+        tasks_src.as_deref(),
+        &tasks_dest,
         source_sha_verified.then_some(item.manifest.sha256_rollout.as_str()),
     )?;
     report.rollout_written = true;
 
-    match append_optional_history(claude, history_src.as_deref(), &item.manifest.session_id) {
+    match append_optional_history(
+        claude,
+        history_src.as_deref(),
+        &item.manifest.session_id,
+        mapped_cwd,
+    ) {
         Ok(appended) => report.history_appended = appended,
         Err(error) => {
             report.error = Some(format!("rollout 已写入，但 history 追加失败: {error}"));
@@ -1608,6 +1934,66 @@ fn import_one_claude(
         }
     }
 
+    report.ok = true;
+    Ok(report)
+}
+
+fn import_one_opencode(
+    data_dir: &Path,
+    item: &BundleListItem,
+    mode: &ImportMode,
+    strict: bool,
+    project_mappings: &HashMap<String, String>,
+) -> AppResult<ImportReport> {
+    let mut report = ImportReport {
+        session_id: item.manifest.session_id.clone(),
+        ok: false,
+        rollout_written: false,
+        history_appended: 0,
+        threads_upserted: false,
+        index_appended: false,
+        skipped_reason: None,
+        error: None,
+        verified: false,
+        sha_mismatch: false,
+    };
+    let bundle_root = validate_bundle_item_root(item)?;
+    let relative = validate_opencode_bundle_rollout_relpath(
+        &item.manifest.rollout_relpath,
+        &item.manifest.session_id,
+    )?;
+    let source = bundle_root.join(PROVIDER_OPENCODE).join(relative);
+    if !crate::path_safety::validate_descendant(
+        &bundle_root,
+        &source,
+        crate::path_safety::EntryKind::File,
+        true,
+        "OpenCode bundle 快照",
+    )? {
+        report.error = Some(format!(
+            "OpenCode bundle 快照缺失: {}",
+            source.to_string_lossy()
+        ));
+        return Ok(report);
+    }
+    let actual = sha256_file(&source)?;
+    if actual != item.manifest.sha256_rollout {
+        report.sha_mismatch = true;
+        if strict {
+            report.error = Some("sha256 不一致，strict 模式跳过".into());
+            return Ok(report);
+        }
+    } else {
+        report.verified = true;
+    }
+    let snapshot = crate::opencode_transfer::read_snapshot(&source, &item.manifest.session_id)?;
+    let target_cwd = mapped_project_cwd(&item.manifest, project_mappings)
+        .unwrap_or(item.manifest.session_cwd.as_str());
+    let outcome =
+        crate::opencode_transfer::import_snapshot(data_dir, &snapshot, Some(target_cwd), mode)?;
+    report.rollout_written = outcome.written;
+    report.threads_upserted = outcome.written;
+    report.skipped_reason = outcome.skipped_reason;
     report.ok = true;
     Ok(report)
 }
@@ -1624,9 +2010,32 @@ fn claude_bundle_sidecar(
     Ok(Some(sidecar))
 }
 
-fn append_optional_history(codex: &Path, source: Option<&Path>, id: &str) -> AppResult<u32> {
+fn claude_bundle_auxiliary(
+    bundle_root: &Path,
+    relative: Option<&str>,
+    label: &str,
+) -> AppResult<Option<PathBuf>> {
+    let Some(relative) = relative else {
+        return Ok(None);
+    };
+    let root = bundle_root.join(paths::checked_relative_path(relative)?);
+    crate::path_safety::validate_tree(bundle_root, &root, &format!("Claude bundle {label}"))?;
+    Ok(Some(root))
+}
+
+fn append_optional_history(
+    codex: &Path,
+    source: Option<&Path>,
+    id: &str,
+    target_project: Option<&str>,
+) -> AppResult<u32> {
     match source {
-        Some(source) => append_history(codex, source, id),
+        Some(source) => crate::history::append_from_file_with_project(
+            &paths::history_path(codex),
+            source,
+            id,
+            target_project,
+        ),
         None => Ok(0),
     }
 }
@@ -1716,6 +2125,305 @@ pub(crate) fn replace_claude_snapshot_verified(
         return Err(cleanup_snapshot_paths(error, &staging));
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct ClaudeExtraSwap {
+    destination: PathBuf,
+    staged: Option<PathBuf>,
+    backup: PathBuf,
+    parked: bool,
+    installed: bool,
+}
+
+pub(crate) fn replace_claude_snapshot_with_extras_verified(
+    src_transcript: &Path,
+    dest_transcript: &Path,
+    target_cwd: Option<&str>,
+    src_sidecar: Option<&Path>,
+    src_companions: Option<&Path>,
+    src_tasks: Option<&Path>,
+    dest_tasks: &Path,
+    expected_source_sha256: Option<&str>,
+) -> AppResult<()> {
+    let parent = dest_transcript
+        .parent()
+        .ok_or_else(|| AppError::Path("Claude transcript 导入目标缺少父目录".into()))?;
+    fs::create_dir_all(parent)?;
+    let before_transcript = match fs::symlink_metadata(dest_transcript) {
+        Ok(metadata)
+            if metadata.is_file()
+                && !crate::path_safety::metadata_is_link_or_reparse(&metadata) =>
+        {
+            Some(atomic_file::fingerprint(dest_transcript)?)
+        }
+        Ok(_) => {
+            return Err(AppError::Path(format!(
+                "Claude transcript 导入目标不是普通文件: {}",
+                dest_transcript.to_string_lossy()
+            )))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+
+    let mut swaps = stage_claude_extra_swaps(dest_transcript, src_companions)?;
+    let task_backup = match unique_snapshot_sibling(dest_tasks, "tasks-backup") {
+        Ok(path) => path,
+        Err(error) => {
+            let cleanup = cleanup_claude_extra_swaps(&swaps);
+            return Err(append_operation_errors(
+                error,
+                "清理 Claude companion 暂存路径失败",
+                cleanup,
+            ));
+        }
+    };
+    let staged_tasks = match src_tasks {
+        Some(source) => {
+            if let Err(error) = validate_claude_tasks_source(source) {
+                let cleanup = cleanup_claude_extra_swaps(&swaps);
+                return Err(append_operation_errors(
+                    error,
+                    "清理 Claude companion 暂存路径失败",
+                    cleanup,
+                ));
+            }
+            match stage_claude_sidecar(source, dest_tasks) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    let cleanup = cleanup_claude_extra_swaps(&swaps);
+                    return Err(append_operation_errors(
+                        error,
+                        "清理 Claude companion 暂存路径失败",
+                        cleanup,
+                    ));
+                }
+            }
+        }
+        None => None,
+    };
+    swaps.push(ClaudeExtraSwap {
+        destination: dest_tasks.to_path_buf(),
+        staged: staged_tasks,
+        backup: task_backup,
+        parked: false,
+        installed: false,
+    });
+
+    let install_result = (|| -> AppResult<()> {
+        for swap in &mut swaps {
+            if path_exists_no_follow(&swap.destination)? {
+                rename_snapshot_path(&swap.destination, &swap.backup)?;
+                swap.parked = true;
+            }
+            if let Some(staged) = swap.staged.as_deref() {
+                if let Some(parent) = swap.destination.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                rename_snapshot_path(staged, &swap.destination)?;
+                swap.installed = true;
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = install_result {
+        let rollback = rollback_claude_extra_swaps(&mut swaps);
+        return Err(append_operation_errors(
+            error,
+            "回滚 Claude companion/tasks 失败",
+            rollback,
+        ));
+    }
+
+    if let Err(error) = replace_claude_snapshot_verified(
+        src_transcript,
+        dest_transcript,
+        target_cwd,
+        src_sidecar,
+        expected_source_sha256,
+    ) {
+        let after_transcript = fs::symlink_metadata(dest_transcript)
+            .ok()
+            .filter(|metadata| {
+                metadata.is_file() && !crate::path_safety::metadata_is_link_or_reparse(metadata)
+            })
+            .and_then(|_| atomic_file::fingerprint(dest_transcript).ok());
+        let core_changed = after_transcript.is_some() && after_transcript != before_transcript;
+        if core_changed {
+            let _ = cleanup_claude_extra_swaps(&swaps);
+            return Err(error);
+        }
+        let rollback = rollback_claude_extra_swaps(&mut swaps);
+        return Err(append_operation_errors(
+            error,
+            "回滚 Claude companion/tasks 失败",
+            rollback,
+        ));
+    }
+
+    let cleanup = cleanup_claude_extra_swaps(&swaps);
+    if cleanup.is_empty() {
+        Ok(())
+    } else {
+        Err(AppError::Other(format!(
+            "Claude 会话已完整替换，但清理 companion/tasks 旧快照失败: {}",
+            cleanup.join("; ")
+        )))
+    }
+}
+
+fn stage_claude_extra_swaps(
+    dest_transcript: &Path,
+    src_companions: Option<&Path>,
+) -> AppResult<Vec<ClaudeExtraSwap>> {
+    let mut sources = HashMap::<std::ffi::OsString, PathBuf>::new();
+    if let Some(root) = src_companions {
+        let session_id = dest_transcript
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| AppError::Path("Claude transcript 文件名无效".into()))?;
+        let transcript_name = dest_transcript
+            .file_name()
+            .ok_or_else(|| AppError::Path("Claude transcript 文件名无效".into()))?;
+        let companion_prefix = format!("{session_id}.");
+        let metadata = fs::symlink_metadata(root)?;
+        if !metadata.is_dir() || crate::path_safety::metadata_is_link_or_reparse(&metadata) {
+            return Err(AppError::Path(format!(
+                "Claude companions 必须是普通目录: {}",
+                root.to_string_lossy()
+            )));
+        }
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name_text = name.to_str().ok_or_else(|| {
+                AppError::Path(format!(
+                    "Claude companion 文件名不是有效 UTF-8: {}",
+                    entry.path().to_string_lossy()
+                ))
+            })?;
+            if name == transcript_name || !name_text.starts_with(&companion_prefix) {
+                return Err(AppError::Path(format!(
+                    "Claude companion 文件名不属于会话 {session_id}: {}",
+                    entry.path().to_string_lossy()
+                )));
+            }
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if !metadata.is_file() || crate::path_safety::metadata_is_link_or_reparse(&metadata) {
+                return Err(AppError::Path(format!(
+                    "Claude companions 只能包含普通文件: {}",
+                    entry.path().to_string_lossy()
+                )));
+            }
+            sources.insert(name, entry.path());
+        }
+    }
+
+    let mut destinations = crate::claude_sessions::companion_files_for(dest_transcript)?
+        .into_iter()
+        .map(|path| {
+            let name = path
+                .file_name()
+                .map(|value| value.to_owned())
+                .ok_or_else(|| {
+                    AppError::Path(format!(
+                        "Claude companion 文件名无效: {}",
+                        path.to_string_lossy()
+                    ))
+                })?;
+            Ok((name, path))
+        })
+        .collect::<AppResult<HashMap<_, _>>>()?;
+    let parent = dest_transcript
+        .parent()
+        .ok_or_else(|| AppError::Path("Claude transcript 导入目标缺少父目录".into()))?;
+    for name in sources.keys() {
+        destinations
+            .entry(name.clone())
+            .or_insert_with(|| parent.join(name));
+    }
+
+    let mut swaps = Vec::new();
+    for (name, destination) in destinations {
+        let backup = match unique_snapshot_sibling(&destination, "companion-backup") {
+            Ok(path) => path,
+            Err(error) => {
+                let cleanup = cleanup_claude_extra_swaps(&swaps);
+                return Err(append_operation_errors(
+                    error,
+                    "清理 Claude companion 暂存路径失败",
+                    cleanup,
+                ));
+            }
+        };
+        let staged = match sources.get(&name) {
+            Some(source) => match stage_claude_sidecar(source, &destination) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    let cleanup = cleanup_claude_extra_swaps(&swaps);
+                    return Err(append_operation_errors(
+                        error,
+                        "清理 Claude companion 暂存路径失败",
+                        cleanup,
+                    ));
+                }
+            },
+            None => None,
+        };
+        swaps.push(ClaudeExtraSwap {
+            backup,
+            destination,
+            staged,
+            parked: false,
+            installed: false,
+        });
+    }
+    swaps.sort_by(|left, right| left.destination.cmp(&right.destination));
+    Ok(swaps)
+}
+
+fn validate_claude_tasks_source(source: &Path) -> AppResult<()> {
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.is_dir() && !crate::path_safety::metadata_is_link_or_reparse(&metadata) {
+        Ok(())
+    } else {
+        Err(AppError::Path(format!(
+            "Claude tasks 必须是普通目录: {}",
+            source.to_string_lossy()
+        )))
+    }
+}
+
+fn rollback_claude_extra_swaps(swaps: &mut [ClaudeExtraSwap]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for swap in swaps.iter_mut().rev() {
+        if swap.installed {
+            collect_path_removal_error(&swap.destination, &mut errors);
+            swap.installed = false;
+        }
+        if swap.parked {
+            collect_rename_error(&swap.backup, &swap.destination, &mut errors);
+            swap.parked = false;
+        }
+        if let Some(staged) = swap.staged.as_deref() {
+            collect_path_removal_error(staged, &mut errors);
+        }
+    }
+    errors
+}
+
+fn cleanup_claude_extra_swaps(swaps: &[ClaudeExtraSwap]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for swap in swaps {
+        if swap.parked {
+            collect_path_removal_error(&swap.backup, &mut errors);
+        }
+        if let Some(staged) = swap.staged.as_deref() {
+            collect_path_removal_error(staged, &mut errors);
+        }
+    }
+    errors
 }
 
 fn commit_staged_claude_snapshot(
@@ -1883,6 +2591,12 @@ fn stage_claude_sidecar(source: &Path, dest: &Path) -> AppResult<PathBuf> {
             source.to_string_lossy()
         )));
     }
+    if let Some(parent) = dest
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
     loop {
         let staged = unique_snapshot_sibling(dest, "sidecar-stage")?;
         if metadata.is_file() {
@@ -2013,9 +2727,8 @@ fn claude_import_dest(
         .file_name()
         .map(|name| name.to_owned())
         .unwrap_or_else(|| std::ffi::OsString::from(format!("{session_id}.jsonl")));
-    let project_dir = find_claude_project_dir_for_cwd(claude, mapped_cwd)?.unwrap_or_else(|| {
-        paths::claude_projects_dir(claude).join(paths::sanitize_slug(mapped_cwd))
-    });
+    let project_dir = find_claude_project_dir_for_cwd(claude, mapped_cwd)?
+        .unwrap_or_else(|| crate::claude_sessions::project_dir_for_cwd(claude, mapped_cwd));
     Ok(project_dir.join(file_name))
 }
 
@@ -2831,6 +3544,39 @@ mod tests {
         Ok(())
     }
 
+    fn write_opencode_database(root: &Path, cwd: &Path, title: &str) -> AppResult<()> {
+        fs::create_dir_all(root)?;
+        fs::create_dir_all(cwd)?;
+        let connection = rusqlite::Connection::open(crate::opencode_sessions::database_path(root))?;
+        connection.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL, vcs TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, sandboxes TEXT NOT NULL);
+             INSERT INTO project VALUES ('global','/',NULL,1,1,'[]');
+             CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES project(id), parent_id TEXT, slug TEXT NOT NULL, directory TEXT NOT NULL, title TEXT NOT NULL, version TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, time_archived INTEGER, path TEXT, workspace_id TEXT);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL REFERENCES message(id) ON DELETE CASCADE, session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+             CREATE TABLE todo (session_id TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE, position INTEGER NOT NULL, content TEXT NOT NULL, PRIMARY KEY(session_id, position));
+             CREATE TABLE session_share (session_id TEXT PRIMARY KEY REFERENCES session(id) ON DELETE CASCADE, id TEXT NOT NULL, secret TEXT NOT NULL, url TEXT NOT NULL);",
+        )?;
+        connection.execute(
+            "INSERT INTO session (id,project_id,parent_id,slug,directory,title,version,time_created,time_updated,time_archived,path,workspace_id) VALUES ('ses_bundle','global',NULL,'bundle',?1,?2,'1.0',1000,4000,NULL,NULL,NULL)",
+            rusqlite::params![cwd.to_string_lossy().as_ref(), title],
+        )?;
+        connection.execute(
+            "INSERT INTO message VALUES ('msg_bundle','ses_bundle',1000,1000,?1)",
+            [serde_json::json!({"role":"assistant","modelID":"gpt-portable","providerID":"test","tokens":{"input":2,"output":3}}).to_string()],
+        )?;
+        connection.execute(
+            "INSERT INTO part VALUES ('part_bundle','msg_bundle','ses_bundle',1000,1000,?1)",
+            [serde_json::json!({"type":"text","text":"portable bundle answer"}).to_string()],
+        )?;
+        connection.execute(
+            "INSERT INTO todo VALUES ('ses_bundle',0,'portable task')",
+            [],
+        )?;
+        Ok(())
+    }
+
     fn write_claude_session_in_project(
         claude: &Path,
         project: &str,
@@ -2986,6 +3732,28 @@ mod tests {
             ),
         )?;
         Ok(path)
+    }
+
+    #[test]
+    fn claude_extra_swap_rejects_companion_from_another_session() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-claude-companion-scope-test");
+        let target_project = root.join("target-project");
+        let companions = root.join("companions");
+        fs::create_dir_all(&target_project)?;
+        fs::create_dir_all(&companions)?;
+        fs::write(
+            companions.join("other-session.claudinal.json"),
+            "must not be installed",
+        )?;
+        let destination = target_project.join("expected-session.jsonl");
+
+        let error = stage_claude_extra_swaps(&destination, Some(&companions))
+            .expect_err("foreign companion name must be rejected");
+
+        assert!(error.to_string().contains("不属于会话 expected-session"));
+        assert!(fs::read_dir(&target_project)?.next().is_none());
+        fs::remove_dir_all(root).ok();
+        Ok(())
     }
 
     #[test]
@@ -3324,6 +4092,12 @@ mod tests {
 
         write_claude_session(&import_claude, id)?;
         let local_sidecar = write_test_sidecar(&import_claude, id, "old.txt", "old snapshot")?;
+        let local_transcript = claude_test_transcript(&import_claude, id);
+        let local_companion = local_transcript.with_file_name(format!("{id}.claudinal.json"));
+        fs::write(&local_companion, "old companion")?;
+        let local_tasks = import_claude.join("tasks").join(id);
+        fs::create_dir_all(&local_tasks)?;
+        fs::write(local_tasks.join("task.json"), "old task")?;
         let imported = import_session_bundles(
             Some(PROVIDER_CLAUDE.to_string()),
             bundle_dir.to_string_lossy().into_owned(),
@@ -3338,6 +4112,8 @@ mod tests {
         assert!(imported[0].ok);
         assert!(imported[0].rollout_written);
         assert!(!local_sidecar.exists());
+        assert!(!local_companion.exists());
+        assert!(!local_tasks.exists());
 
         fs::remove_dir_all(root).ok();
         Ok(())
@@ -3685,12 +4461,72 @@ mod tests {
     }
 
     #[test]
+    fn claude_bundle_import_rejects_linked_tasks_root() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-claude-linked-tasks-test");
+        let source_claude = root.join("source-claude");
+        let import_claude = root.join("import-claude");
+        let external = root.join("external-tasks");
+        let bundle_dir = root.join("bundles");
+        let id = "linked-tasks-session";
+        write_claude_session(&source_claude, id)?;
+        let reports = export_session_bundles(
+            Some(PROVIDER_CLAUDE.to_string()),
+            String::new(),
+            Some(source_claude.to_string_lossy().into_owned()),
+            bundle_dir.to_string_lossy().into_owned(),
+            vec![id.to_string()],
+            None,
+            Some("test-machine".to_string()),
+            Some("default".to_string()),
+        )?;
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].ok);
+        fs::create_dir_all(&import_claude)?;
+        fs::create_dir_all(&external)?;
+        let sentinel = external.join("sentinel.txt");
+        fs::write(&sentinel, "external must stay untouched")?;
+        let tasks_link = import_claude.join("tasks");
+        create_test_directory_link(&external, &tasks_link)?;
+
+        let imported = import_session_bundles(
+            Some(PROVIDER_CLAUDE.to_string()),
+            bundle_dir.to_string_lossy().into_owned(),
+            String::new(),
+            Some(import_claude.to_string_lossy().into_owned()),
+            ImportMode::Overwrite,
+            false,
+            true,
+            vec![],
+        )?;
+
+        assert_eq!(imported.len(), 1);
+        assert!(!imported[0].ok);
+        assert_eq!(
+            fs::read_to_string(&sentinel)?,
+            "external must stay untouched"
+        );
+        assert_eq!(fs::read_dir(&external)?.count(), 1);
+
+        remove_test_directory_link(&tasks_link);
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
     fn exports_verifies_and_imports_claude_bundle() -> AppResult<()> {
         let root = temp_dir("cc-session-manager-claude-bundle-test");
         let source_claude = root.join("source-claude");
         let import_claude = root.join("import-claude");
         let bundle_dir = root.join("bundles");
         write_claude_session(&source_claude, "claude-bundle-1")?;
+        fs::write(
+            claude_test_transcript(&source_claude, "claude-bundle-1")
+                .with_file_name("claude-bundle-1.claudinal.json"),
+            "bundle-companion",
+        )?;
+        let source_tasks = source_claude.join("tasks").join("claude-bundle-1");
+        fs::create_dir_all(&source_tasks)?;
+        fs::write(source_tasks.join("task.json"), "bundle-task")?;
 
         let reports = export_session_bundles(
             Some(PROVIDER_CLAUDE.to_string()),
@@ -3732,17 +4568,32 @@ mod tests {
             }],
         )?;
         assert_eq!(imported.len(), 1);
-        assert!(imported[0].ok);
+        assert!(imported[0].ok, "{:?}", imported[0].error);
         assert_eq!(imported[0].history_appended, 2);
-        let imported_claude_path = paths::claude_projects_dir(&import_claude)
-            .join(paths::sanitize_slug(r"D:\work\sample-project"))
-            .join("claude-bundle-1.jsonl");
+        let imported_claude_path =
+            crate::claude_sessions::project_dir_for_cwd(&import_claude, r"D:\work\sample-project")
+                .join("claude-bundle-1.jsonl");
         assert!(imported_claude_path.is_file());
         let imported_jsonl = fs::read_to_string(&imported_claude_path)?;
         let imported_event: Value = serde_json::from_str(imported_jsonl.lines().next().unwrap())?;
         assert_eq!(
             imported_event.get("cwd").and_then(Value::as_str),
             Some(r"D:\work\sample-project")
+        );
+        assert_eq!(
+            fs::read_to_string(
+                imported_claude_path.with_file_name("claude-bundle-1.claudinal.json")
+            )?,
+            "bundle-companion"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                import_claude
+                    .join("tasks")
+                    .join("claude-bundle-1")
+                    .join("task.json")
+            )?,
+            "bundle-task"
         );
         let imported_history = fs::read_to_string(import_claude.join("history.jsonl"))?;
         assert!(imported_history.contains("bundle one"));
@@ -3791,6 +4642,77 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("辅助文件"));
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn exports_verifies_imports_and_resumes_opencode_bundle() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-opencode-bundle-test");
+        let source = root.join("source-opencode");
+        let target = root.join("target-opencode");
+        let source_cwd = root.join("source-project");
+        let target_cwd = root.join("target-project");
+        let bundle_dir = root.join("bundles");
+        write_opencode_database(&source, &source_cwd, "OpenCode bundle")?;
+        write_opencode_database(&target, &target_cwd, "placeholder")?;
+        let target_connection =
+            rusqlite::Connection::open(crate::opencode_sessions::database_path(&target))?;
+        target_connection.execute_batch("PRAGMA foreign_keys=ON")?;
+        target_connection.execute("DELETE FROM session WHERE id='ses_bundle'", [])?;
+        drop(target_connection);
+
+        let reports = export_session_bundles_with_opencode(
+            Some(PROVIDER_OPENCODE.to_string()),
+            String::new(),
+            None,
+            Some(source.to_string_lossy().into_owned()),
+            bundle_dir.to_string_lossy().into_owned(),
+            vec!["ses_bundle".to_string()],
+            None,
+            Some("test-machine".to_string()),
+            Some("default".to_string()),
+        )?;
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].ok);
+        let verified = verify_bundles(
+            bundle_dir.to_string_lossy().into_owned(),
+            Some(PROVIDER_OPENCODE.to_string()),
+        )?;
+        assert_eq!(verified.len(), 1);
+        assert_eq!(verified[0].verified, Some(true));
+
+        let imported = import_session_bundles_with_opencode(
+            Some(PROVIDER_OPENCODE.to_string()),
+            bundle_dir.to_string_lossy().into_owned(),
+            String::new(),
+            None,
+            Some(target.to_string_lossy().into_owned()),
+            ImportMode::Overwrite,
+            false,
+            true,
+            vec![ProjectPathMapping {
+                source_cwd: source_cwd.to_string_lossy().into_owned(),
+                target_cwd: target_cwd.to_string_lossy().into_owned(),
+            }],
+        )?;
+        assert_eq!(imported.len(), 1);
+        assert!(imported[0].ok);
+        assert!(imported[0].rollout_written);
+        let sessions = crate::opencode_sessions::list_sessions(&target)?;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].cwd,
+            paths::strip_verbatim(&target_cwd.canonicalize()?.to_string_lossy())
+        );
+        assert_eq!(sessions[0].resume_command, "opencode --session ses_bundle");
+        let preview = crate::opencode_sessions::preview_range(&sessions[0].rollout_path, 0, 10)?;
+        assert_eq!(preview.len(), 1);
+        assert_eq!(
+            crate::rollout::preview_event_text(&preview[0]),
+            "portable bundle answer"
+        );
 
         fs::remove_dir_all(root).ok();
         Ok(())

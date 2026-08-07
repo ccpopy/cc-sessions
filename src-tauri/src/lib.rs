@@ -5,6 +5,7 @@ pub mod backup;
 pub mod bundle;
 pub mod claude_memory;
 pub mod claude_sessions;
+pub mod claude_transfer;
 #[cfg(feature = "desktop")]
 pub mod commands;
 pub mod content_search;
@@ -19,6 +20,7 @@ pub mod markdown_export;
 pub mod models;
 pub mod opencode_edit;
 pub mod opencode_sessions;
+pub mod opencode_transfer;
 pub mod path_safety;
 pub mod paths;
 pub mod provenance;

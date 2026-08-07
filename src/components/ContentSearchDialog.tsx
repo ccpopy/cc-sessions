@@ -29,6 +29,7 @@ type Props = {
   provider: SessionProvider;
   codexDir: string;
   claudeDir: string;
+  opencodeDir: string;
   showSubagentSessions: boolean;
   showArchivedSessions: boolean;
   rolloutPaths: readonly string[];
@@ -45,6 +46,7 @@ export function ContentSearchDialog({
   provider,
   codexDir,
   claudeDir,
+  opencodeDir,
   showSubagentSessions,
   showArchivedSessions,
   rolloutPaths,
@@ -67,6 +69,7 @@ export function ContentSearchDialog({
     provider,
     codexDir,
     claudeDir,
+    opencodeDir,
     showSubagentSessions,
     showArchivedSessions,
     rolloutPaths,
@@ -220,6 +223,7 @@ export function ContentSearchDialog({
         provider,
         codexDir,
         claudeDir,
+        opencodeDir,
         query: normalized,
         rolloutPaths,
       });
@@ -266,7 +270,7 @@ export function ContentSearchDialog({
   };
 
   const scopeLabel = showSubagentSessions
-    ? "子代理"
+    ? provider === "opencode" ? "子会话" : "子代理"
     : provider === "codex" && showArchivedSessions
       ? "已归档"
       : "主会话";
@@ -283,7 +287,7 @@ export function ContentSearchDialog({
               <DialogTitle className="text-[15px] leading-tight">对话全文搜索</DialogTitle>
               <div className="mt-1 flex flex-wrap items-center gap-1.5">
                 <Badge variant="outline" className="h-5 px-1.5 text-[10px] font-normal">
-                  {provider === "codex" ? "Codex" : "Claude"}
+                  {provider === "codex" ? "Codex" : provider === "claude" ? "Claude" : "OpenCode"}
                 </Badge>
                 <Badge variant="secondary" className="h-5 px-1.5 text-[10px] font-normal">
                   {scopeLabel}

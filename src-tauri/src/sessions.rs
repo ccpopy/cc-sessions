@@ -296,6 +296,16 @@ pub fn list_sessions_cancellable(
     list_sessions_impl(provider, codex_dir, claude_dir, None, Some(cancel))
 }
 
+pub fn list_sessions_cancellable_with_opencode(
+    provider: Option<String>,
+    codex_dir: String,
+    claude_dir: Option<String>,
+    opencode_dir: Option<String>,
+    cancel: &AtomicBool,
+) -> AppResult<Vec<SessionSummary>> {
+    list_sessions_impl(provider, codex_dir, claude_dir, opencode_dir, Some(cancel))
+}
+
 fn list_sessions_impl(
     provider: Option<String>,
     codex_dir: String,
@@ -602,15 +612,49 @@ pub fn rename_session_with_provider_dir(
     title: String,
     lock: &family::FamilyLock,
 ) -> AppResult<u32> {
-    if provider_or_codex(provider.clone()) == "opencode" {
+    rename_session_with_provider_dirs(
+        provider,
+        codex_dir,
+        None,
+        opencode_dir,
+        id,
+        None,
+        title,
+        lock,
+    )
+}
+
+pub fn rename_session_with_provider_dirs(
+    provider: Option<String>,
+    codex_dir: String,
+    claude_dir: Option<String>,
+    opencode_dir: Option<String>,
+    id: String,
+    rollout_path: Option<String>,
+    title: String,
+    lock: &family::FamilyLock,
+) -> AppResult<u32> {
+    let provider = provider_or_codex(provider);
+    if provider == "opencode" {
         let data_dir = PathBuf::from(
             opencode_dir
                 .unwrap_or_else(|| paths::default_opencode_dir().to_string_lossy().into_owned()),
         );
-        return crate::opencode_sessions::rename_session(&data_dir, &id, &title);
+        return family::with_lock(lock, |_guard| {
+            crate::opencode_sessions::rename_session(&data_dir, &id, &title)
+        });
     }
-    if provider_or_codex(provider) != "codex" {
-        return Err(AppError::Other("Claude 会话暂不支持重命名".into()));
+    if provider == "claude" {
+        let claude = PathBuf::from(
+            claude_dir
+                .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
+        );
+        return family::with_lock(lock, |_guard| {
+            crate::claude_transfer::rename_session(&claude, &id, rollout_path.as_deref(), &title)
+        });
+    }
+    if provider != "codex" {
+        return Err(AppError::Other(format!("不支持的 provider: {provider}")));
     }
     let title = title.trim().to_string();
     if title.is_empty() {
@@ -1012,6 +1056,10 @@ fn move_session_cwd_locked(
         new_cwd,
         threads_updated,
         rollout_rewritten,
+        artifacts_moved: 0,
+        history_rows_updated: 0,
+        target_project_id: None,
+        requires_project_open: false,
     })
 }
 
@@ -1023,9 +1071,19 @@ pub fn move_session_cwd_with_lock(
     target_cwd: String,
     lock: &family::FamilyLock,
 ) -> AppResult<MoveSessionCwdReport> {
-    if provider_or_codex(provider) != "codex" {
-        return Err(AppError::Other("Claude 会话暂不支持移动工作目录".into()));
-    }
+    move_session_cwd_with_provider_dirs(provider, codex_dir, None, None, id, None, target_cwd, lock)
+}
+
+pub fn move_session_cwd_with_provider_dirs(
+    provider: Option<String>,
+    codex_dir: String,
+    claude_dir: Option<String>,
+    opencode_dir: Option<String>,
+    id: String,
+    rollout_path: Option<String>,
+    target_cwd: String,
+    lock: &family::FamilyLock,
+) -> AppResult<MoveSessionCwdReport> {
     let target_cwd = target_cwd.trim().to_string();
     if target_cwd.is_empty() {
         return Err(AppError::Other("工作目录路径不能为空".into()));
@@ -1035,9 +1093,35 @@ pub fn move_session_cwd_with_lock(
             "工作目录路径过长（最多 1024 个字符）".into(),
         ));
     }
-    family::with_lock(lock, |_guard| {
-        move_session_cwd_locked(codex_dir, id, target_cwd)
-    })
+    match provider_or_codex(provider).as_str() {
+        "codex" => family::with_lock(lock, |_guard| {
+            move_session_cwd_locked(codex_dir, id, target_cwd)
+        }),
+        "claude" => {
+            let claude = PathBuf::from(
+                claude_dir
+                    .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
+            );
+            family::with_lock(lock, |_guard| {
+                crate::claude_transfer::move_session_cwd(
+                    &claude,
+                    &id,
+                    rollout_path.as_deref(),
+                    &target_cwd,
+                )
+            })
+        }
+        "opencode" => {
+            let data_dir =
+                PathBuf::from(opencode_dir.unwrap_or_else(|| {
+                    paths::default_opencode_dir().to_string_lossy().into_owned()
+                }));
+            family::with_lock(lock, |_guard| {
+                crate::opencode_transfer::move_session_cwd(&data_dir, &id, &target_cwd)
+            })
+        }
+        other => Err(AppError::Other(format!("不支持的 provider: {other}"))),
+    }
 }
 
 fn set_archived_codex_locked(codex_dir: String, id: String, v: bool) -> AppResult<()> {

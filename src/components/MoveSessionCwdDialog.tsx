@@ -76,7 +76,11 @@ export function MoveSessionCwdDialog({
         <DialogHeader>
           <DialogTitle>移动会话到其他项目</DialogTitle>
           <DialogDescription>
-            修改会话的工作目录路径。更改后会话会重新归入新项目的分组，同时更新 Codex 数据库和 rollout 记录。
+            {session?.provider === "claude"
+              ? "移动主 transcript、同名 sidecar 与 companion 文件，并同步改写 JSONL cwd 和 history 项目路径。"
+              : session?.provider === "opencode"
+                ? "在同一 SQLite 事务中更新会话及其子会话的项目标识、目录和兼容 path 字段。"
+                : "修改会话的工作目录路径。更改后会话会重新归入新项目的分组，同时更新 Codex 数据库和 rollout 记录。"}
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-2">

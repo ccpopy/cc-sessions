@@ -202,6 +202,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "provider")?,
             string_arg(&args, "codexDir")?,
             string_arg(&args, "claudeDir")?,
+            string_arg(&args, "opencodeDir")?,
             string_arg(&args, "query")?,
             arg(&args, "rolloutPaths")?,
         )),
@@ -220,18 +221,23 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             bool_arg(&args, "v")?,
             &state.family_lock,
         )),
-        "rename_session" => to_result_value(sessions::rename_session_with_provider_dir(
+        "rename_session" => to_result_value(sessions::rename_session_with_provider_dirs(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "codexDir")?,
+            opt_string_arg(&args, "claudeDir")?,
             opt_string_arg(&args, "opencodeDir")?,
             string_arg(&args, "id")?,
+            opt_string_arg(&args, "rolloutPath")?,
             string_arg(&args, "title")?,
             &state.family_lock,
         )),
-        "move_session_cwd" => to_result_value(sessions::move_session_cwd_with_lock(
+        "move_session_cwd" => to_result_value(sessions::move_session_cwd_with_provider_dirs(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "codexDir")?,
+            opt_string_arg(&args, "claudeDir")?,
+            opt_string_arg(&args, "opencodeDir")?,
             string_arg(&args, "id")?,
+            opt_string_arg(&args, "rolloutPath")?,
             string_arg(&args, "targetCwd")?,
             &state.family_lock,
         )),
@@ -357,10 +363,11 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             arg(&args, "header")?,
             arg(&args, "options")?,
         )),
-        "create_backup" => to_result_value(backup::create_backup(
+        "create_backup" => to_result_value(backup::create_backup_with_opencode(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "codexDir")?,
             opt_string_arg(&args, "claudeDir")?,
+            opt_string_arg(&args, "opencodeDir")?,
             string_arg(&args, "backupDir")?,
             arg(&args, "ids")?,
             opt_arg(&args, "targets")?,
@@ -375,22 +382,24 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "backupDir")?,
             string_arg(&args, "backupPath")?,
         )),
-        "restore_session" => to_result_value(backup::restore_session(
+        "restore_session" => to_result_value(backup::restore_session_with_opencode(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "backupDir")?,
             string_arg(&args, "backupPath")?,
             string_arg(&args, "codexDir")?,
             opt_string_arg(&args, "claudeDir")?,
+            opt_string_arg(&args, "opencodeDir")?,
             string_arg(&args, "id")?,
             opt_string_arg(&args, "backupRolloutRelpath")?,
             bool_arg(&args, "overwrite")?,
         )),
-        "restore_all" => to_result_value(backup::restore_all(
+        "restore_all" => to_result_value(backup::restore_all_with_opencode(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "backupDir")?,
             string_arg(&args, "backupPath")?,
             string_arg(&args, "codexDir")?,
             opt_string_arg(&args, "claudeDir")?,
+            opt_string_arg(&args, "opencodeDir")?,
             bool_arg(&args, "overwrite")?,
         )),
         "delete_backup" => to_result_value(backup::delete_backup(
@@ -595,20 +604,22 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
                 &state.family_lock,
             ))
         }
-        "export_session_bundles" => to_result_value(bundle::export_session_bundles(
+        "export_session_bundles" => to_result_value(bundle::export_session_bundles_with_opencode(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "codexDir")?,
             opt_string_arg(&args, "claudeDir")?,
+            opt_string_arg(&args, "opencodeDir")?,
             string_arg(&args, "outDir")?,
             arg(&args, "ids")?,
             opt_arg(&args, "targets")?,
             opt_string_arg(&args, "machineLabel")?,
             opt_string_arg(&args, "exportGroup")?,
         )),
-        "export_all_bundles" => to_result_value(bundle::export_all_bundles(
+        "export_all_bundles" => to_result_value(bundle::export_all_bundles_with_opencode(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "codexDir")?,
             opt_string_arg(&args, "claudeDir")?,
+            opt_string_arg(&args, "opencodeDir")?,
             string_arg(&args, "outDir")?,
             opt_string_arg(&args, "machineLabel")?,
             opt_string_arg(&args, "exportGroup")?,
@@ -622,11 +633,12 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "srcDir")?,
             opt_string_arg(&args, "provider")?,
         )),
-        "import_session_bundles" => to_result_value(bundle::import_session_bundles(
+        "import_session_bundles" => to_result_value(bundle::import_session_bundles_with_opencode(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "srcDir")?,
             string_arg(&args, "codexDir")?,
             opt_string_arg(&args, "claudeDir")?,
+            opt_string_arg(&args, "opencodeDir")?,
             enum_arg::<ImportMode>(&args, "mode")?,
             bool_arg(&args, "makeVisible")?,
             bool_arg(&args, "strict")?,

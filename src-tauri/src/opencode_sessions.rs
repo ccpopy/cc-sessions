@@ -133,6 +133,12 @@ pub fn preview_range(locator: &str, offset: usize, limit: usize) -> AppResult<Ve
     Ok(events.into_iter().skip(offset).take(limit).collect())
 }
 
+pub(crate) fn load_preview_events_from_locator(locator: &str) -> AppResult<Vec<PreviewEvent>> {
+    let locator = decode_locator(locator)?;
+    let connection = open_readonly(Path::new(&locator.db))?;
+    load_preview_events(&connection, &locator.session)
+}
+
 pub fn preview_user_prompts(locator: &str) -> AppResult<UserPromptList> {
     let locator = decode_locator(locator)?;
     let connection = open_readonly(Path::new(&locator.db))?;

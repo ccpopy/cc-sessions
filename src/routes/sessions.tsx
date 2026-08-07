@@ -68,7 +68,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const isCodex = provider === "codex";
   const isOpenCode = provider === "opencode";
   const supportsArchive = isCodex || isOpenCode;
-  const { index: backupIndex, error: backupIndexError } = useBackupIndex(provider, !isOpenCode);
+  const { index: backupIndex, error: backupIndexError } = useBackupIndex(provider);
   const selected = useSelection((s) => s.selected);
   const setSelection = useSelection((s) => s.set);
   const clearSelection = useSelection((s) => s.clear);
@@ -165,6 +165,8 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     setPreviewJump(null);
     setContentSearchOpen(false);
     setExportTarget(null);
+    setRenameTarget(null);
+    setMoveTarget(null);
     setBackupTargets([]);
     setDeleteTargets([]);
     setFamilySheetId(null);
@@ -498,9 +500,9 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         stats={loading ? "加载中…" : `${visibleSessions.length} 条`}
         onRefresh={refreshAll}
         refreshing={loading}
-        onBulkBackup={isOpenCode ? undefined : onBulkBackup}
+        onBulkBackup={onBulkBackup}
         onBulkDelete={onBulkDelete}
-        onContentSearch={isOpenCode ? undefined : () => setContentSearchOpen(true)}
+        onContentSearch={() => setContentSearchOpen(true)}
         showListTools
       >
         <DropdownMenu>
@@ -676,15 +678,15 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             onCopyResume={onCopyResume}
             onRevealCwd={onReveal}
             onArchiveToggle={supportsArchive ? onArchiveToggle : undefined}
-            onBackup={isOpenCode ? undefined : (s) => setBackupTargets([s])}
+            onBackup={(s) => setBackupTargets([s])}
             onDelete={(s) => setDeleteTargets([s])}
             onClone={isCodex ? onCloneOne : undefined}
             onDuplicate={isCodex ? setDuplicateTarget : undefined}
             onOpenFamily={isCodex ? (s) => setFamilySheetId(s.id) : undefined}
             onExportMarkdown={setExportTarget}
             onConvert={isOpenCode ? undefined : setConvertTarget}
-            onRename={isCodex || isOpenCode ? setRenameTarget : undefined}
-            onMoveCwd={isCodex ? setMoveTarget : undefined}
+            onRename={setRenameTarget}
+            onMoveCwd={setMoveTarget}
           />
         )}
       </ScrollArea>
@@ -695,6 +697,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         provider={provider}
         codexDir={settings.codex_dir}
         claudeDir={settings.claude_dir}
+        opencodeDir={settings.opencode_dir}
         showSubagentSessions={showSubagentSessions}
         showArchivedSessions={showArchivedSessions}
         rolloutPaths={contentSearchRolloutPaths}
@@ -746,13 +749,15 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         onSubmit={async (title) => {
           if (!settings || !renameTarget) return;
           try {
-            const renamed = await api.renameSession(
+            const renamed = await api.renameSession({
               provider,
-              settings.codex_dir,
-              renameTarget.id,
+              codex_dir: settings.codex_dir,
+              claude_dir: settings.claude_dir,
+              opencode_dir: settings.opencode_dir,
+              id: renameTarget.id,
+              rollout_path: renameTarget.rollout_path,
               title,
-              settings.opencode_dir,
-            );
+            });
             toast.success(renamed > 1 ? `已重命名（同步 ${renamed} 个分支）` : "已重命名");
             await refresh();
           } catch (e: any) {
@@ -769,16 +774,28 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         onSubmit={async (targetCwd) => {
           if (!settings || !moveTarget) return;
           try {
-            const r = await api.moveSessionCwd(
+            const r = await api.moveSessionCwd({
               provider,
-              settings.codex_dir,
-              moveTarget.id,
-              targetCwd,
-            );
+              codex_dir: settings.codex_dir,
+              claude_dir: settings.claude_dir,
+              opencode_dir: settings.opencode_dir,
+              id: moveTarget.id,
+              rollout_path: moveTarget.rollout_path,
+              target_cwd: targetCwd,
+            });
             toast.success(
               `已移动到新项目：${basename(r.new_cwd)}` +
-              (r.threads_updated > 1 ? `（同步 ${r.threads_updated} 个分支）` : ""),
+              (provider === "codex" && r.threads_updated > 1
+                ? `（同步 ${r.threads_updated} 个分支）`
+                : provider === "opencode" && r.threads_updated > 1
+                  ? `（包含 ${r.threads_updated - 1} 个子会话）`
+                  : provider === "claude" && r.artifacts_moved > 1
+                    ? `（移动 ${r.artifacts_moved} 项会话资产）`
+                    : ""),
             );
+            if (r.requires_project_open) {
+              toast.info("首次在目标目录启动 OpenCode 时，会由 OpenCode 自动登记真实项目 ID");
+            }
             await refresh();
           } catch (e: any) {
             toast.error("移动失败：" + String(e?.message ?? e));
