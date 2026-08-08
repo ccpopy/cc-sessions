@@ -5,6 +5,7 @@ import {
   AlertTriangle,
   Archive,
   ChevronDown,
+  ListChecks,
   ListFilter,
   Loader2,
   MessageSquare,
@@ -31,6 +32,7 @@ import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
   DropdownMenuContent,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { useSessions } from "@/hooks/useSessions";
@@ -289,6 +291,23 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     currentProvider,
   ]);
 
+  const searchResultIds = useMemo(
+    () => visibleSessions.map(sessionIdentity),
+    [visibleSessions],
+  );
+  const selectedSearchResultCount = useMemo(
+    () => searchResultIds.filter((id) => selected.has(id)).length,
+    [searchResultIds, selected],
+  );
+  const canSelectSearchResults =
+    query.trim().length > 0 && !loading && searchResultIds.length > 0;
+  const allSearchResultsSelected =
+    canSelectSearchResults && selectedSearchResultCount === searchResultIds.length;
+  const toggleSearchResultSelection = useCallback(() => {
+    if (allSearchResultsSelected) clearSelection();
+    else setSelection(searchResultIds);
+  }, [allSearchResultsSelected, clearSelection, searchResultIds, setSelection]);
+
   const contentSearchRolloutPaths = useMemo(() => {
     return selectSessionsForView(allSessions, overlay, currentProvider, {
       provider,
@@ -510,23 +529,44 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             <Button
               variant="outline"
               size="sm"
-              className="h-8 shrink-0 gap-1.5 border-border/70 bg-muted/30 px-2.5 text-xs font-normal text-muted-foreground shadow-none data-[state=open]:bg-accent data-[state=open]:text-accent-foreground"
+              className="h-8 shrink-0 gap-1.5 border-border/70 bg-muted/30 px-2 text-xs font-normal text-muted-foreground shadow-none data-[state=open]:bg-accent data-[state=open]:text-accent-foreground xl:px-2.5"
               aria-label={
                 hasActiveVisibilityFilter ? "显示更多，当前已启用筛选" : "显示更多"
               }
+              title="显示更多"
             >
               <ListFilter className="h-3.5 w-3.5" />
-              <span>显示更多</span>
-              <ChevronDown className="h-3.5 w-3.5 opacity-60" />
+              <span className="hidden xl:inline">显示更多</span>
+              <ChevronDown className="hidden h-3.5 w-3.5 opacity-60 xl:block" />
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent
             align="start"
             style={{
-              width: "var(--radix-dropdown-menu-trigger-width)",
+              width: canSelectSearchResults
+                ? "max(var(--radix-dropdown-menu-trigger-width), 10rem)"
+                : "var(--radix-dropdown-menu-trigger-width)",
               minWidth: "var(--radix-dropdown-menu-trigger-width)",
             }}
           >
+            {canSelectSearchResults && (
+              <>
+                <DropdownMenuCheckboxItem
+                  checked={allSearchResultsSelected}
+                  onCheckedChange={toggleSearchResultSelection}
+                  className="gap-1.5 px-2 [&>span:first-child]:hidden"
+                >
+                  <ListChecks className="h-3.5 w-3.5 text-muted-foreground" />
+                  <span className="whitespace-nowrap">
+                    {allSearchResultsSelected ? "取消全选" : "全选搜索结果"}
+                  </span>
+                  <span className="ml-auto text-[10px] tabular-nums text-muted-foreground">
+                    {searchResultIds.length}
+                  </span>
+                </DropdownMenuCheckboxItem>
+                <DropdownMenuSeparator />
+              </>
+            )}
             <DropdownMenuCheckboxItem
               checked={showSubagentSessions}
               onCheckedChange={(checked) => setSubagentView(checked === true)}

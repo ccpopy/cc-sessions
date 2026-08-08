@@ -45,7 +45,7 @@ CC Sessions 用来管理 Codex、Claude Code 和 OpenCode 保存在本机的会�
 
 ## 安装
 
-前往 [Releases](https://github.com/ccpopy/cc-sessions/releases/latest)，按系统和使用方式选择文件。下表中的 `<版本号>` 对应 Release 显示的版本数字，例如 `0.5.2`。
+前往 [Releases](https://github.com/ccpopy/cc-sessions/releases/latest)，按系统和使用方式选择文件。下表中的 `<版本号>` 对应 Release 显示的版本数字，例如 `0.5.3`。
 
 | 系统与用途 | 推荐下载 | 说明 |
 | --- | --- | --- |

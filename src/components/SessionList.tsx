@@ -13,6 +13,7 @@ import { useSelection } from "@/stores/selection";
 import { useView } from "@/stores/view";
 import { cn } from "@/lib/utils";
 import { sessionIdentity } from "@/lib/sessionIdentity";
+import { compareSessionSize } from "@/lib/sessionSort";
 
 type Handlers = {
   onPreview: (s: SessionSummary) => void;
@@ -287,10 +288,11 @@ function SizeView({
 }) {
   const selected = useSelection((s) => s.selected);
   const toggle = useSelection((s) => s.toggle);
+  const sizeSortDirection = useView((s) => s.sizeSortDirection);
 
   const sorted = useMemo(
-    () => [...sessions].sort(compareSessionSizeDesc),
-    [sessions],
+    () => [...sessions].sort((a, b) => compareSessionSize(a, b, sizeSortDirection)),
+    [sessions, sizeSortDirection],
   );
 
   return (
@@ -312,14 +314,4 @@ function SizeView({
       ))}
     </div>
   );
-}
-
-function compareSessionSizeDesc(a: SessionSummary, b: SessionSummary): number {
-  const tokenDelta = b.tokens_used - a.tokens_used;
-  if (tokenDelta !== 0) return tokenDelta;
-  const bytesDelta = b.rollout_bytes - a.rollout_bytes;
-  if (bytesDelta !== 0) return bytesDelta;
-  const updatedDelta = b.updated_at - a.updated_at;
-  if (updatedDelta !== 0) return updatedDelta;
-  return a.id.localeCompare(b.id);
 }

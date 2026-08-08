@@ -1,5 +1,16 @@
+import { useRef } from "react";
 import { useLocation } from "react-router-dom";
-import { Archive, ArrowDown10, Clock, FileSearch, FolderKanban, RefreshCw, Trash2, X } from "lucide-react";
+import {
+  Archive,
+  ArrowDown10,
+  ArrowUp01,
+  Clock,
+  FileSearch,
+  FolderKanban,
+  RefreshCw,
+  Trash2,
+  X,
+} from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { SearchInput } from "@/components/SearchInput";
@@ -36,10 +47,13 @@ export function TopBar({
   const loc = useLocation();
   const view = useView((s) => s.view);
   const setView = useView((s) => s.setView);
+  const sizeSortDirection = useView((s) => s.sizeSortDirection);
+  const toggleSizeSortDirection = useView((s) => s.toggleSizeSortDirection);
   const query = useView((s) => s.query);
   const setQuery = useView((s) => s.setQuery);
   const selected = useSelection((s) => s.selected);
   const clearSel = useSelection((s) => s.clear);
+  const sizePointerStartedActive = useRef(false);
 
   const autoShowTools =
     showListTools ??
@@ -94,17 +108,56 @@ export function TopBar({
             )}
             <Tabs value={view} onValueChange={(v) => setView(v as View)} className="shrink-0">
               <TabsList className="h-9">
-                <TabsTrigger value="time" className="gap-1.5 px-2.5 text-xs">
+                <TabsTrigger
+                  value="time"
+                  className="gap-1.5 px-2.5 text-xs"
+                  aria-label="按时间查看"
+                  title="按时间查看"
+                >
                   <Clock className="h-3.5 w-3.5" />
-                  时间
+                  <span className="hidden xl:inline">时间</span>
                 </TabsTrigger>
-                <TabsTrigger value="project" className="gap-1.5 px-2.5 text-xs">
+                <TabsTrigger
+                  value="project"
+                  className="gap-1.5 px-2.5 text-xs"
+                  aria-label="按项目查看"
+                  title="按项目查看"
+                >
                   <FolderKanban className="h-3.5 w-3.5" />
-                  项目
+                  <span className="hidden xl:inline">项目</span>
                 </TabsTrigger>
-                <TabsTrigger value="size" className="gap-1.5 px-2.5 text-xs">
-                  <ArrowDown10 className="h-3.5 w-3.5" />
-                  大小降序
+                <TabsTrigger
+                  value="size"
+                  className="gap-1.5 px-2.5 text-xs"
+                  onPointerDownCapture={(event) => {
+                    sizePointerStartedActive.current = event.button === 0 && view === "size";
+                  }}
+                  onClick={(event) => {
+                    const shouldToggle =
+                      event.detail === 0
+                        ? view === "size"
+                        : sizePointerStartedActive.current;
+                    sizePointerStartedActive.current = false;
+                    if (shouldToggle) toggleSizeSortDirection();
+                  }}
+                  onPointerCancel={() => {
+                    sizePointerStartedActive.current = false;
+                  }}
+                  title={
+                    view === "size"
+                      ? `再次点击切换为大小${sizeSortDirection === "asc" ? "降序" : "升序"}`
+                      : `按大小${sizeSortDirection === "asc" ? "升序" : "降序"}查看`
+                  }
+                  aria-label={`按大小${sizeSortDirection === "asc" ? "升序" : "降序"}查看`}
+                >
+                  {sizeSortDirection === "asc" ? (
+                    <ArrowUp01 className="h-3.5 w-3.5" />
+                  ) : (
+                    <ArrowDown10 className="h-3.5 w-3.5" />
+                  )}
+                  <span className="hidden xl:inline">
+                    大小{sizeSortDirection === "asc" ? "升序" : "降序"}
+                  </span>
                 </TabsTrigger>
               </TabsList>
             </Tabs>
@@ -123,26 +176,38 @@ export function TopBar({
               </span>
               <Separator orientation="vertical" className="mx-1 h-4 bg-emerald-500/30" />
               {onBulkBackup && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={onBulkBackup}
-                  className="h-7 gap-1.5 px-2 text-emerald-700 hover:bg-emerald-500/15 hover:text-emerald-800 dark:text-emerald-300 dark:hover:text-emerald-200"
-                >
-                  <Archive className="h-3.5 w-3.5" />
-                  备份
-                </Button>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={onBulkBackup}
+                      className="h-7 gap-1.5 px-2 text-emerald-700 hover:bg-emerald-500/15 hover:text-emerald-800 dark:text-emerald-300 dark:hover:text-emerald-200"
+                      aria-label="备份所选会话"
+                    >
+                      <Archive className="h-3.5 w-3.5" />
+                      <span className="hidden xl:inline">备份</span>
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>备份所选会话</TooltipContent>
+                </Tooltip>
               )}
               {onBulkDelete && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={onBulkDelete}
-                  className="h-7 gap-1.5 px-2 text-destructive hover:bg-destructive/10 hover:text-destructive"
-                >
-                  <Trash2 className="h-3.5 w-3.5" />
-                  删除
-                </Button>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={onBulkDelete}
+                      className="h-7 gap-1.5 px-2 text-destructive hover:bg-destructive/10 hover:text-destructive"
+                      aria-label="删除所选会话"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                      <span className="hidden xl:inline">删除</span>
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>删除所选会话</TooltipContent>
+                </Tooltip>
               )}
               <Button
                 variant="ghost"
@@ -158,7 +223,7 @@ export function TopBar({
 
           {children}
 
-          {stats && (
+          {stats && !hasSelection && (
             <Badge
               variant="outline"
               className="h-7 gap-1.5 border-border/70 bg-muted/40 px-2 text-[11px] font-medium tabular-nums text-muted-foreground"

@@ -879,7 +879,10 @@ export function PreviewDialog({
               <Sparkles className="h-[18px] w-[18px] text-muted-foreground" />
             </div>
             <div className="min-w-0 flex-1">
-              <DialogTitle className="truncate text-[15px] font-semibold tracking-tight">
+              <DialogTitle
+                className="truncate pr-4 text-[15px] font-semibold tracking-tight"
+                title={session?.title || "预览会话"}
+              >
                 {session?.title || "预览会话"}
               </DialogTitle>
               <DialogDescription className="sr-only">
