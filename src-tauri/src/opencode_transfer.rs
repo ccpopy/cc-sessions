@@ -1280,7 +1280,7 @@ mod tests {
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )?;
-        assert_eq!(cwd, target_cwd.to_string_lossy());
+        assert_eq!(cwd, outcome.target_cwd);
         assert_eq!(project, "global");
         assert_eq!(path, None);
         assert_eq!(workspace, None);
@@ -1340,10 +1340,11 @@ mod tests {
         let target_cwd = temp_dir("move-target");
         create_db(&root, true)?;
         seed(&root, &old_cwd)?;
+        let normalized_target_cwd = normalize_target_cwd(target_cwd.to_string_lossy().as_ref())?;
         let connection = Connection::open(crate::opencode_sessions::database_path(&root))?;
         connection.execute(
             "INSERT INTO project VALUES ('project-target',?1,'git',1,1,'[]')",
-            [target_cwd.to_string_lossy().as_ref()],
+            [&normalized_target_cwd],
         )?;
         connection.execute(
             "INSERT INTO session (id,project_id,parent_id,slug,directory,title,version,time_created,time_updated) VALUES ('ses_child','global','ses_test','child',?1,'child','1.0',1000,2000)",
@@ -1358,7 +1359,7 @@ mod tests {
         let connection = Connection::open(crate::opencode_sessions::database_path(&root))?;
         let rows: i64 = connection.query_row(
             "SELECT COUNT(*) FROM session WHERE project_id='project-target' AND directory=?1",
-            [target_cwd.to_string_lossy().as_ref()],
+            [&normalized_target_cwd],
             |row| row.get(0),
         )?;
         assert_eq!(rows, 2);

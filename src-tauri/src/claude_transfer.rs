@@ -568,8 +568,8 @@ mod tests {
         )?;
         assert_eq!(report.artifacts_moved, 3);
         assert_eq!(report.history_rows_updated, 1);
-        let destination =
-            claude_sessions::project_dir_for_cwd(&claude, new_cwd.to_string_lossy().as_ref());
+        let normalized_new_cwd = report.new_cwd.clone();
+        let destination = claude_sessions::project_dir_for_cwd(&claude, &normalized_new_cwd);
         assert!(destination.join("session-1.jsonl").is_file());
         assert!(destination.join("session-1.claudinal.json").is_file());
         assert!(destination
@@ -584,7 +584,7 @@ mod tests {
         let transcript: Value = serde_json::from_str(&transcript_line)?;
         assert_eq!(
             transcript.get("cwd").and_then(Value::as_str),
-            Some(new_cwd.to_string_lossy().as_ref())
+            Some(normalized_new_cwd.as_str())
         );
         let sidecar_line =
             fs::read_to_string(destination.join("session-1/subagents/agent-a.jsonl"))?
@@ -595,7 +595,7 @@ mod tests {
         let sidecar: Value = serde_json::from_str(&sidecar_line)?;
         assert_eq!(
             sidecar.get("cwd").and_then(Value::as_str),
-            Some(new_cwd.to_string_lossy().as_ref())
+            Some(normalized_new_cwd.as_str())
         );
         let history_line = fs::read_to_string(claude.join("history.jsonl"))?
             .lines()
@@ -605,7 +605,7 @@ mod tests {
         let history: Value = serde_json::from_str(&history_line)?;
         assert_eq!(
             history.get("project").and_then(Value::as_str),
-            Some(new_cwd.to_string_lossy().as_ref())
+            Some(normalized_new_cwd.as_str())
         );
         fs::remove_dir_all(claude.parent().unwrap_or(&claude)).ok();
         Ok(())

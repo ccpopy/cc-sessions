@@ -2637,6 +2637,18 @@ mod tests {
         }
     }
 
+    fn remove_directory_link(link: &Path) -> AppResult<()> {
+        #[cfg(windows)]
+        {
+            fs::remove_dir(link)?;
+        }
+        #[cfg(unix)]
+        {
+            fs::remove_file(link)?;
+        }
+        Ok(())
+    }
+
     fn write_claude_session(claude: &Path, id: &str) -> AppResult<()> {
         let dir = claude.join("projects").join("sample-project");
         fs::create_dir_all(&dir)?;
@@ -3451,7 +3463,7 @@ mod tests {
         .expect_err("backup verification must reject payload links");
         assert!(error.to_string().contains("junction") || error.to_string().contains("链接"));
 
-        fs::remove_dir(backup.join("sessions"))?;
+        remove_directory_link(&backup.join("sessions"))?;
         assert!(source.is_file(), "external payload must remain untouched");
         fs::remove_dir_all(root).ok();
         Ok(())

@@ -1633,6 +1633,8 @@ fn validate_delete_id(id: &str) -> AppResult<()> {
     );
     if id.trim().is_empty()
         || !is_single_normal_component
+        || id.contains('/')
+        || id.contains('\\')
         || id.contains(':')
         || id.chars().any(char::is_control)
     {

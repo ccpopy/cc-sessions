@@ -376,7 +376,9 @@ fn safe_relative_snapshot_path(dir: &Path, relative: &str) -> AppResult<PathBuf>
 fn safe_public_snapshot_name(name: &str) -> AppResult<()> {
     let path = Path::new(name);
     let mut components = path.components();
-    if !matches!(components.next(), Some(Component::Normal(_)))
+    if name.contains('/')
+        || name.contains('\\')
+        || !matches!(components.next(), Some(Component::Normal(_)))
         || components.next().is_some()
         || path.extension().and_then(|value| value.to_str()) != Some("json")
     {
