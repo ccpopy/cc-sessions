@@ -4208,6 +4208,24 @@ fn clone_session_for_provider_locked(
     strategy: SwitchStrategy,
     dry_run: bool,
 ) -> AppResult<CloneReport> {
+    clone_session_for_provider_locked_with_hint(
+        codex_dir,
+        session_id,
+        target_provider,
+        strategy,
+        dry_run,
+        None,
+    )
+}
+
+fn clone_session_for_provider_locked_with_hint(
+    codex_dir: String,
+    session_id: String,
+    target_provider: Option<String>,
+    strategy: SwitchStrategy,
+    dry_run: bool,
+    source_rollout_hint: Option<&Path>,
+) -> AppResult<CloneReport> {
     let codex = PathBuf::from(&codex_dir);
     let configured_provider = effective_current_provider(&codex)?;
     let provider = match target_provider {
@@ -4233,16 +4251,33 @@ fn clone_session_for_provider_locked(
 
     // 加载 family store
     let mut store = family::load(&codex)?;
-    // 从 sessions/ 找到 session_id 对应文件
-    let rollouts = family::scan_rollouts(&codex)?;
-    let mut src_brief: Option<RolloutBrief> = None;
-    for p in &rollouts {
-        let Some(b) = read_rollout_brief(&codex, p)? else {
-            continue;
-        };
-        if b.id == session_id {
-            src_brief = Some(b);
-            break;
+    // 批量同步已在计划阶段完成过全目录扫描，此处直接复用目标路径，避免每条会话
+    // 都重新遍历并完整解析此前的所有 rollout，导致会话数增加时接近 O(n²)。
+    let mut src_brief: Option<RolloutBrief> = match source_rollout_hint {
+        Some(path) => read_rollout_brief(&codex, path)?,
+        None => None,
+    };
+    if src_brief
+        .as_ref()
+        .is_some_and(|brief| brief.id != session_id)
+    {
+        return Err(AppError::Other(format!(
+            "provider 同步计划路径与会话 ID 不一致: 期望 {session_id}，实际 {}",
+            src_brief
+                .as_ref()
+                .map(|brief| brief.id.as_str())
+                .unwrap_or("")
+        )));
+    }
+    if source_rollout_hint.is_none() {
+        for p in family::scan_rollouts(&codex)? {
+            let Some(b) = read_rollout_brief(&codex, &p)? else {
+                continue;
+            };
+            if b.id == session_id {
+                src_brief = Some(b);
+                break;
+            }
         }
     }
     let src_brief = match src_brief {
@@ -4318,22 +4353,28 @@ fn clone_session_for_provider_locked(
         }
     }
 
-    let thread_states = read_thread_state_map(&codex)?;
-    let index_ids = read_session_index_ids(&codex)?;
     let mut existing_usable_target = None;
     if let Some(family) = store.families.get(&family_id) {
-        for branch in &family.chain {
-            if branch.provider == provider
-                && family_branch_is_usable_provider(
-                    &codex,
-                    &thread_states,
-                    &index_ids,
-                    branch,
-                    &provider,
-                )?
-            {
-                existing_usable_target = Some(branch);
-                break;
+        if family
+            .chain
+            .iter()
+            .any(|branch| branch.provider == provider)
+        {
+            let thread_states = read_thread_state_map(&codex)?;
+            let index_ids = read_session_index_ids(&codex)?;
+            for branch in &family.chain {
+                if branch.provider == provider
+                    && family_branch_is_usable_provider(
+                        &codex,
+                        &thread_states,
+                        &index_ids,
+                        branch,
+                        &provider,
+                    )?
+                {
+                    existing_usable_target = Some(branch);
+                    break;
+                }
             }
         }
     }
@@ -4706,18 +4747,27 @@ pub(crate) fn append_index_line(
 /// - 优先读 `session_family.json`（单点真相）
 /// - 对尚未进入 family store 的历史会话继续扫描 rollout，避免部分迁移状态漏处理
 /// - 已在 target_provider 下存在 clone（同家族有匹配 provider 的分支）的不计入
-fn list_mismatched_session_ids(codex: &Path, target_provider: &str) -> AppResult<Vec<String>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderSyncTarget {
+    session_id: String,
+    rollout_path: PathBuf,
+}
+
+fn list_mismatched_sessions(
+    codex: &Path,
+    target_provider: &str,
+) -> AppResult<Vec<ProviderSyncTarget>> {
     use std::collections::BTreeSet;
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut family_managed_ids: BTreeSet<String> = BTreeSet::new();
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<ProviderSyncTarget> = Vec::new();
     let thread_states = read_thread_state_map(codex)?;
     let index_ids = read_session_index_ids(codex)?;
     let active_rollouts = scan_active_rollout_identities(codex)?;
-    let active_rollout_ids = active_rollouts
+    let active_rollout_paths = active_rollouts
         .iter()
-        .map(|(_, identity)| identity.id.as_str())
-        .collect::<BTreeSet<_>>();
+        .map(|(path, identity)| (identity.id.as_str(), path))
+        .collect::<BTreeMap<_, _>>();
 
     let store = family::load(codex)?;
     family_managed_ids.extend(store.index.keys().cloned());
@@ -4729,9 +4779,9 @@ fn list_mismatched_session_ids(codex: &Path, target_provider: &str) -> AppResult
             }
             // family/threads 可能遗留已经不存在的 active 分支。没有源 rollout 时，
             // provider 克隆无从执行；这类记录应由 orphan 清理处理，而不是制造必然失败的同步任务。
-            if !active_rollout_ids.contains(active.id.as_str()) {
+            let Some(active_rollout_path) = active_rollout_paths.get(active.id.as_str()) else {
                 continue;
-            }
+            };
             // 手工归档的 family head 仍保持逻辑 Active 角色，但不应被 provider
             // 批量同步重新复制成一条可见会话。
             if thread_states
@@ -4770,7 +4820,10 @@ fn list_mismatched_session_ids(codex: &Path, target_provider: &str) -> AppResult
             )?;
             if (active.provider != target_provider || state_drift) && seen.insert(active.id.clone())
             {
-                out.push(active.id.clone());
+                out.push(ProviderSyncTarget {
+                    session_id: active.id.clone(),
+                    rollout_path: (*active_rollout_path).clone(),
+                });
             }
         }
     }
@@ -4792,10 +4845,20 @@ fn list_mismatched_session_ids(codex: &Path, target_provider: &str) -> AppResult
             &p,
         )?;
         if (provider != target_provider || state_drift) && seen.insert(identity.id.clone()) {
-            out.push(identity.id);
+            out.push(ProviderSyncTarget {
+                session_id: identity.id,
+                rollout_path: p,
+            });
         }
     }
     Ok(out)
+}
+
+fn list_mismatched_session_ids(codex: &Path, target_provider: &str) -> AppResult<Vec<String>> {
+    Ok(list_mismatched_sessions(codex, target_provider)?
+        .into_iter()
+        .map(|target| target.session_id)
+        .collect())
 }
 
 /// 返回当前 provider 实际会被批量同步处理的会话 ID。
@@ -4820,23 +4883,47 @@ pub fn batch_clone_for_current_provider_with_lock(
     dry_run: bool,
     lock: &family::FamilyLock,
 ) -> AppResult<Vec<CloneReport>> {
+    batch_clone_for_current_provider_with_progress(
+        codex_dir,
+        strategy,
+        dry_run,
+        lock,
+        |_, _, _, _| {},
+    )
+}
+
+pub fn batch_clone_for_current_provider_with_progress<F>(
+    codex_dir: String,
+    strategy: SwitchStrategy,
+    dry_run: bool,
+    lock: &family::FamilyLock,
+    mut on_progress: F,
+) -> AppResult<Vec<CloneReport>>
+where
+    F: FnMut(usize, usize, Option<String>, Option<CloneReport>),
+{
     family::with_lock(lock, |_g| {
         let codex = PathBuf::from(&codex_dir);
         let cur = effective_current_provider(&codex)?;
 
-        let targets = list_mismatched_session_ids(&codex, &cur)?;
+        let targets = list_mismatched_sessions(&codex, &cur)?;
+        let total = targets.len();
+        on_progress(0, total, None, None);
 
         let mut out: Vec<CloneReport> = Vec::new();
-        for id in targets {
-            match clone_session_for_provider_locked(
+        for target in targets {
+            let id = target.session_id;
+            on_progress(out.len(), total, Some(id.clone()), None);
+            let report = match clone_session_for_provider_locked_with_hint(
                 codex_dir.clone(),
                 id.clone(),
                 Some(cur.clone()),
                 strategy.clone(),
                 dry_run,
+                Some(&target.rollout_path),
             ) {
-                Ok(r) => out.push(r),
-                Err(e) => out.push(CloneReport {
+                Ok(report) => report,
+                Err(e) => CloneReport {
                     source_id: id,
                     new_id: None,
                     new_rollout_path: None,
@@ -4844,8 +4931,10 @@ pub fn batch_clone_for_current_provider_with_lock(
                     ok: false,
                     skipped_reason: None,
                     error: Some(e.to_string()),
-                }),
-            }
+                },
+            };
+            out.push(report.clone());
+            on_progress(out.len(), total, None, Some(report));
         }
         Ok(out)
     })
@@ -7568,6 +7657,32 @@ mod tests {
         fs::remove_dir_all(&codex).ok();
 
         assert_eq!(plan, vec!["unregistered-provider-session".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_sync_targets_keep_the_planned_rollout_path() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-provider-sync-target-test");
+        fs::create_dir_all(&codex)?;
+        let id = "planned-provider-session";
+        write_rollout(&codex, id, "anthropic")?;
+
+        let targets = list_mismatched_sessions(&codex, DEFAULT_PROVIDER)?;
+        let expected = codex
+            .join("sessions")
+            .join("2026")
+            .join("04")
+            .join("22")
+            .join(format!("rollout-{id}.jsonl"));
+        fs::remove_dir_all(&codex).ok();
+
+        assert_eq!(
+            targets,
+            vec![ProviderSyncTarget {
+                session_id: id.to_string(),
+                rollout_path: expected,
+            }]
+        );
         Ok(())
     }
 

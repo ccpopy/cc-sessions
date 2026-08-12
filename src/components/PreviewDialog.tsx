@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import {
   Bot,
   Check,
@@ -14,7 +14,6 @@ import {
   Sparkles,
   Terminal,
   Trash2,
-  Undo2,
   User,
   Wrench,
   X,
@@ -32,16 +31,6 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { LocalImageAttachments } from "@/components/LocalImageAttachments";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -55,7 +44,8 @@ import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
-import { Textarea } from "@/components/ui/textarea";
+import { PreviewEditHistoryDialog } from "@/components/PreviewEditHistoryDialog";
+import { PreviewMutationDialogs } from "@/components/PreviewMutationDialogs";
 import {
   api,
   type DeletePlan,
@@ -78,14 +68,29 @@ import {
 import { parseEmbeddedTranscriptPrompt, type EmbeddedTranscriptPrompt } from "@/lib/sessionText";
 import {
   buildConversationPreviewRows,
-  isAssistantTextToolUseEvent,
-  isOpenCodeConversationEvent,
   isProcessGroupExpanded,
   isVisibleConversationEvent,
   summarizeProcessGroupExpansion,
   toConversationDisplayEvent,
   type ConversationPreviewRow,
 } from "@/lib/conversationDisplay";
+import {
+  canDeleteEvent,
+  canEditEventText,
+  editableText,
+  eventMessageLabel,
+  extractPreviewEventText as extractText,
+  isConversationMessage,
+  isEventMessage,
+  isStableForkNode,
+  parseDiffCommentPrompt,
+  payloadType,
+  previewEventSearchText,
+  rawType,
+  subagentEventLabel,
+  subagentEventTime,
+  type DiffCommentPrompt,
+} from "@/lib/previewEvent";
 import { cn } from "@/lib/utils";
 import { useSettings } from "@/stores/settings";
 import { toast } from "sonner";
@@ -107,17 +112,6 @@ export type PreviewJump = {
   eventIndex: number;
   eventOffset: number;
   query: string;
-};
-
-type DiffCommentPrompt = {
-  comments: DiffComment[];
-  request: string;
-};
-
-type DiffComment = {
-  number: number;
-  context: string;
-  body: string;
 };
 
 type ForkAction = {
@@ -385,53 +379,56 @@ export function PreviewDialog({
     resetAndReload();
   }, [open, rolloutPath, resetAndReload]);
 
+  const timelineIndexSet = useMemo(
+    () => (prompts === null ? null : new Set(prompts.map((prompt) => prompt.index))),
+    [prompts],
+  );
+
+  const deferredFilter = useDeferredValue(filter);
+  const normalizedFilter = deferredFilter.trim().toLowerCase();
+  const searchableEvents = useMemo(
+    () => events.map((event) => ({ event, searchText: previewEventSearchText(event) })),
+    [events],
+  );
+
+  const filtered = useMemo(() => {
+    return searchableEvents.flatMap(({ event, searchText }) => {
+      if (
+        onlyMsg &&
+        (!isConversationMessage(event)
+          || !isVisibleConversationEvent(
+            event,
+            timelineIndexSet,
+            initialJump?.eventIndex ?? null,
+          ))
+      ) {
+        return [];
+      }
+      if (normalizedFilter && !searchText.includes(normalizedFilter)) return [];
+      return [event];
+    });
+  }, [initialJump?.eventIndex, normalizedFilter, onlyMsg, searchableEvents, timelineIndexSet]);
+
   useEffect(() => {
     if (!open || loading || done) return;
     const viewport = viewportRef.current;
     if (!viewport) return;
-    // 全部/单轮收起、切换消息过滤后，内容高度可能骤减；重新补页直到填满视口。
+    // 收起过程、切换消息模式或应用延迟搜索后，继续补页直到结果填满视口。
     if (viewport.scrollHeight <= viewport.clientHeight + 20) {
       void loadMore();
     }
   }, [
     done,
     events.length,
-    filter,
+    filtered.length,
     loadMore,
     loading,
+    normalizedFilter,
     onlyMsg,
     open,
     processDefaultCollapsed,
     processExpansionOverrides,
   ]);
-
-  const timelineIndexSet = useMemo(
-    () => (prompts === null ? null : new Set(prompts.map((prompt) => prompt.index))),
-    [prompts],
-  );
-
-  const filtered = useMemo(() => {
-    return events.filter((e) => {
-      if (
-        onlyMsg &&
-        (!isConversationMessage(e)
-          || !isVisibleConversationEvent(
-            e,
-            timelineIndexSet,
-            initialJump?.eventIndex ?? null,
-          ))
-      ) {
-        return false;
-      }
-      if (!filter) return true;
-      const low = filter.toLowerCase();
-      return (
-        e.text_summary.toLowerCase().includes(low) ||
-        e.kind.toLowerCase().includes(low) ||
-        JSON.stringify(e.raw).toLowerCase().includes(low)
-      );
-    });
-  }, [events, filter, initialJump?.eventIndex, onlyMsg, timelineIndexSet]);
 
   /**
    * 有 phase 时仅 final_answer 作为最终答复，commentary 折叠为过程。
@@ -439,11 +436,11 @@ export function PreviewDialog({
    */
   const rows = useMemo<ConversationPreviewRow[]>(() => {
     const displayEvents = onlyMsg ? filtered.map(toConversationDisplayEvent) : filtered;
-    if (!onlyMsg || filter) {
+    if (!onlyMsg || normalizedFilter) {
       return displayEvents.map((event) => ({ type: "event", event }));
     }
     return buildConversationPreviewRows(displayEvents);
-  }, [filtered, filter, onlyMsg]);
+  }, [filtered, normalizedFilter, onlyMsg]);
 
   const processRowKeys = useMemo(
     () => rows.flatMap((row) => (row.type === "process" ? [row.key] : [])),
@@ -494,11 +491,10 @@ export function PreviewDialog({
     const threshold =
       viewport.getBoundingClientRect().top + viewport.clientHeight * 0.33;
     let current: number | null = null;
-    anchors.forEach((node) => {
-      if (node.getBoundingClientRect().top <= threshold) {
-        current = Number(node.dataset.eventIndex);
-      }
-    });
+    for (const node of anchors) {
+      if (node.getBoundingClientRect().top > threshold) break;
+      current = Number(node.dataset.eventIndex);
+    }
     if (current === null) current = Number(anchors[0].dataset.eventIndex);
     if (Number.isFinite(current)) setActiveTimelineIndex(current);
   }, []);
@@ -514,11 +510,13 @@ export function PreviewDialog({
     [loadUpTo, scrollPendingIntoView],
   );
 
-  // 加载/过滤变化后：完成待跳转的定位，并刷新当前提问高亮
+  // 加载/过滤变化后：完成待跳转的定位。搜索期间无需扫描整段 DOM 更新时间线。
   useEffect(() => {
     scrollPendingIntoView();
-    updateActiveFromScroll();
-  }, [filtered, scrollPendingIntoView, updateActiveFromScroll]);
+    if (normalizedFilter) return;
+    if (scrollSpyRafRef.current) cancelAnimationFrame(scrollSpyRafRef.current);
+    scrollSpyRafRef.current = requestAnimationFrame(updateActiveFromScroll);
+  }, [filtered, normalizedFilter, scrollPendingIntoView, updateActiveFromScroll]);
 
   useEffect(() => {
     return () => {
@@ -1239,315 +1237,51 @@ export function PreviewDialog({
         </div>
       </DialogContent>
     </Dialog>
-    <AlertDialog open={!!forkTarget} onOpenChange={(v) => !v && !forking && setForkTarget(null)}>
-      <AlertDialogContent>
-        <AlertDialogHeader>
-          <AlertDialogTitle>从此处创建回溯分支</AlertDialogTitle>
-          <AlertDialogDescription>
-            系统会只复制当前节点之前的有效会话历史，生成一个新的 active 会话分支；原会话会归档到分支历史中，不会被删除。
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        <div className="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-          <div className="font-mono">line {forkTarget ? forkTarget.index + 1 : ""}</div>
-          {forkTarget?.text_summary && (
-            <div className="mt-1 line-clamp-2 text-foreground">{forkTarget.text_summary}</div>
-          )}
-        </div>
-        <AlertDialogFooter>
-          <AlertDialogCancel disabled={forking}>取消</AlertDialogCancel>
-          <AlertDialogAction disabled={forking} onClick={(e) => {
-            e.preventDefault();
-            void confirmForkAt();
-          }}>
-            创建分支
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
-
-    {/* 编辑消息文本 */}
-    <Dialog open={!!editTarget} onOpenChange={(v) => !v && !mutating && setEditTarget(null)}>
-      <DialogContent className="sm:max-w-[640px]">
-        <DialogHeader>
-          <DialogTitle>改写消息文本</DialogTitle>
-          <DialogDescription className="sr-only">
-            修改当前会话事件中的可编辑文本。
-          </DialogDescription>
-        </DialogHeader>
-        <div className="space-y-3">
-          <div className="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-            <span className="font-mono">line {editTarget ? editTarget.index + 1 : ""}</span>
-            <span className="mx-2 text-muted-foreground/50">·</span>
-            {provider === "opencode" ? (
-              <>
-                只更新 opencode.db 中当前会话的 text 内容块（会话 ID 与时间戳不变，可直接续聊）；
-                推理、工具调用及其他会话保持原样。编辑前会保存会话级快照，可在「编辑历史」中撤销或还原。
-              </>
-            ) : (
-              <>
-                会话文件会原地改写（会话 ID 不变，可直接 resume 续聊）；Codex 镜像行会同步更新，
-                思考/推理与工具块保持原样。编辑前会自动保存原始快照，可在「编辑历史」中撤销或还原。
-              </>
-            )}
-          </div>
-          <Textarea
-            value={editText}
-            onChange={(e) => setEditText(e.target.value)}
-            rows={10}
-            className="max-h-[50vh] font-mono text-sm"
-            placeholder="消息文本"
-          />
-        </div>
-        <div className="flex justify-end gap-2">
-          <Button variant="outline" disabled={mutating} onClick={() => setEditTarget(null)}>
-            取消
-          </Button>
-          <Button disabled={mutating || !editText.trim()} onClick={() => void confirmEdit()}>
-            {mutating ? "保存中…" : "保存改写"}
-          </Button>
-        </div>
-      </DialogContent>
-    </Dialog>
-
-    {/* 删除事件（展示级联计划） */}
-    <AlertDialog
-      open={!!deleteTarget}
-      onOpenChange={(v) => {
-        if (!v && !mutating) {
+    <PreviewMutationDialogs
+      provider={provider}
+      fork={{
+        target: forkTarget,
+        running: forking,
+        onClose: () => setForkTarget(null),
+        onConfirm: () => void confirmForkAt(),
+      }}
+      edit={{
+        target: editTarget,
+        running: mutating,
+        text: editText,
+        onTextChange: setEditText,
+        onClose: () => setEditTarget(null),
+        onConfirm: () => void confirmEdit(),
+      }}
+      deleteEvent={{
+        target: deleteTarget,
+        plan: deletePlan,
+        running: mutating,
+        onClose: () => {
           setDeleteTarget(null);
           setDeletePlan(null);
-        }
+        },
+        onConfirm: () => void confirmDelete(),
       }}
-    >
-      <AlertDialogContent className="sm:max-w-[640px]">
-        <AlertDialogHeader>
-          <AlertDialogTitle>删除会话事件</AlertDialogTitle>
-          <AlertDialogDescription>
-            {provider === "opencode" ? (
-              <>
-                OpenCode 会按同轮消息安全删除：选择用户消息会同时删除本轮完整响应；选择推理、工具或回答时，
-                会删除该轮完整 assistant 响应链并保留用户提问。只快照当前会话，不会覆盖整个数据库。
-              </>
-            ) : (
-              <>
-                为保证续聊不报错，配对的工具调用/返回、镜像行与关联推理会一起删除。
-                删除前会自动保存原始快照，可在「编辑历史」中撤销或还原。
-              </>
-            )}
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        {!deletePlan && (
-          <div className="py-2 text-center text-xs text-muted-foreground">正在生成删除计划…</div>
-        )}
-        {deletePlan && deletePlan.blocked.length > 0 && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-            {deletePlan.blocked.map((b, i) => (
-              <div key={i}>{b}</div>
-            ))}
-          </div>
-        )}
-        {deletePlan && deletePlan.blocked.length === 0 && (
-          <ScrollArea className="rounded-md border bg-muted/40" viewportClassName="max-h-72">
-            <div className="space-y-1.5 p-2 pr-3">
-              {deletePlan.lines.map((l) => (
-                <div key={l.line_no} className="flex items-start gap-2 text-xs leading-[1.45]">
-                  <span className="w-16 shrink-0 select-none text-right font-mono text-[11px] tabular-nums text-muted-foreground">
-                    line {l.line_no + 1}
-                  </span>
-                  <Badge
-                    variant={l.reason === "selected" ? "default" : "outline"}
-                    className="mt-px h-4 shrink-0 px-1 py-0 text-[10px] font-normal"
-                  >
-                    {deleteReasonLabel(l.reason)}
-                  </Badge>
-                  <span className="shrink-0 text-muted-foreground">{l.role}</span>
-                  <span className="min-w-0 flex-1 wrap-anywhere">{l.summary}</span>
-                </div>
-              ))}
-            </div>
-          </ScrollArea>
-        )}
-        <AlertDialogFooter>
-          <AlertDialogCancel disabled={mutating}>取消</AlertDialogCancel>
-          <AlertDialogAction
-            disabled={mutating || !deletePlan || deletePlan.blocked.length > 0}
-            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            onClick={(e) => {
-              e.preventDefault();
-              void confirmDelete();
-            }}
-          >
-            {mutating
-              ? "删除中…"
-              : `删除 ${deletePlan?.lines.length ?? 0} 个事件`}
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
-
-    {/* 删除选中事件 */}
-    <AlertDialog
-      open={!!deleteSelectedTarget}
-      onOpenChange={(v) => {
-        if (!v && !mutating) {
+      deleteSelection={{
+        target: deleteSelectedTarget,
+        plan: deletePlan,
+        running: mutating,
+        onClose: () => {
           setDeleteSelectedTarget(null);
           setDeletePlan(null);
-        }
+        },
+        onConfirm: () => void confirmDeleteSelected(),
       }}
-    >
-      <AlertDialogContent className="sm:max-w-[640px]">
-        <AlertDialogHeader>
-          <AlertDialogTitle>删除选中事件</AlertDialogTitle>
-          <AlertDialogDescription>
-            {provider === "opencode" ? (
-              <>
-                将删除选取范围内的事件（含首尾），并按同轮消息补全安全删除范围；
-                用户消息会连同本轮响应删除，assistant 过程或回答会删除本轮完整响应链。
-                删除前会保存当前会话快照，不影响数据库中的其他会话。
-              </>
-            ) : (
-              <>
-                将删除选取范围内的事件（含首尾）。为保证续聊不报错，配对的工具调用/返回、镜像行与关联推理会一起删除。
-                删除前会自动保存原始快照，可在「编辑历史」中撤销或还原。
-              </>
-            )}
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        {!deletePlan && (
-          <div className="py-2 text-center text-xs text-muted-foreground">正在生成删除计划…</div>
-        )}
-        {deletePlan && deletePlan.blocked.length > 0 && (
-          <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-            {deletePlan.blocked.map((b, i) => (
-              <div key={i}>{b}</div>
-            ))}
-          </div>
-        )}
-        {deletePlan && deletePlan.blocked.length === 0 && (
-          <ScrollArea className="rounded-md border bg-muted/40" viewportClassName="max-h-72">
-            <div className="space-y-1.5 p-2 pr-3">
-              <div className="mb-2 text-[11px] font-medium text-muted-foreground">
-                共 {deletePlan.lines.length} 个事件将被删除
-              </div>
-              {deletePlan.lines.map((l) => (
-                <div key={l.line_no} className="flex items-start gap-2 text-xs leading-[1.45]">
-                  <span className="w-16 shrink-0 select-none text-right font-mono text-[11px] tabular-nums text-muted-foreground">
-                    line {l.line_no + 1}
-                  </span>
-                  <Badge
-                    variant={l.reason === "selected" ? "default" : "outline"}
-                    className="mt-px h-4 shrink-0 px-1 py-0 text-[10px] font-normal"
-                  >
-                    {deleteReasonLabel(l.reason)}
-                  </Badge>
-                  <span className="shrink-0 text-muted-foreground">{l.role}</span>
-                  <span className="min-w-0 flex-1 wrap-anywhere">{l.summary}</span>
-                </div>
-              ))}
-            </div>
-          </ScrollArea>
-        )}
-        <AlertDialogFooter>
-          <AlertDialogCancel disabled={mutating}>取消</AlertDialogCancel>
-          <AlertDialogAction
-            disabled={mutating || !deletePlan || deletePlan.blocked.length > 0}
-            className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            onClick={(e) => {
-              e.preventDefault();
-              void confirmDeleteSelected();
-            }}
-          >
-            {mutating
-              ? "删除中…"
-              : `删除选中 ${deletePlan?.lines.length ?? 0} 个事件`}
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
-
-    {/* 编辑历史：撤销 / 快照还原 */}
-    <Dialog open={historyOpen} onOpenChange={(v) => !mutating && setHistoryOpen(v)}>
-      <DialogContent className="sm:max-w-[640px]">
-        <DialogHeader>
-          <DialogTitle>编辑历史</DialogTitle>
-          <DialogDescription className="sr-only">
-            查看、撤销或还原当前会话的编辑记录。
-          </DialogDescription>
-        </DialogHeader>
-        {!editHistory ? (
-          <div className="py-6 text-center text-xs text-muted-foreground">加载中…</div>
-        ) : (
-          <div className="space-y-4">
-            <div className="flex items-center justify-between">
-              <div className="text-xs text-muted-foreground">
-                {editHistory.entries.length > 0
-                  ? `共 ${editHistory.entries.length} 次操作`
-                  : "该会话还没有编辑记录"}
-              </div>
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-8 gap-1.5"
-                disabled={mutating || !editHistory.undo_available}
-                title={editHistory.undo_blocked_reason ?? undefined}
-                onClick={() => void undoLastEdit()}
-              >
-                <Undo2 className="h-3.5 w-3.5" />
-                撤销最近一次
-              </Button>
-            </div>
-            {editHistory.undo_blocked_reason && (
-              <div className="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-                {editHistory.undo_blocked_reason}
-              </div>
-            )}
-            {editHistory.entries.length > 0 && (
-              <div className="max-h-48 space-y-1 overflow-auto rounded-md border bg-muted/30 p-2">
-                {editHistory.entries.map((entry) => (
-                  <div key={entry.op_id} className="flex items-center gap-2 text-xs">
-                    <span className="shrink-0 font-mono text-muted-foreground">
-                      {formatTimeString(entry.ts)}
-                    </span>
-                    <Badge variant="outline" className="h-4 shrink-0 px-1 py-0 text-[10px] font-normal">
-                      {editKindLabel(entry.kind)}
-                    </Badge>
-                    <span className="min-w-0 flex-1 truncate">{entry.description}</span>
-                  </div>
-                ))}
-              </div>
-            )}
-            <div>
-              <div className="mb-1.5 text-xs font-medium">原始快照</div>
-              {editHistory.snapshots.length === 0 ? (
-                <div className="text-xs text-muted-foreground">
-                  暂无快照（首次改写或删除时会自动创建）
-                </div>
-              ) : (
-                <div className="max-h-40 space-y-1 overflow-auto rounded-md border bg-muted/30 p-2">
-                  {editHistory.snapshots.map((snap) => (
-                    <div key={snap.name} className="flex items-center gap-2 text-xs">
-                      <span className="min-w-0 flex-1 truncate font-mono">{snap.name}</span>
-                      <span className="shrink-0 text-muted-foreground">
-                        {formatTimeString(snap.created_at)}
-                      </span>
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        className="h-6 shrink-0 px-2 text-xs"
-                        disabled={mutating}
-                        onClick={() => void restoreSnapshot(snap.name)}
-                      >
-                        还原
-                      </Button>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </div>
-        )}
-      </DialogContent>
-    </Dialog>
+    />
+    <PreviewEditHistoryDialog
+      open={historyOpen}
+      history={editHistory}
+      mutating={mutating}
+      onOpenChange={setHistoryOpen}
+      onUndo={() => void undoLastEdit()}
+      onRestore={(snapshotName) => void restoreSnapshot(snapshotName)}
+    />
     </>
   );
 }
@@ -2195,382 +1929,4 @@ function EventSourceBadge({ e }: { e: PreviewEvent }) {
       {outer}/{payload}
     </Badge>
   );
-}
-
-function extractText(e: PreviewEvent): string {
-  const r = e.raw as any;
-  if (!r) return e.text_summary ?? "";
-  if (r.message) {
-    const content = r.message.content;
-    if (typeof content === "string") return content;
-    if (Array.isArray(content)) {
-      return content
-        .map((x: any) => {
-          if (typeof x === "string") return x;
-          if (x?.type === "thinking") {
-            const t = typeof x.thinking === "string" ? x.thinking.trim() : "";
-            return t || "(加密推理)";
-          }
-          if (x?.type === "redacted_thinking") return "(加密推理)";
-          if (typeof x?.text === "string") return x.text;
-          if (typeof x?.content === "string") return x.content;
-          if (Array.isArray(x?.content)) {
-            return x.content.map((c: any) => c?.text ?? c?.content ?? "").filter(Boolean).join("\n");
-          }
-          if (x?.type === "tool_use") {
-            return e.role === "assistant" ? "" : `[Tool: ${x.name ?? "unknown"}]`;
-          }
-          return "";
-        })
-        .filter(Boolean)
-        .join("\n\n");
-    }
-  }
-  const payload = r.payload;
-  if (!payload) return e.text_summary ?? "";
-  if (typeof payload.message === "string") return payload.message;
-  if (typeof payload.content === "string") return payload.content;
-  if (typeof payload.text === "string") return payload.text;
-  if (Array.isArray(payload.content)) {
-    return payload.content
-      .map((x: any) => (typeof x === "string" ? x : x?.text ?? ""))
-      .filter(Boolean)
-      .join("\n\n");
-  }
-  return e.text_summary ?? "";
-}
-
-function parseDiffCommentPrompt(text: string): DiffCommentPrompt | null {
-  const normalized = normalizeDiffCommentPrompt(text);
-  if (!/^Diff comments\s*:/i.test(normalized)) return null;
-
-  const request = extractSection(
-    normalized,
-    /(?:^|\n)My request for Codex:\s*\n+/,
-    [/\n+The next image shows\b/, /\n*<image>\s*<\/image>/, /\n+In app browser:/],
-  );
-  const commentsSection = normalized
-    .split(/\n+In app browser:/)[0]
-    .split(/\n+My request for Codex:/)[0]
-    .split(/\n+The next image shows\b/)[0]
-    .replace(/^Diff comments\s*:\s*/i, "");
-
-  const comments: DiffComment[] = [];
-  const commentPattern =
-    /(?:^|\n+)Comment\s+(\d+)\s*:?\s*\n+([\s\S]*?)(?=\n+Comment\s+\d+\s*:?\s*\n+|\n+In app browser:|\n+My request for Codex:|\n+The next image shows\b|\n*<image>\s*<\/image>|$)/g;
-  let match: RegExpExecArray | null;
-  while ((match = commentPattern.exec(commentsSection)) !== null) {
-    const number = Number.parseInt(match[1], 10);
-    const block = match[2].trim();
-    const body = extractCommentBody(block);
-    comments.push({
-      number: Number.isFinite(number) ? number : comments.length + 1,
-      context: extractCommentContext(block),
-      body: body || "未能解析批注正文。请展开该事件的 JSON 查看原始内容。",
-    });
-  }
-
-  if (comments.length === 0) {
-    comments.push({
-      number: 1,
-      context: "",
-      body: "未能解析批注正文。请展开该事件的 JSON 查看原始内容。",
-    });
-  }
-
-  return {
-    comments,
-    request: cleanDiffCommentText(request),
-  };
-}
-
-function normalizeDiffCommentPrompt(text: string): string {
-  return text
-    .replace(/\r\n/g, "\n")
-    .split("\n")
-    .map((line) =>
-      line
-        .trim()
-        .replace(/^#{1,6}\s+/, "")
-        .replace(/^\*\*(.+)\*\*$/, "$1")
-        .replace(/^__(.+)__$/, "$1")
-        .trim(),
-    )
-    .join("\n")
-    .trim();
-}
-
-function extractSection(text: string, start: RegExp, endPatterns: RegExp[]): string {
-  const startMatch = start.exec(text);
-  if (!startMatch) return "";
-  const startIndex = startMatch.index + startMatch[0].length;
-  const rest = text.slice(startIndex);
-  const endIndex = endPatterns.reduce((min, pattern) => {
-    const match = pattern.exec(rest);
-    return match ? Math.min(min, match.index) : min;
-  }, rest.length);
-  return rest.slice(0, endIndex);
-}
-
-function extractCommentBody(block: string): string {
-  const marker = "Comment:";
-  const markerIndex = block.lastIndexOf(marker);
-  if (markerIndex < 0) return "";
-  return cleanDiffCommentText(block.slice(markerIndex + marker.length));
-}
-
-function extractCommentContext(block: string): string {
-  const fileMatch = /File:\s*(.*?)(?:\s+Lines?:|\s+Line:|\n|$)/i.exec(block);
-  if (!fileMatch) return "";
-  return cleanDiffCommentText(fileMatch[1].replace(/^browser:/i, ""));
-}
-
-function cleanDiffCommentText(text: string): string {
-  return text
-    .replace(/<image>\s*<\/image>/gi, "")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
-function isConversationMessage(e: PreviewEvent): boolean {
-  if (e.role === "subagent") return false;
-  if (isInternalCodexContextMessage(e)) return false;
-  if (isAssistantTextToolUseEvent(e)) return true;
-  const raw = e.raw as {
-    message?: { role?: unknown };
-    opencode?: unknown;
-  } | null;
-  if (raw?.opencode) return isOpenCodeConversationEvent(e);
-  if (typeof raw?.message?.role === "string") {
-    return e.role === "user" || e.role === "assistant";
-  }
-  if (rawType(e) !== "response_item" || payloadType(e) !== "message") return false;
-  if (e.role !== "user" && e.role !== "assistant") return false;
-  return true;
-}
-
-function isEventMessage(e: PreviewEvent): boolean {
-  if (rawType(e) !== "event_msg") return false;
-  const payload = payloadType(e);
-  return payload === "user_message" || payload === "agent_message";
-}
-
-function isStableForkNode(e: PreviewEvent): boolean {
-  return isConversationMessage(e) || isEventMessage(e);
-}
-
-function eventMessageLabel(e: PreviewEvent): string {
-  const payload = payloadType(e);
-  if (payload === "user_message") return "用户事件消息";
-  if (payload === "agent_message") return "agent事件消息";
-  return "事件消息";
-}
-
-function subagentEventLabel(e: PreviewEvent): string {
-  if (e.kind === "sub_agent_activity") {
-    const raw = e.raw as { payload?: { kind?: unknown } } | null;
-    switch (raw?.payload?.kind) {
-      case "started":
-        return "子智能体开始工作";
-      case "interacted":
-        return "子智能体有新活动";
-      case "interrupted":
-        return "子智能体已中断";
-      case "completed":
-        return "子智能体已完成";
-      default:
-        return "子智能体活动";
-    }
-  }
-
-  switch (e.kind) {
-    case "spawn_agent":
-      return "启动子智能体";
-    case "spawn_agent_result":
-      return "启动子智能体结果";
-    case "list_agents":
-      return "查看子智能体";
-    case "list_agents_result":
-      return "子智能体列表结果";
-    case "send_message":
-      return "发送子智能体消息";
-    case "send_message_result":
-      return "发送消息结果";
-    case "followup_task":
-      return "安排后续任务";
-    case "followup_task_result":
-      return "后续任务结果";
-    case "interrupt_agent":
-      return "中断子智能体";
-    case "interrupt_agent_result":
-      return "中断操作结果";
-    case "wait_agent":
-      return "等待子智能体";
-    case "wait_agent_result":
-      return "等待结果";
-    default:
-      return "子智能体事件";
-  }
-}
-
-function subagentEventTime(e: PreviewEvent, fallback: string): string {
-  if (e.kind !== "sub_agent_activity") return fallback;
-  const raw = e.raw as { payload?: { occurred_at_ms?: unknown } } | null;
-  const occurredAtMs = raw?.payload?.occurred_at_ms;
-  if (typeof occurredAtMs !== "number" || !Number.isFinite(occurredAtMs)) return fallback;
-  return formatTimeString(new Date(occurredAtMs).toISOString());
-}
-
-function isInternalCodexContextMessage(e: PreviewEvent): boolean {
-  if (e.role !== "user") return false;
-  const text = extractText(e).trim();
-  if (!text) return false;
-  const firstLine = normalizePromptHeading(text.split(/\r?\n/, 1)[0] ?? "");
-  if (firstLine.startsWith("AGENTS.md instructions") && text.includes("<INSTRUCTIONS>")) {
-    return true;
-  }
-  if (firstLine === "<environment_context>" && text.includes("</environment_context>")) {
-    return true;
-  }
-  if (firstLine === "<recommended_plugins>" && text.includes("</recommended_plugins>")) {
-    return true;
-  }
-  return false;
-}
-
-function normalizePromptHeading(line: string): string {
-  return line.trim().replace(/^#{1,6}\s+/, "").trim();
-}
-
-function rawType(e: PreviewEvent): string {
-  const raw = e.raw as { type?: unknown } | null;
-  return typeof raw?.type === "string" ? raw.type : "";
-}
-
-function payloadType(e: PreviewEvent): string {
-  const raw = e.raw as { payload?: { type?: unknown } } | null;
-  return typeof raw?.payload?.type === "string" ? raw.payload.type : "";
-}
-
-/* ---------- 编辑 / 删除能力判断（与后端 edit.rs 规则对应）---------- */
-
-const CODEX_DELETABLE_RESPONSE_ITEMS = new Set([
-  "message",
-  "reasoning",
-  "function_call",
-  "custom_tool_call",
-  "local_shell_call",
-  "web_search_call",
-  "function_call_output",
-  "custom_tool_call_output",
-]);
-
-function canEditEventText(provider: string, e: PreviewEvent): boolean {
-  if (provider === "codex") {
-    const outer = rawType(e);
-    const pt = payloadType(e);
-    if (outer === "event_msg") return pt === "user_message" || pt === "agent_message";
-    if (outer === "response_item" && pt === "message") {
-      return editableText(e).length > 0;
-    }
-    return false;
-  }
-  if (provider === "opencode") {
-    const raw = e.raw as any;
-    return (
-      typeof raw?.opencode?.part_id === "string" &&
-      raw?.opencode?.part_type === "text" &&
-      (raw?.message?.role === "user" || raw?.message?.role === "assistant") &&
-      editableText(e).length > 0
-    );
-  }
-  // Claude：user/assistant 消息且含文本块（thinking 带签名、工具块结构化，均不可改写）
-  const raw = e.raw as any;
-  if (!raw?.message || (raw?.type !== "user" && raw?.type !== "assistant")) return false;
-  return editableText(e).length > 0;
-}
-
-function canDeleteEvent(provider: string, e: PreviewEvent): boolean {
-  if (provider === "codex") {
-    const outer = rawType(e);
-    const pt = payloadType(e);
-    if (outer === "event_msg") return pt === "user_message" || pt === "agent_message";
-    if (outer === "response_item") return CODEX_DELETABLE_RESPONSE_ITEMS.has(pt);
-    return false;
-  }
-  if (provider === "opencode") {
-    const raw = e.raw as any;
-    return (
-      typeof raw?.opencode?.part_id === "string" &&
-      typeof raw?.opencode?.message_id === "string" &&
-      (raw?.message?.role === "user" || raw?.message?.role === "assistant")
-    );
-  }
-  const raw = e.raw as any;
-  return (
-    !!raw?.message &&
-    typeof raw?.uuid === "string" &&
-    (raw?.type === "user" || raw?.type === "assistant")
-  );
-}
-
-/** 后端改写的目标文本：与 edit.rs 的 replace_text_items 语义一致（text 项按换行拼接） */
-function editableText(e: PreviewEvent): string {
-  const r = e.raw as any;
-  if (!r) return "";
-  if (r.payload) {
-    // Codex
-    if (typeof r.payload.message === "string") return r.payload.message;
-    const c = r.payload.content;
-    if (typeof c === "string") return c;
-    if (Array.isArray(c)) {
-      return c
-        .filter((x: any) => typeof x?.text === "string")
-        .map((x: any) => x.text)
-        .join("\n");
-    }
-    return "";
-  }
-  // Claude
-  const c = r?.message?.content;
-  if (typeof c === "string") return c;
-  if (Array.isArray(c)) {
-    return c
-      .filter((x: any) => x?.type === "text" && typeof x.text === "string")
-      .map((x: any) => x.text)
-      .join("\n");
-  }
-  return "";
-}
-
-function deleteReasonLabel(reason: string): string {
-  switch (reason) {
-    case "selected":
-      return "选中";
-    case "tool_pair":
-      return "工具配对";
-    case "mirror":
-      return "镜像行";
-    case "reasoning_attached":
-      return "关联推理";
-    case "context_message":
-      return "同轮消息";
-    default:
-      return reason;
-  }
-}
-
-function editKindLabel(kind: string): string {
-  switch (kind) {
-    case "edit_text":
-      return "改写";
-    case "delete_events":
-      return "删除";
-    case "undo":
-      return "撤销";
-    case "restore_snapshot":
-      return "还原";
-    default:
-      return kind;
-  }
 }

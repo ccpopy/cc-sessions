@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use chrono::{Datelike, Duration, TimeZone, Timelike, Utc};
 
 use crate::error::{AppError, AppResult};
-use crate::models::{Kpi, ModelStat, ProjectStat, SessionSummary, TimeseriesPoint};
+use crate::models::{Kpi, ModelStat, ProjectStat, SessionSummary, StatsSnapshot, TimeseriesPoint};
 use crate::paths;
 
 fn provider_or_codex(provider: Option<String>) -> String {
@@ -143,6 +143,10 @@ pub fn stats_kpi(
         cwd_filter,
         include_archived,
     )?;
+    Ok(build_kpi(&sessions))
+}
+
+fn build_kpi(sessions: &[SessionSummary]) -> Kpi {
     let count = sessions.len() as u32;
     let tokens = sessions.iter().map(|s| s.tokens_used).sum::<i64>();
     let projects = sessions
@@ -151,7 +155,7 @@ pub fn stats_kpi(
         .filter(|cwd| !cwd.is_empty())
         .collect::<HashSet<_>>()
         .len() as u32;
-    Ok(Kpi {
+    Kpi {
         sessions_total: count,
         tokens_total: tokens,
         active_projects: projects,
@@ -160,7 +164,7 @@ pub fn stats_kpi(
         } else {
             tokens as f64 / count as f64
         },
-    })
+    }
 }
 
 pub fn stats_timeseries(
@@ -184,6 +188,10 @@ pub fn stats_timeseries(
         cwd_filter,
         include_archived,
     )?;
+    Ok(build_timeseries(&sessions, &bucket))
+}
+
+fn build_timeseries(sessions: &[SessionSummary], bucket: &str) -> Vec<TimeseriesPoint> {
     let mut map: BTreeMap<i64, (u32, i64)> = BTreeMap::new();
     for session in sessions {
         let bucket_start = bucket_start(session.updated_at, &bucket);
@@ -191,14 +199,13 @@ pub fn stats_timeseries(
         entry.0 += 1;
         entry.1 += session.tokens_used;
     }
-    Ok(map
-        .into_iter()
+    map.into_iter()
         .map(|(bucket_start, (sessions, tokens))| TimeseriesPoint {
             bucket_start,
             sessions,
             tokens,
         })
-        .collect())
+        .collect()
 }
 
 pub fn stats_by_project(
@@ -222,6 +229,10 @@ pub fn stats_by_project(
         cwd_filter,
         include_archived,
     )?;
+    Ok(build_by_project(&sessions, limit))
+}
+
+fn build_by_project(sessions: &[SessionSummary], limit: usize) -> Vec<ProjectStat> {
     let mut map: HashMap<(String, String), ProjectStat> = HashMap::new();
     for session in sessions {
         let key = (session.provider.clone(), session.cwd.clone());
@@ -242,7 +253,7 @@ pub fn stats_by_project(
             .then_with(|| b.tokens.cmp(&a.tokens))
     });
     out.truncate(limit);
-    Ok(out)
+    out
 }
 
 pub fn stats_by_model(
@@ -265,6 +276,10 @@ pub fn stats_by_model(
         cwd_filter,
         include_archived,
     )?;
+    Ok(build_by_model(&sessions))
+}
+
+fn build_by_model(sessions: &[SessionSummary]) -> Vec<ModelStat> {
     let mut map: HashMap<(String, String, Option<String>), ModelStat> = HashMap::new();
     for session in sessions {
         let model = session.model.clone().unwrap_or_default();
@@ -289,7 +304,7 @@ pub fn stats_by_model(
             .cmp(&a.sessions)
             .then_with(|| b.tokens.cmp(&a.tokens))
     });
-    Ok(out)
+    out
 }
 
 pub fn stats_heatmap(
@@ -312,6 +327,10 @@ pub fn stats_heatmap(
         cwd_filter,
         include_archived,
     )?;
+    Ok(build_heatmap(&sessions))
+}
+
+fn build_heatmap(sessions: &[SessionSummary]) -> Vec<Vec<u32>> {
     let mut grid = vec![vec![0u32; 24]; 7];
     for session in sessions {
         if let Some(dt) = Utc.timestamp_opt(session.updated_at, 0).single() {
@@ -322,7 +341,38 @@ pub fn stats_heatmap(
             }
         }
     }
-    Ok(grid)
+    grid
+}
+
+pub fn stats_snapshot(
+    provider: Option<String>,
+    codex_dir: String,
+    claude_dir: Option<String>,
+    opencode_dir: Option<String>,
+    from_ts: Option<i64>,
+    to_ts: Option<i64>,
+    bucket: String,
+    project_limit: usize,
+    cwd_filter: Vec<String>,
+    include_archived: bool,
+) -> AppResult<StatsSnapshot> {
+    let sessions = stat_sessions(
+        provider,
+        codex_dir,
+        claude_dir,
+        opencode_dir,
+        from_ts,
+        to_ts,
+        cwd_filter,
+        include_archived,
+    )?;
+    Ok(StatsSnapshot {
+        kpi: build_kpi(&sessions),
+        timeseries: build_timeseries(&sessions, &bucket),
+        by_project: build_by_project(&sessions, project_limit),
+        by_model: build_by_model(&sessions),
+        heatmap: build_heatmap(&sessions),
+    })
 }
 
 fn bucket_start(ts: i64, bucket: &str) -> i64 {
@@ -474,6 +524,32 @@ mod tests {
         assert_eq!(kpi.sessions_total, 3);
         assert_eq!(kpi.tokens_total, 41);
         assert_eq!(kpi.active_projects, 3);
+
+        let snapshot = stats_snapshot(
+            Some("all".to_string()),
+            codex.to_string_lossy().into_owned(),
+            Some(claude.to_string_lossy().into_owned()),
+            Some(opencode.to_string_lossy().into_owned()),
+            None,
+            None,
+            "day".to_string(),
+            10,
+            Vec::new(),
+            false,
+        )?;
+        assert_eq!(snapshot.kpi.sessions_total, kpi.sessions_total);
+        assert_eq!(snapshot.kpi.tokens_total, kpi.tokens_total);
+        assert_eq!(snapshot.by_project.len(), 3);
+        assert_eq!(snapshot.by_model.len(), 3);
+        assert_eq!(
+            snapshot
+                .timeseries
+                .iter()
+                .map(|point| point.sessions)
+                .sum::<u32>(),
+            3
+        );
+        assert_eq!(snapshot.heatmap.iter().flatten().sum::<u32>(), 3);
 
         let projects = stats_by_project(
             Some("all".to_string()),

@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use serde_json::Value;
 
@@ -11,6 +14,18 @@ use crate::models::{
 };
 
 const PREVIEW_CAPACITY_HINT_MAX: usize = 1024;
+
+#[derive(Clone, Copy)]
+struct TokenTotalCacheEntry {
+    file_len: u64,
+    modified: Option<SystemTime>,
+    total: i64,
+}
+
+fn token_total_cache() -> &'static Mutex<HashMap<PathBuf, TokenTotalCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, TokenTotalCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 fn classify(index: usize, raw: Value) -> PreviewEvent {
     let timestamp = raw
         .get("timestamp")
@@ -675,8 +690,19 @@ fn read_rollout_token_total_impl(path: &Path, cancel: Option<&AtomicBool>) -> Ap
     const REVERSE_SCAN_CHUNK_BYTES: usize = 64 * 1024;
 
     ensure_not_cancelled(cancel)?;
+    let metadata = path.metadata()?;
+    let file_len = metadata.len();
+    let modified = metadata.modified().ok();
+    if let Ok(cache) = token_total_cache().lock() {
+        if let Some(entry) = cache.get(path) {
+            if entry.file_len == file_len && entry.modified == modified {
+                return Ok(entry.total);
+            }
+        }
+    }
+
     let mut file = File::open(path)?;
-    let mut scan_end = file.metadata()?.len();
+    let mut scan_end = file_len;
     let mut line_end = scan_end;
     let mut chunk = vec![0u8; REVERSE_SCAN_CHUNK_BYTES];
 
@@ -696,6 +722,7 @@ fn read_rollout_token_total_impl(path: &Path, cancel: Option<&AtomicBool>) -> Ap
             ensure_not_cancelled(cancel)?;
             let separator = chunk_start + offset as u64;
             if let Some(total) = read_token_total_from_range(&mut file, separator + 1, line_end)? {
+                cache_rollout_token_total(path, file_len, modified, total);
                 return Ok(total);
             }
             line_end = separator;
@@ -703,7 +730,22 @@ fn read_rollout_token_total_impl(path: &Path, cancel: Option<&AtomicBool>) -> Ap
         scan_end = chunk_start;
     }
 
-    Ok(read_token_total_from_range(&mut file, 0, line_end)?.unwrap_or(0))
+    let total = read_token_total_from_range(&mut file, 0, line_end)?.unwrap_or(0);
+    cache_rollout_token_total(path, file_len, modified, total);
+    Ok(total)
+}
+
+fn cache_rollout_token_total(path: &Path, file_len: u64, modified: Option<SystemTime>, total: i64) {
+    if let Ok(mut cache) = token_total_cache().lock() {
+        cache.insert(
+            path.to_path_buf(),
+            TokenTotalCacheEntry {
+                file_len,
+                modified,
+                total,
+            },
+        );
+    }
 }
 
 fn read_token_total_from_range(file: &mut File, start: u64, end: u64) -> AppResult<Option<i64>> {
@@ -907,6 +949,35 @@ mod tests {
         fs::remove_file(file).ok();
 
         assert_eq!(total, 7_654_321);
+        Ok(())
+    }
+
+    #[test]
+    fn token_cache_is_invalidated_when_rollout_grows() -> AppResult<()> {
+        let file = temp_file("cc-session-manager-rollout-token-cache-test");
+        let token_line = |total| {
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": { "total_token_usage": { "total_tokens": total } }
+                }
+            })
+        };
+        {
+            let mut out = File::create(&file)?;
+            writeln!(out, "{}", token_line(123))?;
+        }
+        assert_eq!(read_rollout_token_total(&file)?, 123);
+
+        {
+            let mut out = fs::OpenOptions::new().append(true).open(&file)?;
+            writeln!(out, "{}", token_line(456))?;
+        }
+        let total = read_rollout_token_total(&file)?;
+        fs::remove_file(file).ok();
+
+        assert_eq!(total, 456);
         Ok(())
     }
 

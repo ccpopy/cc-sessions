@@ -55,6 +55,8 @@ import { humanBytes, humanTokens } from "@/lib/format";
 import { providerLabel } from "@/lib/providerTheme";
 import { basename, dirname, joinPath } from "@/lib/cwd";
 
+const SESSION_PAGE_SIZE = 500;
+
 export default function TransferRoute({ provider = "codex" }: { provider?: SessionProvider }) {
   const settings = useSettings((s) => s.settings);
   const codexDir = settings?.codex_dir ?? "";
@@ -126,6 +128,7 @@ function ExportPanel({
   const [exportGroup, setExportGroup] = useState("default");
   const [activeOnly, setActiveOnly] = useState(true);
   const [sessionSearch, setSessionSearch] = useState("");
+  const [visibleSessionLimit, setVisibleSessionLimit] = useState(SESSION_PAGE_SIZE);
   const [selectedSessionKeys, setSelectedSessionKeys] = useState<Set<string>>(new Set());
   const [running, setRunning] = useState(false);
   const [lastZipSource, setLastZipSource] = useState<string | null>(null);
@@ -141,7 +144,12 @@ function ExportPanel({
   useEffect(() => {
     setSelectedSessionKeys(new Set());
     setLastZipSource(null);
+    setVisibleSessionLimit(SESSION_PAGE_SIZE);
   }, [provider]);
+
+  useEffect(() => {
+    setVisibleSessionLimit(SESSION_PAGE_SIZE);
+  }, [sessionSearch]);
 
   const toggle = (session: SessionSummary) => {
     const key = sessionIdentity(session);
@@ -182,7 +190,10 @@ function ExportPanel({
     () => filteredSessions.filter((session) => session.archived).length,
     [filteredSessions],
   );
-  const visibleSessions = useMemo(() => filteredSessions.slice(0, 500), [filteredSessions]);
+  const visibleSessions = useMemo(
+    () => filteredSessions.slice(0, visibleSessionLimit),
+    [filteredSessions, visibleSessionLimit],
+  );
   const selectedSessions = useMemo(
     () => sessions.filter((session) => selectedSessionKeys.has(sessionIdentity(session))),
     [sessions, selectedSessionKeys],
@@ -527,6 +538,20 @@ function ExportPanel({
                         </li>
                       ))}
                     </ul>
+                    {visibleSessions.length < filteredSessions.length && (
+                      <div className="border-t p-3 text-center">
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          onClick={() =>
+                            setVisibleSessionLimit((limit) => limit + SESSION_PAGE_SIZE)
+                          }
+                        >
+                          继续加载（剩余 {filteredSessions.length - visibleSessions.length} 条）
+                        </Button>
+                      </div>
+                    )}
                   </ScrollArea>
                 </div>
               )}

@@ -46,6 +46,7 @@ import {
   type ContentSearchMatch,
   type DeleteResult,
   type FamilyOverlay,
+  type ProviderSyncStatus,
   type SessionProvider,
   type SessionSummary,
 } from "@/lib/api";
@@ -110,6 +111,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const [providerSyncPlan, setProviderSyncPlan] = useState<string[]>([]);
   const [currentProvider, setCurrentProvider] = useState<string | null>(null);
   const [maintenanceError, setMaintenanceError] = useState<string | null>(null);
+  const [providerSyncProgress, setProviderSyncProgress] = useState<ProviderSyncStatus | null>(null);
   const [familySheetId, setFamilySheetId] = useState<string | null>(null);
   const providerSyncRegistry = useRef(new ProviderSyncRegistry());
   const duplicateRegistry = useRef(new SessionActionRegistry());
@@ -119,6 +121,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const [duplicatingSessionIds, setDuplicatingSessionIds] = useState<ReadonlySet<string>>(
     () => duplicateRegistry.current.snapshot(),
   );
+  const sessionScrollRef = useRef<HTMLDivElement>(null);
   const publishProviderSyncState = useCallback(() => {
     setProviderSyncState(providerSyncRegistry.current.snapshot());
   }, []);
@@ -402,11 +405,12 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     if (!providerSyncRegistry.current.tryBeginBatch()) return;
     publishProviderSyncState();
     try {
-      const r = await api.batchCloneForCurrentProvider({
+      setProviderSyncProgress(null);
+      const r = await api.runProviderSync({
         codex_dir: settings.codex_dir,
         strategy: "scatter",
         dry_run: false,
-      });
+      }, setProviderSyncProgress);
       const ok = r.filter((x) => x.ok).length;
       const failed = r.filter((x) => !x.ok);
       await refresh();
@@ -429,6 +433,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     } catch (e) {
       toast.error(String((e as Error)?.message ?? e));
     } finally {
+      setProviderSyncProgress(null);
       providerSyncRegistry.current.finishBatch();
       publishProviderSyncState();
     }
@@ -456,24 +461,41 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     [visibleSessions, selected],
   );
 
-  const onCopyResume = async (s: SessionSummary) => {
+  const onPreview = useCallback((session: SessionSummary) => {
+    setPreviewJump(null);
+    setPreview(session);
+  }, []);
+
+  const onBackup = useCallback((session: SessionSummary) => {
+    setBackupTargets([session]);
+  }, []);
+
+  const onDelete = useCallback((session: SessionSummary) => {
+    setDeleteTargets([session]);
+  }, []);
+
+  const onOpenFamily = useCallback((session: SessionSummary) => {
+    setFamilySheetId(session.id);
+  }, []);
+
+  const onCopyResume = useCallback(async (s: SessionSummary) => {
     try {
       const text = await api.copyResumeCommand(s.provider, s.id, s.cwd);
       toast.success("已复制：" + text);
     } catch (e: any) {
       toast.error("复制失败：" + String(e?.message ?? e));
     }
-  };
+  }, []);
 
-  const onReveal = async (s: SessionSummary) => {
+  const onReveal = useCallback(async (s: SessionSummary) => {
     try {
       await api.revealCwd(s.cwd);
     } catch (e: any) {
       toast.error("打开失败：" + String(e?.message ?? e));
     }
-  };
+  }, []);
 
-  const onArchiveToggle = async (s: SessionSummary) => {
+  const onArchiveToggle = useCallback(async (s: SessionSummary) => {
     if (!settings) return;
     try {
       await api.setArchived(
@@ -488,7 +510,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     } catch (e: any) {
       toast.error(String(e?.message ?? e));
     }
-  };
+  }, [provider, refresh, settings]);
 
   const onBulkBackup = () => {
     if (selectedItems.length === 0) return;
@@ -660,12 +682,14 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             className="ml-auto h-7 gap-1.5"
           >
             <RotateCw className={cloning ? "h-3.5 w-3.5 animate-spin" : "h-3.5 w-3.5"} />
-            一键处理
+            {providerSyncProgress
+              ? `处理中 ${providerSyncProgress.completed}/${providerSyncProgress.total || clonableCount}`
+              : "一键处理"}
           </Button>
         </div>
       )}
 
-      <ScrollArea className="flex-1">
+      <ScrollArea className="flex-1" viewportRef={sessionScrollRef}>
         {error ? (
           <EmptyState
             title="读取失败"
@@ -705,24 +729,22 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         ) : (
           <SessionList
             sessions={visibleSessions}
+            scrollElementRef={sessionScrollRef}
             backupIndex={backupIndex}
             overlay={overlay}
             currentProvider={currentProvider}
             syncingSessionIds={providerSyncState.sessionIds}
             syncActionsDisabled={providerSyncState.batchActive}
             duplicatingSessionIds={duplicatingSessionIds}
-            onPreview={(session) => {
-              setPreviewJump(null);
-              setPreview(session);
-            }}
+            onPreview={onPreview}
             onCopyResume={onCopyResume}
             onRevealCwd={onReveal}
             onArchiveToggle={supportsArchive ? onArchiveToggle : undefined}
-            onBackup={(s) => setBackupTargets([s])}
-            onDelete={(s) => setDeleteTargets([s])}
+            onBackup={onBackup}
+            onDelete={onDelete}
             onClone={isCodex ? onCloneOne : undefined}
             onDuplicate={isCodex ? setDuplicateTarget : undefined}
-            onOpenFamily={isCodex ? (s) => setFamilySheetId(s.id) : undefined}
+            onOpenFamily={isCodex ? onOpenFamily : undefined}
             onExportMarkdown={setExportTarget}
             onConvert={isOpenCode ? undefined : setConvertTarget}
             onRename={setRenameTarget}

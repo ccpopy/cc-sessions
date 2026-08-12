@@ -47,7 +47,7 @@ import { cn } from "@/lib/utils";
 type Props = {
   s: SessionSummary;
   selected: boolean;
-  onToggleSelect: (id: string) => void;
+  onToggleSelect: () => void;
   onPreview: (s: SessionSummary) => void;
   onCopyResume: (s: SessionSummary) => void;
   onRevealCwd: (s: SessionSummary) => void;
@@ -122,7 +122,7 @@ export const SessionCard = memo(function SessionCard({
       <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-x-3 p-4">
         <Checkbox
           checked={selected}
-          onCheckedChange={() => onToggleSelect(s.id)}
+          onCheckedChange={onToggleSelect}
           className="mt-0.5"
           aria-label="选择会话"
         />

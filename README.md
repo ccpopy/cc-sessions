@@ -329,7 +329,7 @@ Codex 的部分推理内容经过加密，Claude Code 的部分思考内容带�
 
 ### 环境
 
-- Node.js 20 或更高版本
+- Node.js 20 或更高版本（前端 TypeScript 测试由 `tsx` 运行）
 - npm
 - Rust stable 工具链
 - [Tauri 2 对应平台的构建依赖](https://v2.tauri.app/start/prerequisites/)

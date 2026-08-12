@@ -1,11 +1,17 @@
 {
   "name": "cc-session-manager",
   "private": true,
-  "version": "0.5.3",
+  "version": "0.5.4",
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build --config vite.config.ts",
+    "test": "npm run test:frontend && npm run test:rust",
+    "test:frontend": "tsx --test \"src/lib/*.test.ts\"",
+    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --all-targets",
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
@@ -44,15 +50,13 @@
     "@tauri-apps/plugin-fs": "^2.2.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
-    "cmdk": "^1.0.4",
     "date-fns": "^4.1.0",
     "lucide-react": "^0.469.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-hook-form": "^7.54.2",
     "react-json-view-lite": "^2.1.0",
     "react-markdown": "^9.0.3",
-    "react-router-dom": "^7.1.1",
+    "react-router-dom": "^7.18.2",
     "recharts": "^2.15.0",
     "remark-gfm": "^4.0.0",
     "sonner": "^1.7.1",
@@ -66,11 +70,12 @@
     "@types/node": "^22.10.5",
     "@types/react": "^18.3.18",
     "@types/react-dom": "^18.3.5",
-    "@vitejs/plugin-react": "^4.3.4",
+    "@vitejs/plugin-react": "^4.7.0",
     "autoprefixer": "^10.4.20",
-    "postcss": "^8.4.49",
+    "postcss": "^8.5.26",
     "tailwindcss": "^3.4.17",
+    "tsx": "^4.23.12",
     "typescript": "^5.7.2",
-    "vite": "^6.0.7"
+    "vite": "^6.4.3"
   }
 }

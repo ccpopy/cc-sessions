@@ -1,38 +1,17 @@
-import { useMemo, useState } from "react";
-import { ChevronDown } from "lucide-react";
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "@/components/ui/collapsible";
+import { memo, useMemo, type RefObject } from "react";
+
+import { ProjectSessionView } from "@/components/ProjectSessionView";
+import type { SessionCardHandlers } from "@/components/SelectableSessionCard";
+import { SizeSessionView } from "@/components/SizeSessionView";
+import { TimeSessionView } from "@/components/TimeSessionView";
+import type { SessionListViewProps } from "@/components/SessionListRowCard";
 import type { FamilyOverlay, SessionSummary } from "@/lib/api";
-import { SessionCard } from "@/components/SessionCard";
-import { ProjectGroupView } from "@/components/ProjectGroup";
-import { bucketLabel, dayBucket } from "@/lib/format";
-import { useSelection } from "@/stores/selection";
-import { useView } from "@/stores/view";
-import { cn } from "@/lib/utils";
 import { sessionIdentity } from "@/lib/sessionIdentity";
-import { compareSessionSize } from "@/lib/sessionSort";
+import { useView } from "@/stores/view";
 
-type Handlers = {
-  onPreview: (s: SessionSummary) => void;
-  onCopyResume: (s: SessionSummary) => void;
-  onRevealCwd: (s: SessionSummary) => void;
-  onArchiveToggle?: (s: SessionSummary) => void;
-  onBackup?: (s: SessionSummary) => void;
-  onDelete?: (s: SessionSummary) => void;
-  onClone?: (s: SessionSummary) => void;
-  onDuplicate?: (s: SessionSummary) => void;
-  onOpenFamily?: (s: SessionSummary) => void;
-  onExportMarkdown?: (s: SessionSummary) => void;
-  onConvert?: (s: SessionSummary) => void;
-  onRename?: (s: SessionSummary) => void;
-  onMoveCwd?: (s: SessionSummary) => void;
-};
-
-type Props = Handlers & {
+type Props = SessionCardHandlers & {
   sessions: SessionSummary[];
+  scrollElementRef: RefObject<HTMLDivElement | null>;
   backupIndex?: Record<string, string[]>;
   overlay?: Map<string, FamilyOverlay>;
   currentProvider?: string | null;
@@ -41,277 +20,46 @@ type Props = Handlers & {
   duplicatingSessionIds?: ReadonlySet<string>;
 };
 
-type BucketKey = "today" | "yesterday" | "week" | "month" | "earlier";
-
-export function SessionList({
+export const SessionList = memo(function SessionList({
   sessions,
+  scrollElementRef,
   backupIndex,
   overlay,
   currentProvider,
   syncingSessionIds,
   syncActionsDisabled,
   duplicatingSessionIds,
-  ...h
+  ...handlers
 }: Props) {
-  const view = useView((s) => s.view);
-  const query = useView((s) => s.query);
-  const prefillCwd = useView((s) => s.prefillCwd);
+  const view = useView((state) => state.view);
+  const query = useView((state) => state.query);
+  const prefillCwd = useView((state) => state.prefillCwd);
 
-  const filtered = useMemo(() => {
-    if (!prefillCwd) return sessions;
-    return sessions.filter((s) => s.cwd === prefillCwd);
-  }, [sessions, prefillCwd]);
+  const visibleSessions = useMemo(() => {
+    const filtered = prefillCwd
+      ? sessions.filter((session) => session.cwd === prefillCwd)
+      : sessions;
+    return filtered.map((session) => ({
+      ...session,
+      has_backup: backupIndex
+        ? Boolean(backupIndex[sessionIdentity(session)]?.length)
+        : session.has_backup,
+    }));
+  }, [backupIndex, prefillCwd, sessions]);
 
-  const enriched = useMemo(
-    () =>
-      filtered.map((s) => ({
-        ...s,
-        has_backup: backupIndex ? !!backupIndex[sessionIdentity(s)]?.length : s.has_backup,
-      })),
-    [filtered, backupIndex],
-  );
+  const viewProps: SessionListViewProps = {
+    sessions: visibleSessions,
+    handlers,
+    query,
+    scrollElementRef,
+    overlay,
+    currentProvider,
+    syncingSessionIds,
+    syncActionsDisabled,
+    duplicatingSessionIds,
+  };
 
-  if (view === "project") {
-    return (
-      <ProjectView
-        sessions={enriched}
-        handlers={h}
-        query={query}
-        overlay={overlay}
-        currentProvider={currentProvider}
-        syncingSessionIds={syncingSessionIds}
-        syncActionsDisabled={syncActionsDisabled}
-        duplicatingSessionIds={duplicatingSessionIds}
-      />
-    );
-  }
-
-  if (view === "size") {
-    return (
-      <SizeView
-        sessions={enriched}
-        handlers={h}
-        query={query}
-        overlay={overlay}
-        currentProvider={currentProvider}
-        syncingSessionIds={syncingSessionIds}
-        syncActionsDisabled={syncActionsDisabled}
-        duplicatingSessionIds={duplicatingSessionIds}
-      />
-    );
-  }
-
-  return (
-    <TimeView
-      sessions={enriched}
-      handlers={h}
-      query={query}
-      overlay={overlay}
-      currentProvider={currentProvider}
-      syncingSessionIds={syncingSessionIds}
-      syncActionsDisabled={syncActionsDisabled}
-      duplicatingSessionIds={duplicatingSessionIds}
-    />
-  );
-}
-
-function TimeView({
-  sessions,
-  handlers,
-  query,
-  overlay,
-  currentProvider,
-  syncingSessionIds,
-  syncActionsDisabled,
-  duplicatingSessionIds,
-}: {
-  sessions: SessionSummary[];
-  handlers: Handlers;
-  query: string;
-  overlay?: Map<string, FamilyOverlay>;
-  currentProvider?: string | null;
-  syncingSessionIds?: ReadonlySet<string>;
-  syncActionsDisabled?: boolean;
-  duplicatingSessionIds?: ReadonlySet<string>;
-}) {
-  const selected = useSelection((s) => s.selected);
-  const toggle = useSelection((s) => s.toggle);
-  const [collapsed, setCollapsed] = useState<Record<BucketKey, boolean>>({
-    today: false,
-    yesterday: false,
-    week: false,
-    month: false,
-    earlier: true,
-  });
-
-  const groups = useMemo(() => {
-    const map = new Map<BucketKey, SessionSummary[]>();
-    for (const s of sessions) {
-      const k = dayBucket(s.updated_at);
-      if (!map.has(k)) map.set(k, []);
-      map.get(k)!.push(s);
-    }
-    const order: BucketKey[] = ["today", "yesterday", "week", "month", "earlier"];
-    return order.filter((k) => map.has(k)).map((k) => ({ key: k, items: map.get(k)! }));
-  }, [sessions]);
-
-  return (
-    <div className="min-w-0 max-w-full space-y-5 overflow-hidden px-6 py-5">
-      {groups.map((g) => (
-        <Collapsible
-          key={g.key}
-          open={!collapsed[g.key]}
-          onOpenChange={(open) =>
-            setCollapsed((s) => ({ ...s, [g.key]: !open }))
-          }
-          className="min-w-0"
-        >
-          <CollapsibleTrigger asChild>
-            <button className="group flex w-full items-center gap-2.5 rounded-md px-1.5 py-1 transition-colors hover:bg-muted/40">
-              <ChevronDown
-                className={cn(
-                  "h-3.5 w-3.5 shrink-0 text-muted-foreground/80 transition-transform duration-200 group-hover:text-foreground",
-                  collapsed[g.key] && "-rotate-90",
-                )}
-              />
-              <h2 className="text-[13px] font-semibold tracking-tight text-foreground">
-                {bucketLabel[g.key]}
-              </h2>
-              <span className="inline-flex h-5 min-w-[1.5rem] items-center justify-center rounded-md border border-border/60 bg-muted/40 px-1.5 text-[10.5px] font-medium tabular-nums text-muted-foreground">
-                {g.items.length}
-              </span>
-              <div
-                aria-hidden="true"
-                className="ml-1 h-px flex-1 bg-gradient-to-r from-border via-border/60 to-transparent"
-              />
-            </button>
-          </CollapsibleTrigger>
-          <CollapsibleContent className="data-[state=open]:animate-accordion-down data-[state=closed]:animate-accordion-up overflow-hidden">
-            <div className="mt-3 min-w-0 space-y-3">
-              {g.items.map((s) => (
-                <SessionCard
-                  key={sessionIdentity(s)}
-                  s={s}
-                  selected={selected.has(sessionIdentity(s))}
-                  onToggleSelect={() => toggle(sessionIdentity(s))}
-                  query={query}
-                  overlay={overlay?.get(s.id)}
-                  currentProvider={currentProvider}
-                  syncing={syncingSessionIds?.has(s.id)}
-                  syncDisabled={syncActionsDisabled}
-                  duplicating={duplicatingSessionIds?.has(s.id)}
-                  {...handlers}
-                />
-              ))}
-            </div>
-          </CollapsibleContent>
-        </Collapsible>
-      ))}
-    </div>
-  );
-}
-
-function ProjectView({
-  sessions,
-  handlers,
-  query,
-  overlay,
-  currentProvider,
-  syncingSessionIds,
-  syncActionsDisabled,
-  duplicatingSessionIds,
-}: {
-  sessions: SessionSummary[];
-  handlers: Handlers;
-  query: string;
-  overlay?: Map<string, FamilyOverlay>;
-  currentProvider?: string | null;
-  syncingSessionIds?: ReadonlySet<string>;
-  syncActionsDisabled?: boolean;
-  duplicatingSessionIds?: ReadonlySet<string>;
-}) {
-  const groups = useMemo(() => {
-    const map = new Map<string, SessionSummary[]>();
-    for (const s of sessions) {
-      if (!map.has(s.cwd)) map.set(s.cwd, []);
-      map.get(s.cwd)!.push(s);
-    }
-    return Array.from(map.entries())
-      .map(([cwd, items]) => ({
-        cwd,
-        cwd_display: items[0]?.cwd_display ?? cwd,
-        items,
-        latest: Math.max(...items.map((x) => x.updated_at)),
-      }))
-      .sort((a, b) => b.latest - a.latest);
-  }, [sessions]);
-
-  return (
-    <div className="min-w-0 max-w-full space-y-3 overflow-hidden px-6 py-5">
-      {groups.map((g) => (
-        <ProjectGroupView
-          key={g.cwd}
-          cwd={g.cwd}
-          cwdDisplay={g.cwd_display}
-          sessions={g.items}
-          query={query}
-          handlers={handlers}
-          overlay={overlay}
-          currentProvider={currentProvider}
-          syncingSessionIds={syncingSessionIds}
-          syncActionsDisabled={syncActionsDisabled}
-          duplicatingSessionIds={duplicatingSessionIds}
-        />
-      ))}
-    </div>
-  );
-}
-
-function SizeView({
-  sessions,
-  handlers,
-  query,
-  overlay,
-  currentProvider,
-  syncingSessionIds,
-  syncActionsDisabled,
-  duplicatingSessionIds,
-}: {
-  sessions: SessionSummary[];
-  handlers: Handlers;
-  query: string;
-  overlay?: Map<string, FamilyOverlay>;
-  currentProvider?: string | null;
-  syncingSessionIds?: ReadonlySet<string>;
-  syncActionsDisabled?: boolean;
-  duplicatingSessionIds?: ReadonlySet<string>;
-}) {
-  const selected = useSelection((s) => s.selected);
-  const toggle = useSelection((s) => s.toggle);
-  const sizeSortDirection = useView((s) => s.sizeSortDirection);
-
-  const sorted = useMemo(
-    () => [...sessions].sort((a, b) => compareSessionSize(a, b, sizeSortDirection)),
-    [sessions, sizeSortDirection],
-  );
-
-  return (
-    <div className="min-w-0 max-w-full space-y-3 overflow-hidden px-6 py-5">
-      {sorted.map((s) => (
-        <SessionCard
-          key={sessionIdentity(s)}
-          s={s}
-          selected={selected.has(sessionIdentity(s))}
-          onToggleSelect={() => toggle(sessionIdentity(s))}
-          query={query}
-          overlay={overlay?.get(s.id)}
-          currentProvider={currentProvider}
-          syncing={syncingSessionIds?.has(s.id)}
-          syncDisabled={syncActionsDisabled}
-          duplicating={duplicatingSessionIds?.has(s.id)}
-          {...handlers}
-        />
-      ))}
-    </div>
-  );
-}
+  if (view === "project") return <ProjectSessionView {...viewProps} />;
+  if (view === "size") return <SizeSessionView {...viewProps} />;
+  return <TimeSessionView {...viewProps} />;
+});

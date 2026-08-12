@@ -66,6 +66,7 @@ import {
   type OrphanPruneReport,
   type ProjectConfigReport,
   type ProviderInfo,
+  type ProviderSyncStatus,
   type SessionProvider,
   type SwitchStrategy,
 } from "@/lib/api";
@@ -92,6 +93,7 @@ function CodexRepairRoute() {
     null,
   );
   const [running, setRunning] = useState<string | null>(null);
+  const [providerSyncProgress, setProviderSyncProgress] = useState<ProviderSyncStatus | null>(null);
   const [dryRun, setDryRun] = useState(false);
   const expectedThreadsCount =
     diag == null ? null : diag.rollout_count + diag.archived_rollout_count;
@@ -146,6 +148,7 @@ function CodexRepairRoute() {
     } catch (e) {
       toast.error(String((e as Error)?.message ?? e));
     } finally {
+      setProviderSyncProgress(null);
       setRunning(null);
     }
   };
@@ -650,11 +653,12 @@ function CodexRepairRoute() {
                           onClick={() => {
                             if (dryRun) {
                               run("clone", async () => {
-                                const r = await api.batchCloneForCurrentProvider({
+                                setProviderSyncProgress(null);
+                                const r = await api.runProviderSync({
                                   codex_dir: codexDir,
                                   strategy,
                                   dry_run: true,
-                                });
+                                }, setProviderSyncProgress);
                                 const ok = r.filter((x) => x.ok).length;
                                 const failed = r.filter((x) => !x.ok);
                                 if (r.length === 0) {
@@ -695,7 +699,11 @@ function CodexRepairRoute() {
                       </TooltipContent>
                     </Tooltip>
                     <span className="text-xs text-muted-foreground">
-                      {dryRun ? "当前：效果预览（不写入）" : "当前：实际执行（会写入磁盘）"}
+                      {providerSyncProgress
+                        ? `正在处理 ${providerSyncProgress.completed}/${providerSyncProgress.total || diag?.provider_mismatched_families || 0}`
+                        : dryRun
+                          ? "当前：效果预览（不写入）"
+                          : "当前：实际执行（会写入磁盘）"}
                     </span>
                   </div>
                 </CardContent>
@@ -916,11 +924,12 @@ function CodexRepairRoute() {
             <AlertDialogAction
               onClick={() =>
                 run("clone_do", async () => {
-                  const r = await api.batchCloneForCurrentProvider({
+                  setProviderSyncProgress(null);
+                  const r = await api.runProviderSync({
                     codex_dir: codexDir,
                     strategy,
                     dry_run: false,
-                  });
+                  }, setProviderSyncProgress);
                   const ok = r.filter((x) => x.ok).length;
                   const failed = r.filter((x) => !x.ok);
                   await refresh();

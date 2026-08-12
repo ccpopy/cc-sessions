@@ -411,6 +411,14 @@ export type ModelStat = {
   tokens: number;
 };
 
+export type StatsSnapshot = {
+  kpi: Kpi;
+  timeseries: TimeseriesPoint[];
+  by_project: ProjectStat[];
+  by_model: ModelStat[];
+  heatmap: number[][];
+};
+
 // ========================= 修复 / 诊断 =========================
 
 export type ProviderInfo = {
@@ -561,6 +569,19 @@ export type CloneReport = {
   new_provider: string;
   ok: boolean;
   skipped_reason: string | null;
+  error: string | null;
+};
+
+export type ProviderSyncStatus = {
+  job_id: number;
+  state: "running" | "completed" | "failed";
+  current_provider: string | null;
+  completed: number;
+  total: number;
+  succeeded: number;
+  failed: number;
+  current_session_id: string | null;
+  reports: CloneReport[];
   error: string | null;
 };
 
@@ -1081,27 +1102,7 @@ export const api = {
   verifyBackup: (backupDir: string, backupPath: string) =>
     invokeCommand<VerifyReport>("verify_backup", { backupDir, backupPath }),
 
-  statsKpi: (p: {
-    provider: StatsProvider;
-    codex_dir: string;
-    claude_dir?: string;
-    opencode_dir?: string;
-    from_ts: number | null;
-    to_ts: number | null;
-    cwd_filter: string[];
-    include_archived: boolean;
-  }) =>
-    invokeCommand<Kpi>("stats_kpi", {
-      provider: p.provider,
-      codexDir: p.codex_dir,
-      claudeDir: p.claude_dir,
-      opencodeDir: p.opencode_dir,
-      fromTs: p.from_ts,
-      toTs: p.to_ts,
-      cwdFilter: p.cwd_filter,
-      includeArchived: p.include_archived,
-    }),
-  statsTimeseries: (p: {
+  statsSnapshot: (p: {
     provider: StatsProvider;
     codex_dir: string;
     claude_dir?: string;
@@ -1109,10 +1110,11 @@ export const api = {
     from_ts: number | null;
     to_ts: number | null;
     bucket: "day" | "week";
+    project_limit: number;
     cwd_filter: string[];
     include_archived: boolean;
   }) =>
-    invokeCommand<TimeseriesPoint[]>("stats_timeseries", {
+    invokeCommand<StatsSnapshot>("stats_snapshot", {
       provider: p.provider,
       codexDir: p.codex_dir,
       claudeDir: p.claude_dir,
@@ -1120,68 +1122,7 @@ export const api = {
       fromTs: p.from_ts,
       toTs: p.to_ts,
       bucket: p.bucket,
-      cwdFilter: p.cwd_filter,
-      includeArchived: p.include_archived,
-    }),
-  statsByProject: (p: {
-    provider: StatsProvider;
-    codex_dir: string;
-    claude_dir?: string;
-    opencode_dir?: string;
-    from_ts: number | null;
-    to_ts: number | null;
-    limit: number;
-    cwd_filter: string[];
-    include_archived: boolean;
-  }) =>
-    invokeCommand<ProjectStat[]>("stats_by_project", {
-      provider: p.provider,
-      codexDir: p.codex_dir,
-      claudeDir: p.claude_dir,
-      opencodeDir: p.opencode_dir,
-      fromTs: p.from_ts,
-      toTs: p.to_ts,
-      limit: p.limit,
-      cwdFilter: p.cwd_filter,
-      includeArchived: p.include_archived,
-    }),
-  statsByModel: (p: {
-    provider: StatsProvider;
-    codex_dir: string;
-    claude_dir?: string;
-    opencode_dir?: string;
-    from_ts: number | null;
-    to_ts: number | null;
-    cwd_filter: string[];
-    include_archived: boolean;
-  }) =>
-    invokeCommand<ModelStat[]>("stats_by_model", {
-      provider: p.provider,
-      codexDir: p.codex_dir,
-      claudeDir: p.claude_dir,
-      opencodeDir: p.opencode_dir,
-      fromTs: p.from_ts,
-      toTs: p.to_ts,
-      cwdFilter: p.cwd_filter,
-      includeArchived: p.include_archived,
-    }),
-  statsHeatmap: (p: {
-    provider: StatsProvider;
-    codex_dir: string;
-    claude_dir?: string;
-    opencode_dir?: string;
-    from_ts: number | null;
-    to_ts: number | null;
-    cwd_filter: string[];
-    include_archived: boolean;
-  }) =>
-    invokeCommand<number[][]>("stats_heatmap", {
-      provider: p.provider,
-      codexDir: p.codex_dir,
-      claudeDir: p.claude_dir,
-      opencodeDir: p.opencode_dir,
-      fromTs: p.from_ts,
-      toTs: p.to_ts,
+      projectLimit: p.project_limit,
       cwdFilter: p.cwd_filter,
       includeArchived: p.include_archived,
     }),
@@ -1370,6 +1311,45 @@ export const api = {
       strategy: p.strategy,
       dryRun: p.dry_run,
     }),
+  startProviderSync: (p: {
+    codex_dir: string;
+    strategy: SwitchStrategy;
+    dry_run: boolean;
+  }) => invokeCommand<{ job_id: number }>("start_provider_sync", {
+    codexDir: p.codex_dir,
+    strategy: p.strategy,
+    dryRun: p.dry_run,
+  }),
+  providerSyncStatus: (jobId: number) =>
+    invokeCommand<ProviderSyncStatus>("provider_sync_status", { jobId }),
+  activeProviderSync: () =>
+    invokeCommand<{ job_id: number } | null>("active_provider_sync"),
+  runProviderSync: async (
+    p: {
+      codex_dir: string;
+      strategy: SwitchStrategy;
+      dry_run: boolean;
+    },
+    onProgress?: (status: ProviderSyncStatus) => void,
+  ) => {
+    const active = await invokeCommand<{ job_id: number } | null>("active_provider_sync");
+    const started = active ?? await invokeCommand<{ job_id: number }>("start_provider_sync", {
+        codexDir: p.codex_dir,
+        strategy: p.strategy,
+        dryRun: p.dry_run,
+      });
+    while (true) {
+      const status = await invokeCommand<ProviderSyncStatus>("provider_sync_status", {
+        jobId: started.job_id,
+      });
+      onProgress?.(status);
+      if (status.state === "completed") return status.reports;
+      if (status.state === "failed") {
+        throw new Error(status.error ?? "provider 批量同步失败");
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 250));
+    }
+  },
   rollbackFamilyActive: (codexDir: string, familyId: string, targetBranchId: string) =>
     invokeCommand<void>("rollback_family_active", { codexDir, familyId, targetBranchId }),
   deleteFamilyBranch: (codexDir: string, familyId: string, branchId: string) =>

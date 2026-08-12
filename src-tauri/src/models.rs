@@ -408,6 +408,15 @@ pub struct ModelStat {
     pub tokens: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct StatsSnapshot {
+    pub kpi: Kpi,
+    pub timeseries: Vec<TimeseriesPoint>,
+    pub by_project: Vec<ProjectStat>,
+    pub by_model: Vec<ModelStat>,
+    pub heatmap: Vec<Vec<u32>>,
+}
+
 // ========================= 修复 / 诊断 =========================
 
 #[derive(Debug, Clone, Serialize)]
@@ -504,6 +513,26 @@ pub struct CloneReport {
     pub new_provider: String,
     pub ok: bool,
     pub skipped_reason: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderSyncStart {
+    pub job_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderSyncStatus {
+    pub job_id: u64,
+    /// running / completed / failed
+    pub state: String,
+    pub current_provider: Option<String>,
+    pub completed: usize,
+    pub total: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub current_session_id: Option<String>,
+    pub reports: Vec<CloneReport>,
     pub error: Option<String>,
 }
 

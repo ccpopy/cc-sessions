@@ -39,7 +39,7 @@ pub struct WebuiConfig {
 struct WebuiState {
     settings: Mutex<Settings>,
     settings_file: PathBuf,
-    family_lock: family::FamilyLock,
+    family_lock: Arc<family::FamilyLock>,
     dist_dir: PathBuf,
     api_token: String,
     default_provider: String,
@@ -74,7 +74,7 @@ pub fn run(config: WebuiConfig) -> AppResult<()> {
     let state = Arc::new(WebuiState {
         settings: Mutex::new(initial_settings),
         settings_file,
-        family_lock: family::FamilyLock::default(),
+        family_lock: Arc::new(family::FamilyLock::default()),
         dist_dir,
         api_token: generate_api_token()?,
         default_provider: config
@@ -410,17 +410,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "backupDir")?,
             string_arg(&args, "backupPath")?,
         )),
-        "stats_kpi" => to_result_value(stats::stats_kpi(
-            opt_string_arg(&args, "provider")?,
-            string_arg(&args, "codexDir")?,
-            opt_string_arg(&args, "claudeDir")?,
-            opt_string_arg(&args, "opencodeDir")?,
-            opt_i64_arg(&args, "fromTs")?,
-            opt_i64_arg(&args, "toTs")?,
-            arg(&args, "cwdFilter")?,
-            bool_arg(&args, "includeArchived")?,
-        )),
-        "stats_timeseries" => to_result_value(stats::stats_timeseries(
+        "stats_snapshot" => to_result_value(stats::stats_snapshot(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "codexDir")?,
             opt_string_arg(&args, "claudeDir")?,
@@ -428,37 +418,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             opt_i64_arg(&args, "fromTs")?,
             opt_i64_arg(&args, "toTs")?,
             string_arg(&args, "bucket")?,
-            arg(&args, "cwdFilter")?,
-            bool_arg(&args, "includeArchived")?,
-        )),
-        "stats_by_project" => to_result_value(stats::stats_by_project(
-            opt_string_arg(&args, "provider")?,
-            string_arg(&args, "codexDir")?,
-            opt_string_arg(&args, "claudeDir")?,
-            opt_string_arg(&args, "opencodeDir")?,
-            opt_i64_arg(&args, "fromTs")?,
-            opt_i64_arg(&args, "toTs")?,
-            usize_arg(&args, "limit")?,
-            arg(&args, "cwdFilter")?,
-            bool_arg(&args, "includeArchived")?,
-        )),
-        "stats_by_model" => to_result_value(stats::stats_by_model(
-            opt_string_arg(&args, "provider")?,
-            string_arg(&args, "codexDir")?,
-            opt_string_arg(&args, "claudeDir")?,
-            opt_string_arg(&args, "opencodeDir")?,
-            opt_i64_arg(&args, "fromTs")?,
-            opt_i64_arg(&args, "toTs")?,
-            arg(&args, "cwdFilter")?,
-            bool_arg(&args, "includeArchived")?,
-        )),
-        "stats_heatmap" => to_result_value(stats::stats_heatmap(
-            opt_string_arg(&args, "provider")?,
-            string_arg(&args, "codexDir")?,
-            opt_string_arg(&args, "claudeDir")?,
-            opt_string_arg(&args, "opencodeDir")?,
-            opt_i64_arg(&args, "fromTs")?,
-            opt_i64_arg(&args, "toTs")?,
+            usize_arg(&args, "projectLimit")?,
             arg(&args, "cwdFilter")?,
             bool_arg(&args, "includeArchived")?,
         )),
@@ -559,6 +519,16 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
                 &state.family_lock,
             ))
         }
+        "start_provider_sync" => to_result_value(crate::provider_sync::start_provider_sync(
+            string_arg(&args, "codexDir")?,
+            enum_arg::<SwitchStrategy>(&args, "strategy")?,
+            bool_arg(&args, "dryRun")?,
+            Arc::clone(&state.family_lock),
+        )),
+        "provider_sync_status" => to_result_value(crate::provider_sync::provider_sync_status(
+            arg::<u64>(&args, "jobId")?,
+        )),
+        "active_provider_sync" => to_result_value(crate::provider_sync::active_provider_sync()),
         "rollback_family_active" => to_result_value(repair::rollback_family_active_with_lock(
             string_arg(&args, "codexDir")?,
             string_arg(&args, "familyId")?,

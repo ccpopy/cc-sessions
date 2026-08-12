@@ -31,7 +31,6 @@ function manualChunks(id: string): string | undefined {
     normalized.includes("/@radix-ui/") ||
     normalized.includes("/aria-hidden/") ||
     normalized.includes("/lucide-react/") ||
-    normalized.includes("/cmdk/") ||
     normalized.includes("/class-variance-authority/") ||
     normalized.includes("/clsx/") ||
     normalized.includes("/react-remove-scroll") ||

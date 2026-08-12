@@ -115,19 +115,17 @@ export function StatsDashboard() {
     setLoading(true);
     void (async () => {
       try {
-        const [k, t, p, m, h] = await Promise.all([
-          api.statsKpi(common),
-          api.statsTimeseries({ ...common, bucket }),
-          api.statsByProject({ ...common, limit: 10 }),
-          api.statsByModel(common),
-          api.statsHeatmap(common),
-        ]);
+        const snapshot = await api.statsSnapshot({
+          ...common,
+          bucket,
+          project_limit: 10,
+        });
         if (cancelled) return;
-        setKpi(k);
-        setTs(t);
-        setByProject(p);
-        setByModel(m);
-        setHeat(h);
+        setKpi(snapshot.kpi);
+        setTs(snapshot.timeseries);
+        setByProject(snapshot.by_project);
+        setByModel(snapshot.by_model);
+        setHeat(snapshot.heatmap);
       } catch (error) {
         if (!cancelled) setError(String((error as Error)?.message ?? error));
       } finally {

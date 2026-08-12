@@ -24,6 +24,7 @@ pub mod opencode_transfer;
 pub mod path_safety;
 pub mod paths;
 pub mod provenance;
+pub mod provider_sync;
 pub mod repair;
 pub mod rollout;
 pub mod sessions;
@@ -111,11 +112,7 @@ pub fn run() {
             commands::restore_all,
             commands::delete_backup,
             commands::verify_backup,
-            commands::stats_kpi,
-            commands::stats_timeseries,
-            commands::stats_by_project,
-            commands::stats_by_model,
-            commands::stats_heatmap,
+            commands::stats_snapshot,
             commands::read_preview_image,
             commands::get_provider_info,
             commands::diagnose_project_configs,
@@ -134,6 +131,9 @@ pub fn run() {
             commands::duplicate_session,
             commands::get_provider_sync_plan,
             commands::batch_clone_for_current_provider,
+            commands::start_provider_sync,
+            commands::provider_sync_status,
+            commands::active_provider_sync,
             commands::rollback_family_active,
             commands::delete_family_branch,
             commands::get_family_branch_sync_states,

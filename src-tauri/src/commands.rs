@@ -640,6 +640,26 @@ pub async fn batch_clone_for_current_provider(
 }
 
 #[tauri::command]
+pub fn start_provider_sync(
+    codex_dir: String,
+    strategy: SwitchStrategy,
+    dry_run: bool,
+    lock: SharedLock<'_>,
+) -> AppResult<ProviderSyncStart> {
+    crate::provider_sync::start_provider_sync(codex_dir, strategy, dry_run, lock.inner().clone())
+}
+
+#[tauri::command]
+pub fn provider_sync_status(job_id: u64) -> AppResult<ProviderSyncStatus> {
+    crate::provider_sync::provider_sync_status(job_id)
+}
+
+#[tauri::command]
+pub fn active_provider_sync() -> AppResult<Option<ProviderSyncStart>> {
+    crate::provider_sync::active_provider_sync()
+}
+
+#[tauri::command]
 pub async fn rollback_family_active(
     codex_dir: String,
     family_id: String,
@@ -1017,33 +1037,7 @@ pub async fn move_session_cwd(
 }
 
 #[tauri::command]
-pub async fn stats_kpi(
-    provider: Option<String>,
-    codex_dir: String,
-    claude_dir: Option<String>,
-    opencode_dir: Option<String>,
-    from_ts: Option<i64>,
-    to_ts: Option<i64>,
-    cwd_filter: Vec<String>,
-    include_archived: bool,
-) -> AppResult<Kpi> {
-    run_blocking(move || {
-        crate::stats::stats_kpi(
-            provider,
-            codex_dir,
-            claude_dir,
-            opencode_dir,
-            from_ts,
-            to_ts,
-            cwd_filter,
-            include_archived,
-        )
-    })
-    .await
-}
-
-#[tauri::command]
-pub async fn stats_timeseries(
+pub async fn stats_snapshot(
     provider: Option<String>,
     codex_dir: String,
     claude_dir: Option<String>,
@@ -1051,11 +1045,12 @@ pub async fn stats_timeseries(
     from_ts: Option<i64>,
     to_ts: Option<i64>,
     bucket: String,
+    project_limit: usize,
     cwd_filter: Vec<String>,
     include_archived: bool,
-) -> AppResult<Vec<TimeseriesPoint>> {
+) -> AppResult<StatsSnapshot> {
     run_blocking(move || {
-        crate::stats::stats_timeseries(
+        crate::stats::stats_snapshot(
             provider,
             codex_dir,
             claude_dir,
@@ -1063,86 +1058,7 @@ pub async fn stats_timeseries(
             from_ts,
             to_ts,
             bucket,
-            cwd_filter,
-            include_archived,
-        )
-    })
-    .await
-}
-
-#[tauri::command]
-pub async fn stats_by_project(
-    provider: Option<String>,
-    codex_dir: String,
-    claude_dir: Option<String>,
-    opencode_dir: Option<String>,
-    from_ts: Option<i64>,
-    to_ts: Option<i64>,
-    limit: usize,
-    cwd_filter: Vec<String>,
-    include_archived: bool,
-) -> AppResult<Vec<ProjectStat>> {
-    run_blocking(move || {
-        crate::stats::stats_by_project(
-            provider,
-            codex_dir,
-            claude_dir,
-            opencode_dir,
-            from_ts,
-            to_ts,
-            limit,
-            cwd_filter,
-            include_archived,
-        )
-    })
-    .await
-}
-
-#[tauri::command]
-pub async fn stats_by_model(
-    provider: Option<String>,
-    codex_dir: String,
-    claude_dir: Option<String>,
-    opencode_dir: Option<String>,
-    from_ts: Option<i64>,
-    to_ts: Option<i64>,
-    cwd_filter: Vec<String>,
-    include_archived: bool,
-) -> AppResult<Vec<ModelStat>> {
-    run_blocking(move || {
-        crate::stats::stats_by_model(
-            provider,
-            codex_dir,
-            claude_dir,
-            opencode_dir,
-            from_ts,
-            to_ts,
-            cwd_filter,
-            include_archived,
-        )
-    })
-    .await
-}
-
-#[tauri::command]
-pub async fn stats_heatmap(
-    provider: Option<String>,
-    codex_dir: String,
-    claude_dir: Option<String>,
-    opencode_dir: Option<String>,
-    from_ts: Option<i64>,
-    to_ts: Option<i64>,
-    cwd_filter: Vec<String>,
-    include_archived: bool,
-) -> AppResult<Vec<Vec<u32>>> {
-    run_blocking(move || {
-        crate::stats::stats_heatmap(
-            provider,
-            codex_dir,
-            claude_dir,
-            opencode_dir,
-            from_ts,
-            to_ts,
+            project_limit,
             cwd_filter,
             include_archived,
         )

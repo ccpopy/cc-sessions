@@ -1,5 +1,5 @@
-import type { SessionSummary } from "@/lib/api";
-import { stripVerbatim } from "@/lib/cwd";
+import type { SessionSummary } from "./api.ts";
+import { stripVerbatim } from "./cwd.ts";
 
 function normalizedIdentityPath(path: string): string {
   const stripped = stripVerbatim(path.trim());
