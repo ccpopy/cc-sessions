@@ -43,11 +43,8 @@ function manualChunks(id: string): string | undefined {
   }
 
   if (
-    normalized.includes("/recharts/") ||
-    normalized.includes("/d3-") ||
-    normalized.includes("/victory-vendor/") ||
-    normalized.includes("/react-smooth/") ||
-    normalized.includes("/react-transition-group/")
+    normalized.includes("/echarts/") ||
+    normalized.includes("/zrender/")
   ) {
     return "vendor-charts";
   }

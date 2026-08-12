@@ -1,7 +1,7 @@
 {
   "name": "cc-session-manager",
   "private": true,
-  "version": "0.5.4",
+  "version": "0.5.5",
   "type": "module",
   "engines": {
     "node": ">=20"
@@ -51,13 +51,13 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "date-fns": "^4.1.0",
+    "echarts": "^6.1.0",
     "lucide-react": "^0.469.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-json-view-lite": "^2.1.0",
     "react-markdown": "^9.0.3",
     "react-router-dom": "^7.18.2",
-    "recharts": "^2.15.0",
     "remark-gfm": "^4.0.0",
     "sonner": "^1.7.1",
     "tailwind-merge": "^2.5.5",

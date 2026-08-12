@@ -5,6 +5,7 @@ import {
   BarChart3,
   Bot,
   Braces,
+  Check,
   ChevronDown,
   MessageSquare,
   NotebookText,
@@ -22,8 +23,6 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
@@ -151,29 +150,41 @@ export function Sidebar() {
             <DropdownMenuTrigger asChild>
               <Button
                 variant="outline"
-                className="group/provider h-11 w-full justify-start gap-2.5 rounded-lg border-border/70 bg-muted/30 px-2.5 text-left shadow-[inset_0_1px_0_0_hsl(var(--background)/0.55)] hover:bg-muted/50"
+                className="group/provider h-10 w-full justify-start gap-2.5 rounded-lg border-border/60 bg-card px-2 text-left shadow-[0_1px_2px_hsl(var(--foreground)/0.05)] transition-colors hover:border-border hover:bg-muted/40 data-[state=open]:border-border data-[state=open]:bg-muted/40"
               >
                 <ProviderMark provider={provider} />
-                <span className="min-w-0 flex-1 truncate text-xs font-semibold text-foreground">
+                <span className="min-w-0 flex-1 truncate text-[13px] font-semibold text-foreground">
                   {provider.label}
                 </span>
-                <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform group-data-[state=open]/provider:rotate-180" />
+                <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground/70 transition-transform duration-200 group-data-[state=open]/provider:rotate-180" />
               </Button>
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="start" className="w-[calc(14rem-1.25rem)]">
-              <DropdownMenuLabel className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">切换 Agent</DropdownMenuLabel>
-              <DropdownMenuSeparator />
-              {providers.map((item) => (
-                <DropdownMenuItem
-                  key={item.id}
-                  onSelect={() => switchProvider(item)}
-                  className="gap-2.5 py-2"
-                >
-                  <ProviderMark provider={item} compact />
-                  <span className="min-w-0 flex-1 truncate text-xs font-medium">{item.label}</span>
-                  {item.id === provider.id && <span className={cn("h-1.5 w-1.5 rounded-full", accentDot[item.id])} />}
-                </DropdownMenuItem>
-              ))}
+            <DropdownMenuContent
+              align="start"
+              sideOffset={6}
+              className="w-[var(--radix-dropdown-menu-trigger-width)] min-w-0 rounded-lg p-1"
+            >
+              {providers.map((item) => {
+                const isActive = item.id === provider.id;
+                return (
+                  <DropdownMenuItem
+                    key={item.id}
+                    onSelect={() => switchProvider(item)}
+                    className={cn("gap-2.5 rounded-md p-1.5", isActive && accentActiveTint[item.id])}
+                  >
+                    <ProviderMark provider={item} />
+                    <span
+                      className={cn(
+                        "min-w-0 flex-1 truncate text-[13px]",
+                        isActive ? "font-semibold text-foreground" : "font-medium",
+                      )}
+                    >
+                      {item.label}
+                    </span>
+                    {isActive && <Check className={cn("h-3.5 w-3.5 shrink-0", accentActiveIcon[item.id])} />}
+                  </DropdownMenuItem>
+                );
+              })}
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
@@ -204,18 +215,16 @@ export function Sidebar() {
   );
 }
 
-function ProviderMark({ provider, compact = false }: { provider: ProviderDefinition; compact?: boolean }) {
+function ProviderMark({ provider }: { provider: ProviderDefinition }) {
   const Icon = provider.icon;
   return (
     <span
       className={cn(
-        "relative flex shrink-0 items-center justify-center rounded-md border bg-background/80",
-        compact ? "h-7 w-7" : "h-8 w-8",
+        "flex h-7 w-7 shrink-0 items-center justify-center rounded-md",
         accentMark[provider.id],
       )}
     >
-      <span className={cn("absolute bottom-0.5 right-0.5 h-1 w-1 rounded-full", accentDot[provider.id])} />
-      <Icon className={compact ? "h-3.5 w-3.5" : "h-4 w-4"} />
+      <Icon className="h-4 w-4" />
     </span>
   );
 }

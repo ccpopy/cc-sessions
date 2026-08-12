@@ -61,11 +61,11 @@ export const accentActiveTint: Record<AccentKey, string> = {
   global: "bg-sidebar-accent ring-1 ring-inset ring-border/60",
 };
 
-/** 方形 Agent 标记（侧栏切换器）。 */
+/** 方形 Agent 标记（侧栏切换器）：品牌色淡底 + 内描边 + 同色图标。 */
 export const accentMark: Record<SessionProvider, string> = {
-  codex: "border-provider-codex/25 text-provider-codex-fg",
-  claude: "border-provider-claude/25 text-provider-claude-fg",
-  opencode: "border-provider-opencode/25 text-provider-opencode-fg",
+  codex: "bg-provider-codex/10 text-provider-codex-fg ring-1 ring-inset ring-provider-codex/25",
+  claude: "bg-provider-claude/10 text-provider-claude-fg ring-1 ring-inset ring-provider-claude/25",
+  opencode: "bg-provider-opencode/10 text-provider-opencode-fg ring-1 ring-inset ring-provider-opencode/25",
 };
 
 /** 会话卡片上的 provider 徽章。 */
