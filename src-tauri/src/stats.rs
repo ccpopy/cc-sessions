@@ -674,6 +674,7 @@ mod tests {
                     sha256: None,
                     line_count: None,
                     note: None,
+                    archive_origin: None,
                 },
                 FamilyBranch {
                     id: "codex-2".to_string(),
@@ -684,6 +685,7 @@ mod tests {
                     sha256: None,
                     line_count: None,
                     note: None,
+                    archive_origin: None,
                 },
             ],
             active_id: "codex-2".to_string(),

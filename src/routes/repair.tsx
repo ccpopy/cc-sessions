@@ -95,6 +95,7 @@ function CodexRepairRoute() {
   const [running, setRunning] = useState<string | null>(null);
   const [providerSyncProgress, setProviderSyncProgress] = useState<ProviderSyncStatus | null>(null);
   const [dryRun, setDryRun] = useState(false);
+  const providerSyncRunning = running === "clone" || running === "clone_do";
   const expectedThreadsCount =
     diag == null ? null : diag.rollout_count + diag.archived_rollout_count;
   const threadsStatHint =
@@ -700,7 +701,11 @@ function CodexRepairRoute() {
                     </Tooltip>
                     <span className="text-xs text-muted-foreground">
                       {providerSyncProgress
-                        ? `正在处理 ${providerSyncProgress.completed}/${providerSyncProgress.total || diag?.provider_mismatched_families || 0}`
+                        ? providerSyncProgress.total > 0
+                          ? `正在处理 ${providerSyncProgress.completed}/${providerSyncProgress.total}`
+                          : "正在扫描需要同步的会话…"
+                        : providerSyncRunning
+                          ? "正在准备同步…"
                         : dryRun
                           ? "当前：效果预览（不写入）"
                           : "当前：实际执行（会写入磁盘）"}

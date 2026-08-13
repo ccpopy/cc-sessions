@@ -19,11 +19,10 @@
 //! zip 打包：压缩传入的单会话 bundle 目录或批次目录（跨机器：解压后 import_bundles 即可）。
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
 
 use rusqlite::{params, OptionalExtension};
 use serde_json::Value;
@@ -34,7 +33,7 @@ use crate::error::{AppError, AppResult};
 use crate::family;
 use crate::models::{
     BundleExportTarget, BundleListItem, BundleManifest, ExportReport, ImportMode, ImportReport,
-    ManifestArtifact, ProjectPathMapping, SessionSummary, ZipReport,
+    ManifestArtifact, ProjectPathMapping, SessionSummary,
 };
 use crate::paths;
 use crate::state_db;
@@ -49,7 +48,113 @@ const DEFAULT_MEMORY_MODE: &str = "enabled";
 
 static CLAUDE_SNAPSHOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static BUNDLE_EXPORT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static ZIP_STAGE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+mod zip_archive;
+
+#[cfg(test)]
+use zip_archive::{crc32, CentralEntry};
+pub use zip_archive::{pack_bundles_zip, unpack_zip, unpack_zip_to_temp};
+
+#[cfg(test)]
+#[derive(Debug)]
+enum BundleImportTestFaultAction {
+    Error,
+    ReplaceAndError { path: PathBuf, contents: Vec<u8> },
+    Replace { path: PathBuf, contents: Vec<u8> },
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct BundleImportTestFault {
+    stage: &'static str,
+    action: BundleImportTestFaultAction,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static BUNDLE_IMPORT_TEST_FAULT: std::cell::RefCell<Option<BundleImportTestFault>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+struct BundleImportTestFaultGuard;
+
+#[cfg(test)]
+impl BundleImportTestFaultGuard {
+    fn error(stage: &'static str) -> Self {
+        BUNDLE_IMPORT_TEST_FAULT.with(|fault| {
+            *fault.borrow_mut() = Some(BundleImportTestFault {
+                stage,
+                action: BundleImportTestFaultAction::Error,
+            });
+        });
+        Self
+    }
+
+    fn replace_and_error(stage: &'static str, path: PathBuf, contents: Vec<u8>) -> Self {
+        BUNDLE_IMPORT_TEST_FAULT.with(|fault| {
+            *fault.borrow_mut() = Some(BundleImportTestFault {
+                stage,
+                action: BundleImportTestFaultAction::ReplaceAndError { path, contents },
+            });
+        });
+        Self
+    }
+
+    fn replace(stage: &'static str, path: PathBuf, contents: Vec<u8>) -> Self {
+        BUNDLE_IMPORT_TEST_FAULT.with(|fault| {
+            *fault.borrow_mut() = Some(BundleImportTestFault {
+                stage,
+                action: BundleImportTestFaultAction::Replace { path, contents },
+            });
+        });
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for BundleImportTestFaultGuard {
+    fn drop(&mut self) {
+        BUNDLE_IMPORT_TEST_FAULT.with(|fault| *fault.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+fn inject_bundle_import_fault(stage: &'static str) -> AppResult<()> {
+    let fault = BUNDLE_IMPORT_TEST_FAULT.with(|fault| {
+        let mut fault = fault.borrow_mut();
+        if fault.as_ref().is_some_and(|fault| fault.stage == stage) {
+            fault.take()
+        } else {
+            None
+        }
+    });
+    let Some(fault) = fault else {
+        return Ok(());
+    };
+    match fault.action {
+        BundleImportTestFaultAction::Error => {
+            Err(AppError::Other(format!("Bundle 导入测试故障: {stage}")))
+        }
+        BundleImportTestFaultAction::ReplaceAndError { path, contents } => {
+            fs::write(&path, contents)?;
+            Err(AppError::Other(format!(
+                "Bundle 导入测试并发写入故障: {stage}: {}",
+                path.to_string_lossy()
+            )))
+        }
+        BundleImportTestFaultAction::Replace { path, contents } => {
+            fs::write(path, contents)?;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn inject_bundle_import_fault(_stage: &'static str) -> AppResult<()> {
+    Ok(())
+}
 
 struct RolloutSource {
     abs: PathBuf,
@@ -663,10 +768,14 @@ fn export_one(
         .get("payload")
         .cloned()
         .unwrap_or(Value::Null);
-    let cwd = payload
-        .get("cwd")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
+    let rollout_cwd =
+        crate::codex_rollout_cwd::read_effective_cwd(&rollout_source.abs, id)?.unwrap_or_default();
+    // Desktop can move a thread to a project before Core persists the pending cwd back to the
+    // rollout. Preserve that current user-visible destination in the portable manifest.
+    let assignment_cwd = crate::codex_projects::pending_thread_project_assignment_cwd(codex, id)?;
+    let cwd = assignment_cwd
+        .as_deref()
+        .unwrap_or(rollout_cwd.as_str())
         .to_string();
     let originator = payload
         .get("originator")
@@ -706,7 +815,18 @@ fn export_one(
     if let Some(p) = codex_sub.parent() {
         fs::create_dir_all(p)?;
     }
-    fs::copy(&rollout_source.abs, &codex_sub)?;
+    let export_core_cwd = match assignment_cwd.as_deref() {
+        Some(assignment_cwd) => Some(codex_import_cwds(codex, assignment_cwd)?.0),
+        None if !rollout_cwd.trim().is_empty() => Some(rollout_cwd.clone()),
+        None => None,
+    };
+    copy_codex_rollout_with_cwd(
+        &rollout_source.abs,
+        &codex_sub,
+        id,
+        export_core_cwd.as_deref(),
+        None,
+    )?;
     let sha = sha256_file(&codex_sub)?;
     let line_count = count_jsonl_lines(&codex_sub)?;
 
@@ -1812,6 +1932,7 @@ fn import_one_claude(
     } else {
         report.verified = artifacts_verified;
     }
+    inject_bundle_import_fault("after_claude_source_hash")?;
 
     let source_rel = item
         .manifest
@@ -1917,7 +2038,7 @@ fn import_one_claude(
         companions_src.as_deref(),
         tasks_src.as_deref(),
         &tasks_dest,
-        source_sha_verified.then_some(item.manifest.sha256_rollout.as_str()),
+        Some(actual.as_str()),
     )?;
     report.rollout_written = true;
 
@@ -2804,6 +2925,9 @@ fn import_one(
         verified: false,
         sha_mismatch: false,
     };
+    if make_visible {
+        crate::codex_projects::ensure_desktop_not_running(codex)?;
+    }
 
     // 1) 找源文件
     let rel = validate_codex_bundle_rollout_relpath(
@@ -2874,6 +2998,7 @@ fn import_one(
     } else {
         report.verified = artifacts_verified;
     }
+    inject_bundle_import_fault("after_codex_source_hash")?;
 
     // 3) 目标路径决策
     let dest_abs = codex.join(&rel);
@@ -2885,86 +3010,334 @@ fn import_one(
         "Codex bundle 导入目标",
     )?;
     let mapped_cwd = mapped_project_cwd(&item.manifest, project_mappings);
+    let rollout_cwd =
+        crate::codex_rollout_cwd::read_effective_cwd(&src_file, &item.manifest.session_id)?
+            .unwrap_or_default();
     if dest_abs.is_file() {
-        match mode {
-            ImportMode::Skip => {
-                report.skipped_reason = Some("本地已存在，Skip 模式".into());
-                report.ok = true;
-                let hist_src = PathBuf::from(&item.bundle_dir).join("history.jsonl");
-                report.history_appended =
-                    append_history(codex, &hist_src, &item.manifest.session_id)?;
-                return Ok(report);
-            }
-            ImportMode::KeepLocal => {
-                if let Some(reason) = keep_local_reason(&dest_abs, &src_file)? {
-                    report.skipped_reason = Some(reason);
-                    report.ok = true;
-                    // 仍然尝试补 history
-                    let hist_src = PathBuf::from(&item.bundle_dir).join("history.jsonl");
-                    if hist_src.is_file() {
-                        report.history_appended =
-                            append_history(codex, &hist_src, &item.manifest.session_id)?;
+        let skipped_reason = match mode {
+            ImportMode::Skip => Some("本地已存在，Skip 模式".to_string()),
+            ImportMode::KeepLocal => keep_local_reason(&dest_abs, &src_file)?,
+            ImportMode::Overwrite => None,
+        };
+        if let Some(reason) = skipped_reason {
+            report.skipped_reason = Some(reason);
+            let local_cwd = if make_visible {
+                match existing_codex_rollout_cwd(&dest_abs, &item.manifest.session_id) {
+                    Ok(cwd) => {
+                        let desktop_cwd = paths::host_path_string_from_codex_record(codex, &cwd);
+                        if let Err(error) =
+                            crate::codex_projects::validate_thread_project_assignment(
+                                codex,
+                                &item.manifest.session_id,
+                                &desktop_cwd,
+                            )
+                        {
+                            report.error = Some(format!(
+                                "本地 rollout 已保留，但 Codex 项目归属预检失败: {error}"
+                            ));
+                            return Ok(report);
+                        }
+                        Some(cwd)
                     }
+                    Err(error) => {
+                        report.error = Some(format!(
+                            "本地 rollout 已保留，但读取当前工作目录失败: {error}"
+                        ));
+                        return Ok(report);
+                    }
+                }
+            } else {
+                None
+            };
+            let hist_src = PathBuf::from(&item.bundle_dir).join("history.jsonl");
+            let mutation = run_codex_import_atomic(codex, |state, has_state_db, journal| {
+                let history_appended = if hist_src.is_file() {
+                    let history_path = paths::history_path(codex);
+                    journal.mutate_file(&history_path, || {
+                        append_history(codex, &hist_src, &item.manifest.session_id)
+                    })?
+                } else {
+                    0
+                };
+                let (threads_upserted, index_appended) = if make_visible {
+                    let local_cwd = local_cwd.as_deref().unwrap_or_default();
+                    ensure_codex_import_visible(
+                        codex,
+                        state,
+                        has_state_db,
+                        journal,
+                        &item.manifest,
+                        &dest_abs,
+                        local_cwd,
+                        false,
+                    )?
+                } else {
+                    (false, false)
+                };
+                Ok(CodexImportMutationOutcome {
+                    rollout_written: false,
+                    history_appended,
+                    threads_upserted,
+                    index_appended,
+                })
+            });
+            let outcome = match mutation {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    report.error = Some(format!(
+                        "本地 rollout 已保留，但 Codex 可见性修复未完整成功: {error}"
+                    ));
                     return Ok(report);
                 }
-            }
-            ImportMode::Overwrite => {}
+            };
+            report.rollout_written = outcome.rollout_written;
+            report.history_appended = outcome.history_appended;
+            report.threads_upserted = outcome.threads_upserted;
+            report.index_appended = outcome.index_appended;
+            report.ok = true;
+            return Ok(report);
         }
     }
-
-    // 4) 拷 rollout
-    if let Some(parent) = dest_abs.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    copy_codex_rollout_with_cwd(
-        &src_file,
-        &dest_abs,
-        mapped_cwd,
-        source_sha_verified.then_some(item.manifest.sha256_rollout.as_str()),
-    )?;
-    report.rollout_written = true;
-
-    // 5) 追加 history
-    let hist_src = PathBuf::from(&item.bundle_dir).join("history.jsonl");
-    if hist_src.is_file() {
-        match append_history(codex, &hist_src, &item.manifest.session_id) {
-            Ok(appended) => report.history_appended = appended,
-            Err(error) => {
-                report.error = Some(format!("rollout 已写入，但 history 追加失败: {error}"));
-                return Ok(report);
-            }
+    let requested_cwd = mapped_cwd.unwrap_or_else(|| {
+        let manifest_cwd = item.manifest.session_cwd.trim();
+        if manifest_cwd.is_empty() {
+            rollout_cwd.as_str()
+        } else {
+            manifest_cwd
         }
-    }
-
-    // 6) 若需 make_visible，则 upsert threads + 追加 session_index
+    });
+    let (import_cwd, _) = codex_import_cwds(codex, requested_cwd)?;
     if make_visible {
-        if paths::state_db_path(codex).is_file() {
-            let import_cwd = mapped_cwd.unwrap_or(item.manifest.session_cwd.as_str());
-            if let Err(e) = upsert_threads_minimal(codex, &item.manifest, &dest_abs, import_cwd) {
-                report.error = Some(format!("threads upsert 失败: {}", e));
-                return Ok(report);
-            } else {
-                report.threads_upserted = true;
-            }
-        }
-        match upsert_bundle_index_line(codex, &item.manifest) {
-            Ok(appended) => report.index_appended = appended,
-            Err(error) => {
-                report.error = Some(format!(
-                    "rollout{}已写入，但 session_index 更新失败: {error}",
-                    if report.threads_upserted {
-                        " 与 threads "
-                    } else {
-                        " "
-                    }
-                ));
-                return Ok(report);
-            }
+        let desktop_cwd = paths::host_path_string_from_codex_record(codex, &import_cwd);
+        if let Err(error) = crate::codex_projects::validate_thread_project_assignment(
+            codex,
+            &item.manifest.session_id,
+            &desktop_cwd,
+        ) {
+            report.error = Some(format!("Codex 项目归属预检失败，未执行导入: {error}"));
+            return Ok(report);
         }
     }
 
-    report.ok = report.error.is_none();
+    let hist_src = PathBuf::from(&item.bundle_dir).join("history.jsonl");
+    let mutation = run_codex_import_atomic(codex, |state, has_state_db, journal| {
+        journal.mutate_file(&dest_abs, || {
+            copy_codex_rollout_with_cwd(
+                &src_file,
+                &dest_abs,
+                &item.manifest.session_id,
+                (!import_cwd.trim().is_empty()).then_some(import_cwd.as_str()),
+                Some(actual.as_str()),
+            )
+        })?;
+
+        let history_appended = if hist_src.is_file() {
+            let history_path = paths::history_path(codex);
+            journal.mutate_file(&history_path, || {
+                append_history(codex, &hist_src, &item.manifest.session_id)
+            })?
+        } else {
+            0
+        };
+
+        let (threads_upserted, index_appended) = if make_visible {
+            ensure_codex_import_visible(
+                codex,
+                state,
+                has_state_db,
+                journal,
+                &item.manifest,
+                &dest_abs,
+                &import_cwd,
+                true,
+            )?
+        } else {
+            (false, false)
+        };
+
+        Ok(CodexImportMutationOutcome {
+            rollout_written: true,
+            history_appended,
+            threads_upserted,
+            index_appended,
+        })
+    });
+    let outcome = match mutation {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            report.error = Some(format!("Codex Bundle 导入未完整成功: {error}"));
+            return Ok(report);
+        }
+    };
+    report.rollout_written = outcome.rollout_written;
+    report.history_appended = outcome.history_appended;
+    report.threads_upserted = outcome.threads_upserted;
+    report.index_appended = outcome.index_appended;
+    report.ok = true;
     Ok(report)
+}
+
+#[derive(Debug, Default)]
+struct CodexImportMutationOutcome {
+    rollout_written: bool,
+    history_appended: u32,
+    threads_upserted: bool,
+    index_appended: bool,
+}
+
+fn run_codex_import_atomic<T>(
+    codex: &Path,
+    operation: impl FnOnce(
+        &rusqlite::Connection,
+        bool,
+        &mut crate::mutation_journal::MutationJournal,
+    ) -> AppResult<T>,
+) -> AppResult<T> {
+    let has_state_db = paths::state_db_path(codex).is_file();
+    let state = if has_state_db {
+        state_db::open(codex)?
+    } else {
+        rusqlite::Connection::open_in_memory()?
+    };
+    let transaction =
+        rusqlite::Transaction::new_unchecked(&state, rusqlite::TransactionBehavior::Immediate)?;
+    let mut journal = crate::mutation_journal::MutationJournal::default();
+    let result = operation(&transaction, has_state_db, &mut journal);
+    match result {
+        Ok(value) => {
+            match crate::mutation_journal::commit_transaction_with_compensation(
+                transaction,
+                journal,
+            ) {
+                Ok(()) => Ok(value),
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(
+            crate::mutation_journal::rollback_transaction_with_compensation(
+                transaction,
+                journal,
+                error,
+            ),
+        ),
+    }
+}
+
+fn codex_import_cwds(codex: &Path, requested_cwd: &str) -> AppResult<(String, String)> {
+    let requested_cwd = requested_cwd.trim();
+    if requested_cwd.is_empty() {
+        return Ok((String::new(), String::new()));
+    }
+    if paths::is_wsl_unc_path(codex) {
+        let core_cwd = if requested_cwd.starts_with('/') {
+            paths::strip_verbatim(requested_cwd)
+        } else {
+            paths::codex_record_path_from_host(codex, Path::new(requested_cwd))?
+        };
+        let desktop_cwd = paths::host_path_string_from_codex_record(codex, &core_cwd);
+        return Ok((core_cwd, desktop_cwd));
+    }
+    let core_cwd = paths::strip_verbatim(requested_cwd);
+    let desktop_cwd = paths::host_path_string_from_codex_record(codex, &core_cwd);
+    Ok((core_cwd, desktop_cwd))
+}
+
+fn existing_codex_rollout_cwd(rollout: &Path, expected_id: &str) -> AppResult<String> {
+    crate::codex_rollout_cwd::read_effective_cwd(rollout, expected_id)?
+        .map(|cwd| paths::strip_verbatim(&cwd))
+        .ok_or_else(|| {
+            AppError::Other(format!(
+                "Codex rollout 缺少有效 cwd: {}",
+                rollout.to_string_lossy()
+            ))
+        })
+}
+
+fn ensure_codex_import_visible(
+    codex: &Path,
+    state: &rusqlite::Connection,
+    has_state_db: bool,
+    journal: &mut crate::mutation_journal::MutationJournal,
+    manifest: &BundleManifest,
+    rollout: &Path,
+    core_cwd: &str,
+    use_manifest_metadata: bool,
+) -> AppResult<(bool, bool)> {
+    let threads_upserted = if has_state_db {
+        if use_manifest_metadata {
+            upsert_threads_minimal_on_connection(state, manifest, rollout, core_cwd)?;
+        } else {
+            if !crate::repair::upsert_thread_from_rollout(codex, state, rollout, false)? {
+                return Err(AppError::InvalidCodexDir(format!(
+                    "rollout 缺少有效 session_meta.id，无法同步 threads: {}",
+                    rollout.to_string_lossy()
+                )));
+            }
+        }
+        true
+    } else {
+        false
+    };
+    let index_path = paths::session_index_path(codex);
+    let index_appended = journal.mutate_file(&index_path, || {
+        if use_manifest_metadata {
+            upsert_bundle_index_line(codex, manifest)
+        } else {
+            ensure_existing_codex_index_line(
+                codex,
+                has_state_db.then_some(state),
+                manifest,
+                rollout,
+            )
+        }
+    })?;
+    inject_bundle_import_fault("before_project_sync")?;
+    let desktop_cwd = paths::host_path_string_from_codex_record(codex, core_cwd);
+    if let Some(receipt) = crate::codex_projects::sync_thread_project_assignment_with_receipt(
+        codex,
+        &manifest.session_id,
+        &desktop_cwd,
+    )? {
+        journal.register_project_state_receipt(receipt);
+    }
+    inject_bundle_import_fault("after_project_sync")?;
+    Ok((threads_upserted, index_appended))
+}
+
+fn ensure_existing_codex_index_line(
+    codex: &Path,
+    state: Option<&rusqlite::Connection>,
+    manifest: &BundleManifest,
+    rollout: &Path,
+) -> AppResult<bool> {
+    if crate::repair::read_session_index_ids(codex)?.contains(&manifest.session_id) {
+        return Ok(false);
+    }
+    let thread_name = if let Some(state) = state {
+        let columns = crate::repair::threads_table_columns(&state)?;
+        let sql = if columns.iter().any(|column| column == "name") {
+            "SELECT COALESCE(NULLIF(TRIM(name),''), NULLIF(TRIM(title),''), \
+             COALESCE(first_user_message,'')) FROM threads WHERE id = ?"
+        } else {
+            "SELECT COALESCE(NULLIF(TRIM(title),''), COALESCE(first_user_message,'')) \
+             FROM threads WHERE id = ?"
+        };
+        state
+            .query_row(sql, [&manifest.session_id], |row| row.get::<_, String>(0))
+            .optional()?
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let thread_name = if thread_name.trim().is_empty() {
+        crate::repair::read_rollout_brief(codex, rollout)?
+            .map(|brief| brief.first_user_message)
+            .unwrap_or_default()
+    } else {
+        thread_name
+    };
+    crate::repair::append_index_line(codex, &manifest.session_id, &thread_name, rollout)?;
+    Ok(true)
 }
 
 fn validate_codex_bundle_rollout_relpath(raw: &str, session_id: &str) -> AppResult<PathBuf> {
@@ -3093,6 +3466,7 @@ fn verify_streamed_sha(
 fn copy_codex_rollout_with_cwd(
     src: &Path,
     dest: &Path,
+    session_id: &str,
     target_cwd: Option<&str>,
     expected_source_sha256: Option<&str>,
 ) -> AppResult<()> {
@@ -3114,57 +3488,13 @@ fn copy_codex_rollout_with_cwd(
     };
 
     replace_import_destination(dest, |target| {
-        let mut reader = BufReader::new(File::open(src)?);
-        let mut writer = BufWriter::new(target);
-        let mut hasher = Sha256::new();
-        let mut line = String::new();
-        let mut rewrote_meta = false;
-        loop {
-            line.clear();
-            let bytes = reader.read_line(&mut line)?;
-            if bytes == 0 {
-                break;
-            }
-            hasher.update(line.as_bytes());
-            let trimmed = line.trim_end_matches(['\r', '\n']);
-            if !rewrote_meta && !trimmed.trim().is_empty() {
-                let mut value: Value = serde_json::from_str(trimmed).map_err(|e| {
-                    AppError::Other(format!(
-                        "无法重写 Codex 项目路径，rollout 首个事件不是有效 JSON: {}: {}",
-                        src.to_string_lossy(),
-                        e
-                    ))
-                })?;
-                if value.get("type").and_then(Value::as_str) != Some("session_meta") {
-                    return Err(AppError::Other(format!(
-                        "无法重写 Codex 项目路径，rollout 首个事件不是 session_meta: {}",
-                        src.to_string_lossy()
-                    )));
-                }
-                let payload = value
-                    .get_mut("payload")
-                    .and_then(Value::as_object_mut)
-                    .ok_or_else(|| {
-                        AppError::Other(format!(
-                            "无法重写 Codex 项目路径，session_meta.payload 不是对象: {}",
-                            src.to_string_lossy()
-                        ))
-                    })?;
-                payload.insert("cwd".into(), Value::String(target_cwd.to_string()));
-                writeln!(writer, "{}", serde_json::to_string(&value)?)?;
-                rewrote_meta = true;
-            } else {
-                writer.write_all(line.as_bytes())?;
-            }
-        }
-        verify_streamed_sha(src, hasher, expected_source_sha256)?;
-        if !rewrote_meta {
-            return Err(AppError::Other(format!(
-                "无法重写 Codex 项目路径，rollout 没有有效 session_meta: {}",
-                src.to_string_lossy()
-            )));
-        }
-        writer.flush()?;
+        crate::codex_rollout_cwd::copy_with_effective_cwd(
+            src,
+            target,
+            session_id,
+            target_cwd,
+            expected_source_sha256,
+        )?;
         Ok(())
     })
 }
@@ -3231,13 +3561,12 @@ fn write_claude_jsonl_with_cwd(
     Ok(())
 }
 
-fn upsert_threads_minimal(
-    codex: &Path,
+fn upsert_threads_minimal_on_connection(
+    conn: &rusqlite::Connection,
     m: &BundleManifest,
     dest_abs: &Path,
     import_cwd: &str,
 ) -> AppResult<()> {
-    let conn = state_db::open(codex)?;
     let updated_at = m.updated_at;
     let source = m
         .session_source
@@ -3255,6 +3584,7 @@ fn upsert_threads_minimal(
             rollout_path=excluded.rollout_path,
             updated_at=excluded.updated_at,
             model_provider=excluded.model_provider,
+            cwd=excluded.cwd,
             title=excluded.title,
             first_user_message=excluded.first_user_message";
     conn.execute(
@@ -3732,6 +4062,40 @@ mod tests {
             ),
         )?;
         Ok(path)
+    }
+
+    fn write_test_codex_global_state(
+        codex: &Path,
+        id: &str,
+        old_cwd: &str,
+        target_cwd: &str,
+    ) -> AppResult<()> {
+        fs::create_dir_all(codex)?;
+        fs::write(
+            paths::codex_global_state_json_path(codex),
+            serde_json::to_vec(&serde_json::json!({
+                "local-projects": {
+                    "old-project": {
+                        "id": "old-project",
+                        "rootPaths": [old_cwd]
+                    },
+                    "target-project": {
+                        "id": "target-project",
+                        "rootPaths": [target_cwd]
+                    }
+                },
+                "thread-project-assignments": {
+                    id: {
+                        "projectKind": "local",
+                        "projectId": "old-project",
+                        "cwd": old_cwd,
+                        "pendingCoreUpdate": false
+                    }
+                },
+                "projectless-thread-ids": [id]
+            }))?,
+        )?;
+        Ok(())
     }
 
     #[test]
@@ -4719,15 +5083,71 @@ mod tests {
     }
 
     #[test]
-    fn imports_codex_bundle_with_seconds_timestamp() -> AppResult<()> {
+    fn imports_codex_bundle_updates_existing_thread_cwd_with_seconds_timestamp() -> AppResult<()> {
         let root = temp_dir("cc-session-manager-codex-bundle-time-test");
         let source_codex = root.join("source-codex");
         let import_codex = root.join("import-codex");
         let bundle_dir = root.join("bundles");
         let id = "codex-bundle-time";
         let updated_at = 1_777_777_777;
-        write_codex_session(&source_codex, id, updated_at)?;
-        create_bundle_state(&import_codex)?;
+        let source_rollout = write_codex_session(&source_codex, id, updated_at)?;
+        let mut source = fs::OpenOptions::new().append(true).open(&source_rollout)?;
+        writeln!(
+            source,
+            "{}",
+            serde_json::json!({
+                "timestamp": "2026-05-12T10:00:31Z",
+                "type": "turn_context",
+                "payload": {"cwd": r"F:\project\historical"}
+            })
+        )?;
+        writeln!(
+            source,
+            "{}",
+            serde_json::json!({
+                "timestamp": "2026-05-12T10:00:32Z",
+                "type": "turn_context",
+                "payload": {"cwd": r"F:\project\portable-context"}
+            })
+        )?;
+        drop(source);
+        let import_conn = create_bundle_state(&import_codex)?;
+        import_conn.execute(
+            "INSERT INTO threads (
+                id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+                sandbox_policy, approval_mode, memory_mode, archived, tokens_used, has_user_event,
+                first_user_message, cli_version
+            ) VALUES (?1, 'stale-rollout.jsonl', 1, 1, 'cli', 'openai',
+                'C:\\stale-project', 'Stale title', 'read-only', 'on-request', 'enabled',
+                0, 0, 1, 'Stale title', '')",
+            [id],
+        )?;
+        drop(import_conn);
+        fs::write(
+            paths::codex_global_state_json_path(&import_codex),
+            serde_json::to_vec(&serde_json::json!({
+                "local-projects": {
+                    "old-project": {
+                        "id": "old-project",
+                        "rootPaths": [r"C:\stale-project"]
+                    },
+                    "target-project": {
+                        "id": "target-project",
+                        "rootPaths": [r"D:\work\portable-context"]
+                    }
+                },
+                "thread-project-assignments": {
+                    id: {
+                        "projectKind": "local",
+                        "projectId": "old-project",
+                        "cwd": r"C:\stale-project",
+                        "pendingCoreUpdate": false
+                    }
+                },
+                "thread-workspace-root-hints": {id: r"C:\stale-project"},
+                "projectless-thread-ids": [id]
+            }))?,
+        )?;
 
         let reports = export_session_bundles(
             Some(PROVIDER_CODEX.to_string()),
@@ -4769,13 +5189,38 @@ mod tests {
             conn.query_row("SELECT cwd FROM threads WHERE id = ?1", [id], |r| r.get(0))?;
         assert_eq!(actual_cwd, r"D:\work\portable-context");
 
+        let global_state: Value = serde_json::from_slice(&fs::read(
+            paths::codex_global_state_json_path(&import_codex),
+        )?)?;
+        assert_eq!(
+            global_state["thread-project-assignments"][id],
+            serde_json::json!({
+                "projectKind": "local",
+                "projectId": "target-project",
+                "cwd": r"D:\work\portable-context",
+                "pendingCoreUpdate": false
+            })
+        );
+        assert_eq!(
+            global_state["local-projects"]["target-project"]["rootPaths"],
+            serde_json::json!([r"D:\work\portable-context"])
+        );
+        assert_eq!(global_state["project-order"][0], "target-project");
+        assert_eq!(
+            global_state["thread-workspace-root-hints"][id],
+            r"C:\stale-project"
+        );
+        assert!(global_state["projectless-thread-ids"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().all(|value| value.as_str() != Some(id))));
+
         let imported_rollout = import_codex
             .join("sessions")
             .join("2026")
             .join("05")
             .join("12")
             .join(format!("rollout-{id}.jsonl"));
-        let first_line = fs::read_to_string(imported_rollout)?
+        let first_line = fs::read_to_string(&imported_rollout)?
             .lines()
             .next()
             .unwrap()
@@ -4787,6 +5232,13 @@ mod tests {
                 .and_then(Value::as_str),
             Some(r"D:\work\portable-context")
         );
+        let turns = fs::read_to_string(&imported_rollout)?
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|value| value["type"] == "turn_context")
+            .collect::<Vec<_>>();
+        assert_eq!(turns[0]["payload"]["cwd"], r"F:\project\historical");
+        assert_eq!(turns[1]["payload"]["cwd"], r"D:\work\portable-context");
 
         let index_raw = fs::read_to_string(paths::session_index_path(&import_codex))?;
         let index_line: Value = serde_json::from_str(index_raw.lines().next().unwrap())?;
@@ -4796,6 +5248,715 @@ mod tests {
             Some(unix_seconds_to_rfc3339(updated_at)?.as_str())
         );
         assert!(index_line.get("rollout_path").is_none());
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn codex_import_rejects_malformed_project_state_before_writing_core() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-codex-bundle-project-preflight-test");
+        let source_codex = root.join("source-codex");
+        let import_codex = root.join("import-codex");
+        let bundle_dir = root.join("bundles");
+        let id = "codex-bundle-project-preflight";
+        let source_rollout = write_codex_session(&source_codex, id, 1_777_777_777)?;
+        let reports = export_session_bundles(
+            Some(PROVIDER_CODEX.to_string()),
+            source_codex.to_string_lossy().into_owned(),
+            None,
+            bundle_dir.to_string_lossy().into_owned(),
+            vec![id.to_string()],
+            None,
+            Some("test-machine".to_string()),
+            Some("default".to_string()),
+        )?;
+        assert!(reports[0].ok, "{:?}", reports[0].error);
+
+        let import_conn = create_bundle_state(&import_codex)?;
+        drop(import_conn);
+        fs::write(
+            paths::codex_global_state_json_path(&import_codex),
+            serde_json::to_vec(&serde_json::json!({"local-projects": []}))?,
+        )?;
+        let malformed_before = fs::read(paths::codex_global_state_json_path(&import_codex))?;
+
+        let imported = import_session_bundles(
+            Some(PROVIDER_CODEX.to_string()),
+            bundle_dir.to_string_lossy().into_owned(),
+            import_codex.to_string_lossy().into_owned(),
+            None,
+            ImportMode::Overwrite,
+            true,
+            true,
+            vec![],
+        )?;
+        assert_eq!(imported.len(), 1);
+        assert!(!imported[0].ok);
+        assert!(!imported[0].rollout_written);
+        assert!(!imported[0].threads_upserted);
+        assert!(!imported[0].index_appended);
+        assert_eq!(imported[0].history_appended, 0);
+        assert!(imported[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("项目归属预检失败"));
+        assert_eq!(
+            fs::read(paths::codex_global_state_json_path(&import_codex))?,
+            malformed_before
+        );
+        let manifest: BundleManifest = serde_json::from_slice(&fs::read(
+            PathBuf::from(reports[0].bundle_path.as_deref().unwrap()).join("manifest.json"),
+        )?)?;
+        let destination = import_codex.join(&manifest.rollout_relpath);
+        assert!(!destination.exists());
+        let state = state_db::open_ro(&import_codex)?;
+        let count: i64 =
+            state.query_row("SELECT COUNT(*) FROM threads WHERE id = ?", [id], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(count, 0);
+        assert_eq!(fs::read(source_rollout)?.len() > 0, true);
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn codex_import_while_desktop_running_preserves_every_target_store() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-codex-bundle-desktop-running-test");
+        let source_codex = root.join("source-codex");
+        let import_codex = root.join("import-codex");
+        let bundle_dir = root.join("bundles");
+        let id = "codex-bundle-desktop-running";
+        write_codex_session(&source_codex, id, 1_777_777_777)?;
+        let exported = export_session_bundles(
+            Some(PROVIDER_CODEX.to_string()),
+            source_codex.to_string_lossy().into_owned(),
+            None,
+            bundle_dir.to_string_lossy().into_owned(),
+            vec![id.to_string()],
+            None,
+            Some("test-machine".to_string()),
+            Some("default".to_string()),
+        )?;
+        assert!(exported[0].ok, "{:?}", exported[0].error);
+
+        let state = create_bundle_state(&import_codex)?;
+        state.execute(
+            "INSERT INTO threads (
+                id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+                sandbox_policy, approval_mode, memory_mode, archived, tokens_used, has_user_event,
+                first_user_message, cli_version
+            ) VALUES ('existing-thread', 'existing.jsonl', 1, 1, 'cli', 'openai',
+                'C:\\existing', 'Existing', 'read-only', 'on-request', 'enabled',
+                0, 0, 1, 'Existing', '')",
+            [],
+        )?;
+        drop(state);
+        write_test_codex_global_state(
+            &import_codex,
+            "existing-thread",
+            r"C:\existing",
+            r"F:\project\portable-context",
+        )?;
+
+        let manifest: BundleManifest = serde_json::from_slice(&fs::read(
+            PathBuf::from(exported[0].bundle_path.as_deref().unwrap()).join("manifest.json"),
+        )?)?;
+        let destination = import_codex.join(&manifest.rollout_relpath);
+        fs::create_dir_all(destination.parent().unwrap_or(&import_codex))?;
+        fs::write(
+            &destination,
+            b"local rollout must remain byte-for-byte unchanged\n",
+        )?;
+        let index_path = paths::session_index_path(&import_codex);
+        let history_path = paths::history_path(&import_codex);
+        let state_path = paths::state_db_path(&import_codex);
+        let global_state_path = paths::codex_global_state_json_path(&import_codex);
+        fs::write(&index_path, b"index-before\r\n")?;
+        fs::write(&history_path, b"history-before\r\n")?;
+
+        let rollout_before = fs::read(&destination)?;
+        let state_before = fs::read(&state_path)?;
+        let index_before = fs::read(&index_path)?;
+        let history_before = fs::read(&history_path)?;
+        let global_state_before = fs::read(&global_state_path)?;
+
+        let _desktop_running = crate::codex_projects::DesktopTestProbeGuard::running();
+        let imported = import_session_bundles(
+            Some(PROVIDER_CODEX.to_string()),
+            bundle_dir.to_string_lossy().into_owned(),
+            import_codex.to_string_lossy().into_owned(),
+            None,
+            ImportMode::Overwrite,
+            true,
+            true,
+            vec![],
+        )?;
+
+        assert_eq!(imported.len(), 1);
+        assert!(!imported[0].ok);
+        assert!(!imported[0].rollout_written);
+        assert!(!imported[0].threads_upserted);
+        assert!(!imported[0].index_appended);
+        assert_eq!(imported[0].history_appended, 0);
+        let error = imported[0].error.as_deref().unwrap_or_default();
+        assert!(error.contains("Codex/ChatGPT 桌面应用正在运行"), "{error}");
+        assert!(
+            error.contains("请完全退出桌面应用（包括后台进程）后重试"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&destination)?, rollout_before);
+        assert_eq!(fs::read(&state_path)?, state_before);
+        assert_eq!(fs::read(&index_path)?, index_before);
+        assert_eq!(fs::read(&history_path)?, history_before);
+        assert_eq!(fs::read(&global_state_path)?, global_state_before);
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn codex_import_rolls_back_core_when_final_project_sync_fails() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-codex-bundle-project-sync-rollback-test");
+        let source_codex = root.join("source-codex");
+        let import_codex = root.join("import-codex");
+        let bundle_dir = root.join("bundles");
+        let id = "codex-bundle-project-sync-rollback";
+        write_codex_session(&source_codex, id, 1_777_777_777)?;
+        fs::write(
+            paths::history_path(&source_codex),
+            format!(
+                "{}\n",
+                serde_json::to_string(&serde_json::json!({
+                    "session_id": id,
+                    "text": "bundle history"
+                }))?
+            ),
+        )?;
+        let exported = export_session_bundles(
+            Some(PROVIDER_CODEX.to_string()),
+            source_codex.to_string_lossy().into_owned(),
+            None,
+            bundle_dir.to_string_lossy().into_owned(),
+            vec![id.to_string()],
+            None,
+            Some("test-machine".to_string()),
+            Some("default".to_string()),
+        )?;
+        assert!(exported[0].ok, "{:?}", exported[0].error);
+
+        let state = create_bundle_state(&import_codex)?;
+        drop(state);
+        write_test_codex_global_state(
+            &import_codex,
+            id,
+            r"C:\old-project",
+            r"F:\project\portable-context",
+        )?;
+        let history_path = paths::history_path(&import_codex);
+        let index_path = paths::session_index_path(&import_codex);
+        fs::write(&history_path, b"history-before\r\n")?;
+        fs::write(&index_path, b"index-before\r\n")?;
+        let history_before = fs::read(&history_path)?;
+        let index_before = fs::read(&index_path)?;
+        let project_state_before = fs::read(paths::codex_global_state_json_path(&import_codex))?;
+
+        let manifest: BundleManifest = serde_json::from_slice(&fs::read(
+            PathBuf::from(exported[0].bundle_path.as_deref().unwrap()).join("manifest.json"),
+        )?)?;
+        let destination = import_codex.join(&manifest.rollout_relpath);
+        assert!(!destination.exists());
+
+        let _fault = BundleImportTestFaultGuard::error("before_project_sync");
+        let imported = import_session_bundles(
+            Some(PROVIDER_CODEX.to_string()),
+            bundle_dir.to_string_lossy().into_owned(),
+            import_codex.to_string_lossy().into_owned(),
+            None,
+            ImportMode::Overwrite,
+            true,
+            true,
+            vec![],
+        )?;
+        assert_eq!(imported.len(), 1);
+        assert!(!imported[0].ok);
+        assert!(!imported[0].rollout_written);
+        assert_eq!(imported[0].history_appended, 0);
+        assert!(!imported[0].threads_upserted);
+        assert!(!imported[0].index_appended);
+        assert!(imported[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("before_project_sync"));
+
+        assert!(!destination.exists());
+        assert_eq!(fs::read(&history_path)?, history_before);
+        assert_eq!(fs::read(&index_path)?, index_before);
+        assert_eq!(
+            fs::read(paths::codex_global_state_json_path(&import_codex))?,
+            project_state_before
+        );
+        let state = state_db::open_ro(&import_codex)?;
+        let thread_count: i64 =
+            state.query_row("SELECT COUNT(*) FROM threads WHERE id = ?", [id], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(thread_count, 0);
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn non_strict_codex_import_rejects_source_changed_after_hashing() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-codex-nonstrict-source-race-test");
+        let source_codex = root.join("source-codex");
+        let import_codex = root.join("import-codex");
+        let bundle_dir = root.join("bundles");
+        fs::create_dir_all(&import_codex)?;
+        let id = "codex-nonstrict-source-race";
+        write_codex_session(&source_codex, id, 1_777_777_777)?;
+        let exported = export_session_bundles(
+            Some(PROVIDER_CODEX.to_string()),
+            source_codex.to_string_lossy().into_owned(),
+            None,
+            bundle_dir.to_string_lossy().into_owned(),
+            vec![id.to_string()],
+            None,
+            Some("test-machine".to_string()),
+            Some("default".to_string()),
+        )?;
+        assert!(exported[0].ok, "{:?}", exported[0].error);
+
+        let manifest: BundleManifest = serde_json::from_slice(&fs::read(
+            PathBuf::from(exported[0].bundle_path.as_deref().unwrap()).join("manifest.json"),
+        )?)?;
+        let source = PathBuf::from(exported[0].bundle_path.as_deref().unwrap())
+            .join(PROVIDER_CODEX)
+            .join(&manifest.rollout_relpath);
+        fs::write(
+            PathBuf::from(exported[0].bundle_path.as_deref().unwrap()).join("manifest.json"),
+            serde_json::to_vec_pretty(&BundleManifest {
+                sha256_rollout: hex::encode(Sha256::digest(b"known manifest mismatch")),
+                ..manifest.clone()
+            })?,
+        )?;
+        let changed = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&serde_json::json!({
+                "timestamp": "2026-05-12T10:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "cwd": r"F:\project\changed-after-hash",
+                    "source": "cli",
+                    "model_provider": "openai"
+                }
+            }))?,
+            serde_json::to_string(&serde_json::json!({
+                "timestamp": "2026-05-12T10:00:30Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "changed after hash"}
+            }))?
+        );
+        let _fault = BundleImportTestFaultGuard::replace(
+            "after_codex_source_hash",
+            source,
+            changed.into_bytes(),
+        );
+
+        let imported = import_session_bundles(
+            Some(PROVIDER_CODEX.to_string()),
+            bundle_dir.to_string_lossy().into_owned(),
+            import_codex.to_string_lossy().into_owned(),
+            None,
+            ImportMode::Overwrite,
+            false,
+            false,
+            vec![],
+        )?;
+
+        assert_eq!(imported.len(), 1);
+        assert!(!imported[0].ok);
+        assert!(imported[0].sha_mismatch, "{:?}", imported[0]);
+        assert!(imported[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("导入期间发生变化"));
+        assert!(!import_codex.join(&manifest.rollout_relpath).exists());
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn codex_import_preserves_concurrent_project_state_when_compensation_is_rejected(
+    ) -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-codex-bundle-project-concurrent-test");
+        let source_codex = root.join("source-codex");
+        let import_codex = root.join("import-codex");
+        let bundle_dir = root.join("bundles");
+        let id = "codex-bundle-project-concurrent";
+        write_codex_session(&source_codex, id, 1_777_777_777)?;
+        let exported = export_session_bundles(
+            Some(PROVIDER_CODEX.to_string()),
+            source_codex.to_string_lossy().into_owned(),
+            None,
+            bundle_dir.to_string_lossy().into_owned(),
+            vec![id.to_string()],
+            None,
+            Some("test-machine".to_string()),
+            Some("default".to_string()),
+        )?;
+        assert!(exported[0].ok, "{:?}", exported[0].error);
+
+        let state = create_bundle_state(&import_codex)?;
+        drop(state);
+        write_test_codex_global_state(
+            &import_codex,
+            id,
+            r"C:\old-project",
+            r"F:\project\portable-context",
+        )?;
+        let index_path = paths::session_index_path(&import_codex);
+        fs::write(&index_path, b"index-before\r\n")?;
+        let index_before = fs::read(&index_path)?;
+        let manifest: BundleManifest = serde_json::from_slice(&fs::read(
+            PathBuf::from(exported[0].bundle_path.as_deref().unwrap()).join("manifest.json"),
+        )?)?;
+        let destination = import_codex.join(&manifest.rollout_relpath);
+        let project_state_path = paths::codex_global_state_json_path(&import_codex);
+        let concurrent_state = serde_json::to_vec(&serde_json::json!({
+            "external-concurrent-marker": true,
+            "local-projects": {},
+            "thread-project-assignments": {},
+            "projectless-thread-ids": []
+        }))?;
+
+        let _fault = BundleImportTestFaultGuard::replace_and_error(
+            "after_project_sync",
+            project_state_path.clone(),
+            concurrent_state.clone(),
+        );
+        let imported = import_session_bundles(
+            Some(PROVIDER_CODEX.to_string()),
+            bundle_dir.to_string_lossy().into_owned(),
+            import_codex.to_string_lossy().into_owned(),
+            None,
+            ImportMode::Overwrite,
+            true,
+            true,
+            vec![],
+        )?;
+        assert_eq!(imported.len(), 1);
+        assert!(!imported[0].ok);
+        assert!(!imported[0].rollout_written);
+        assert_eq!(imported[0].history_appended, 0);
+        assert!(!imported[0].threads_upserted);
+        assert!(!imported[0].index_appended);
+        let error = imported[0].error.as_deref().unwrap_or_default();
+        assert!(error.contains("after_project_sync"), "{error}");
+        assert!(error.contains("拒绝补偿并发数据"), "{error}");
+
+        assert_eq!(fs::read(&project_state_path)?, concurrent_state);
+        assert!(!destination.exists());
+        assert_eq!(fs::read(&index_path)?, index_before);
+        let state = state_db::open_ro(&import_codex)?;
+        let thread_count: i64 =
+            state.query_row("SELECT COUNT(*) FROM threads WHERE id = ?", [id], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(thread_count, 0);
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn skipped_codex_import_repairs_visibility_from_local_rollout() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-codex-bundle-skip-visible-test");
+        let source_codex = root.join("source-codex");
+        let import_codex = root.join("import-codex");
+        let bundle_dir = root.join("bundles");
+        let id = "codex-bundle-skip-visible";
+        let local_cwd = r"E:\local\kept-project";
+        write_codex_session(&source_codex, id, 1_777_777_777)?;
+
+        let exported = export_session_bundles(
+            Some(PROVIDER_CODEX.to_string()),
+            source_codex.to_string_lossy().into_owned(),
+            None,
+            bundle_dir.to_string_lossy().into_owned(),
+            vec![id.to_string()],
+            None,
+            Some("test-machine".to_string()),
+            Some("default".to_string()),
+        )?;
+        assert!(exported[0].ok);
+
+        let local_rollout = write_codex_session(&import_codex, id, 1_888_888_888)?;
+        let local_raw = fs::read_to_string(&local_rollout)?
+            .lines()
+            .map(|line| -> AppResult<String> {
+                let mut value: Value = serde_json::from_str(line)?;
+                if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+                    value
+                        .get_mut("payload")
+                        .and_then(Value::as_object_mut)
+                        .ok_or_else(|| {
+                            AppError::Other("test session_meta.payload 不是对象".into())
+                        })?
+                        .insert("cwd".into(), Value::String(local_cwd.to_string()));
+                }
+                Ok(serde_json::to_string(&value)?)
+            })
+            .collect::<AppResult<Vec<_>>>()?
+            .join("\n")
+            + "\n";
+        fs::write(&local_rollout, &local_raw)?;
+        let state = state_db::open(&import_codex)?;
+        state.execute("DELETE FROM threads WHERE id = ?", [id])?;
+        drop(state);
+        write_test_codex_global_state(&import_codex, id, r"C:\stale-project", local_cwd)?;
+
+        for mode in [ImportMode::Skip, ImportMode::KeepLocal] {
+            let report = import_session_bundles(
+                Some(PROVIDER_CODEX.to_string()),
+                bundle_dir.to_string_lossy().into_owned(),
+                import_codex.to_string_lossy().into_owned(),
+                None,
+                mode,
+                true,
+                true,
+                vec![ProjectPathMapping {
+                    source_cwd: r"F:\project\portable-context".to_string(),
+                    target_cwd: r"D:\bundle\mapped-project".to_string(),
+                }],
+            )?;
+            assert_eq!(report.len(), 1);
+            assert!(report[0].ok, "{:?}", report[0].error);
+            assert!(!report[0].rollout_written);
+            assert!(report[0].skipped_reason.is_some());
+
+            let state = state_db::open(&import_codex)?;
+            let db_cwd: String =
+                state.query_row("SELECT cwd FROM threads WHERE id = ?", [id], |row| {
+                    row.get(0)
+                })?;
+            assert_eq!(db_cwd, local_cwd);
+            drop(state);
+            let global_state: Value = serde_json::from_slice(&fs::read(
+                paths::codex_global_state_json_path(&import_codex),
+            )?)?;
+            assert_eq!(
+                global_state["thread-project-assignments"][id]["projectId"],
+                "target-project"
+            );
+            assert_eq!(
+                global_state["thread-project-assignments"][id]["cwd"],
+                local_cwd
+            );
+            assert!(!fs::read_to_string(&local_rollout)?.contains("bundle\\mapped-project"));
+        }
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn codex_import_cwds_separates_wsl_core_and_desktop_paths() -> AppResult<()> {
+        let codex = Path::new(r"\\wsl.localhost\Ubuntu\home\alice\.codex");
+        let host_cwd = r"\\wsl.localhost\Ubuntu\home\alice\project";
+
+        assert_eq!(
+            codex_import_cwds(codex, host_cwd)?,
+            ("/home/alice/project".to_string(), host_cwd.to_string())
+        );
+        assert_eq!(
+            codex_import_cwds(codex, "/home/alice/project")?,
+            ("/home/alice/project".to_string(), host_cwd.to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn codex_export_rollout_uses_wsl_core_path_for_pending_assignment() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-codex-bundle-wsl-export-test");
+        let source = root.join("source.jsonl");
+        let bundle_copy = root.join("bundle.jsonl");
+        let id = "wsl-export";
+        fs::create_dir_all(&root)?;
+        fs::write(
+            &source,
+            format!(
+                "{}\n",
+                serde_json::to_string(&serde_json::json!({
+                    "type": "session_meta",
+                    "payload": {"id": id, "cwd": "/home/alice/old"}
+                }))?
+            ),
+        )?;
+        let codex = Path::new(r"\\wsl.localhost\Ubuntu\home\alice\.codex");
+        let assignment_cwd = r"\\wsl.localhost\Ubuntu\home\alice\new";
+        let (core_cwd, desktop_cwd) = codex_import_cwds(codex, assignment_cwd)?;
+        copy_codex_rollout_with_cwd(&source, &bundle_copy, id, Some(&core_cwd), None)?;
+
+        assert_eq!(desktop_cwd, assignment_cwd);
+        assert_eq!(
+            existing_codex_rollout_cwd(&bundle_copy, id)?,
+            "/home/alice/new"
+        );
+        assert_eq!(existing_codex_rollout_cwd(&source, id)?, "/home/alice/old");
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn codex_export_prefers_pending_desktop_assignment_cwd() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-codex-bundle-pending-export-test");
+        let codex = root.join("codex");
+        let bundle_dir = root.join("bundles");
+        let id = "codex-bundle-pending-export";
+        let pending_cwd = r"D:\pending\desktop-project";
+        let source_rollout = write_codex_session(&codex, id, 1_777_777_777)?;
+        write_test_codex_global_state(&codex, id, pending_cwd, pending_cwd)?;
+        let mut pending_state: Value =
+            serde_json::from_slice(&fs::read(paths::codex_global_state_json_path(&codex))?)?;
+        pending_state["thread-project-assignments"][id]["pendingCoreUpdate"] = Value::Bool(true);
+        fs::write(
+            paths::codex_global_state_json_path(&codex),
+            serde_json::to_vec(&pending_state)?,
+        )?;
+        assert_eq!(
+            pending_state["thread-project-assignments"][id]["pendingCoreUpdate"],
+            true
+        );
+
+        let report = export_session_bundles(
+            Some(PROVIDER_CODEX.to_string()),
+            codex.to_string_lossy().into_owned(),
+            None,
+            bundle_dir.to_string_lossy().into_owned(),
+            vec![id.to_string()],
+            None,
+            Some("test-machine".to_string()),
+            Some("default".to_string()),
+        )?;
+        assert!(report[0].ok, "{:?}", report[0].error);
+        let bundle = PathBuf::from(report[0].bundle_path.as_deref().unwrap());
+        let manifest: BundleManifest =
+            serde_json::from_slice(&fs::read(bundle.join("manifest.json"))?)?;
+        assert_eq!(manifest.session_cwd, pending_cwd);
+        let bundled_rollout = bundle
+            .join(PROVIDER_CODEX)
+            .join(paths::checked_relative_path(&manifest.rollout_relpath)?);
+        assert_eq!(
+            existing_codex_rollout_cwd(&bundled_rollout, id)?,
+            pending_cwd
+        );
+        assert_eq!(
+            existing_codex_rollout_cwd(&source_rollout, id)?,
+            r"F:\project\portable-context"
+        );
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn codex_export_uses_latest_turn_cwd_and_normalizes_only_current_records() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-codex-bundle-effective-cwd-export-test");
+        let codex = root.join("codex");
+        let bundle_dir = root.join("bundles");
+        let id = "codex-bundle-effective-cwd-export";
+        let source_rollout = write_codex_session(&codex, id, 1_777_777_777)?;
+        let mut source = fs::OpenOptions::new().append(true).open(&source_rollout)?;
+        for cwd in [r"F:\project\historical", r"F:\project\latest"] {
+            writeln!(
+                source,
+                "{}",
+                serde_json::json!({
+                    "timestamp": "2026-05-12T10:00:31Z",
+                    "type": "turn_context",
+                    "payload": {"cwd": cwd}
+                })
+            )?;
+        }
+        drop(source);
+
+        let report = export_session_bundles(
+            Some(PROVIDER_CODEX.to_string()),
+            codex.to_string_lossy().into_owned(),
+            None,
+            bundle_dir.to_string_lossy().into_owned(),
+            vec![id.to_string()],
+            None,
+            Some("test-machine".to_string()),
+            Some("default".to_string()),
+        )?;
+        assert!(report[0].ok, "{:?}", report[0].error);
+        let bundle = PathBuf::from(report[0].bundle_path.as_deref().unwrap());
+        let manifest: BundleManifest =
+            serde_json::from_slice(&fs::read(bundle.join("manifest.json"))?)?;
+        assert_eq!(manifest.session_cwd, r"F:\project\latest");
+        let bundled_rollout = bundle
+            .join(PROVIDER_CODEX)
+            .join(paths::checked_relative_path(&manifest.rollout_relpath)?);
+        let values = fs::read_to_string(&bundled_rollout)?
+            .lines()
+            .map(serde_json::from_str::<Value>)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(values[0]["payload"]["cwd"], r"F:\project\latest");
+        let turns = values
+            .iter()
+            .filter(|value| value["type"] == "turn_context")
+            .collect::<Vec<_>>();
+        assert_eq!(turns[0]["payload"]["cwd"], r"F:\project\historical");
+        assert_eq!(turns[1]["payload"]["cwd"], r"F:\project\latest");
+        assert_eq!(
+            crate::codex_rollout_cwd::read_effective_cwd(&source_rollout, id)?,
+            Some(r"F:\project\latest".to_string())
+        );
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn codex_export_ignores_settled_stale_desktop_assignment_cwd() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-codex-bundle-stale-assignment-export-test");
+        let codex = root.join("codex");
+        let bundle_dir = root.join("bundles");
+        let id = "codex-bundle-stale-assignment-export";
+        let core_cwd = r"F:\project\portable-context";
+        let stale_cwd = r"D:\stale\desktop-project";
+        let source_rollout = write_codex_session(&codex, id, 1_777_777_777)?;
+        write_test_codex_global_state(&codex, id, stale_cwd, core_cwd)?;
+
+        let report = export_session_bundles(
+            Some(PROVIDER_CODEX.to_string()),
+            codex.to_string_lossy().into_owned(),
+            None,
+            bundle_dir.to_string_lossy().into_owned(),
+            vec![id.to_string()],
+            None,
+            Some("test-machine".to_string()),
+            Some("default".to_string()),
+        )?;
+        assert!(report[0].ok, "{:?}", report[0].error);
+        let bundle = PathBuf::from(report[0].bundle_path.as_deref().unwrap());
+        let manifest: BundleManifest =
+            serde_json::from_slice(&fs::read(bundle.join("manifest.json"))?)?;
+        assert_eq!(manifest.session_cwd, core_cwd);
+        let bundled_rollout = bundle
+            .join(PROVIDER_CODEX)
+            .join(paths::checked_relative_path(&manifest.rollout_relpath)?);
+        assert_eq!(existing_codex_rollout_cwd(&bundled_rollout, id)?, core_cwd);
+        assert_eq!(existing_codex_rollout_cwd(&source_rollout, id)?, core_cwd);
 
         fs::remove_dir_all(root).ok();
         Ok(())
@@ -5038,1194 +6199,4 @@ mod tests {
         fs::remove_dir_all(root).ok();
         Ok(())
     }
-}
-
-// ========================= zip 打包 =========================
-
-pub fn pack_bundles_zip(src_dir: String, zip_path: String) -> AppResult<ZipReport> {
-    let src = absolute_lexical_path(Path::new(&src_dir), "ZIP 打包源")?;
-    validate_existing_directory_chain(&src, "ZIP 打包源父链")?;
-    validate_plain_directory_tree(&src, "ZIP 打包源")?;
-
-    let out = absolute_lexical_path(Path::new(&zip_path), "ZIP 输出")?;
-    let parent = out
-        .parent()
-        .ok_or_else(|| AppError::Path(format!("ZIP 输出缺少父目录: {}", out.to_string_lossy())))?;
-    ensure_plain_directory_path(parent, "ZIP 输出父目录")?;
-    validate_existing_directory_chain(parent, "ZIP 输出父目录")?;
-    match fs::symlink_metadata(&out) {
-        Ok(metadata)
-            if metadata.is_file()
-                && !crate::path_safety::metadata_is_link_or_reparse(&metadata) => {}
-        Ok(_) => {
-            return Err(AppError::Path(format!(
-                "ZIP 输出已存在但不是普通文件，或属于链接/reparse point: {}",
-                out.to_string_lossy()
-            )))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-
-    let src_canon = fs::canonicalize(&src)?;
-    let out_parent_canon = fs::canonicalize(parent)?;
-    if out_parent_canon == src_canon || out_parent_canon.starts_with(&src_canon) {
-        return Err(AppError::Path(format!(
-            "zip 输出路径不能位于被打包目录内部: 输出 {}, 源目录 {}",
-            out.to_string_lossy(),
-            src.to_string_lossy()
-        )));
-    }
-
-    let (stage_path, stage_file) = create_unique_zip_pack_stage(parent, &out)?;
-    let write_result = write_store_zip(&src, stage_file);
-    let (file_count, total_bytes) = match write_result {
-        Ok(report) => report,
-        Err(error) => {
-            return Err(match fs::remove_file(&stage_path) {
-                Ok(()) => error,
-                Err(cleanup_error) => AppError::Other(format!(
-                    "{error}; 清理 ZIP 打包暂存文件失败 {}: {cleanup_error}",
-                    stage_path.to_string_lossy()
-                )),
-            })
-        }
-    };
-    if let Err(error) = publish_packed_zip(&stage_path, &out) {
-        return Err(match fs::remove_file(&stage_path) {
-            Ok(()) => error,
-            Err(cleanup_error) => AppError::Other(format!(
-                "{error}; 清理 ZIP 打包暂存文件失败 {}: {cleanup_error}",
-                stage_path.to_string_lossy()
-            )),
-        });
-    }
-    fs::remove_file(&stage_path).map_err(|error| {
-        AppError::Other(format!(
-            "ZIP 已原子发布，但清理暂存文件失败 {}: {error}",
-            stage_path.to_string_lossy()
-        ))
-    })?;
-
-    Ok(ZipReport {
-        path: out.to_string_lossy().into_owned(),
-        files: file_count,
-        bytes: total_bytes,
-    })
-}
-
-fn create_unique_zip_pack_stage(parent: &Path, output: &Path) -> AppResult<(PathBuf, File)> {
-    let file_name = output.file_name().ok_or_else(|| {
-        AppError::Path(format!("ZIP 输出缺少文件名: {}", output.to_string_lossy()))
-    })?;
-    loop {
-        let sequence = ZIP_STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let mut stage_name = file_name.to_os_string();
-        stage_name.push(format!(
-            ".{}.{}.ccsm-pack.tmp",
-            std::process::id(),
-            sequence
-        ));
-        let stage = parent.join(stage_name);
-        match OpenOptions::new().write(true).create_new(true).open(&stage) {
-            Ok(file) => return Ok((stage, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error.into()),
-        }
-    }
-}
-
-fn write_store_zip(src: &Path, file: File) -> AppResult<(u32, u64)> {
-    let canonical_src = src.canonicalize()?;
-    let mut writer = BufWriter::new(file);
-    let mut central: Vec<CentralEntry> = Vec::new();
-    let mut total_bytes: u64 = 0;
-    let mut file_count: u32 = 0;
-    let mut offset: u32 = 0;
-
-    for entry in walkdir::WalkDir::new(src).follow_links(false) {
-        let entry = entry.map_err(|error| {
-            AppError::Other(format!(
-                "遍历待打包 bundle 目录失败 {}: {error}",
-                src.to_string_lossy()
-            ))
-        })?;
-        let metadata = fs::symlink_metadata(entry.path())?;
-        if crate::path_safety::metadata_is_link_or_reparse(&metadata) {
-            return Err(AppError::Path(format!(
-                "ZIP 打包源包含链接/junction/reparse point: {}",
-                entry.path().to_string_lossy()
-            )));
-        }
-        if !entry.path().canonicalize()?.starts_with(&canonical_src) {
-            return Err(AppError::Path(format!(
-                "ZIP 打包源条目解析后逃出根目录: {}",
-                entry.path().to_string_lossy()
-            )));
-        }
-        if metadata.is_dir() {
-            continue;
-        }
-        if !metadata.is_file() {
-            return Err(AppError::Path(format!(
-                "ZIP 打包源包含不支持的文件类型: {}",
-                entry.path().to_string_lossy()
-            )));
-        }
-        let rel = entry
-            .path()
-            .strip_prefix(src)
-            .map(|p| p.to_path_buf())
-            .map_err(|error| {
-                AppError::Path(format!(
-                    "无法计算 zip 内相对路径 {}: {error}",
-                    entry.path().to_string_lossy()
-                ))
-            })?;
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
-        checked_zip_entry_path(&rel_str, false)?;
-        let name_len = u16::try_from(rel_str.len())
-            .map_err(|_| AppError::Other(format!("ZIP 文件名过长: {rel_str}")))?;
-        let size = u32::try_from(metadata.len()).map_err(|_| {
-            AppError::Other(format!(
-                "ZIP STORE 不支持超过 4 GiB 的文件: {}",
-                entry.path().to_string_lossy()
-            ))
-        })?;
-        let mut data: Vec<u8> = Vec::new();
-        File::open(entry.path())?.read_to_end(&mut data)?;
-        if data.len() as u64 != metadata.len() {
-            return Err(AppError::Other(format!(
-                "ZIP 打包源在读取期间发生变化: {}",
-                entry.path().to_string_lossy()
-            )));
-        }
-        let crc = crc32(&data);
-        total_bytes = total_bytes
-            .checked_add(size as u64)
-            .ok_or_else(|| AppError::Other("ZIP 总字节数溢出".into()))?;
-        file_count = file_count
-            .checked_add(1)
-            .ok_or_else(|| AppError::Other("ZIP 文件数溢出".into()))?;
-        if file_count > u16::MAX as u32 {
-            return Err(AppError::Other("ZIP32 最多支持 65535 个条目".into()));
-        }
-        // Local file header
-        writer.write_all(&0x04034b50u32.to_le_bytes())?; // signature
-        writer.write_all(&20u16.to_le_bytes())?; // version needed
-        writer.write_all(&0u16.to_le_bytes())?; // flags
-        writer.write_all(&0u16.to_le_bytes())?; // method STORE
-        writer.write_all(&0u16.to_le_bytes())?; // mod time
-        writer.write_all(&0u16.to_le_bytes())?; // mod date
-        writer.write_all(&crc.to_le_bytes())?;
-        writer.write_all(&size.to_le_bytes())?; // compressed size
-        writer.write_all(&size.to_le_bytes())?; // uncompressed size
-        writer.write_all(&name_len.to_le_bytes())?;
-        writer.write_all(&0u16.to_le_bytes())?; // extra len
-        writer.write_all(rel_str.as_bytes())?;
-        writer.write_all(&data)?;
-
-        let local_header_size = 30u32
-            .checked_add(rel_str.len() as u32)
-            .ok_or_else(|| AppError::Other("ZIP local header 大小溢出".into()))?;
-        central.push(CentralEntry {
-            name: rel_str,
-            crc,
-            size,
-            offset,
-        });
-        offset = offset
-            .checked_add(local_header_size)
-            .and_then(|value| value.checked_add(size))
-            .ok_or_else(|| AppError::Other("ZIP32 local offset 溢出".into()))?;
-    }
-
-    // Central directory
-    let cd_offset = offset;
-    let mut cd_size: u32 = 0;
-    for e in &central {
-        let name_len = u16::try_from(e.name.len())
-            .map_err(|_| AppError::Other(format!("ZIP central 文件名过长: {}", e.name)))?;
-        writer.write_all(&0x02014b50u32.to_le_bytes())?; // signature
-        writer.write_all(&20u16.to_le_bytes())?; // version made by
-        writer.write_all(&20u16.to_le_bytes())?; // version needed
-        writer.write_all(&0u16.to_le_bytes())?; // flags
-        writer.write_all(&0u16.to_le_bytes())?; // method
-        writer.write_all(&0u16.to_le_bytes())?; // mod time
-        writer.write_all(&0u16.to_le_bytes())?; // mod date
-        writer.write_all(&e.crc.to_le_bytes())?;
-        writer.write_all(&e.size.to_le_bytes())?;
-        writer.write_all(&e.size.to_le_bytes())?;
-        writer.write_all(&name_len.to_le_bytes())?;
-        writer.write_all(&0u16.to_le_bytes())?; // extra len
-        writer.write_all(&0u16.to_le_bytes())?; // comment len
-        writer.write_all(&0u16.to_le_bytes())?; // disk start
-        writer.write_all(&0u16.to_le_bytes())?; // int attrs
-        writer.write_all(&0u32.to_le_bytes())?; // ext attrs
-        writer.write_all(&e.offset.to_le_bytes())?;
-        writer.write_all(e.name.as_bytes())?;
-        cd_size = cd_size
-            .checked_add(46)
-            .and_then(|value| value.checked_add(e.name.len() as u32))
-            .ok_or_else(|| AppError::Other("ZIP32 central directory 大小溢出".into()))?;
-    }
-
-    // EOCD
-    writer.write_all(&0x06054b50u32.to_le_bytes())?;
-    writer.write_all(&0u16.to_le_bytes())?; // disk
-    writer.write_all(&0u16.to_le_bytes())?; // cd start disk
-    let entry_count = u16::try_from(central.len())
-        .map_err(|_| AppError::Other("ZIP32 最多支持 65535 个条目".into()))?;
-    writer.write_all(&entry_count.to_le_bytes())?;
-    writer.write_all(&entry_count.to_le_bytes())?;
-    writer.write_all(&cd_size.to_le_bytes())?;
-    writer.write_all(&cd_offset.to_le_bytes())?;
-    writer.write_all(&0u16.to_le_bytes())?; // comment len
-    writer.flush()?;
-    writer.get_ref().sync_all()?;
-
-    Ok((file_count, total_bytes))
-}
-
-fn publish_packed_zip(stage: &Path, output: &Path) -> AppResult<()> {
-    let stage_fingerprint = atomic_file::fingerprint(stage)?;
-    let copy_stage = |file: &mut File| -> AppResult<()> {
-        let mut source = File::open(stage)?;
-        std::io::copy(&mut source, file)?;
-        if atomic_file::fingerprint(stage)? != stage_fingerprint {
-            return Err(AppError::Other(format!(
-                "ZIP 暂存文件在发布期间发生变化: {}",
-                stage.to_string_lossy()
-            )));
-        }
-        Ok(())
-    };
-    match fs::symlink_metadata(output) {
-        Ok(metadata) => {
-            if !metadata.is_file() || crate::path_safety::metadata_is_link_or_reparse(&metadata) {
-                return Err(AppError::Path(format!(
-                    "ZIP 输出在发布前不是普通文件或属于链接/reparse point: {}",
-                    output.to_string_lossy()
-                )));
-            }
-            let expected = atomic_file::fingerprint(output)?;
-            atomic_file::replace_with_writer_if_unchanged(output, &expected, copy_stage)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            atomic_file::create_with_writer_if_absent(output, copy_stage)
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
-struct CentralEntry {
-    name: String,
-    crc: u32,
-    size: u32,
-    offset: u32,
-}
-
-fn crc32_table() -> &'static [u32; 256] {
-    static TABLE: OnceLock<[u32; 256]> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut table = [0u32; 256];
-        for i in 0..256u32 {
-            let mut c = i;
-            for _ in 0..8 {
-                c = if c & 1 == 1 {
-                    0xEDB88320 ^ (c >> 1)
-                } else {
-                    c >> 1
-                };
-            }
-            table[i as usize] = c;
-        }
-        table
-    })
-}
-
-struct Crc32Hasher {
-    value: u32,
-}
-
-impl Crc32Hasher {
-    fn new() -> Self {
-        Self { value: 0xFFFFFFFF }
-    }
-
-    fn update(&mut self, data: &[u8]) {
-        let table = crc32_table();
-        for &byte in data {
-            let index = ((self.value ^ byte as u32) & 0xFF) as usize;
-            self.value = table[index] ^ (self.value >> 8);
-        }
-    }
-
-    fn finish(self) -> u32 {
-        self.value ^ 0xFFFFFFFF
-    }
-}
-
-fn crc32(data: &[u8]) -> u32 {
-    let mut hasher = Crc32Hasher::new();
-    hasher.update(data);
-    hasher.finish()
-}
-
-fn checked_zip_slice<'a>(
-    data: &'a [u8],
-    start: usize,
-    len: usize,
-    label: &str,
-) -> AppResult<&'a [u8]> {
-    let end = start
-        .checked_add(len)
-        .ok_or_else(|| AppError::Other(format!("{label} 偏移溢出")))?;
-    data.get(start..end)
-        .ok_or_else(|| AppError::Other(format!("{label} 超出 zip 文件边界")))
-}
-
-fn read_zip_u16(data: &[u8], start: usize, label: &str) -> AppResult<u16> {
-    let bytes = checked_zip_slice(data, start, 2, label)?;
-    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
-}
-
-fn read_zip_u32(data: &[u8], start: usize, label: &str) -> AppResult<u32> {
-    let bytes = checked_zip_slice(data, start, 4, label)?;
-    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-}
-
-#[derive(Debug)]
-struct ParsedZipEntry {
-    name: String,
-    relative_path: PathBuf,
-    is_directory: bool,
-    crc32: u32,
-    size: u64,
-    payload_start: u64,
-    local_range_end: u64,
-    local_offset: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ZipDestinationState {
-    Missing,
-    EmptyDirectory,
-}
-
-fn validate_plain_directory_metadata(path: &Path, label: &str) -> AppResult<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if crate::path_safety::metadata_is_link_or_reparse(&metadata) {
-        return Err(AppError::Path(format!(
-            "{label} 包含符号链接、junction 或 reparse point，已拒绝: {}",
-            path.to_string_lossy()
-        )));
-    }
-    if !metadata.is_dir() {
-        return Err(AppError::Path(format!(
-            "{label} 必须是普通目录: {}",
-            path.to_string_lossy()
-        )));
-    }
-    Ok(())
-}
-
-fn absolute_lexical_path(path: &Path, label: &str) -> AppResult<PathBuf> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
-                normalized.push(component.as_os_str());
-            }
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    return Err(AppError::Path(format!(
-                        "{label} 包含无法解析的父目录跳转: {}",
-                        path.to_string_lossy()
-                    )));
-                }
-            }
-        }
-    }
-    if normalized.file_name().is_none() {
-        return Err(AppError::Path(format!(
-            "{label} 不能指向文件系统根目录: {}",
-            path.to_string_lossy()
-        )));
-    }
-    Ok(normalized)
-}
-
-fn validate_existing_directory_chain(path: &Path, label: &str) -> AppResult<()> {
-    let mut ancestors = path
-        .ancestors()
-        .filter(|ancestor| !ancestor.as_os_str().is_empty())
-        .collect::<Vec<_>>();
-    ancestors.reverse();
-    let mut missing_parent_seen = false;
-    for ancestor in ancestors {
-        match fs::symlink_metadata(ancestor) {
-            Ok(_) => {
-                if missing_parent_seen {
-                    return Err(AppError::Path(format!(
-                        "{label} 在缺失父目录之后出现已有条目: {}",
-                        ancestor.to_string_lossy()
-                    )));
-                }
-                validate_plain_directory_metadata(ancestor, label)?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                missing_parent_seen = true;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(())
-}
-
-fn remove_created_directories(created: &[PathBuf]) -> Vec<String> {
-    let mut errors = Vec::new();
-    for directory in created.iter().rev() {
-        match fs::remove_dir(directory) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => errors.push(format!(
-                "清理新建父目录失败 {}: {error}",
-                directory.to_string_lossy()
-            )),
-        }
-    }
-    errors
-}
-
-fn ensure_plain_directory_chain(path: &Path, label: &str) -> AppResult<Vec<PathBuf>> {
-    let mut ancestors = path
-        .ancestors()
-        .filter(|ancestor| !ancestor.as_os_str().is_empty())
-        .map(Path::to_path_buf)
-        .collect::<Vec<_>>();
-    ancestors.reverse();
-    let mut created = Vec::new();
-    for ancestor in ancestors {
-        let result = match fs::symlink_metadata(&ancestor) {
-            Ok(_) => validate_plain_directory_metadata(&ancestor, label),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                match fs::create_dir(&ancestor) {
-                    Ok(()) => created.push(ancestor.clone()),
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(error) => {
-                        let cleanup = remove_created_directories(&created);
-                        let suffix = if cleanup.is_empty() {
-                            String::new()
-                        } else {
-                            format!("；{}", cleanup.join("；"))
-                        };
-                        return Err(AppError::Other(format!(
-                            "创建 {label} 失败 {}: {error}{suffix}",
-                            ancestor.to_string_lossy()
-                        )));
-                    }
-                }
-                validate_plain_directory_metadata(&ancestor, label)
-            }
-            Err(error) => Err(error.into()),
-        };
-        if let Err(error) = result {
-            let cleanup = remove_created_directories(&created);
-            if cleanup.is_empty() {
-                return Err(error);
-            }
-            return Err(AppError::Other(format!("{error}；{}", cleanup.join("；"))));
-        }
-    }
-    if let Err(error) = validate_existing_directory_chain(path, label) {
-        let cleanup = remove_created_directories(&created);
-        if cleanup.is_empty() {
-            return Err(error);
-        }
-        return Err(AppError::Other(format!("{error}；{}", cleanup.join("；"))));
-    }
-    Ok(created)
-}
-
-fn inspect_zip_destination(path: &Path) -> AppResult<ZipDestinationState> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if crate::path_safety::metadata_is_link_or_reparse(&metadata) {
-                return Err(AppError::Path(format!(
-                    "ZIP 解包目标不能是符号链接、junction 或 reparse point: {}",
-                    path.to_string_lossy()
-                )));
-            }
-            if !metadata.is_dir() {
-                return Err(AppError::Path(format!(
-                    "ZIP 解包目标已存在且不是目录: {}",
-                    path.to_string_lossy()
-                )));
-            }
-            if fs::read_dir(path)?.next().transpose()?.is_some() {
-                return Err(AppError::Path(format!(
-                    "ZIP 解包目标已存在且非空，拒绝覆盖: {}",
-                    path.to_string_lossy()
-                )));
-            }
-            Ok(ZipDestinationState::EmptyDirectory)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(ZipDestinationState::Missing)
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn validate_zip_flags(flags: u16, name: &str, header: &str) -> AppResult<()> {
-    const UTF8_FLAG: u16 = 1 << 11;
-    if flags & !UTF8_FLAG != 0 {
-        return Err(AppError::Other(format!(
-            "{header} 含不支持的 ZIP flags=0x{flags:04x}: {name}"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_zip_entry_attributes(
-    name: &str,
-    version_made_by: u16,
-    external_attributes: u32,
-    is_directory: bool,
-) -> AppResult<()> {
-    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0010;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
-    if external_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(AppError::Path(format!(
-            "ZIP 条目标记为 reparse point，已拒绝: {name}"
-        )));
-    }
-    if external_attributes & FILE_ATTRIBUTE_DIRECTORY != 0 && !is_directory {
-        return Err(AppError::Other(format!(
-            "ZIP 条目的目录属性与文件名不一致: {name}"
-        )));
-    }
-
-    let creator_system = (version_made_by >> 8) as u8;
-    if creator_system == 3 {
-        let unix_mode = (external_attributes >> 16) as u16;
-        match unix_mode & 0o170000 {
-            0 => {}
-            0o040000 if is_directory => {}
-            0o100000 if !is_directory => {}
-            0o120000 => {
-                return Err(AppError::Path(format!(
-                    "ZIP 条目是符号链接，已拒绝: {name}"
-                )))
-            }
-            _ => {
-                return Err(AppError::Path(format!(
-                    "ZIP 条目不是普通文件或目录，已拒绝: {name}"
-                )))
-            }
-        }
-    }
-    Ok(())
-}
-
-fn checked_zip_entry_path(name: &str, is_directory: bool) -> AppResult<(PathBuf, String)> {
-    if name != name.trim() || name.contains('\\') {
-        return Err(AppError::Path(format!(
-            "ZIP 条目路径包含歧义空白或反斜杠，已拒绝: {name}"
-        )));
-    }
-    let path_text = if is_directory {
-        name.strip_suffix('/').unwrap_or(name)
-    } else {
-        name
-    };
-    if path_text.is_empty()
-        || path_text
-            .split('/')
-            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
-    {
-        return Err(AppError::Path(format!(
-            "ZIP 条目路径无效或包含目录穿越: {name}"
-        )));
-    }
-    #[cfg(windows)]
-    for segment in path_text.split('/') {
-        if segment.ends_with(' ') || segment.ends_with('.') {
-            return Err(AppError::Path(format!(
-                "ZIP 条目在 Windows 上具有歧义的尾随空格或点: {name}"
-            )));
-        }
-    }
-    let relative = paths::checked_relative_path(path_text)?;
-    let mut key = relative.to_string_lossy().replace('\\', "/");
-    #[cfg(windows)]
-    {
-        key = key.to_lowercase();
-    }
-    Ok((relative, key))
-}
-
-fn parse_zip_entries(file: &mut File, file_len: u64) -> AppResult<Vec<ParsedZipEntry>> {
-    if file_len < 22 {
-        return Err(AppError::Other("不是合法的 zip 文件（过短）".into()));
-    }
-
-    let tail_window = file_len.min(65_557);
-    let tail_base = file_len - tail_window;
-    file.seek(SeekFrom::Start(tail_base))?;
-    let tail_len = usize::try_from(tail_window)
-        .map_err(|_| AppError::Other("ZIP 尾部窗口长度超出平台限制".into()))?;
-    let mut tail = vec![0u8; tail_len];
-    file.read_exact(&mut tail)?;
-    let eocd_signature = [0x50u8, 0x4b, 0x05, 0x06];
-    let eocd_in_tail = (0..=tail.len() - 22)
-        .rev()
-        .find(|&index| {
-            if tail[index..index + 4] != eocd_signature {
-                return false;
-            }
-            let comment_len = u16::from_le_bytes([tail[index + 20], tail[index + 21]]) as usize;
-            index
-                .checked_add(22)
-                .and_then(|value| value.checked_add(comment_len))
-                == Some(tail.len())
-        })
-        .ok_or_else(|| AppError::Other("不是合法的 zip 文件（未找到有效 EOCD）".into()))?;
-    let eocd_offset = tail_base
-        .checked_add(eocd_in_tail as u64)
-        .ok_or_else(|| AppError::Other("EOCD 偏移溢出".into()))?;
-    let disk_number = read_zip_u16(&tail, eocd_in_tail + 4, "EOCD disk number")?;
-    let central_disk = read_zip_u16(&tail, eocd_in_tail + 6, "EOCD central disk")?;
-    let disk_entry_count = read_zip_u16(&tail, eocd_in_tail + 8, "EOCD 当前磁盘条目数")?;
-    let entry_count = read_zip_u16(&tail, eocd_in_tail + 10, "EOCD 总条目数")?;
-    let central_size = read_zip_u32(&tail, eocd_in_tail + 12, "central directory 总大小")?;
-    let central_offset = read_zip_u32(&tail, eocd_in_tail + 16, "central directory 偏移")?;
-    if disk_number != 0 || central_disk != 0 || disk_entry_count != entry_count {
-        return Err(AppError::Other("不支持分卷 ZIP".into()));
-    }
-    if entry_count == u16::MAX || central_size == u32::MAX || central_offset == u32::MAX {
-        return Err(AppError::Other("不支持 ZIP64".into()));
-    }
-    let central_offset = central_offset as u64;
-    let central_size = central_size as u64;
-    if central_offset.checked_add(central_size) != Some(eocd_offset) {
-        return Err(AppError::Other(format!(
-            "central directory 范围与 EOCD 不一致: offset={central_offset} size={central_size} eocd={eocd_offset}"
-        )));
-    }
-    let central_len = usize::try_from(central_size)
-        .map_err(|_| AppError::Other("central directory 大小超出平台限制".into()))?;
-    file.seek(SeekFrom::Start(central_offset))?;
-    let mut central = vec![0u8; central_len];
-    file.read_exact(&mut central)?;
-
-    let mut position = 0usize;
-    let mut entries = Vec::with_capacity(entry_count as usize);
-    let mut path_kinds = HashMap::<String, bool>::new();
-    for _ in 0..entry_count {
-        if checked_zip_slice(&central, position, 4, "central directory 签名")?
-            != [0x50, 0x4b, 0x01, 0x02]
-        {
-            return Err(AppError::Other("central directory 损坏".into()));
-        }
-        checked_zip_slice(&central, position, 46, "central directory header")?;
-        let version_made_by =
-            read_zip_u16(&central, position + 4, "central directory version made by")?;
-        let flags = read_zip_u16(&central, position + 8, "central directory flags")?;
-        let method = read_zip_u16(&central, position + 10, "central directory 压缩方式")?;
-        let crc = read_zip_u32(&central, position + 16, "central directory CRC")?;
-        let compressed_size =
-            read_zip_u32(&central, position + 20, "central directory 压缩后大小")? as u64;
-        let uncompressed_size =
-            read_zip_u32(&central, position + 24, "central directory 原始大小")? as u64;
-        let name_len =
-            read_zip_u16(&central, position + 28, "central directory 文件名长度")? as usize;
-        let extra_len =
-            read_zip_u16(&central, position + 30, "central directory extra 长度")? as usize;
-        let comment_len =
-            read_zip_u16(&central, position + 32, "central directory 注释长度")? as usize;
-        let disk_start = read_zip_u16(&central, position + 34, "central directory disk start")?;
-        let external_attributes =
-            read_zip_u32(&central, position + 38, "central directory 外部属性")?;
-        let local_offset = read_zip_u32(&central, position + 42, "local header 偏移")? as u64;
-        let name_bytes = checked_zip_slice(
-            &central,
-            position + 46,
-            name_len,
-            "central directory 文件名",
-        )?;
-        let name = String::from_utf8(name_bytes.to_vec())
-            .map_err(|error| AppError::Other(format!("zip 文件名不是 UTF-8: {error}")))?;
-        let advance = 46usize
-            .checked_add(name_len)
-            .and_then(|value| value.checked_add(extra_len))
-            .and_then(|value| value.checked_add(comment_len))
-            .ok_or_else(|| AppError::Other("central directory entry 长度溢出".into()))?;
-        checked_zip_slice(&central, position, advance, "central directory entry")?;
-        position = position
-            .checked_add(advance)
-            .ok_or_else(|| AppError::Other("central directory 游标溢出".into()))?;
-
-        if disk_start != 0 {
-            return Err(AppError::Other(format!("ZIP 条目位于其他分卷: {name}")));
-        }
-        validate_zip_flags(flags, &name, "central directory")?;
-        if method != 0 {
-            return Err(AppError::Other(format!(
-                "不支持的压缩方式 method={method}（仅支持 STORE）: {name}"
-            )));
-        }
-        if compressed_size != uncompressed_size {
-            return Err(AppError::Other(format!(
-                "STORE 条目的压缩大小与原始大小不一致: {name}"
-            )));
-        }
-        let is_directory = name.ends_with('/');
-        if is_directory && (compressed_size != 0 || crc != 0) {
-            return Err(AppError::Other(format!(
-                "ZIP 目录条目声明了 payload 或非零 CRC: {name}"
-            )));
-        }
-        validate_zip_entry_attributes(&name, version_made_by, external_attributes, is_directory)?;
-        let (relative_path, path_key) = checked_zip_entry_path(&name, is_directory)?;
-        if path_kinds.insert(path_key.clone(), is_directory).is_some() {
-            return Err(AppError::Path(format!(
-                "ZIP 包含重复或等价路径，已拒绝: {name}"
-            )));
-        }
-
-        let local_header_end = local_offset
-            .checked_add(30)
-            .ok_or_else(|| AppError::Other(format!("local header 偏移溢出: {name}")))?;
-        if local_header_end > central_offset {
-            return Err(AppError::Other(format!("local header 越界: {name}")));
-        }
-        file.seek(SeekFrom::Start(local_offset))?;
-        let mut local_header = [0u8; 30];
-        file.read_exact(&mut local_header)?;
-        if local_header[..4] != [0x50, 0x4b, 0x03, 0x04] {
-            return Err(AppError::Other(format!("local header 损坏: {name}")));
-        }
-        let local_flags = read_zip_u16(&local_header, 6, "local header flags")?;
-        let local_method = read_zip_u16(&local_header, 8, "local header 压缩方式")?;
-        let local_crc = read_zip_u32(&local_header, 14, "local header CRC")?;
-        let local_compressed_size =
-            read_zip_u32(&local_header, 18, "local header 压缩后大小")? as u64;
-        let local_uncompressed_size =
-            read_zip_u32(&local_header, 22, "local header 原始大小")? as u64;
-        let local_name_len = read_zip_u16(&local_header, 26, "local header 文件名长度")? as u64;
-        let local_extra_len = read_zip_u16(&local_header, 28, "local header extra 长度")? as u64;
-        validate_zip_flags(local_flags, &name, "local header")?;
-        if local_flags != flags
-            || local_method != method
-            || local_crc != crc
-            || local_compressed_size != compressed_size
-            || local_uncompressed_size != uncompressed_size
-        {
-            return Err(AppError::Other(format!(
-                "central directory 与 local header 的 flags/method/CRC/size 不一致: {name}"
-            )));
-        }
-        let local_name_start = local_offset + 30;
-        let payload_start = local_name_start
-            .checked_add(local_name_len)
-            .and_then(|value| value.checked_add(local_extra_len))
-            .ok_or_else(|| AppError::Other(format!("payload 偏移溢出: {name}")))?;
-        let payload_end = payload_start
-            .checked_add(compressed_size)
-            .ok_or_else(|| AppError::Other(format!("payload 范围溢出: {name}")))?;
-        if payload_end > central_offset {
-            return Err(AppError::Other(format!("payload 范围越界: {name}")));
-        }
-        let local_name_len_usize = usize::try_from(local_name_len)
-            .map_err(|_| AppError::Other(format!("local header 文件名过长: {name}")))?;
-        file.seek(SeekFrom::Start(local_name_start))?;
-        let mut local_name = vec![0u8; local_name_len_usize];
-        file.read_exact(&mut local_name)?;
-        if local_name != name_bytes {
-            return Err(AppError::Other(format!(
-                "central directory 与 local header 的文件名不一致: {name}"
-            )));
-        }
-
-        entries.push(ParsedZipEntry {
-            name,
-            relative_path,
-            is_directory,
-            crc32: crc,
-            size: compressed_size,
-            payload_start,
-            local_range_end: payload_end,
-            local_offset,
-        });
-    }
-    if position != central.len() {
-        return Err(AppError::Other(format!(
-            "central directory 条目数量或总大小不一致: 已解析 {position} 字节，声明 {} 字节",
-            central.len()
-        )));
-    }
-
-    for path in path_kinds.keys() {
-        let mut parent = path.as_str();
-        while let Some(separator) = parent.rfind('/') {
-            parent = &parent[..separator];
-            if path_kinds.get(parent) == Some(&false) {
-                return Err(AppError::Path(format!(
-                    "ZIP 文件条目同时被用作父目录，已拒绝: {parent} -> {path}"
-                )));
-            }
-        }
-    }
-
-    let mut ranges = entries
-        .iter()
-        .map(|entry| {
-            (
-                entry.local_offset,
-                entry.local_range_end,
-                entry.name.as_str(),
-            )
-        })
-        .collect::<Vec<_>>();
-    ranges.sort_unstable_by_key(|range| range.0);
-    for pair in ranges.windows(2) {
-        if pair[0].1 > pair[1].0 {
-            return Err(AppError::Other(format!(
-                "ZIP local header/payload 范围重叠: {} 与 {}",
-                pair[0].2, pair[1].2
-            )));
-        }
-    }
-    Ok(entries)
-}
-
-fn create_unique_stage_directory(parent: &Path) -> AppResult<PathBuf> {
-    loop {
-        let sequence = ZIP_STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = parent.join(format!(
-            ".ccsm-unpack-{}-{sequence}.stage",
-            std::process::id()
-        ));
-        match fs::create_dir(&path) {
-            Ok(()) => {
-                if let Err(error) = validate_plain_directory_metadata(&path, "ZIP 解包暂存目录")
-                {
-                    return match fs::remove_dir(&path) {
-                        Ok(()) => Err(error),
-                        Err(cleanup_error) => Err(AppError::Other(format!(
-                            "{error}；清理新建 ZIP 暂存目录失败 {}: {cleanup_error}",
-                            path.to_string_lossy()
-                        ))),
-                    };
-                }
-                return Ok(path);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error.into()),
-        }
-    }
-}
-
-fn ensure_plain_stage_subdirectory(stage: &Path, relative: &Path) -> AppResult<PathBuf> {
-    let mut current = stage.to_path_buf();
-    for component in relative.components() {
-        let Component::Normal(segment) = component else {
-            return Err(AppError::Path(format!(
-                "ZIP 暂存相对目录包含非法组件: {}",
-                relative.to_string_lossy()
-            )));
-        };
-        current.push(segment);
-        match fs::symlink_metadata(&current) {
-            Ok(_) => validate_plain_directory_metadata(&current, "ZIP 暂存子目录")?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(&current)?;
-                validate_plain_directory_metadata(&current, "ZIP 暂存子目录")?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(current)
-}
-
-fn extract_zip_entries_to_stage(
-    file: &mut File,
-    entries: &[ParsedZipEntry],
-    stage: &Path,
-) -> AppResult<(u32, u64)> {
-    let mut file_count = 0u32;
-    let mut total_bytes = 0u64;
-    let mut buffer = vec![0u8; 64 * 1024];
-    for entry in entries {
-        if entry.is_directory {
-            ensure_plain_stage_subdirectory(stage, &entry.relative_path)?;
-            continue;
-        }
-        let parent_relative = entry
-            .relative_path
-            .parent()
-            .unwrap_or_else(|| Path::new(""));
-        let parent = ensure_plain_stage_subdirectory(stage, parent_relative)?;
-        let file_name = entry
-            .relative_path
-            .file_name()
-            .ok_or_else(|| AppError::Path(format!("ZIP 文件条目缺少文件名: {}", entry.name)))?;
-        let output_path = parent.join(file_name);
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&output_path)?;
-        let output_metadata = output.metadata()?;
-        if !output_metadata.is_file()
-            || crate::path_safety::metadata_is_link_or_reparse(&output_metadata)
-        {
-            return Err(AppError::Path(format!(
-                "ZIP 暂存输出不是普通文件: {}",
-                output_path.to_string_lossy()
-            )));
-        }
-
-        file.seek(SeekFrom::Start(entry.payload_start))?;
-        let mut remaining = entry.size;
-        let mut hasher = Crc32Hasher::new();
-        while remaining > 0 {
-            let requested = usize::try_from(remaining.min(buffer.len() as u64))
-                .map_err(|_| AppError::Other("ZIP payload 读取长度超出平台限制".into()))?;
-            let read = file.read(&mut buffer[..requested])?;
-            if read == 0 {
-                return Err(AppError::Other(format!(
-                    "ZIP payload 提前结束，仍缺少 {remaining} 字节: {}",
-                    entry.name
-                )));
-            }
-            output.write_all(&buffer[..read])?;
-            hasher.update(&buffer[..read]);
-            remaining -= read as u64;
-        }
-        output.flush()?;
-        output.sync_all()?;
-        let actual_crc = hasher.finish();
-        if actual_crc != entry.crc32 {
-            return Err(AppError::Other(format!(
-                "ZIP 条目 CRC 校验失败: {}，声明 {:08x}，实际 {:08x}",
-                entry.name, entry.crc32, actual_crc
-            )));
-        }
-        let written_metadata = fs::symlink_metadata(&output_path)?;
-        if !written_metadata.is_file()
-            || crate::path_safety::metadata_is_link_or_reparse(&written_metadata)
-        {
-            return Err(AppError::Path(format!(
-                "ZIP 暂存文件在写入期间被替换: {}",
-                output_path.to_string_lossy()
-            )));
-        }
-        if written_metadata.len() != entry.size {
-            return Err(AppError::Other(format!(
-                "ZIP 暂存文件大小不一致: {}，声明 {}，实际 {}",
-                entry.name,
-                entry.size,
-                written_metadata.len()
-            )));
-        }
-        total_bytes = total_bytes
-            .checked_add(entry.size)
-            .ok_or_else(|| AppError::Other("ZIP 解包总字节数溢出".into()))?;
-        file_count = file_count
-            .checked_add(1)
-            .ok_or_else(|| AppError::Other("ZIP 解包文件数溢出".into()))?;
-    }
-    Ok((file_count, total_bytes))
-}
-
-fn unique_missing_sibling(parent: &Path, suffix: &str) -> AppResult<PathBuf> {
-    loop {
-        let sequence = ZIP_STAGE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let candidate = parent.join(format!(
-            ".ccsm-unpack-{}-{sequence}.{suffix}",
-            std::process::id()
-        ));
-        match fs::symlink_metadata(&candidate) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
-            Ok(_) => continue,
-            Err(error) => return Err(error.into()),
-        }
-    }
-}
-
-fn publish_zip_stage(
-    stage: &Path,
-    destination: &Path,
-    parent: &Path,
-    initial_state: ZipDestinationState,
-) -> AppResult<()> {
-    validate_existing_directory_chain(parent, "ZIP 解包目标父目录")?;
-    match initial_state {
-        ZipDestinationState::Missing => {
-            if inspect_zip_destination(destination)? != ZipDestinationState::Missing {
-                return Err(AppError::Other(format!(
-                    "ZIP 解包目标在发布前被其他进程创建: {}",
-                    destination.to_string_lossy()
-                )));
-            }
-            fs::rename(stage, destination)?;
-        }
-        ZipDestinationState::EmptyDirectory => {
-            if inspect_zip_destination(destination)? != ZipDestinationState::EmptyDirectory {
-                return Err(AppError::Other(format!(
-                    "ZIP 解包目标在发布前发生变化: {}",
-                    destination.to_string_lossy()
-                )));
-            }
-            let backup = unique_missing_sibling(parent, "empty-destination")?;
-            fs::rename(destination, &backup)?;
-            if let Err(publish_error) = fs::rename(stage, destination) {
-                let restore_error = fs::rename(&backup, destination).err();
-                return match restore_error {
-                    None => Err(publish_error.into()),
-                    Some(restore_error) => Err(AppError::Other(format!(
-                        "发布 ZIP 解包结果失败: {publish_error}；恢复原空目标也失败: {restore_error}"
-                    ))),
-                };
-            }
-            if let Err(cleanup_error) = fs::remove_dir(&backup) {
-                let park_result = fs::rename(destination, stage);
-                let restore_result = fs::rename(&backup, destination);
-                return match (park_result, restore_result) {
-                    (Ok(()), Ok(())) => Err(AppError::Other(format!(
-                        "清理原空目标暂存目录失败，已回滚发布: {cleanup_error}"
-                    ))),
-                    (park, restore) => Err(AppError::Other(format!(
-                        "清理原空目标暂存目录失败: {cleanup_error}；回滚新目标结果={park:?}；恢复原目标结果={restore:?}"
-                    ))),
-                };
-            }
-        }
-    }
-    Ok(())
-}
-
-fn cleanup_failed_zip_unpack(
-    stage: &Path,
-    created_parents: &[PathBuf],
-    primary_error: AppError,
-) -> AppError {
-    let mut cleanup_errors = Vec::new();
-    match fs::symlink_metadata(stage) {
-        Ok(metadata) => {
-            if crate::path_safety::metadata_is_link_or_reparse(&metadata) || !metadata.is_dir() {
-                cleanup_errors.push(format!(
-                    "暂存路径不再是普通目录，拒绝递归清理: {}",
-                    stage.to_string_lossy()
-                ));
-            } else if let Err(error) = fs::remove_dir_all(stage) {
-                cleanup_errors.push(format!(
-                    "清理 ZIP 暂存目录失败 {}: {error}",
-                    stage.to_string_lossy()
-                ));
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => cleanup_errors.push(format!(
-            "检查 ZIP 暂存目录失败 {}: {error}",
-            stage.to_string_lossy()
-        )),
-    }
-    cleanup_errors.extend(remove_created_directories(created_parents));
-    if cleanup_errors.is_empty() {
-        primary_error
-    } else {
-        AppError::Other(format!(
-            "{primary_error}；清理失败：{}",
-            cleanup_errors.join("；")
-        ))
-    }
-}
-
-pub fn unpack_zip(zip_path: String, dst_dir: String) -> AppResult<ZipReport> {
-    let destination = absolute_lexical_path(Path::new(&dst_dir), "ZIP 解包目标")?;
-    let parent = destination.parent().ok_or_else(|| {
-        AppError::Path(format!(
-            "ZIP 解包目标缺少父目录: {}",
-            destination.to_string_lossy()
-        ))
-    })?;
-    validate_existing_directory_chain(parent, "ZIP 解包目标父目录")?;
-    let initial_state = inspect_zip_destination(&destination)?;
-
-    let zip_source = PathBuf::from(&zip_path);
-    let source_metadata = fs::symlink_metadata(&zip_source)?;
-    if crate::path_safety::metadata_is_link_or_reparse(&source_metadata)
-        || !source_metadata.is_file()
-    {
-        return Err(AppError::Path(format!(
-            "ZIP 源必须是普通文件且不能是链接或 reparse point: {}",
-            zip_source.to_string_lossy()
-        )));
-    }
-    let mut file = File::open(&zip_source)?;
-    let file_len = file.metadata()?.len();
-    let entries = parse_zip_entries(&mut file, file_len)?;
-
-    let created_parents = ensure_plain_directory_chain(parent, "ZIP 解包目标父目录")?;
-    if let Err(error) = match (initial_state, inspect_zip_destination(&destination)) {
-        (ZipDestinationState::Missing, Ok(ZipDestinationState::Missing))
-        | (ZipDestinationState::EmptyDirectory, Ok(ZipDestinationState::EmptyDirectory)) => Ok(()),
-        (_, Ok(_)) => Err(AppError::Other(format!(
-            "ZIP 解包目标在验证期间发生变化: {}",
-            destination.to_string_lossy()
-        ))),
-        (_, Err(error)) => Err(error),
-    } {
-        let cleanup = remove_created_directories(&created_parents);
-        if cleanup.is_empty() {
-            return Err(error);
-        }
-        return Err(AppError::Other(format!("{error}；{}", cleanup.join("；"))));
-    }
-
-    let stage = match create_unique_stage_directory(parent) {
-        Ok(stage) => stage,
-        Err(error) => {
-            let cleanup = remove_created_directories(&created_parents);
-            if cleanup.is_empty() {
-                return Err(error);
-            }
-            return Err(AppError::Other(format!("{error}；{}", cleanup.join("；"))));
-        }
-    };
-    let (file_count, total_bytes) = match extract_zip_entries_to_stage(&mut file, &entries, &stage)
-    {
-        Ok(report) => report,
-        Err(error) => return Err(cleanup_failed_zip_unpack(&stage, &created_parents, error)),
-    };
-    if let Err(error) = crate::path_safety::validate_tree(parent, &stage, "ZIP 解包暂存树") {
-        return Err(cleanup_failed_zip_unpack(&stage, &created_parents, error));
-    }
-    if let Err(error) = publish_zip_stage(&stage, &destination, parent, initial_state) {
-        return Err(cleanup_failed_zip_unpack(&stage, &created_parents, error));
-    }
-
-    Ok(ZipReport {
-        path: destination.to_string_lossy().into_owned(),
-        files: file_count,
-        bytes: total_bytes,
-    })
-}
-
-pub fn unpack_zip_to_temp(zip_path: String) -> AppResult<ZipReport> {
-    let dir = std::env::temp_dir().join(format!(
-        "cc-session-manager-import-{}-{}",
-        std::process::id(),
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-    ));
-    unpack_zip(zip_path, dir.to_string_lossy().into_owned())
 }

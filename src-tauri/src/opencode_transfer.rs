@@ -304,6 +304,7 @@ pub fn move_session_cwd(
         new_cwd: target_cwd,
         threads_updated: updated,
         rollout_rewritten: true,
+        desktop_project_synced: false,
         artifacts_moved: 0,
         history_rows_updated: 0,
         target_project_id: Some(target.project_id),

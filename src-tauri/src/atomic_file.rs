@@ -9,6 +9,11 @@ use crate::error::{AppError, AppResult};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+thread_local! {
+    static TEST_REMOVE_CREATED_TEMP_FAILURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileFingerprint {
     len: u64,
@@ -18,6 +23,13 @@ pub struct FileFingerprint {
 pub fn fingerprint(path: &Path) -> AppResult<FileFingerprint> {
     let mut file = File::open(path)?;
     fingerprint_open_file(&mut file)
+}
+
+pub(crate) fn fingerprint_bytes(bytes: &[u8]) -> FileFingerprint {
+    FileFingerprint {
+        len: bytes.len() as u64,
+        sha256: Sha256::digest(bytes).into(),
+    }
 }
 
 fn fingerprint_open_file(file: &mut File) -> AppResult<FileFingerprint> {
@@ -46,6 +58,223 @@ pub fn create_with_writer_if_absent(
     replace_with_writer(path, None, writer)
 }
 
+/// Move an existing file without ever replacing an existing destination entry.
+///
+/// The platform no-replace rename is the atomic commit point. This is intentionally limited to
+/// ordinary same-filesystem files, which is exactly the contract required by the mutation journal.
+pub(crate) fn move_file_if_absent(source: &Path, destination: &Path) -> AppResult<()> {
+    let source_metadata = fs::symlink_metadata(source)?;
+    if !source_metadata.is_file()
+        || crate::path_safety::metadata_is_link_or_reparse(&source_metadata)
+    {
+        return Err(AppError::Path(format!(
+            "待移动源不是普通文件或属于链接/junction: {}",
+            source.to_string_lossy()
+        )));
+    }
+    match fs::symlink_metadata(destination) {
+        Ok(_) => {
+            return Err(AppError::AtomicWriteConflict(format!(
+                "移动目标已存在，已拒绝覆盖: {}",
+                destination.to_string_lossy()
+            )))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    rename_file_no_replace(source, destination).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            AppError::AtomicWriteConflict(format!(
+                "移动目标在操作期间已生成，已拒绝覆盖: {}",
+                destination.to_string_lossy()
+            ))
+        } else {
+            AppError::AtomicWriteNotCommitted(format!(
+                "原子移动文件失败 {} -> {}: {error}",
+                source.to_string_lossy(),
+                destination.to_string_lossy()
+            ))
+        }
+    })
+}
+
+/// Atomically detach one ordinary file name only while it still refers to the expected bytes.
+/// The file is first moved to a unique same-directory name so no concurrent replacement at the
+/// original path can be removed by this operation.
+pub(crate) fn remove_file_if_unchanged(
+    path: &Path,
+    expected: &FileFingerprint,
+    label: &str,
+) -> AppResult<()> {
+    let staged = unique_sibling_path(path, "remove-stage")?;
+    move_file_if_absent(path, &staged)?;
+    let staged_fingerprint = match fingerprint(&staged) {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => {
+            return match move_file_if_absent(&staged, path) {
+                Ok(()) => Err(error),
+                Err(restore_error) => Err(AppError::Other(format!(
+                    "{label} 暂存后无法读取指纹: {error}; 恢复原路径也失败: {restore_error}"
+                ))),
+            };
+        }
+    };
+    if &staged_fingerprint != expected {
+        let conflict = AppError::AtomicWriteConflict(format!(
+            "{label} 在删除期间发生变化，已拒绝删除: {}",
+            path.to_string_lossy()
+        ));
+        return match move_file_if_absent(&staged, path) {
+            Ok(()) => Err(conflict),
+            Err(restore_error) => Err(AppError::Other(format!(
+                "{conflict}; 恢复原路径也失败: {restore_error}"
+            ))),
+        };
+    }
+    fs::remove_file(&staged).map_err(|error| {
+        AppError::AtomicWriteCommitted(format!(
+            "{label} 已从原路径移除，但清理删除暂存文件失败 {}: {error}",
+            staged.to_string_lossy()
+        ))
+    })
+}
+
+/// Remove a private staged file after verifying that its bytes still match the journaled value.
+/// The path is first renamed with no-replace semantics so a later writer cannot be unlinked after
+/// the verification step.
+pub(crate) fn remove_staged_file_if_unchanged(
+    path: &Path,
+    expected: &FileFingerprint,
+    label: &str,
+) -> AppResult<()> {
+    let cleanup = unique_sibling_path(path, "cleanup-stage")?;
+    move_file_if_absent(path, &cleanup)?;
+    let cleanup_fingerprint = match fingerprint(&cleanup) {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => {
+            return match move_file_if_absent(&cleanup, path) {
+                Ok(()) => Err(error),
+                Err(restore_error) => Err(AppError::Other(format!(
+                    "{label} 暂存后无法读取指纹: {error}; 恢复原暂存路径也失败: {restore_error}"
+                ))),
+            };
+        }
+    };
+    if &cleanup_fingerprint != expected {
+        let conflict = AppError::Other(format!(
+            "{label} 在提交后发生变化，拒绝清理，文件保留在 {}",
+            path.to_string_lossy()
+        ));
+        return match move_file_if_absent(&cleanup, path) {
+            Ok(()) => Err(conflict),
+            Err(restore_error) => Err(AppError::Other(format!(
+                "{conflict}; 恢复原暂存路径也失败，文件保留在 {}: {restore_error}",
+                cleanup.to_string_lossy()
+            ))),
+        };
+    }
+    fs::remove_file(&cleanup).map_err(|error| {
+        AppError::Other(format!(
+            "{label} 清理失败，文件保留在 {}: {error}",
+            cleanup.to_string_lossy()
+        ))
+    })
+}
+
+fn unique_sibling_path(path: &Path, suffix: &str) -> AppResult<PathBuf> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| AppError::Path(format!("路径缺少文件名: {}", path.to_string_lossy())))?;
+    loop {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let mut staged_name = file_name.to_os_string();
+        staged_name.push(format!(".{}.{}.{suffix}", std::process::id(), sequence));
+        let candidate = parent.join(staged_name);
+        match fs::symlink_metadata(&candidate) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(candidate),
+            Ok(_) => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn rename_file_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    replace_file_atomically(source, destination, false)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_file_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "源路径包含 NUL 字节")
+    })?;
+    let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "目标路径包含 NUL 字节")
+    })?;
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn rename_file_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "源路径包含 NUL 字节")
+    })?;
+    let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "目标路径包含 NUL 字节")
+    })?;
+    let result = unsafe {
+        libc::renameatx_np(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android", target_os = "macos"))
+))]
+fn rename_file_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    // These targets have no portable atomic no-replace rename API in std. Fail closed instead of
+    // emulating it with a check-then-rename sequence that can overwrite another process's file.
+    let _ = (source, destination);
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "当前平台不支持安全的 no-replace 文件移动",
+    ))
+}
+
 fn replace_with_writer(
     path: &Path,
     expected: Option<&FileFingerprint>,
@@ -59,7 +288,10 @@ fn replace_with_writer(
     });
     drop(temp_file);
     if let Err(error) = write_result {
-        return Err(cleanup_after_error(&temp_path, error));
+        return Err(cleanup_after_error(
+            &temp_path,
+            atomic_write_not_committed(error),
+        ));
     }
 
     match expected {
@@ -73,30 +305,104 @@ fn replace_with_writer(
             Ok(true) => {
                 return Err(cleanup_after_error(
                     &temp_path,
-                    AppError::Other(format!(
+                    AppError::AtomicWriteConflict(format!(
                         "文件在创建期间已由其他进程生成，已拒绝覆盖: {}",
                         path.to_string_lossy()
                     )),
                 ))
             }
-            Err(error) => return Err(cleanup_after_error(&temp_path, error.into())),
+            Err(error) => {
+                return Err(cleanup_after_error(
+                    &temp_path,
+                    AppError::AtomicWriteNotCommitted(error.to_string()),
+                ))
+            }
         },
     }
 
     if expected.is_none() {
-        if let Err(error) = replace_file_atomically(&temp_path, path, false) {
-            return Err(cleanup_after_error(&temp_path, error.into()));
+        if let Err(error) = create_file_atomically(&temp_path, path) {
+            return Err(cleanup_after_error(&temp_path, error));
         }
     }
-    sync_parent(path)?;
+    sync_parent(path).map_err(|error| {
+        AppError::AtomicWriteCommitted(format!(
+            "文件已写入，但同步父目录失败 {}: {error}",
+            path.to_string_lossy()
+        ))
+    })?;
     Ok(())
 }
 
+fn create_file_atomically(temp_path: &Path, final_path: &Path) -> AppResult<()> {
+    #[cfg(windows)]
+    {
+        replace_file_atomically(temp_path, final_path, false).map_err(|error| {
+            AppError::AtomicWriteNotCommitted(format!(
+                "原子创建目标文件失败 {}: {error}",
+                final_path.to_string_lossy()
+            ))
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        fs::hard_link(temp_path, final_path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                AppError::AtomicWriteConflict(format!(
+                    "文件在创建期间已由其他进程生成，已拒绝覆盖: {}",
+                    final_path.to_string_lossy()
+                ))
+            } else {
+                AppError::AtomicWriteNotCommitted(format!(
+                    "原子创建目标文件失败 {}: {error}",
+                    final_path.to_string_lossy()
+                ))
+            }
+        })?;
+        remove_created_temp(temp_path).map_err(|error| {
+            AppError::AtomicWriteCommitted(format!(
+                "文件已创建，但清理同内容临时硬链接失败 {}: {error}",
+                temp_path.to_string_lossy()
+            ))
+        })
+    }
+}
+
+#[cfg(not(windows))]
+fn remove_created_temp(temp_path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if TEST_REMOVE_CREATED_TEMP_FAILURES.with(|remaining| {
+        let current = remaining.get();
+        if current == 0 {
+            false
+        } else {
+            remaining.set(current - 1);
+            true
+        }
+    }) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "测试注入：临时硬链接清理失败",
+        ));
+    }
+    fs::remove_file(temp_path)
+}
+
 fn changed_during_operation(path: &Path) -> AppError {
-    AppError::Other(format!(
+    AppError::AtomicWriteConflict(format!(
         "文件在操作期间发生变化，已拒绝覆盖，请停止对应会话后重试: {}",
         path.to_string_lossy()
     ))
+}
+
+fn atomic_write_not_committed(error: AppError) -> AppError {
+    match error {
+        AppError::AtomicWriteConflict(_) | AppError::AtomicWriteNotCommitted(_) => error,
+        AppError::AtomicWriteCommitted(message) => AppError::AtomicWriteNotCommitted(format!(
+            "临时文件写入阶段意外返回已提交状态: {message}"
+        )),
+        other => AppError::AtomicWriteNotCommitted(other.to_string()),
+    }
 }
 
 #[cfg(windows)]
@@ -118,12 +424,14 @@ fn commit_existing_if_unchanged(
         .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
         .open(final_path)
         .map_err(|error| {
-            AppError::Other(format!(
+            AppError::AtomicWriteConflict(format!(
                 "文件正在被其他进程写入，已拒绝覆盖，请停止对应会话后重试: {} ({error})",
                 final_path.to_string_lossy()
             ))
         })?;
-    if &fingerprint_open_file(&mut guarded)? != expected {
+    let guarded_fingerprint =
+        fingerprint_open_file(&mut guarded).map_err(atomic_write_not_committed)?;
+    if &guarded_fingerprint != expected {
         return Err(changed_during_operation(final_path));
     }
     let backup_path = loop {
@@ -150,7 +458,12 @@ fn commit_existing_if_unchanged(
             Err(error) if matches!(error.raw_os_error(), Some(80) | Some(183)) => {
                 continue;
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                return Err(AppError::AtomicWriteNotCommitted(format!(
+                    "建立原子替换旧快照失败 {}: {error}",
+                    final_path.to_string_lossy()
+                )))
+            }
         }
     };
 
@@ -158,8 +471,11 @@ fn commit_existing_if_unchanged(
         let rollback = replace_file_atomically(&backup_path, final_path, false);
         drop(guarded);
         return match rollback {
-            Ok(()) => Err(install_error.into()),
-            Err(rollback_error) => Err(AppError::Other(format!(
+            Ok(()) => Err(AppError::AtomicWriteNotCommitted(format!(
+                "安装替换文件失败，旧文件已恢复 {}: {install_error}",
+                final_path.to_string_lossy()
+            ))),
+            Err(rollback_error) => Err(AppError::AtomicWriteNotCommitted(format!(
                 "安装替换文件失败: {install_error}; 恢复旧文件也失败，旧数据保留在 {}: {rollback_error}",
                 backup_path.to_string_lossy()
             ))),
@@ -167,7 +483,7 @@ fn commit_existing_if_unchanged(
     }
     drop(guarded);
     fs::remove_file(&backup_path).map_err(|error| {
-        AppError::Other(format!(
+        AppError::AtomicWriteCommitted(format!(
             "文件已替换，但清理旧快照失败 {}: {error}",
             backup_path.to_string_lossy()
         ))
@@ -181,10 +497,16 @@ fn commit_existing_if_unchanged(
     final_path: &Path,
     expected: &FileFingerprint,
 ) -> AppResult<()> {
-    if &fingerprint(final_path)? != expected {
+    let current = fingerprint(final_path).map_err(atomic_write_not_committed)?;
+    if &current != expected {
         return Err(changed_during_operation(final_path));
     }
-    replace_file_atomically(temp_path, final_path, true)?;
+    replace_file_atomically(temp_path, final_path, true).map_err(|error| {
+        AppError::AtomicWriteNotCommitted(format!(
+            "原子替换目标文件失败 {}: {error}",
+            final_path.to_string_lossy()
+        ))
+    })?;
     Ok(())
 }
 
@@ -217,10 +539,18 @@ fn cleanup_after_error(temp_path: &Path, original: AppError) -> AppError {
     match fs::remove_file(temp_path) {
         Ok(()) => original,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => original,
-        Err(error) => AppError::Other(format!(
-            "{original}; 清理临时文件失败 {}: {error}",
-            temp_path.to_string_lossy()
-        )),
+        Err(error) => {
+            let message = format!(
+                "{original}; 清理临时文件失败 {}: {error}",
+                temp_path.to_string_lossy()
+            );
+            match original {
+                AppError::AtomicWriteConflict(_) => AppError::AtomicWriteConflict(message),
+                AppError::AtomicWriteNotCommitted(_) => AppError::AtomicWriteNotCommitted(message),
+                AppError::AtomicWriteCommitted(_) => AppError::AtomicWriteCommitted(message),
+                _ => AppError::AtomicWriteNotCommitted(message),
+            }
+        }
     }
 }
 
@@ -360,6 +690,53 @@ mod tests {
 
         assert_eq!(fs::read(&destination)?, b"concurrent\n");
         assert_eq!(fs::read(&temp)?, b"pending\n");
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn absent_create_reports_committed_when_only_temp_link_cleanup_fails() -> AppResult<()> {
+        let root = std::env::temp_dir().join(format!(
+            "cc-session-manager-atomic-create-cleanup-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir_all(&root)?;
+        let destination = root.join("session.jsonl");
+        TEST_REMOVE_CREATED_TEMP_FAILURES.set(1);
+
+        let error = create_with_writer_if_absent(&destination, |file| {
+            file.write_all(b"committed\n")?;
+            Ok(())
+        })
+        .expect_err("temp-link cleanup failure must surface after the destination commit");
+
+        assert!(error.atomic_write_committed(), "{error}");
+        assert_eq!(fs::read(&destination)?, b"committed\n");
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn move_file_if_absent_never_replaces_an_existing_destination() -> AppResult<()> {
+        let root = std::env::temp_dir().join(format!(
+            "cc-session-manager-move-no-replace-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir_all(&root)?;
+        let source = root.join("source.jsonl");
+        let destination = root.join("destination.jsonl");
+        fs::write(&source, b"source\n")?;
+        fs::write(&destination, b"concurrent\n")?;
+
+        let error = move_file_if_absent(&source, &destination)
+            .expect_err("a no-replace move must preserve an existing destination");
+
+        assert!(error.retryable_atomic_write_conflict(), "{error}");
+        assert_eq!(fs::read(&source)?, b"source\n");
+        assert_eq!(fs::read(&destination)?, b"concurrent\n");
         fs::remove_dir_all(root).ok();
         Ok(())
     }

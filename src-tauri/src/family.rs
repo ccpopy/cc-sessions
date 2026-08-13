@@ -18,8 +18,8 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{ensure_not_cancelled, AppError, AppResult};
 use crate::models::{
-    BranchStatus, Family, FamilyBranch, FamilyIntegrityItem, FamilyIntegrityReport, FamilyOverlay,
-    FamilyStore,
+    ArchiveOrigin, BranchStatus, Family, FamilyBranch, FamilyIntegrityItem, FamilyIntegrityReport,
+    FamilyOverlay, FamilyStore,
 };
 use crate::paths;
 use crate::state_db;
@@ -305,6 +305,7 @@ pub fn ensure_family_for(
         sha256: None,
         line_count: None,
         note: None,
+        archive_origin: None,
     };
     let family = Family {
         family_id: fid.clone(),
@@ -329,6 +330,7 @@ pub fn set_active(store: &mut FamilyStore, family_id: &str, branch_id: &str) -> 
     for b in family.chain.iter_mut() {
         if b.id == branch_id {
             b.status = BranchStatus::Active;
+            b.archive_origin = None;
             found = true;
         } else if matches!(b.status, BranchStatus::Active) {
             b.status = BranchStatus::Archived;
@@ -520,6 +522,7 @@ pub fn update_manual_archive_metadata(
             branch.line_count = None;
         }
     }
+    branch.archive_origin = None;
     family.updated_at = now_iso();
     Ok(true)
 }
@@ -708,7 +711,28 @@ pub fn archive_with_integrity(
     branch.sha256 = Some(sha);
     branch.line_count = Some(lines);
     branch.status = BranchStatus::Archived;
+    branch.archive_origin = None;
     family.updated_at = now_iso();
+    Ok(())
+}
+
+pub fn set_archive_origin(
+    store: &mut FamilyStore,
+    family_id: &str,
+    branch_id: &str,
+    origin: ArchiveOrigin,
+) -> AppResult<()> {
+    let branch = store
+        .families
+        .get_mut(family_id)
+        .ok_or_else(|| AppError::NotFound(format!("family not found: {family_id}")))?
+        .chain
+        .iter_mut()
+        .find(|branch| branch.id == branch_id)
+        .ok_or_else(|| {
+            AppError::NotFound(format!("branch not in family {family_id}: {branch_id}"))
+        })?;
+    branch.archive_origin = Some(origin);
     Ok(())
 }
 
@@ -952,6 +976,11 @@ pub fn get_session_family_overlay_with_lock(
             false
         };
         let source_rollout_available = recorded_rollout_available || family_rollout_available;
+        let archive_origin = family_id
+            .as_ref()
+            .and_then(|family_id| store.families.get(family_id))
+            .and_then(|family| family.chain.iter().find(|branch| branch.id == *id))
+            .and_then(|branch| branch.archive_origin.clone());
         let (branch_count, is_active_branch, clone_state) = match family_id.as_ref() {
             None => {
                 let cs = compute_clone_state(
@@ -1020,6 +1049,7 @@ pub fn get_session_family_overlay_with_lock(
             family_id,
             branch_count,
             is_active_branch,
+            archive_origin,
             clone_state,
         });
     }
@@ -1084,6 +1114,7 @@ mod tests {
             sha256: None,
             line_count: None,
             note: None,
+            archive_origin: None,
         }
     }
 
@@ -1112,6 +1143,44 @@ mod tests {
             families,
             index,
         }
+    }
+
+    #[test]
+    fn family_store_without_archive_origin_remains_compatible() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-family-origin-compat-test");
+        fs::create_dir_all(&codex)?;
+        fs::write(
+            paths::family_store_path(&codex),
+            serde_json::json!({
+                "version": 1,
+                "families": {
+                    "legacy": {
+                        "family_id": "legacy",
+                        "root_id": "legacy",
+                        "title": "legacy family",
+                        "chain": [{
+                            "id": "legacy",
+                            "provider": "openai",
+                            "created_at": "2026-04-24T00:00:00Z",
+                            "status": "archived",
+                            "rollout_relpath": "archived_sessions/rollout-legacy.jsonl",
+                            "sha256": null,
+                            "line_count": null,
+                            "note": null
+                        }],
+                        "active_id": "legacy",
+                        "updated_at": "2026-04-24T00:00:00Z"
+                    }
+                },
+                "index": {"legacy": "legacy"}
+            })
+            .to_string(),
+        )?;
+
+        let store = load(&codex)?;
+        assert_eq!(store.families["legacy"].chain[0].archive_origin, None);
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
     }
 
     fn family_save_temp_files(codex_dir: &Path) -> AppResult<Vec<PathBuf>> {
@@ -1418,6 +1487,7 @@ mod tests {
                     sha256: None,
                     line_count: None,
                     note: None,
+                    archive_origin: None,
                 },
                 FamilyBranch {
                     id: "overlay-target".to_string(),
@@ -1428,6 +1498,7 @@ mod tests {
                     sha256: None,
                     line_count: None,
                     note: None,
+                    archive_origin: None,
                 },
             ],
             active_id: "overlay-source".to_string(),
@@ -1517,6 +1588,7 @@ mod tests {
                 sha256: None,
                 line_count: None,
                 note: None,
+                archive_origin: None,
             }],
             active_id: "missing-active".to_string(),
             updated_at: "2026-04-24T00:00:00Z".to_string(),

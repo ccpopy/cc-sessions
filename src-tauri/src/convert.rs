@@ -17,7 +17,9 @@ use walkdir::WalkDir;
 
 use crate::error::{AppError, AppResult};
 use crate::models::ConvertReport;
-use crate::{atomic_file, family, fs_ops, paths, provenance, repair, sessions, state_db};
+use crate::{
+    atomic_file, family, fs_ops, mutation_journal, paths, provenance, repair, sessions, state_db,
+};
 
 /// 降级工具注记不包含转换来源。
 const TOOL_CALL_TAG: &str = "tool_call";
@@ -179,7 +181,7 @@ fn convert_claude_to_codex(
     let codex = PathBuf::from(codex_dir);
     let source = PathBuf::from(source_path);
     let parsed = parse_claude_session(&source)?;
-    let Some(cwd) = parsed.cwd.clone() else {
+    let Some(source_cwd) = parsed.cwd.as_deref() else {
         return Err(AppError::Other(
             "源会话缺少 cwd，无法确定 Codex 项目目录".into(),
         ));
@@ -189,6 +191,7 @@ fn convert_claude_to_codex(
             "源会话没有可迁移的用户消息（thinking、工具和元数据不计入）".into(),
         ));
     }
+    let cwd = claude_cwd_for_codex(&codex, source_cwd)?;
 
     let new_id = repair::new_session_id();
     let now = chrono::Utc::now();
@@ -205,19 +208,16 @@ fn convert_claude_to_codex(
             .unwrap_or_default()
     });
     let title = conversion_title(parsed.title.as_deref(), &parsed.messages);
+    let desktop_cwd = desktop_project_cwd(&codex, &cwd);
 
-    if let Some(parent) = new_abs.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    atomic_file::create_with_writer_if_absent(&new_abs, |out| {
-        for line in &built.lines {
-            writeln!(out, "{line}")?;
-        }
-        Ok(())
-    })?;
+    // Project membership is part of making a converted Codex session usable. Refuse before the
+    // first file/database write while Desktop owns the global state in memory; do not downgrade
+    // this into a warning after leaving a partially visible conversion behind.
+    crate::codex_projects::ensure_desktop_not_running(&codex)?;
+    crate::codex_projects::validate_thread_project_assignment(&codex, &new_id, &desktop_cwd)?;
 
-    // 依次更新 threads、session_index 和 workspace roots。
-    // 没有 state 库时只写 rollout，CLI 仍可恢复。
+    // rollout、threads、session_index 和 Desktop 项目归属共同决定会话是否可见。
+    // 这些必需写入必须作为一个可补偿操作提交，不能把项目同步失败降级成 warning。
     let mut warnings: Vec<String> = Vec::new();
     if mode == CodexImportMode::Native {
         warnings.push(
@@ -230,34 +230,76 @@ fn convert_claude_to_codex(
             ));
         }
     }
-    if paths::state_db_path(&codex).is_file() {
-        let state = state_db::open(&codex)?;
-        if let Err(error) = repair::upsert_thread_from_rollout(&codex, &state, &new_abs, false)
-            .and_then(|ok| {
-                if ok {
-                    Ok(())
-                } else {
-                    Err(AppError::Other("rollout 缺少有效 session_meta.id".into()))
+    let state = paths::state_db_path(&codex)
+        .is_file()
+        .then(|| state_db::open(&codex))
+        .transpose()?;
+    let transaction = state
+        .as_ref()
+        .map(|state| {
+            rusqlite::Transaction::new_unchecked(state, rusqlite::TransactionBehavior::Immediate)
+        })
+        .transpose()?;
+    let mut journal = mutation_journal::MutationJournal::default();
+    let operation = (|| -> AppResult<()> {
+        journal.mutate_file(&new_abs, || {
+            if let Some(parent) = new_abs.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            atomic_file::create_with_writer_if_absent(&new_abs, |out| {
+                for line in &built.lines {
+                    writeln!(out, "{line}")?;
                 }
+                Ok(())
             })
-        {
-            cleanup_failed_import(&new_abs);
-            return Err(AppError::Other(format!("同步 threads 失败: {error}")));
+        })?;
+
+        if let Some(transaction) = transaction.as_ref() {
+            let synced = repair::upsert_thread_from_rollout(&codex, transaction, &new_abs, false)?;
+            if !synced {
+                return Err(AppError::Other(
+                    "同步 threads 失败: rollout 缺少有效 session_meta.id".into(),
+                ));
+            }
+            transaction.execute(
+                "UPDATE threads SET title = ?1 WHERE id = ?2",
+                rusqlite::params![title, new_id],
+            )?;
         }
-        if let Err(error) = state.execute(
-            "UPDATE threads SET title = ?1 WHERE id = ?2",
-            rusqlite::params![title, new_id],
-        ) {
-            warnings.push(format!("同步 threads 标题失败: {error}"));
+
+        let index_path = paths::session_index_path(&codex);
+        journal.mutate_file(&index_path, || {
+            repair::append_index_line(&codex, &new_id, &title, &new_abs)
+        })?;
+        if let Some(receipt) = crate::codex_projects::sync_thread_project_assignment_with_receipt(
+            &codex,
+            &new_id,
+            &desktop_cwd,
+        )? {
+            journal.register_project_state_receipt(receipt);
         }
-    } else {
+        Ok(())
+    })();
+    match (operation, transaction) {
+        (Ok(()), Some(transaction)) => {
+            mutation_journal::commit_transaction_with_compensation(transaction, journal)?;
+        }
+        (Ok(()), None) => {
+            // With no state database there is no SQLite commit point. All fallible required
+            // writes above have completed; finalize any staged cleanup owned by the journal.
+            journal.finalize()?;
+        }
+        (Err(error), Some(transaction)) => {
+            return Err(mutation_journal::rollback_transaction_with_compensation(
+                transaction,
+                journal,
+                error,
+            ));
+        }
+        (Err(error), None) => return Err(journal.compensate_without_transaction(error)),
+    }
+    if state.is_none() {
         warnings.push("Codex App 会话列表未同步：未找到 state_5.sqlite".into());
-    }
-    if let Err(error) = repair::append_index_line(&codex, &new_id, &title, &new_abs) {
-        warnings.push(format!("写入 session_index 失败: {error}"));
-    }
-    if let Err(error) = repair::ensure_workspace_root_registered(&codex, &cwd) {
-        warnings.push(format!("注册 workspace root 失败: {error}"));
     }
     if let Err(error) = provenance::record_conversion(
         &codex,
@@ -285,8 +327,19 @@ fn convert_claude_to_codex(
     })
 }
 
-fn cleanup_failed_import(path: &Path) {
-    let _ = fs::remove_file(path);
+fn claude_cwd_for_codex(codex: &Path, source_cwd: &str) -> AppResult<String> {
+    let source_cwd = source_cwd.trim();
+    if paths::is_wsl_unc_path(codex) {
+        if source_cwd.starts_with('/') && !source_cwd.starts_with("//") {
+            return Ok(paths::strip_verbatim(source_cwd));
+        }
+        return paths::codex_record_path_from_host(codex, Path::new(source_cwd));
+    }
+    Ok(source_cwd.to_string())
+}
+
+fn desktop_project_cwd(codex: &Path, core_cwd: &str) -> String {
+    paths::host_path_string_from_codex_record(codex, core_cwd)
 }
 
 fn first_user_preview(messages: &[ConvMessage]) -> &str {
@@ -3250,6 +3303,342 @@ mod tests {
         assert_eq!(origin["source_id"], "src-session");
         assert_eq!(origin["conversion_mode"], "simple");
 
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn claude_to_codex_syncs_codex_app_project_assignment() {
+        let root = temp_dir("cla2codex-project-assignment");
+        let codex = root.join("codex");
+        let project = root.join("target-project");
+        fs::create_dir_all(&codex).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let project_cwd = project.to_string_lossy().into_owned();
+        let source = root.join("source-claude.jsonl");
+        write_lines(
+            &source,
+            &[claude_record("user", "迁移到目标项目", &project_cwd)],
+        );
+
+        let global_state_path = paths::codex_global_state_json_path(&codex);
+        fs::write(
+            &global_state_path,
+            serde_json::to_vec(&json!({
+                "local-projects": {
+                    "local-known-project": {
+                        "id": "local-known-project",
+                        "name": "target-project",
+                        "rootPaths": [project_cwd.clone()],
+                        "createdAt": 1,
+                        "updatedAt": 1
+                    }
+                },
+                "thread-project-assignments": {},
+                "thread-workspace-root-hints": {
+                    "existing-thread": "C:\\keep-this-independent-cache"
+                },
+                "projectless-thread-ids": [],
+                "future-codex-field": {"mustStay": true}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let report = convert_claude_to_codex(
+            codex.to_string_lossy().as_ref(),
+            source.to_string_lossy().as_ref(),
+            CodexImportMode::Simple,
+        )
+        .unwrap();
+
+        let global_state: Value =
+            serde_json::from_slice(&fs::read(global_state_path).unwrap()).unwrap();
+        let assignment = &global_state["thread-project-assignments"][report.new_id.as_str()];
+        assert_eq!(assignment["projectKind"], "local");
+        assert_eq!(assignment["projectId"], "local-known-project");
+        assert_eq!(assignment["cwd"], project_cwd);
+        assert_eq!(assignment["pendingCoreUpdate"], false);
+        assert_eq!(
+            global_state["thread-workspace-root-hints"]["existing-thread"],
+            r"C:\keep-this-independent-cache"
+        );
+        assert!(global_state["thread-workspace-root-hints"]
+            .get(report.new_id.as_str())
+            .is_none());
+        assert!(!global_state["projectless-thread-ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id.as_str() == Some(report.new_id.as_str())));
+        assert_eq!(global_state["project-order"][0], "local-known-project");
+        assert_eq!(global_state["future-codex-field"]["mustStay"], true);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn claude_to_codex_rejects_when_project_assignment_preflight_fails() {
+        let root = temp_dir("cla2codex-project-assignment-error");
+        let codex = root.join("codex");
+        fs::create_dir_all(&codex).unwrap();
+        let source = root.join("source-claude.jsonl");
+        write_lines(
+            &source,
+            &[claude_record("user", "仍应完成转换", "F:\\demo\\project")],
+        );
+        fs::write(paths::codex_global_state_json_path(&codex), b"{broken").unwrap();
+
+        let before_rollouts = family::scan_rollouts(&codex).unwrap();
+        let error = convert_claude_to_codex(
+            codex.to_string_lossy().as_ref(),
+            source.to_string_lossy().as_ref(),
+            CodexImportMode::Simple,
+        )
+        .expect_err("broken Desktop project state must reject conversion before writing");
+
+        assert!(error.to_string().contains("JSON 损坏"), "{error}");
+        assert_eq!(family::scan_rollouts(&codex).unwrap(), before_rollouts);
+        assert!(!paths::session_index_path(&codex).exists());
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn claude_to_codex_while_desktop_running_preserves_every_target_store() {
+        let root = temp_dir("cla2codex-desktop-running");
+        let codex = root.join("codex");
+        fs::create_dir_all(&codex).unwrap();
+        let source = root.join("source-claude.jsonl");
+        write_lines(
+            &source,
+            &[claude_record(
+                "user",
+                "Desktop 运行时不得产生转换目标",
+                "F:\\demo\\project",
+            )],
+        );
+
+        let existing_rollout = codex.join("sessions/2026/07/20/rollout-existing.jsonl");
+        fs::create_dir_all(existing_rollout.parent().unwrap()).unwrap();
+        fs::write(&existing_rollout, b"existing rollout\n").unwrap();
+        fs::File::create(paths::state_db_path(&codex)).unwrap();
+        let state = state_db::open(&codex).unwrap();
+        state
+            .execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT)",
+                [],
+            )
+            .unwrap();
+        state
+            .execute(
+                "INSERT INTO threads VALUES ('existing', ?1, 'C:\\existing', 'Existing')",
+                [existing_rollout.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        drop(state);
+        let index_path = paths::session_index_path(&codex);
+        let state_path = paths::state_db_path(&codex);
+        let global_state_path = paths::codex_global_state_json_path(&codex);
+        fs::write(&index_path, b"index-before\r\n").unwrap();
+        fs::write(
+            &global_state_path,
+            serde_json::to_vec(&json!({
+                "local-projects": {
+                    "existing-project": {
+                        "id": "existing-project",
+                        "rootPaths": [r"C:\existing"]
+                    }
+                },
+                "thread-project-assignments": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let rollouts_before = family::scan_rollouts(&codex).unwrap();
+        let existing_rollout_before = fs::read(&existing_rollout).unwrap();
+        let state_before = fs::read(&state_path).unwrap();
+        let index_before = fs::read(&index_path).unwrap();
+        let global_state_before = fs::read(&global_state_path).unwrap();
+
+        let _desktop_running = crate::codex_projects::DesktopTestProbeGuard::running();
+        let lock = family::FamilyLock::default();
+        let error = convert_session_with_lock(
+            codex.to_string_lossy().into_owned(),
+            root.join("claude").to_string_lossy().into_owned(),
+            "claude".to_string(),
+            source.to_string_lossy().into_owned(),
+            Some("simple".to_string()),
+            &lock,
+        )
+        .expect_err("running Desktop must reject conversion before any target mutation");
+        let error = error.to_string();
+        assert!(error.contains("Codex/ChatGPT 桌面应用正在运行"), "{error}");
+        assert!(
+            error.contains("请完全退出桌面应用（包括后台进程）后重试"),
+            "{error}"
+        );
+        assert_eq!(family::scan_rollouts(&codex).unwrap(), rollouts_before);
+        assert_eq!(
+            fs::read(&existing_rollout).unwrap(),
+            existing_rollout_before
+        );
+        assert_eq!(fs::read(&state_path).unwrap(), state_before);
+        assert_eq!(fs::read(&index_path).unwrap(), index_before);
+        assert_eq!(fs::read(&global_state_path).unwrap(), global_state_before);
+        assert!(!paths::session_provenance_path(&codex).exists());
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn claude_to_codex_rolls_back_when_desktop_starts_before_project_commit() {
+        let root = temp_dir("cla2codex-desktop-starts-during-commit");
+        let codex = root.join("codex");
+        fs::create_dir_all(&codex).unwrap();
+        let source = root.join("source-claude.jsonl");
+        write_lines(
+            &source,
+            &[claude_record(
+                "user",
+                "项目状态提交前启动 Desktop 必须全量回滚",
+                r"F:\demo\project",
+            )],
+        );
+
+        fs::File::create(paths::state_db_path(&codex)).unwrap();
+        let state = state_db::open(&codex).unwrap();
+        state
+            .execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT)",
+                [],
+            )
+            .unwrap();
+        drop(state);
+        let index_path = paths::session_index_path(&codex);
+        let global_state_path = paths::codex_global_state_json_path(&codex);
+        fs::write(&index_path, b"index-before\r\n").unwrap();
+        fs::write(
+            &global_state_path,
+            serde_json::to_vec(&json!({
+                "local-projects": {},
+                "thread-project-assignments": {},
+                "future-field": {"keep": true}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let rollouts_before = family::scan_rollouts(&codex).unwrap();
+        let index_before = fs::read(&index_path).unwrap();
+        let global_state_before = fs::read(&global_state_path).unwrap();
+
+        // Conversion preflight consumes the first probe. The project-state mutation consumes the
+        // second immediately before touching JSON and must compensate rollout/index/SQLite.
+        let _desktop = crate::codex_projects::DesktopTestProbeGuard::running_after_not_running(1);
+        let error = convert_claude_to_codex(
+            codex.to_string_lossy().as_ref(),
+            source.to_string_lossy().as_ref(),
+            CodexImportMode::Simple,
+        )
+        .expect_err("Desktop starting after preflight must abort the whole conversion");
+
+        assert!(error.to_string().contains("完全退出桌面应用"), "{error}");
+        assert_eq!(family::scan_rollouts(&codex).unwrap(), rollouts_before);
+        let state = state_db::open_ro(&codex).unwrap();
+        let thread_count: i64 = state
+            .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(thread_count, 0);
+        assert_eq!(fs::read(&index_path).unwrap(), index_before);
+        assert_eq!(fs::read(&global_state_path).unwrap(), global_state_before);
+
+        drop(state);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn claude_to_codex_keeps_wsl_core_cwd_but_syncs_desktop_host_cwd() {
+        let codex = Path::new(r"\\wsl.localhost\Ubuntu\home\alice\.codex");
+        let core_cwd = claude_cwd_for_codex(codex, "/home/alice/project").unwrap();
+        let now = chrono::Utc::now();
+        let rollout = CodexRolloutBuilder::new(
+            "wsl-converted-session",
+            &core_cwd,
+            "openai",
+            &CodexIdentity::default(),
+            &now,
+        );
+
+        // Claude running in the same WSL distro records the Linux path. The generated rollout
+        // must keep that Core path, while Desktop global state consumes the host-visible UNC path.
+        let meta: Value = serde_json::from_str(&rollout.lines[0]).unwrap();
+        let desktop_cwd = desktop_project_cwd(codex, &core_cwd);
+
+        assert_eq!(meta["payload"]["cwd"], "/home/alice/project");
+        assert_eq!(desktop_cwd, r"\\wsl.localhost\Ubuntu\home\alice\project");
+    }
+
+    #[test]
+    fn claude_to_codex_maps_same_distro_unc_to_wsl_core_cwd() {
+        let codex = Path::new(r"\\wsl.localhost\Ubuntu\home\alice\.codex");
+        for source_cwd in [
+            r"\\wsl$\ubuntu\home\alice\project",
+            "//wsl.localhost/Ubuntu/home/alice/project",
+        ] {
+            let core_cwd = claude_cwd_for_codex(codex, source_cwd).unwrap();
+
+            assert_eq!(core_cwd, "/home/alice/project");
+            assert_eq!(
+                desktop_project_cwd(codex, &core_cwd),
+                r"\\wsl.localhost\Ubuntu\home\alice\project"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_to_codex_rejects_unmappable_windows_cwd_for_wsl_core() {
+        let codex = Path::new(r"\\wsl.localhost\Ubuntu\home\alice\.codex");
+
+        for cwd in [
+            r"F:\demo\project",
+            r"\\wsl.localhost\Debian\home\alice\project",
+            r"\\server\share\project",
+            "//server/share/project",
+        ] {
+            let error = claude_cwd_for_codex(codex, cwd).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("WSL Codex 的项目目录必须位于当前发行版"),
+                "unexpected error for {cwd}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_to_codex_rejects_unmappable_wsl_cwd_before_writing_rollout() {
+        let root = temp_dir("cla2codex-wsl-unmappable");
+        let codex = PathBuf::from(r"\\wsl.localhost\Ubuntu\home\alice\.codex");
+        let source = root.join("source-claude.jsonl");
+        write_lines(
+            &source,
+            &[claude_record(
+                "user",
+                "不能写入错误路径",
+                r"F:\demo\project",
+            )],
+        );
+
+        let error = convert_claude_to_codex(
+            codex.to_string_lossy().as_ref(),
+            source.to_string_lossy().as_ref(),
+            CodexImportMode::Simple,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("WSL Codex 的项目目录必须位于当前发行版"));
         fs::remove_dir_all(root).ok();
     }
 

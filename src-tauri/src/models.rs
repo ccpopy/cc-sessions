@@ -181,6 +181,7 @@ pub struct MoveSessionCwdReport {
     pub new_cwd: String,
     pub threads_updated: u32,
     pub rollout_rewritten: bool,
+    pub desktop_project_synced: bool,
     #[serde(default)]
     pub artifacts_moved: u32,
     #[serde(default)]
@@ -577,6 +578,12 @@ pub enum BranchStatus {
     Deleted,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveOrigin {
+    ProviderSync,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FamilyBranch {
     pub id: String,
@@ -588,6 +595,8 @@ pub struct FamilyBranch {
     pub sha256: Option<String>,
     pub line_count: Option<u64>,
     pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_origin: Option<ArchiveOrigin>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -917,6 +926,7 @@ pub struct FamilyOverlay {
     pub family_id: Option<String>,
     pub branch_count: u32,
     pub is_active_branch: bool,
+    pub archive_origin: Option<ArchiveOrigin>,
     /// "matches" / "resync" / "clonable" / "has_clone" / "unknown"
     pub clone_state: String,
 }

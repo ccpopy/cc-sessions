@@ -42,6 +42,7 @@ function familyOverlay(
     family_id: familyId,
     branch_count: 2,
     is_active_branch: active,
+    archive_origin: null,
     clone_state: provider === "openai" ? "matches" : "has_clone",
   };
 }

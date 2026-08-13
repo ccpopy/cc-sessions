@@ -302,6 +302,11 @@ export function FamilyHistorySheet({
                                 {inactiveBranchStatusLabel(b.status)}
                               </Badge>
                             )}
+                            {!isActive && b.archive_origin === "provider_sync" && (
+                              <Badge variant="outline" className="h-5 px-1.5 font-normal text-blue-600">
+                                同步分支
+                              </Badge>
+                            )}
                             <span className="text-muted-foreground">
                               {safeDate(b.created_at)}
                             </span>

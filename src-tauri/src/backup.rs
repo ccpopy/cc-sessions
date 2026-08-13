@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
 
@@ -17,10 +16,12 @@ use crate::path_safety::{self, EntryKind};
 use crate::paths;
 use crate::state_db;
 
+mod restore_snapshot;
+use restore_snapshot::{inject_restore_file_fault, restore_failure_message, RestoreFileSnapshots};
+
 const PROVIDER_CODEX: &str = "codex";
 const PROVIDER_CLAUDE: &str = "claude";
 const PROVIDER_OPENCODE: &str = "opencode";
-static RESTORE_SNAPSHOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RolloutPresence {
@@ -39,6 +40,7 @@ struct BackupThread {
     tokens_used: i64,
     model: Option<String>,
     thread_row: serde_json::Value,
+    rollout_cwd_override: Option<String>,
 }
 
 fn sha256_file(path: &Path) -> AppResult<String> {
@@ -46,6 +48,44 @@ fn sha256_file(path: &Path) -> AppResult<String> {
     let mut hasher = Sha256::new();
     std::io::copy(&mut f, &mut hasher)?;
     Ok(hex::encode(hasher.finalize()))
+}
+
+/// Copy a Codex rollout into the backup, optionally materializing Desktop's pending cwd into the
+/// backup copy. The source rollout is never modified.
+fn copy_codex_rollout_for_backup(
+    source: &Path,
+    destination: &Path,
+    thread_id: &str,
+    target_cwd: Option<&str>,
+) -> AppResult<()> {
+    let Some(target_cwd) = target_cwd else {
+        fs::copy(source, destination)?;
+        return Ok(());
+    };
+
+    let copy_result = (|| -> AppResult<()> {
+        let mut output = File::create(destination)?;
+        crate::codex_rollout_cwd::copy_with_effective_cwd(
+            source,
+            &mut output,
+            thread_id,
+            target_cwd,
+            None,
+        )?;
+        output.sync_all()?;
+        Ok(())
+    })();
+    if let Err(error) = copy_result {
+        return match fs::remove_file(destination) {
+            Ok(()) => Err(error),
+            Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => Err(error),
+            Err(remove_error) => Err(AppError::Other(format!(
+                "{error}; 清理未完成的备份 rollout 失败 {}: {remove_error}",
+                destination.to_string_lossy()
+            ))),
+        };
+    }
+    Ok(())
 }
 
 fn collect_manifest_artifacts(root: &Path) -> AppResult<Vec<ManifestArtifact>> {
@@ -319,7 +359,12 @@ pub fn create_backup_with_opencode(
         if let Some(p) = dest.parent() {
             fs::create_dir_all(p)?;
         }
-        fs::copy(&thread.rollout_path, &dest)?;
+        copy_codex_rollout_for_backup(
+            &thread.rollout_path,
+            &dest,
+            &thread.id,
+            thread.rollout_cwd_override.as_deref(),
+        )?;
         let sha = sha256_file(&dest)?;
         let bytes = fs::metadata(&dest)?.len();
 
@@ -849,7 +894,7 @@ fn load_backup_thread(
         .into_iter()
         .map(str::to_string)
         .collect();
-    let row_json = match stmt.query_row([id], |row| {
+    let mut row_json = match stmt.query_row([id], |row| {
         let mut obj = serde_json::Map::new();
         for (i, name) in cols.iter().enumerate() {
             let v = row.get_ref(i)?;
@@ -880,6 +925,34 @@ fn load_backup_thread(
         .to_string();
     let rollout_path = paths::host_path_from_codex_record(codex, &rollout_path_raw);
     let rollout_relpath = rel_path(&rollout_path.to_string_lossy(), codex)?;
+    let database_cwd = row_json
+        .get("cwd")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let rollout_cwd = crate::codex_rollout_cwd::read_effective_cwd(&rollout_path, id)?;
+    // Official Desktop moves update the explicit assignment immediately and may defer the Core
+    // cwd until the next turn. A backup must preserve that newer intent without carrying the
+    // source machine's projectId. Convert the Desktop-visible host path back to this Codex home's
+    // Core record format and make only the backup artifacts self-consistent.
+    let assignment_core_cwd =
+        crate::codex_projects::pending_thread_project_assignment_cwd(codex, id)?
+            .map(|host_cwd| paths::codex_record_path_from_host(codex, Path::new(&host_cwd)))
+            .transpose()?;
+    let effective_cwd = assignment_core_cwd
+        .or(rollout_cwd)
+        .filter(|cwd| !cwd.trim().is_empty())
+        .unwrap_or(database_cwd);
+    row_json
+        .as_object_mut()
+        .ok_or_else(|| AppError::Other("threads 查询结果必须是 JSON 对象".to_string()))?
+        .insert(
+            "cwd".to_string(),
+            serde_json::Value::String(effective_cwd.clone()),
+        );
+    // Always normalize the backup copy from the same effective cwd used by its manifest and
+    // threads row. This also heals older rollouts whose session_meta lags the latest turn_context.
+    let rollout_cwd_override = (!effective_cwd.trim().is_empty()).then(|| effective_cwd.clone());
 
     Ok(BackupThread {
         id: id.to_string(),
@@ -890,11 +963,7 @@ fn load_backup_thread(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        cwd: row_json
-            .get("cwd")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
+        cwd: effective_cwd,
         created_at: row_json
             .get("created_at")
             .and_then(|v| v.as_i64())
@@ -912,6 +981,7 @@ fn load_backup_thread(
             .and_then(|v| v.as_str())
             .map(String::from),
         thread_row: row_json,
+        rollout_cwd_override,
     })
 }
 
@@ -1909,230 +1979,6 @@ fn restore_one_opencode(
     Ok(result)
 }
 
-struct RestoreFileSnapshot {
-    label: &'static str,
-    path: PathBuf,
-    snapshot_path: Option<PathBuf>,
-    original_fingerprint: Option<atomic_file::FileFingerprint>,
-    mutation_started: bool,
-    expected_after: Option<atomic_file::FileFingerprint>,
-}
-
-struct RestoreFileSnapshots {
-    root: PathBuf,
-    files: Vec<RestoreFileSnapshot>,
-}
-
-impl RestoreFileSnapshots {
-    fn capture(paths: &[(&'static str, &Path)]) -> AppResult<Self> {
-        let root = loop {
-            let sequence = RESTORE_SNAPSHOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let candidate = std::env::temp_dir().join(format!(
-                "ccsm-restore-snapshot-{}-{sequence}",
-                std::process::id()
-            ));
-            match fs::create_dir(&candidate) {
-                Ok(()) => break candidate,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error.into()),
-            }
-        };
-        let mut files = Vec::with_capacity(paths.len());
-        for (index, (label, path)) in paths.iter().enumerate() {
-            let capture = (|| -> AppResult<RestoreFileSnapshot> {
-                match fs::symlink_metadata(path) {
-                    Ok(metadata) => {
-                        if path_safety::metadata_is_link_or_reparse(&metadata)
-                            || !metadata.is_file()
-                        {
-                            return Err(AppError::Path(format!(
-                                "{label} 不是普通文件，拒绝创建还原快照: {}",
-                                path.to_string_lossy()
-                            )));
-                        }
-                        let before = atomic_file::fingerprint(path)?;
-                        let snapshot_path = root.join(format!("{index}.snapshot"));
-                        fs::copy(path, &snapshot_path)?;
-                        File::open(&snapshot_path)?.sync_all()?;
-                        let snapshot_fingerprint = atomic_file::fingerprint(&snapshot_path)?;
-                        let after = atomic_file::fingerprint(path)?;
-                        if before != after || before != snapshot_fingerprint {
-                            return Err(AppError::Other(format!(
-                                "{label} 在创建还原快照期间发生变化: {}",
-                                path.to_string_lossy()
-                            )));
-                        }
-                        Ok(RestoreFileSnapshot {
-                            label,
-                            path: path.to_path_buf(),
-                            snapshot_path: Some(snapshot_path),
-                            original_fingerprint: Some(before),
-                            mutation_started: false,
-                            expected_after: None,
-                        })
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        Ok(RestoreFileSnapshot {
-                            label,
-                            path: path.to_path_buf(),
-                            snapshot_path: None,
-                            original_fingerprint: None,
-                            mutation_started: false,
-                            expected_after: None,
-                        })
-                    }
-                    Err(error) => Err(error.into()),
-                }
-            })();
-            match capture {
-                Ok(snapshot) => files.push(snapshot),
-                Err(error) => {
-                    return match fs::remove_dir_all(&root) {
-                        Ok(()) => Err(error),
-                        Err(cleanup_error) => Err(AppError::Other(format!(
-                            "{error}；清理未完成还原快照失败 {}: {cleanup_error}",
-                            root.to_string_lossy()
-                        ))),
-                    };
-                }
-            }
-        }
-        Ok(Self { root, files })
-    }
-
-    fn start(&mut self, label: &'static str) -> AppResult<()> {
-        let snapshot = self
-            .files
-            .iter_mut()
-            .find(|snapshot| snapshot.label == label)
-            .ok_or_else(|| AppError::Other(format!("缺少 {label} 的还原快照")))?;
-        snapshot.mutation_started = true;
-        Ok(())
-    }
-
-    fn finish(&mut self, label: &'static str) -> AppResult<()> {
-        let snapshot = self
-            .files
-            .iter_mut()
-            .find(|snapshot| snapshot.label == label)
-            .ok_or_else(|| AppError::Other(format!("缺少 {label} 的还原快照")))?;
-        snapshot.expected_after = Some(atomic_file::fingerprint(&snapshot.path)?);
-        Ok(())
-    }
-
-    fn compensate(&self) -> Vec<String> {
-        let mut errors = Vec::new();
-        for snapshot in self
-            .files
-            .iter()
-            .rev()
-            .filter(|snapshot| snapshot.mutation_started)
-        {
-            if let Err(error) = restore_file_snapshot(snapshot) {
-                errors.push(format!("补偿 {} 失败: {error}", snapshot.label));
-            }
-        }
-        errors
-    }
-
-    fn cleanup(&self) -> AppResult<()> {
-        fs::remove_dir_all(&self.root).map_err(|error| {
-            AppError::Other(format!(
-                "清理还原快照失败 {}: {error}",
-                self.root.to_string_lossy()
-            ))
-        })
-    }
-}
-
-fn current_regular_fingerprint(
-    path: &Path,
-    label: &str,
-) -> AppResult<Option<atomic_file::FileFingerprint>> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => {
-            if path_safety::metadata_is_link_or_reparse(&metadata) || !metadata.is_file() {
-                return Err(AppError::Path(format!(
-                    "{label} 在补偿前不再是普通文件: {}",
-                    path.to_string_lossy()
-                )));
-            }
-            Ok(Some(atomic_file::fingerprint(path)?))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn restore_file_snapshot(snapshot: &RestoreFileSnapshot) -> AppResult<()> {
-    let current = current_regular_fingerprint(&snapshot.path, snapshot.label)?;
-    if current == snapshot.original_fingerprint {
-        return Ok(());
-    }
-    if let Some(expected_after) = snapshot.expected_after.as_ref() {
-        if current.as_ref() != Some(expected_after) {
-            return Err(AppError::Other(format!(
-                "文件在还原失败后又发生变化，拒绝覆盖并发数据: {}",
-                snapshot.path.to_string_lossy()
-            )));
-        }
-    }
-
-    match (
-        snapshot.original_fingerprint.as_ref(),
-        snapshot.snapshot_path.as_deref(),
-        current.as_ref(),
-    ) {
-        (Some(_), Some(snapshot_path), Some(current)) => {
-            atomic_file::replace_with_writer_if_unchanged(&snapshot.path, current, |destination| {
-                let mut source = File::open(snapshot_path)?;
-                std::io::copy(&mut source, destination)?;
-                Ok(())
-            })
-        }
-        (Some(_), Some(snapshot_path), None) => {
-            if let Some(parent) = snapshot.path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            atomic_file::create_with_writer_if_absent(&snapshot.path, |destination| {
-                let mut source = File::open(snapshot_path)?;
-                std::io::copy(&mut source, destination)?;
-                Ok(())
-            })
-        }
-        (None, None, Some(_)) => {
-            fs::remove_file(&snapshot.path)?;
-            Ok(())
-        }
-        (None, None, None) => Ok(()),
-        _ => Err(AppError::Other(format!(
-            "{} 的还原快照结构不完整",
-            snapshot.label
-        ))),
-    }
-}
-
-fn restore_failure_message(
-    primary: impl std::fmt::Display,
-    rollback_error: Option<rusqlite::Error>,
-    compensation_errors: Vec<String>,
-    cleanup_error: Option<AppError>,
-) -> String {
-    let final_state_uncertain = rollback_error.is_some() || !compensation_errors.is_empty();
-    let mut details = vec![primary.to_string()];
-    if let Some(error) = rollback_error {
-        details.push(format!("回滚 SQLite 事务失败: {error}"));
-    }
-    details.extend(compensation_errors);
-    if let Some(error) = cleanup_error {
-        details.push(error.to_string());
-    }
-    if final_state_uncertain {
-        details.push("部分回滚或补偿失败，最终状态不确定，请检查上述文件与数据库".into());
-    }
-    details.join("；")
-}
-
 fn insert_restore_thread(
     transaction: &rusqlite::Transaction<'_>,
     codex: &Path,
@@ -2290,6 +2136,20 @@ fn insert_restore_logs(
     Ok(inserted)
 }
 
+fn restore_thread_cwd<'a>(row: &'a serde_json::Value, target: &'a ManifestSession) -> &'a str {
+    row.get("cwd")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&target.cwd)
+}
+
+fn restore_thread_host_cwd(
+    codex: &Path,
+    row: &serde_json::Value,
+    target: &ManifestSession,
+) -> String {
+    paths::host_path_string_from_codex_record(codex, restore_thread_cwd(row, target))
+}
+
 fn restore_one(
     backup: &Path,
     codex: &Path,
@@ -2318,23 +2178,16 @@ fn restore_one(
         "Codex rollout 还原目标",
     )?;
     verify_restore_source(backup, &src, target, PROVIDER_CODEX)?;
-
-    // 1) 冲突检测
-    let mut state = state_db::open(codex)?;
-    let thread_exists =
-        match state.query_row("SELECT 1 FROM threads WHERE id = ?", [&target.id], |_| {
-            Ok(true)
-        }) {
-            Ok(exists) => exists,
-            Err(rusqlite::Error::QueryReturnedNoRows) => false,
-            Err(error) => return Err(error.into()),
-        };
-    if (thread_exists || dest.exists()) && !overwrite {
+    if dest.exists() && !overwrite {
         result.conflict = true;
         return Ok(result);
     }
+    if crate::codex_projects::desktop_state_initialized(codex)? {
+        crate::codex_projects::ensure_desktop_not_running(codex)?;
+    }
 
-    // 2) 在改动任何本地状态前，完整解析 threads/logs 并校验目标表结构。
+    // 1) 在打开任何目标数据库前先解析备份行并验证 Desktop 项目状态。SQLite 打开
+    // 本身可能更新 header/WAL，因此所有无需目标数据库的严格预检必须先完成。
     let threads_raw = fs::read_to_string(backup.join("threads.json"))?;
     let threads: Vec<serde_json::Value> = serde_json::from_str(&threads_raw)?;
     let matching_threads = threads
@@ -2359,6 +2212,28 @@ fn restore_one(
             )))
         }
     };
+    if crate::codex_projects::desktop_state_initialized(codex)? {
+        crate::codex_projects::validate_thread_project_assignment(
+            codex,
+            &target.id,
+            &restore_thread_host_cwd(codex, row, target),
+        )?;
+    }
+
+    // 2) 冲突检测及依赖目标 schema 的日志校验。
+    let mut state = state_db::open(codex)?;
+    let thread_exists =
+        match state.query_row("SELECT 1 FROM threads WHERE id = ?", [&target.id], |_| {
+            Ok(true)
+        }) {
+            Ok(exists) => exists,
+            Err(rusqlite::Error::QueryReturnedNoRows) => false,
+            Err(error) => return Err(error.into()),
+        };
+    if (thread_exists || dest.exists()) && !overwrite {
+        result.conflict = true;
+        return Ok(result);
+    }
     let backup_log_rows = read_backup_log_rows(backup, target)?;
     let logs_path = codex.join("logs_2.sqlite");
     let logs_exist = match fs::symlink_metadata(&logs_path) {
@@ -2376,6 +2251,12 @@ fn restore_one(
     };
     let restore_logs = !backup_log_rows.is_empty() || (overwrite && logs_exist);
     let allowed_log_columns = if restore_logs {
+        if !logs_exist {
+            return Err(AppError::NotFound(format!(
+                "备份包含 Codex 日志，但目标 logs_2.sqlite 不存在: {}",
+                logs_path.to_string_lossy()
+            )));
+        }
         let logs_connection = logs_db::open(codex)?;
         drop(logs_connection);
         let logs_path_string = logs_path.to_string_lossy().into_owned();
@@ -2408,7 +2289,6 @@ fn restore_one(
             )));
         }
     }
-
     // 3) threads 与 logs 先在同一 SQLite 事务中实际执行所有约束，但暂不提交。
     let transaction = state.transaction()?;
     let database_stage = (|| -> AppResult<()> {
@@ -2438,10 +2318,12 @@ fn restore_one(
     // 4) 为所有即将改写的文件创建一致快照。后续任一步失败均按变更后指纹补偿。
     let history_path = paths::history_path(codex);
     let index_path = paths::session_index_path(codex);
+    let global_state_path = paths::codex_global_state_json_path(codex);
     let mut snapshots = match RestoreFileSnapshots::capture(&[
         ("rollout", &dest),
         ("history", &history_path),
         ("session index", &index_path),
+        ("Codex global state", &global_state_path),
     ]) {
         Ok(snapshots) => snapshots,
         Err(error) => {
@@ -2460,33 +2342,71 @@ fn restore_one(
         }
     };
 
+    let mut project_state_receipt = None;
     let file_stage = (|| -> AppResult<()> {
         snapshots.start("rollout")?;
-        copy_restore_file_atomically(
+        if let Err(error) = copy_restore_file_atomically(
             codex,
             &src,
             &dest,
             &target.sha256_rollout,
             "Codex rollout 还原目标",
-        )?;
+        ) {
+            snapshots.record_failure("rollout", &error)?;
+            return Err(error);
+        }
         result.rollout_copied = true;
         snapshots.finish("rollout")?;
 
         snapshots.start("history")?;
         result.history_appended =
-            append_backup_history_if_present(&history_path, backup, &target.id)?;
+            match append_backup_history_if_present(&history_path, backup, &target.id) {
+                Ok(appended) => appended,
+                Err(error) => {
+                    snapshots.record_failure("history", &error)?;
+                    return Err(error);
+                }
+            };
         if result.history_appended > 0 {
             snapshots.finish("history")?;
         }
 
         snapshots.start("session index")?;
-        crate::repair::append_index_line(codex, &target.id, &target.title, &dest)?;
+        if let Err(error) = inject_restore_file_fault("session index") {
+            snapshots.record_failure("session index", &error)?;
+            return Err(error);
+        }
+        if let Err(error) =
+            crate::repair::append_index_line(codex, &target.id, &target.title, &dest)
+        {
+            snapshots.record_failure("session index", &error)?;
+            return Err(error);
+        }
         snapshots.finish("session index")?;
+
+        // 全局状态在一致快照时尚不存在，说明 Desktop 未初始化该 Codex home。
+        // 此时必须保持 no-op；若文件随后由 Desktop 并发创建，也不能把它误当作
+        // 本次还原生成的文件并在补偿时删除。
+        if snapshots.was_present("Codex global state")? {
+            snapshots.start("Codex global state")?;
+            project_state_receipt =
+                crate::codex_projects::sync_thread_project_assignment_with_receipt(
+                    codex,
+                    &target.id,
+                    &restore_thread_host_cwd(codex, row, target),
+                )?;
+        }
         Ok(())
     })();
     if let Err(error) = file_stage {
         let rollback_error = transaction.rollback().err();
-        let compensation_errors = snapshots.compensate();
+        let mut compensation_errors = Vec::new();
+        if let Some(receipt) = project_state_receipt.as_ref() {
+            if let Err(error) = receipt.compensate() {
+                compensation_errors.push(format!("补偿 Codex global state 失败: {error}"));
+            }
+        }
+        compensation_errors.extend(snapshots.compensate_except(&["Codex global state"]));
         let cleanup_error = snapshots.cleanup().err();
         if rollback_error.is_none() {
             result.threads_inserted = false;
@@ -2507,7 +2427,13 @@ fn restore_one(
 
     // 5) 文件全部落盘后一次提交 threads 与附加的 logs 数据库。
     if let Err(error) = transaction.commit() {
-        let compensation_errors = snapshots.compensate();
+        let mut compensation_errors = Vec::new();
+        if let Some(receipt) = project_state_receipt.as_ref() {
+            if let Err(error) = receipt.compensate() {
+                compensation_errors.push(format!("补偿 Codex global state 失败: {error}"));
+            }
+        }
+        compensation_errors.extend(snapshots.compensate_except(&["Codex global state"]));
         let cleanup_error = snapshots.cleanup().err();
         if compensation_errors.is_empty() {
             result.rollout_copied = false;
@@ -2593,6 +2519,7 @@ fn _unused() {
 
 #[cfg(test)]
 mod tests {
+    use super::restore_snapshot::RestoreFileTestFaultGuard;
     use super::*;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -2704,6 +2631,359 @@ mod tests {
             "INSERT INTO todo VALUES ('ses_backup',0,'portable task')",
             [],
         )?;
+        Ok(())
+    }
+
+    fn write_codex_restore_backup(
+        backup: &Path,
+        id: &str,
+        relative: &Path,
+        thread_row: serde_json::Value,
+        manifest_cwd: &str,
+    ) -> AppResult<ManifestSession> {
+        let source = backup.join(relative);
+        fs::create_dir_all(source.parent().unwrap_or(backup))?;
+        let rollout_cwd = thread_row
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(manifest_cwd);
+        let session_meta = serde_json::json!({
+            "timestamp": "2026-07-10T00:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": id,
+                "model_provider": "openai",
+                "cwd": rollout_cwd
+            }
+        });
+        fs::write(
+            &source,
+            format!("{}\n", serde_json::to_string(&session_meta)?),
+        )?;
+        fs::write(
+            backup.join("threads.json"),
+            serde_json::to_vec_pretty(&vec![thread_row.clone()])?,
+        )?;
+        Ok(ManifestSession {
+            provider: Some(PROVIDER_CODEX.to_string()),
+            id: id.to_string(),
+            rollout_relpath: relative.to_string_lossy().replace('\\', "/"),
+            source_relpath: None,
+            sidecar_relpath: None,
+            sidecar_files: Vec::new(),
+            companions_relpath: None,
+            companion_files: Vec::new(),
+            tasks_relpath: None,
+            task_files: Vec::new(),
+            title: thread_row
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            cwd: manifest_cwd.to_string(),
+            created_at: 0,
+            updated_at: 0,
+            tokens_used: 0,
+            model: None,
+            bytes_rollout: fs::metadata(&source)?.len(),
+            logs_count: 0,
+            history_rows: 0,
+            sha256_rollout: sha256_file(&source)?,
+        })
+    }
+
+    #[test]
+    fn restore_thread_host_cwd_maps_wsl_record_before_desktop_assignment() {
+        let codex = Path::new(r"\\wsl.localhost\Ubuntu\home\alice\.codex");
+        let row = serde_json::json!({"cwd": "/home/alice/work/repo"});
+        let target = ManifestSession {
+            provider: Some(PROVIDER_CODEX.to_string()),
+            id: "wsl-restore".to_string(),
+            rollout_relpath: "sessions/rollout-wsl-restore.jsonl".to_string(),
+            source_relpath: None,
+            sidecar_relpath: None,
+            sidecar_files: Vec::new(),
+            companions_relpath: None,
+            companion_files: Vec::new(),
+            tasks_relpath: None,
+            task_files: Vec::new(),
+            title: String::new(),
+            cwd: "/manifest/fallback".to_string(),
+            created_at: 0,
+            updated_at: 0,
+            tokens_used: 0,
+            model: None,
+            bytes_rollout: 0,
+            logs_count: 0,
+            history_rows: 0,
+            sha256_rollout: String::new(),
+        };
+
+        assert_eq!(
+            restore_thread_host_cwd(codex, &row, &target),
+            r"\\wsl.localhost\Ubuntu\home\alice\work\repo"
+        );
+    }
+
+    #[test]
+    fn codex_backup_materializes_pending_desktop_move_without_source_project_id() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-codex-pending-move-backup-test");
+        let codex = root.join("source-codex");
+        let backups = root.join("backups");
+        let id = "pending-desktop-move-backup";
+        let source_rollout = codex
+            .join("sessions/2026/08/13")
+            .join(format!("rollout-2026-08-13T10-00-00-{id}.jsonl"));
+        fs::create_dir_all(source_rollout.parent().unwrap_or(&codex))?;
+        let stale_core_cwd = r"F:\old-project";
+        let pending_host_cwd = r"F:\new-project";
+        let source_lines = [
+            serde_json::json!({
+                "timestamp": "2026-08-13T10:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": id, "cwd": stale_core_cwd, "model_provider": "openai"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-08-13T10:00:01Z",
+                "type": "session_meta",
+                "payload": {"id": "ancestor-thread", "cwd": r"F:\ancestor"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-08-13T10:00:01.100Z",
+                "type": "turn_context",
+                "payload": {"cwd": r"F:\historical-project"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-08-13T10:00:01.200Z",
+                "type": "turn_context",
+                "payload": {"cwd": stale_core_cwd}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-08-13T10:00:02Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "keep"}
+            }),
+        ];
+        fs::write(
+            &source_rollout,
+            format!(
+                "{}\n",
+                source_lines
+                    .iter()
+                    .map(serde_json::Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        )?;
+        let source_before = fs::read(&source_rollout)?;
+
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        state.execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT,
+                created_at INTEGER, updated_at INTEGER, tokens_used INTEGER, model TEXT
+            );",
+        )?;
+        state.execute(
+            "INSERT INTO threads VALUES (?1, ?2, ?3, 'pending move', 1, 2, 3, 'gpt-5')",
+            rusqlite::params![
+                id,
+                source_rollout.to_string_lossy().into_owned(),
+                pending_host_cwd
+            ],
+        )?;
+        drop(state);
+        fs::write(
+            paths::codex_global_state_json_path(&codex),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "local-projects": {
+                    "source-machine-project-id": {
+                        "id": "source-machine-project-id",
+                        "name": "new-project",
+                        "rootPaths": [pending_host_cwd]
+                    }
+                },
+                "thread-project-assignments": {
+                    (id): {
+                        "projectKind": "local",
+                        "projectId": "source-machine-project-id",
+                        "cwd": pending_host_cwd,
+                        "pendingCoreUpdate": true
+                    }
+                }
+            }))?,
+        )?;
+
+        let summary = create_backup(
+            Some(PROVIDER_CODEX.to_string()),
+            codex.to_string_lossy().into_owned(),
+            None,
+            backups.to_string_lossy().into_owned(),
+            vec![id.to_string()],
+            None,
+            Some("pending-move".to_string()),
+            None,
+        )?;
+        let backup = PathBuf::from(&summary.path);
+        let manifest = load_backup_manifest(&backup)?;
+        assert_eq!(manifest.sessions[0].cwd, pending_host_cwd);
+
+        let threads: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(backup.join("threads.json"))?)?;
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0]["cwd"], pending_host_cwd);
+        assert!(
+            !serde_json::to_string(&threads[0])?.contains("source-machine-project-id"),
+            "threads.json must never carry the source projectId"
+        );
+
+        let backed_up_rollout = backup.join(&manifest.sessions[0].rollout_relpath);
+        let metas = fs::read_to_string(&backed_up_rollout)?
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|value| value["type"] == "session_meta")
+            .collect::<Vec<_>>();
+        assert_eq!(metas[0]["payload"]["id"], id);
+        assert_eq!(metas[0]["payload"]["cwd"], pending_host_cwd);
+        assert_eq!(metas[1]["payload"]["id"], "ancestor-thread");
+        assert_eq!(metas[1]["payload"]["cwd"], r"F:\ancestor");
+        let turns = fs::read_to_string(&backed_up_rollout)?
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|value| value["type"] == "turn_context")
+            .collect::<Vec<_>>();
+        assert_eq!(turns[0]["payload"]["cwd"], r"F:\historical-project");
+        assert_eq!(turns[1]["payload"]["cwd"], pending_host_cwd);
+        assert_eq!(fs::read(&source_rollout)?, source_before);
+
+        // Restore on a different Codex home: membership is re-derived from the target machine's
+        // local-project root, and the source machine projectId is not reused.
+        let target_codex = root.join("target-codex");
+        fs::create_dir_all(&target_codex)?;
+        let target_state = rusqlite::Connection::open(paths::state_db_path(&target_codex))?;
+        target_state.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT)",
+            [],
+        )?;
+        drop(target_state);
+        fs::write(
+            paths::codex_global_state_json_path(&target_codex),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "local-projects": {
+                    "target-machine-project-id": {
+                        "id": "target-machine-project-id",
+                        "name": "new-project",
+                        "rootPaths": [pending_host_cwd]
+                    }
+                },
+                "project-order": []
+            }))?,
+        )?;
+
+        let restored = restore_one(&backup, &target_codex, &manifest.sessions[0], false)?;
+        assert!(restored.ok, "restore failed: {:?}", restored.error);
+        let restored_global: serde_json::Value = serde_json::from_slice(&fs::read(
+            paths::codex_global_state_json_path(&target_codex),
+        )?)?;
+        let restored_assignment = &restored_global["thread-project-assignments"][id];
+        assert_eq!(
+            restored_assignment["projectId"],
+            "target-machine-project-id"
+        );
+        assert_eq!(restored_assignment["cwd"], pending_host_cwd);
+        assert_eq!(restored_assignment["pendingCoreUpdate"], false);
+        let restored_state = state_db::open_ro(&target_codex)?;
+        let restored_cwd: String =
+            restored_state.query_row("SELECT cwd FROM threads WHERE id = ?", [id], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(restored_cwd, pending_host_cwd);
+        let restored_rollout = target_codex.join(&manifest.sessions[0].rollout_relpath);
+        let restored_meta = crate::family::read_session_meta(&restored_rollout)?;
+        assert_eq!(restored_meta["payload"]["cwd"], pending_host_cwd);
+
+        drop(restored_state);
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn codex_backup_ignores_settled_stale_desktop_assignment_cwd() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-codex-stale-assignment-backup-test");
+        let codex = root.join("source-codex");
+        let backups = root.join("backups");
+        let id = "settled-stale-desktop-assignment-backup";
+        let core_cwd = r"F:\core-project";
+        let stale_host_cwd = r"F:\stale-desktop-project";
+        let source_rollout = codex
+            .join("sessions/2026/08/13")
+            .join(format!("rollout-2026-08-13T10-00-00-{id}.jsonl"));
+        fs::create_dir_all(source_rollout.parent().unwrap_or(&codex))?;
+        fs::write(
+            &source_rollout,
+            format!(
+                "{}\n",
+                serde_json::to_string(&serde_json::json!({
+                    "timestamp": "2026-08-13T10:00:00Z",
+                    "type": "session_meta",
+                    "payload": {"id": id, "cwd": core_cwd, "model_provider": "openai"}
+                }))?
+            ),
+        )?;
+
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        state.execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT,
+                created_at INTEGER, updated_at INTEGER, tokens_used INTEGER, model TEXT
+            );",
+        )?;
+        state.execute(
+            "INSERT INTO threads VALUES (?1, ?2, ?3, 'settled move', 1, 2, 3, 'gpt-5')",
+            rusqlite::params![id, source_rollout.to_string_lossy().into_owned(), core_cwd],
+        )?;
+        drop(state);
+        fs::write(
+            paths::codex_global_state_json_path(&codex),
+            serde_json::to_vec(&serde_json::json!({
+                "local-projects": {
+                    "stale-project-id": {
+                        "id": "stale-project-id",
+                        "rootPaths": [stale_host_cwd]
+                    }
+                },
+                "thread-project-assignments": {
+                    (id): {
+                        "projectKind": "local",
+                        "projectId": "stale-project-id",
+                        "cwd": stale_host_cwd,
+                        "pendingCoreUpdate": false
+                    }
+                }
+            }))?,
+        )?;
+
+        let summary = create_backup(
+            Some(PROVIDER_CODEX.to_string()),
+            codex.to_string_lossy().into_owned(),
+            None,
+            backups.to_string_lossy().into_owned(),
+            vec![id.to_string()],
+            None,
+            Some("settled-stale-assignment".to_string()),
+            None,
+        )?;
+        let backup = PathBuf::from(&summary.path);
+        let manifest = load_backup_manifest(&backup)?;
+        assert_eq!(manifest.sessions[0].cwd, core_cwd);
+        let threads: Vec<serde_json::Value> =
+            serde_json::from_slice(&fs::read(backup.join("threads.json"))?)?;
+        assert_eq!(threads[0]["cwd"], core_cwd);
+        let backed_up_meta =
+            crate::family::read_session_meta(&backup.join(&manifest.sessions[0].rollout_relpath))?;
+        assert_eq!(backed_up_meta["payload"]["cwd"], core_cwd);
+
+        fs::remove_dir_all(root).ok();
         Ok(())
     }
 
@@ -3080,6 +3360,460 @@ mod tests {
     }
 
     #[test]
+    fn codex_restore_syncs_desktop_project_from_thread_row_cwd() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-codex-project-restore-test");
+        let backup = root.join("backup");
+        let codex = root.join("codex");
+        let id = "restore-project-assignment";
+        let relative = PathBuf::from(format!("sessions/2026/07/10/rollout-{id}.jsonl"));
+        fs::create_dir_all(&codex)?;
+
+        let state = rusqlite::Connection::open(codex.join("state_5.sqlite"))?;
+        state.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT)",
+            [],
+        )?;
+        drop(state);
+
+        let row_cwd = r"F:\work\repo\src";
+        let target = write_codex_restore_backup(
+            &backup,
+            id,
+            &relative,
+            serde_json::json!({
+                "id": id,
+                "rollout_path": backup.join(&relative).to_string_lossy(),
+                "cwd": row_cwd,
+                "title": "restored project thread"
+            }),
+            r"C:\manifest-fallback-must-not-win",
+        )?;
+        let global_state_path = paths::codex_global_state_json_path(&codex);
+        fs::write(
+            &global_state_path,
+            serde_json::to_vec(&serde_json::json!({
+                "local-projects": {
+                    "project-existing": {
+                        "id": "project-existing",
+                        "name": "Repo",
+                        "rootPaths": [r"F:\work\repo"]
+                    }
+                },
+                "thread-project-assignments": {
+                    id: {"projectKind": "local", "projectId": "old-project", "cwd": r"C:\old"}
+                },
+                "projectless-thread-ids": [id]
+            }))?,
+        )?;
+
+        let restored = restore_one(&backup, &codex, &target, false)?;
+
+        assert!(restored.ok, "restore failed: {:?}", restored.error);
+        let global_state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&global_state_path)?)?;
+        assert_eq!(
+            global_state["thread-project-assignments"][id],
+            serde_json::json!({
+                "projectKind": "local",
+                "projectId": "project-existing",
+                "cwd": row_cwd,
+                "pendingCoreUpdate": false
+            })
+        );
+        assert!(global_state["projectless-thread-ids"]
+            .as_array()
+            .is_some_and(Vec::is_empty));
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let restored_cwd: String =
+            state.query_row("SELECT cwd FROM threads WHERE id = ?", [id], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(restored_cwd, row_cwd);
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn codex_restore_rejects_malformed_project_state_before_core_mutation() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-codex-restore-project-preflight-test");
+        let backup = root.join("backup");
+        let codex = root.join("codex");
+        let id = "restore-project-preflight";
+        let relative = PathBuf::from(format!("sessions/2026/07/10/rollout-{id}.jsonl"));
+        fs::create_dir_all(&codex)?;
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        state.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT)",
+            [],
+        )?;
+        drop(state);
+        let target = write_codex_restore_backup(
+            &backup,
+            id,
+            &relative,
+            serde_json::json!({
+                "id": id,
+                "rollout_path": backup.join(&relative).to_string_lossy(),
+                "cwd": r"F:\work\repo",
+                "title": "must not restore"
+            }),
+            r"F:\work\repo",
+        )?;
+        let state_path = paths::state_db_path(&codex);
+        let state_before = fs::read(&state_path)?;
+        let global_path = paths::codex_global_state_json_path(&codex);
+        fs::write(
+            &global_path,
+            serde_json::to_vec(&serde_json::json!({"project-order": null}))?,
+        )?;
+        let global_before = fs::read(&global_path)?;
+
+        let error = restore_one(&backup, &codex, &target, false)
+            .expect_err("malformed Desktop project state must reject restore preflight");
+
+        assert!(error.to_string().contains("project-order"), "{error}");
+        assert_eq!(fs::read(&state_path)?, state_before);
+        assert_eq!(fs::read(&global_path)?, global_before);
+        assert!(!codex.join(&relative).exists());
+        assert!(!paths::session_index_path(&codex).exists());
+        assert!(!paths::history_path(&codex).exists());
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn codex_restore_keeps_missing_desktop_global_state_absent() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-codex-missing-project-state-restore-test");
+        let backup = root.join("backup");
+        let codex = root.join("codex");
+        let id = "restore-without-global-state";
+        let relative = PathBuf::from(format!("sessions/2026/07/10/rollout-{id}.jsonl"));
+        fs::create_dir_all(&codex)?;
+        let state = rusqlite::Connection::open(codex.join("state_5.sqlite"))?;
+        state.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT)",
+            [],
+        )?;
+        drop(state);
+        let target = write_codex_restore_backup(
+            &backup,
+            id,
+            &relative,
+            serde_json::json!({
+                "id": id,
+                "rollout_path": backup.join(&relative).to_string_lossy(),
+                "cwd": r"F:\work\repo",
+                "title": "legacy Desktop restore"
+            }),
+            r"F:\work\repo",
+        )?;
+        let global_state_path = paths::codex_global_state_json_path(&codex);
+        assert!(!global_state_path.exists());
+
+        let restored = restore_one(&backup, &codex, &target, false)?;
+
+        assert!(restored.ok, "restore failed: {:?}", restored.error);
+        assert!(!global_state_path.exists());
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn codex_restore_while_desktop_running_preserves_every_target_store() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-codex-restore-desktop-running-test");
+        let backup_root = root.join("backups");
+        let backup = backup_root.join("desktop-running");
+        let codex = root.join("codex");
+        let id = "restore-desktop-running";
+        let relative = PathBuf::from(format!("sessions/2026/07/10/rollout-{id}.jsonl"));
+        let destination = codex.join(&relative);
+        fs::create_dir_all(destination.parent().unwrap_or(&codex))?;
+        fs::create_dir_all(&backup)?;
+
+        let target = write_codex_restore_backup(
+            &backup,
+            id,
+            &relative,
+            serde_json::json!({
+                "id": id,
+                "rollout_path": backup.join(&relative).to_string_lossy(),
+                "cwd": r"F:\work\restored",
+                "title": "restored title"
+            }),
+            r"F:\work\restored",
+        )?;
+        let manifest = Manifest {
+            version: 3,
+            provider: Some(PROVIDER_CODEX.to_string()),
+            created_at: "2026-07-10T00:00:00Z".to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            codex_dir: String::new(),
+            claude_dir: None,
+            opencode_dir: None,
+            note: None,
+            artifacts: Vec::new(),
+            sessions: vec![target],
+        };
+        fs::write(
+            backup.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest)?,
+        )?;
+
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        state.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT)",
+            [],
+        )?;
+        state.execute(
+            "INSERT INTO threads VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                id,
+                destination.to_string_lossy().into_owned(),
+                r"C:\local-before",
+                "local title"
+            ],
+        )?;
+        drop(state);
+        fs::write(
+            &destination,
+            b"local rollout must remain byte-for-byte unchanged\n",
+        )?;
+        let index_path = paths::session_index_path(&codex);
+        let history_path = paths::history_path(&codex);
+        let state_path = paths::state_db_path(&codex);
+        let global_state_path = paths::codex_global_state_json_path(&codex);
+        fs::write(&index_path, b"index-before\r\n")?;
+        fs::write(&history_path, b"history-before\r\n")?;
+        fs::write(
+            &global_state_path,
+            serde_json::to_vec(&serde_json::json!({
+                "local-projects": {
+                    "local-before": {
+                        "id": "local-before",
+                        "rootPaths": [r"C:\local-before"]
+                    }
+                },
+                "thread-project-assignments": {
+                    id: {
+                        "projectKind": "local",
+                        "projectId": "local-before",
+                        "cwd": r"C:\local-before",
+                        "pendingCoreUpdate": false
+                    }
+                }
+            }))?,
+        )?;
+
+        let rollout_before = fs::read(&destination)?;
+        let state_before = fs::read(&state_path)?;
+        let index_before = fs::read(&index_path)?;
+        let history_before = fs::read(&history_path)?;
+        let global_state_before = fs::read(&global_state_path)?;
+
+        let _desktop_running = crate::codex_projects::DesktopTestProbeGuard::running();
+        let error = restore_session(
+            Some(PROVIDER_CODEX.to_string()),
+            backup_root.to_string_lossy().into_owned(),
+            backup.to_string_lossy().into_owned(),
+            codex.to_string_lossy().into_owned(),
+            None,
+            id.to_string(),
+            Some(relative.to_string_lossy().replace('\\', "/")),
+            true,
+        )
+        .expect_err("running Desktop must reject restore before any target mutation");
+        let error = error.to_string();
+        assert!(error.contains("Codex/ChatGPT 桌面应用正在运行"), "{error}");
+        assert!(
+            error.contains("请完全退出桌面应用（包括后台进程）后重试"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&destination)?, rollout_before);
+        assert_eq!(fs::read(&state_path)?, state_before);
+        assert_eq!(fs::read(&index_path)?, index_before);
+        assert_eq!(fs::read(&history_path)?, history_before);
+        assert_eq!(fs::read(&global_state_path)?, global_state_before);
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn codex_restore_commit_failure_compensates_desktop_project_state() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-codex-project-compensation-test");
+        let backup = root.join("backup");
+        let codex = root.join("codex");
+        let id = "restore-project-rollback";
+        let relative = PathBuf::from(format!("sessions/2026/07/10/rollout-{id}.jsonl"));
+        let destination = codex.join(&relative);
+        fs::create_dir_all(&codex)?;
+
+        // The deferred constraint lets all files, including Desktop global state, be staged
+        // before SQLite rejects COMMIT. This exercises the real post-sync compensation path.
+        let state = rusqlite::Connection::open(codex.join("state_5.sqlite"))?;
+        state.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE parents (id TEXT PRIMARY KEY);
+             CREATE TABLE threads (
+                 id TEXT PRIMARY KEY,
+                 rollout_path TEXT,
+                 cwd TEXT,
+                 title TEXT,
+                 parent_id TEXT REFERENCES parents(id) DEFERRABLE INITIALLY DEFERRED
+             );",
+        )?;
+        drop(state);
+
+        let cwd = r"F:\work\repo";
+        let target = write_codex_restore_backup(
+            &backup,
+            id,
+            &relative,
+            serde_json::json!({
+                "id": id,
+                "rollout_path": backup.join(&relative).to_string_lossy(),
+                "cwd": cwd,
+                "title": "must roll back",
+                "parent_id": "missing-parent"
+            }),
+            cwd,
+        )?;
+        let history_path = paths::history_path(&codex);
+        let index_path = paths::session_index_path(&codex);
+        fs::write(&history_path, b"old history\n")?;
+        fs::write(&index_path, b"old index\n")?;
+        let global_state_path = paths::codex_global_state_json_path(&codex);
+        fs::write(
+            &global_state_path,
+            serde_json::to_vec(&serde_json::json!({
+                "local-projects": {
+                    "project-existing": {
+                        "id": "project-existing",
+                        "name": "Repo",
+                        "rootPaths": [cwd]
+                    }
+                },
+                "project-order": ["project-existing"],
+                "untouched": {"value": 1}
+            }))?,
+        )?;
+        let history_before = fs::read(&history_path)?;
+        let index_before = fs::read(&index_path)?;
+        let global_state_before = fs::read(&global_state_path)?;
+
+        let restored = restore_one(&backup, &codex, &target, false)?;
+
+        assert!(!restored.ok);
+        assert!(!restored.rollout_copied);
+        assert!(restored
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("提交 Codex 数据库还原事务失败"));
+        assert!(!destination.exists());
+        assert_eq!(fs::read(&history_path)?, history_before);
+        assert_eq!(fs::read(&index_path)?, index_before);
+        assert_eq!(fs::read(&global_state_path)?, global_state_before);
+        let state = state_db::open(&codex)?;
+        let restored_rows: i64 =
+            state.query_row("SELECT COUNT(*) FROM threads WHERE id = ?", [id], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(restored_rows, 0);
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn codex_restore_never_overwrites_concurrent_index_change_during_compensation() -> AppResult<()>
+    {
+        let root = temp_dir("cc-session-manager-codex-restore-index-race-test");
+        let backup = root.join("backup");
+        let codex = root.join("codex");
+        let id = "restore-index-race";
+        let relative = PathBuf::from(format!("sessions/2026/07/10/rollout-{id}.jsonl"));
+        fs::create_dir_all(&codex)?;
+
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        state.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT)",
+            [],
+        )?;
+        drop(state);
+        let target = write_codex_restore_backup(
+            &backup,
+            id,
+            &relative,
+            serde_json::json!({
+                "id": id,
+                "rollout_path": backup.join(&relative).to_string_lossy(),
+                "cwd": r"F:\work\repo",
+                "title": "restore index race"
+            }),
+            r"F:\work\repo",
+        )?;
+        let history_path = paths::history_path(&codex);
+        let index_path = paths::session_index_path(&codex);
+        fs::write(&history_path, b"history before\n")?;
+        fs::write(&index_path, b"index before\n")?;
+        let concurrent_index = b"index written concurrently\n".to_vec();
+        let _fault = RestoreFileTestFaultGuard::replace_and_conflict(
+            "session index",
+            index_path.clone(),
+            concurrent_index.clone(),
+        );
+
+        let restored = restore_one(&backup, &codex, &target, false)?;
+
+        assert!(!restored.ok);
+        assert!(!restored.rollout_copied);
+        assert!(restored
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("并发写入冲突"));
+        assert_eq!(fs::read(&index_path)?, concurrent_index);
+        assert_eq!(fs::read(&history_path)?, b"history before\n");
+        assert!(!codex.join(&relative).exists());
+        let state = state_db::open_ro(&codex)?;
+        let rows: i64 =
+            state.query_row("SELECT COUNT(*) FROM threads WHERE id = ?", [id], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(rows, 0);
+
+        drop(state);
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn restore_snapshot_never_blindly_compensates_without_a_post_write_fingerprint() -> AppResult<()>
+    {
+        let root = temp_dir("cc-session-manager-restore-unobserved-commit-test");
+        fs::create_dir_all(&root)?;
+        let path = root.join("session_index.jsonl");
+        fs::write(&path, b"before\n")?;
+        let mut snapshots = RestoreFileSnapshots::capture(&[("session index", &path)])?;
+        snapshots.start("session index")?;
+
+        // Model a successful writer followed by a failure while observing the resulting path.
+        fs::write(&path, b"committed but unobserved\n")?;
+        snapshots.mark_committed_without_observation("session index")?;
+
+        let errors = snapshots.compensate_except(&[]);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("拒绝盲目覆盖"), "{}", errors[0]);
+        assert_eq!(fs::read(&path)?, b"committed but unobserved\n");
+
+        snapshots.cleanup()?;
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
     fn codex_restore_log_constraint_failure_preserves_all_existing_state() -> AppResult<()> {
         let root = temp_dir("cc-session-manager-codex-restore-rollback-test");
         let backup = root.join("backup");
@@ -3215,6 +3949,59 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()?;
         assert_eq!(rows, vec![(1, "old log".to_string())]);
 
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn codex_restore_with_logs_requires_existing_logs_database_without_creating_it() -> AppResult<()>
+    {
+        let root = temp_dir("cc-session-manager-codex-restore-missing-logs-db-test");
+        let backup = root.join("backup");
+        let codex = root.join("codex");
+        let id = "restore-missing-logs-db";
+        let relative = PathBuf::from(format!("sessions/2026/07/10/rollout-{id}.jsonl"));
+        fs::create_dir_all(&codex)?;
+        let state = rusqlite::Connection::open(codex.join("state_5.sqlite"))?;
+        state.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT)",
+            [],
+        )?;
+        drop(state);
+
+        let mut target = write_codex_restore_backup(
+            &backup,
+            id,
+            &relative,
+            serde_json::json!({
+                "id": id,
+                "rollout_path": relative.to_string_lossy(),
+                "cwd": r"F:\work\restored",
+                "title": "restore with logs"
+            }),
+            r"F:\work\restored",
+        )?;
+        target.logs_count = 1;
+        fs::write(
+            backup.join("logs.ndjson"),
+            format!("{{\"thread_id\":\"{id}\",\"message\":\"restored\"}}\n"),
+        )?;
+        let logs_path = codex.join("logs_2.sqlite");
+        assert!(!logs_path.exists());
+
+        let error = restore_one(&backup, &codex, &target, false)
+            .expect_err("logs restore must require an existing target schema");
+
+        assert!(
+            error.to_string().contains("logs_2.sqlite 不存在"),
+            "{error}"
+        );
+        assert!(!logs_path.exists());
+        assert!(!codex.join(&relative).exists());
+        let state = state_db::open_ro(&codex)?;
+        let thread_count: i64 =
+            state.query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))?;
+        assert_eq!(thread_count, 0);
         fs::remove_dir_all(root).ok();
         Ok(())
     }

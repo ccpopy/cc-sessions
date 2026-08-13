@@ -297,6 +297,7 @@ export type MoveSessionCwdReport = {
   new_cwd: string;
   threads_updated: number;
   rollout_rewritten: boolean;
+  desktop_project_synced: boolean;
   artifacts_moved: number;
   history_rows_updated: number;
   target_project_id?: string | null;
@@ -656,6 +657,7 @@ export type SwitchStrategy = "continuous" | "scatter" | "follow";
 // ========================= 家族树 =========================
 
 export type BranchStatus = "active" | "archived" | "deleted";
+export type ArchiveOrigin = "provider_sync";
 
 export type FamilyBranch = {
   id: string;
@@ -666,6 +668,7 @@ export type FamilyBranch = {
   sha256: string | null;
   line_count: number | null;
   note: string | null;
+  archive_origin?: ArchiveOrigin | null;
 };
 
 export type Family = {
@@ -773,6 +776,7 @@ export type FamilyOverlay = {
   family_id: string | null;
   branch_count: number;
   is_active_branch: boolean;
+  archive_origin?: ArchiveOrigin | null;
   clone_state: CloneState;
 };
 

@@ -18,12 +18,15 @@ use crate::atomic_file;
 use crate::error::{ensure_not_cancelled, AppError, AppResult};
 use crate::family;
 use crate::models::{
-    BranchStatus, BranchSyncReport, BranchSyncState, CloneReport, DiagnosticReport,
+    ArchiveOrigin, BranchStatus, BranchSyncReport, BranchSyncState, CloneReport, DiagnosticReport,
     DuplicateSessionReport, Family, FamilyBranch, ForkSessionReport, GuiVisibilityFixReport,
     GuiVisibilityIssue, GuiVisibilityReport, HistoryOrphanReport, HistoryPruneReport,
     IndexRepairReport, OrphanPruneReport, ProjectConfigIssue, ProjectConfigRepairItem,
     ProjectConfigRepairReport, ProjectConfigReport, ProviderInfo, SwitchStrategy, SyncBranchReport,
     ThreadsRebuildReport,
+};
+use crate::mutation_journal::{
+    commit_transaction_with_compensation, rollback_transaction_with_compensation, MutationJournal,
 };
 
 /// Codex CLI 的内建默认 provider（与官方文档一致）。
@@ -674,6 +677,22 @@ pub(crate) fn read_rollout_brief_cancellable(
     read_rollout_brief_impl(codex_dir, path, Some(cancel))
 }
 
+/// Build one Desktop project-assignment record from rollout metadata.
+///
+/// Rollouts created under WSL persist Core paths, while the Desktop global state expects the
+/// corresponding host path. Empty/missing cwd is deliberately skipped so one incomplete rollout
+/// cannot block batch repair of all other threads.
+fn project_assignment_record(codex: &Path, brief: &RolloutBrief) -> Option<(String, String)> {
+    let cwd = brief.cwd.as_deref()?.trim();
+    if cwd.is_empty() {
+        return None;
+    }
+    Some((
+        brief.id.clone(),
+        paths::host_path_string_from_codex_record(codex, cwd),
+    ))
+}
+
 fn read_rollout_brief_impl(
     codex_dir: &Path,
     path: &Path,
@@ -685,7 +704,7 @@ fn read_rollout_brief_impl(
     let mut id: Option<String> = None;
     let mut model_provider: Option<String> = None;
     let mut source: Option<String> = None;
-    let mut cwd: Option<String> = None;
+    let mut cwd_tracker = crate::codex_rollout_cwd::EffectiveCwdTracker::default();
     let mut sandbox_policy: Option<String> = None;
     let mut approval_mode: Option<String> = None;
     let mut memory_mode: Option<String> = None;
@@ -705,6 +724,7 @@ fn read_rollout_brief_impl(
             Ok(x) => x,
             Err(_) => continue,
         };
+        cwd_tracker.observe(&v);
         // 时间戳（顶层可能是 ISO8601 字符串）
         if let Some(ts) = v.get("timestamp").and_then(|x| x.as_str()) {
             if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
@@ -736,23 +756,11 @@ fn read_rollout_brief_impl(
                 });
                 source =
                     source.or_else(|| payload.and_then(|p| metadata_string_field(p, "source")));
-                cwd = cwd.or_else(|| {
-                    payload
-                        .and_then(|p| p.get("cwd"))
-                        .and_then(|x| x.as_str())
-                        .map(String::from)
-                });
                 memory_mode = memory_mode
                     .or_else(|| payload.and_then(|p| metadata_string_field(p, "memory_mode")));
             }
             "turn_context" => {
                 let payload = v.get("payload").unwrap_or(&v);
-                if cwd.is_none() {
-                    cwd = payload
-                        .get("cwd")
-                        .and_then(|x| x.as_str())
-                        .map(String::from);
-                }
                 sandbox_policy =
                     sandbox_policy.or_else(|| metadata_string_field(payload, "sandbox_policy"));
                 approval_mode = approval_mode
@@ -788,6 +796,7 @@ fn read_rollout_brief_impl(
         Some(x) => x,
         None => return Ok(None), // 没有有效 session_meta.id 直接跳过
     };
+    let cwd = cwd_tracker.effective_for(&id);
     let relpath = path
         .strip_prefix(codex_dir)
         .map(|p| p.to_path_buf())
@@ -1029,15 +1038,27 @@ pub fn diagnose_codex_state(codex_dir: String) -> AppResult<DiagnosticReport> {
 
 pub fn repair_session_index(codex_dir: String, dry_run: bool) -> AppResult<IndexRepairReport> {
     let codex = PathBuf::from(&codex_dir);
+    if !dry_run {
+        crate::codex_projects::ensure_desktop_not_running(&codex)?;
+    }
     let rollouts = family::scan_rollouts(&codex)?;
     let mut written = 0u32;
     let mut salvaged = 0u32;
     let mut errors: Vec<String> = Vec::new();
+    let mut project_assignments = Vec::new();
 
     let mut entries: Vec<Value> = Vec::with_capacity(rollouts.len());
     for p in &rollouts {
         match read_rollout_brief(&codex, p) {
             Ok(Some(b)) => {
+                if let Some(record) = project_assignment_record(&codex, &b) {
+                    project_assignments.push(record);
+                } else {
+                    errors.push(format!(
+                        "{}: rollout 缺少有效 cwd，已跳过 Codex Desktop 项目归属修复",
+                        p.to_string_lossy()
+                    ));
+                }
                 let updated = if b.updated_at_ms > 0 {
                     b.updated_at_ms
                 } else if b.created_at_ms > 0 {
@@ -1079,12 +1100,31 @@ pub fn repair_session_index(codex_dir: String, dry_run: bool) -> AppResult<Index
     }
 
     if !dry_run {
+        crate::codex_projects::validate_missing_thread_project_assignment_records(
+            &codex,
+            &project_assignments,
+        )?;
         let out_path = paths::session_index_path(&codex);
         let lines = entries
             .iter()
             .map(serde_json::to_string)
             .collect::<Result<Vec<_>, _>>()?;
-        rewrite_lines_atomically(&out_path, &lines)?;
+        let mut journal = MutationJournal::default();
+        let operation = (|| -> AppResult<()> {
+            journal.mutate_file(&out_path, || rewrite_lines_atomically(&out_path, &lines))?;
+            if let Some(receipt) =
+                crate::codex_projects::sync_missing_thread_project_assignment_records_with_receipt(
+                    &codex,
+                    &project_assignments,
+                )?
+            {
+                journal.register_project_state_receipt(receipt);
+            }
+            Ok(())
+        })();
+        if let Err(error) = operation {
+            return Err(journal.compensate_without_transaction(error));
+        }
     }
 
     Ok(IndexRepairReport {
@@ -1353,6 +1393,25 @@ fn prune_orphan_entries_locked(
         }
     }
 
+    let state_db_exists = paths::state_db_path(&codex).is_file();
+    let orphan_ids = if prune_threads && state_db_exists {
+        let state = state_db::open_ro(&codex)?;
+        let mut stmt = state.prepare("SELECT id FROM threads")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|id| !all_rollout_ids.contains(id))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if !dry_run && prune_threads {
+        crate::codex_projects::preflight_thread_project_state_cleanup(&codex, &orphan_ids)?;
+        if crate::codex_projects::desktop_state_initialized(&codex)? {
+            crate::codex_projects::ensure_desktop_not_running(&codex)?;
+        }
+    }
+
     let mut index_removed = 0u32;
     let mut threads_removed = 0u32;
     let mut family_branches_removed = 0u32;
@@ -1360,6 +1419,8 @@ fn prune_orphan_entries_locked(
     let mut families_recovered = 0u32;
     let mut families_normalized = 0u32;
     let mut families_skipped = Vec::new();
+    let mut changed_family_store = None;
+    let mut changed_index = None;
 
     if prune_family {
         let mut store = family::load(&codex)?;
@@ -1439,7 +1500,7 @@ fn prune_orphan_entries_locked(
                     store.index.remove(branch_id);
                 }
             }
-            family::save(&codex, &store)?;
+            changed_family_store = Some(store);
         }
     }
 
@@ -1468,27 +1529,70 @@ fn prune_orphan_entries_locked(
                 }
             }
             if !dry_run && index_removed > 0 {
-                rewrite_lines_atomically(&index_path, &kept_lines)?;
+                // The actual rewrite is part of the joint transaction below.
+                changed_index = Some((index_path, kept_lines));
             }
         }
     }
 
-    if prune_threads && paths::state_db_path(&codex).is_file() {
-        let conn = state_db::open(&codex)?;
-        let orphan_ids: Vec<String> = {
-            let mut stmt = conn.prepare("SELECT id FROM threads")?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            rows.flatten()
-                .filter(|id| !all_rollout_ids.contains(id))
-                .collect()
-        };
+    if prune_threads && state_db_exists {
         threads_removed = orphan_ids.len() as u32;
-        if !dry_run && !orphan_ids.is_empty() {
-            let tx = conn.unchecked_transaction()?;
-            for id in &orphan_ids {
-                tx.execute("DELETE FROM threads WHERE id = ?", [id])?;
+    }
+
+    if !dry_run {
+        let mut journal = MutationJournal::default();
+        let family_path = paths::family_store_path(&codex);
+        let state = if prune_threads && state_db_exists {
+            Some(state_db::open(&codex)?)
+        } else {
+            None
+        };
+        let transaction = match state.as_ref() {
+            Some(connection) => Some(rusqlite::Transaction::new_unchecked(
+                connection,
+                rusqlite::TransactionBehavior::Immediate,
+            )?),
+            None => None,
+        };
+        let operation = (|| -> AppResult<()> {
+            if let Some(store) = changed_family_store.as_ref() {
+                journal.mutate_file(&family_path, || family::save(&codex, store))?;
             }
-            tx.commit()?;
+            if let Some((index_path, kept_lines)) = changed_index.as_ref() {
+                journal.mutate_file(index_path, || {
+                    rewrite_lines_atomically(index_path, kept_lines)
+                })?;
+            }
+            if prune_threads {
+                if let Some(transaction) = transaction.as_ref() {
+                    for id in &orphan_ids {
+                        transaction.execute("DELETE FROM threads WHERE id = ?", [id])?;
+                    }
+                }
+                if let Some(receipt) =
+                    crate::codex_projects::clear_thread_project_states_with_receipt(
+                        &codex,
+                        &orphan_ids,
+                    )?
+                {
+                    journal.register_project_state_receipt(receipt);
+                }
+            }
+            inject_repair_fault("prune_after_project_state")?;
+            Ok(())
+        })();
+        if let Err(error) = operation {
+            return Err(match transaction {
+                Some(transaction) => {
+                    rollback_transaction_with_compensation(transaction, journal, error)
+                }
+                None => journal.compensate_without_transaction(error),
+            });
+        }
+        if let Some(transaction) = transaction {
+            commit_transaction_with_compensation(transaction, journal)?;
+        } else {
+            journal.finalize()?;
         }
     }
 
@@ -2132,12 +2236,16 @@ fn effective_threads_cols(state: &rusqlite::Connection) -> AppResult<Vec<&'stati
 
 pub fn rebuild_threads_table(codex_dir: String, dry_run: bool) -> AppResult<ThreadsRebuildReport> {
     let codex = PathBuf::from(&codex_dir);
+    if !dry_run {
+        crate::codex_projects::ensure_desktop_not_running(&codex)?;
+    }
     let active_rollouts = family::scan_rollouts(&codex)?;
     let archived_rollouts = family::scan_archived_rollouts(&codex)?;
     let mut scanned = 0u32;
     let mut upserted = 0u32;
     let mut skipped = 0u32;
     let mut errors: Vec<String> = Vec::new();
+    let mut project_assignments = Vec::new();
 
     if !paths::state_db_path(&codex).is_file() {
         return Err(AppError::InvalidCodexDir(format!(
@@ -2148,6 +2256,7 @@ pub fn rebuild_threads_table(codex_dir: String, dry_run: bool) -> AppResult<Thre
 
     let state = state_db::open(&codex)?;
     let effective_cols = effective_threads_cols(&state)?;
+    let mut planned_upserts = Vec::new();
 
     for (p, archived) in active_rollouts
         .iter()
@@ -2155,26 +2264,65 @@ pub fn rebuild_threads_table(codex_dir: String, dry_run: bool) -> AppResult<Thre
         .chain(archived_rollouts.iter().map(|p| (p, true)))
     {
         scanned += 1;
-        if dry_run {
-            match thread_values_from_rollout(&codex, p, archived, &effective_cols) {
-                Ok(Some(_)) => upserted += 1,
-                Ok(None) => skipped += 1,
-                Err(e) => {
-                    errors.push(format!("{}: {}", p.to_string_lossy(), e));
-                    skipped += 1;
+        match thread_values_from_rollout(&codex, p, archived, &effective_cols) {
+            Ok(Some(values)) => {
+                upserted += 1;
+                match read_rollout_brief(&codex, p) {
+                    Ok(Some(brief)) => {
+                        if let Some(record) = project_assignment_record(&codex, &brief) {
+                            project_assignments.push(record);
+                        } else {
+                            errors.push(format!(
+                                "{}: rollout 缺少有效 cwd，已跳过 Codex Desktop 项目归属修复",
+                                p.to_string_lossy()
+                            ));
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => errors.push(format!("{}: {}", p.to_string_lossy(), e)),
+                }
+                if !dry_run {
+                    planned_upserts.push(values);
                 }
             }
-            continue;
-        }
-
-        match upsert_thread_from_rollout(&codex, &state, p, archived) {
-            Ok(true) => upserted += 1,
-            Ok(false) => skipped += 1,
+            Ok(None) => skipped += 1,
             Err(e) => {
                 errors.push(format!("{}: {}", p.to_string_lossy(), e));
                 skipped += 1;
             }
         }
+    }
+
+    if !dry_run {
+        crate::codex_projects::validate_missing_thread_project_assignment_records(
+            &codex,
+            &project_assignments,
+        )?;
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&state, rusqlite::TransactionBehavior::Immediate)?;
+        let mut journal = MutationJournal::default();
+        let operation = (|| -> AppResult<()> {
+            for values in &planned_upserts {
+                upsert_thread_values(&transaction, &effective_cols, values)?;
+            }
+            if let Some(receipt) =
+                crate::codex_projects::sync_missing_thread_project_assignment_records_with_receipt(
+                    &codex,
+                    &project_assignments,
+                )?
+            {
+                journal.register_project_state_receipt(receipt);
+            }
+            Ok(())
+        })();
+        if let Err(error) = operation {
+            return Err(rollback_transaction_with_compensation(
+                transaction,
+                journal,
+                error,
+            ));
+        }
+        commit_transaction_with_compensation(transaction, journal)?;
     }
 
     Ok(ThreadsRebuildReport {
@@ -2277,8 +2425,10 @@ fn thread_values_from_rollout(
                 "recency_at" => Value::from(updated / 1000),
                 "recency_at_ms" => Value::from(updated),
                 "cwd" => Value::String(
-                    metadata_string_field(&payload, "cwd")
-                        .or_else(|| brief.cwd.clone())
+                    brief
+                        .cwd
+                        .clone()
+                        .or_else(|| metadata_string_field(&payload, "cwd"))
                         .unwrap_or_default(),
                 ),
                 "source" => Value::String(desktop_visible_source(&payload)),
@@ -2382,6 +2532,19 @@ fn bind_thread_values(values: &[Value]) -> Vec<Box<dyn rusqlite::ToSql>> {
         .collect()
 }
 
+fn upsert_thread_values(
+    state: &rusqlite::Connection,
+    cols: &[&str],
+    values: &[Value],
+) -> AppResult<()> {
+    let sql = threads_upsert_sql(cols);
+    let mut stmt = state.prepare(&sql)?;
+    let boxed = bind_thread_values(values);
+    let refs: Vec<&dyn rusqlite::ToSql> = boxed.iter().map(|value| value.as_ref()).collect();
+    stmt.execute(refs.as_slice())?;
+    Ok(())
+}
+
 pub(crate) fn upsert_thread_from_rollout(
     codex: &Path,
     state: &rusqlite::Connection,
@@ -2393,11 +2556,7 @@ pub(crate) fn upsert_thread_from_rollout(
         Some(values) => values,
         None => return Ok(false),
     };
-    let sql = threads_upsert_sql(&cols);
-    let mut stmt = state.prepare(&sql)?;
-    let boxed = bind_thread_values(&values);
-    let refs: Vec<&dyn rusqlite::ToSql> = boxed.iter().map(|b| b.as_ref()).collect();
-    stmt.execute(refs.as_slice())?;
+    upsert_thread_values(state, &cols, &values)?;
     Ok(true)
 }
 
@@ -2473,132 +2632,6 @@ fn mark_thread_archived(
         return Err(AppError::NotFound(format!("threads 中未找到 id: {}", id)));
     }
     Ok(())
-}
-
-/// 把会话的 cwd 注册进 `.codex-global-state.json` 的三个数组：
-/// - `electron-saved-workspace-roots`（已知项目根，父目录已覆盖则跳过）
-/// - `active-workspace-roots`（Codex App 侧栏当前显示的项目筛选集）
-/// - `project-order`（侧栏项目展示顺序）
-///
-/// 三者缺一，官方 App 在"按项目分组"模式下都可能漏显新会话。文件不存在时无需处理；
-/// 已存在但不可读或损坏时必须显式报错，避免把“已同步”误报给用户。
-pub(crate) fn ensure_workspace_root_registered(codex: &Path, cwd: &str) -> AppResult<()> {
-    let cwd = cwd.trim();
-    if cwd.is_empty() {
-        return Ok(());
-    }
-    let path = paths::codex_global_state_json_path(codex);
-    match fs::metadata(&path) {
-        Ok(metadata) if metadata.is_file() => {}
-        Ok(_) => {
-            return Err(AppError::Path(format!(
-                "Codex 全局状态路径不是文件: {}",
-                path.to_string_lossy()
-            )))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    }
-    let expected = atomic_file::fingerprint(&path)?;
-    let raw = fs::read_to_string(&path)?;
-    let mut root: Value = serde_json::from_str(&raw).map_err(|error| {
-        AppError::Other(format!(
-            "Codex 全局状态 JSON 损坏 {}: {error}",
-            path.to_string_lossy()
-        ))
-    })?;
-    let obj = root.as_object_mut().ok_or_else(|| {
-        AppError::Other(format!(
-            "Codex 全局状态必须是 JSON 对象: {}",
-            path.to_string_lossy()
-        ))
-    })?;
-
-    let mut changed = false;
-    // electron-saved-workspace-roots：若已有条目是 cwd 的前缀，则视为已覆盖。
-    let saved_covered = workspace_root_covered(obj, "electron-saved-workspace-roots", cwd);
-    if !saved_covered {
-        append_string_to_array(obj, "electron-saved-workspace-roots", cwd);
-        changed = true;
-    }
-    // active-workspace-roots：严格包含 cwd 才算命中，避免被父目录吞掉。
-    if !array_contains(obj, "active-workspace-roots", cwd) {
-        append_string_to_array(obj, "active-workspace-roots", cwd);
-        changed = true;
-    }
-    // project-order：同上，保证侧栏顺序里能看到。
-    if !array_contains(obj, "project-order", cwd) {
-        append_string_to_array(obj, "project-order", cwd);
-        changed = true;
-    }
-    if !changed {
-        return Ok(());
-    }
-
-    let serialized = serde_json::to_vec(&root)?;
-    atomic_file::replace_with_writer_if_unchanged(&path, &expected, |file| {
-        file.write_all(&serialized)?;
-        Ok(())
-    })?;
-    Ok(())
-}
-
-fn workspace_root_covered(obj: &serde_json::Map<String, Value>, key: &str, cwd: &str) -> bool {
-    let arr = match obj.get(key).and_then(|v| v.as_array()) {
-        Some(a) => a,
-        None => return false,
-    };
-    let cwd_norm = normalize_path_for_compare(cwd);
-    for item in arr {
-        if let Some(s) = item.as_str() {
-            let item_norm = normalize_path_for_compare(s);
-            if item_norm == cwd_norm {
-                return true;
-            }
-            // 父目录覆盖：cwd 以 item + 分隔符开头
-            let with_sep = format!("{}/", item_norm.trim_end_matches('/'));
-            if cwd_norm.starts_with(&with_sep) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn array_contains(obj: &serde_json::Map<String, Value>, key: &str, cwd: &str) -> bool {
-    let arr = match obj.get(key).and_then(|v| v.as_array()) {
-        Some(a) => a,
-        None => return false,
-    };
-    let cwd_norm = normalize_path_for_compare(cwd);
-    arr.iter().any(|item| {
-        item.as_str()
-            .map(|s| normalize_path_for_compare(s) == cwd_norm)
-            .unwrap_or(false)
-    })
-}
-
-fn append_string_to_array(obj: &mut serde_json::Map<String, Value>, key: &str, cwd: &str) {
-    let entry = obj
-        .entry(key.to_string())
-        .or_insert_with(|| Value::Array(Vec::new()));
-    if let Some(arr) = entry.as_array_mut() {
-        arr.push(Value::String(cwd.to_string()));
-    } else {
-        *entry = Value::Array(vec![Value::String(cwd.to_string())]);
-    }
-}
-
-fn normalize_path_for_compare(s: &str) -> String {
-    // Windows 路径比较：剥离 `\\?\` 前缀，统一为正斜杠，忽略大小写和尾随分隔符。
-    let stripped = paths::strip_verbatim(s);
-    let unified = stripped.replace('\\', "/");
-    let trimmed = unified.trim_end_matches('/').to_string();
-    if cfg!(windows) {
-        trimmed.to_ascii_lowercase()
-    } else {
-        trimmed
-    }
 }
 
 fn remove_index_line(codex: &Path, id: &str) -> AppResult<()> {
@@ -3300,263 +3333,6 @@ fn write_duplicated_rollout(
     })
 }
 
-#[derive(Debug)]
-struct FileMutationSnapshot {
-    path: PathBuf,
-    contents: Option<Vec<u8>>,
-    fingerprint: Option<atomic_file::FileFingerprint>,
-}
-
-impl FileMutationSnapshot {
-    fn capture(path: &Path) -> AppResult<Self> {
-        match fs::symlink_metadata(path) {
-            Ok(metadata)
-                if metadata.is_file()
-                    && !crate::path_safety::metadata_is_link_or_reparse(&metadata) =>
-            {
-                Ok(Self {
-                    path: path.to_path_buf(),
-                    contents: Some(fs::read(path)?),
-                    fingerprint: Some(atomic_file::fingerprint(path)?),
-                })
-            }
-            Ok(_) => Err(AppError::Path(format!(
-                "待修改路径不是普通文件: {}",
-                path.to_string_lossy()
-            ))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self {
-                path: path.to_path_buf(),
-                contents: None,
-                fingerprint: None,
-            }),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    fn into_compensation(self) -> AppResult<Option<MutationCompensation>> {
-        match fs::symlink_metadata(&self.path) {
-            Ok(metadata)
-                if metadata.is_file()
-                    && !crate::path_safety::metadata_is_link_or_reparse(&metadata) =>
-            {
-                let current = atomic_file::fingerprint(&self.path)?;
-                if self.fingerprint.as_ref() == Some(&current) {
-                    Ok(None)
-                } else {
-                    Ok(Some(MutationCompensation::RestoreFile {
-                        path: self.path,
-                        contents: self.contents,
-                        expected_current: current,
-                    }))
-                }
-            }
-            Ok(_) => Err(AppError::Path(format!(
-                "修改后的路径不是普通文件: {}",
-                self.path.to_string_lossy()
-            ))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if self.contents.is_none() {
-                    Ok(None)
-                } else {
-                    Err(AppError::Other(format!(
-                        "修改后的文件意外消失，无法登记补偿: {}",
-                        self.path.to_string_lossy()
-                    )))
-                }
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
-}
-
-#[derive(Debug)]
-enum MutationCompensation {
-    RestoreFile {
-        path: PathBuf,
-        contents: Option<Vec<u8>>,
-        expected_current: atomic_file::FileFingerprint,
-    },
-    UndoMove {
-        original: PathBuf,
-        current: PathBuf,
-        expected_current: atomic_file::FileFingerprint,
-    },
-}
-
-impl MutationCompensation {
-    fn apply(self) -> AppResult<()> {
-        match self {
-            Self::RestoreFile {
-                path,
-                contents,
-                expected_current,
-            } => {
-                let metadata = fs::symlink_metadata(&path)?;
-                if !metadata.is_file() || crate::path_safety::metadata_is_link_or_reparse(&metadata)
-                {
-                    return Err(AppError::Path(format!(
-                        "补偿目标不是普通文件或属于链接/junction: {}",
-                        path.to_string_lossy()
-                    )));
-                }
-                let current = atomic_file::fingerprint(&path)?;
-                if current != expected_current {
-                    return Err(AppError::Other(format!(
-                        "补偿前文件已再次变化，拒绝覆盖: {}",
-                        path.to_string_lossy()
-                    )));
-                }
-                if let Some(contents) = contents {
-                    atomic_file::replace_with_writer_if_unchanged(
-                        &path,
-                        &expected_current,
-                        |file| {
-                            file.write_all(&contents)?;
-                            Ok(())
-                        },
-                    )?;
-                } else {
-                    fs::remove_file(&path)?;
-                }
-                Ok(())
-            }
-            Self::UndoMove {
-                original,
-                current,
-                expected_current,
-            } => {
-                if original.try_exists()? {
-                    return Err(AppError::Other(format!(
-                        "补偿移动的原位置已被占用: {}",
-                        original.to_string_lossy()
-                    )));
-                }
-                let metadata = fs::symlink_metadata(&current)?;
-                if !metadata.is_file() || crate::path_safety::metadata_is_link_or_reparse(&metadata)
-                {
-                    return Err(AppError::Path(format!(
-                        "补偿移动源不是普通文件或属于链接/junction: {}",
-                        current.to_string_lossy()
-                    )));
-                }
-                let current_fingerprint = atomic_file::fingerprint(&current)?;
-                if current_fingerprint != expected_current {
-                    return Err(AppError::Other(format!(
-                        "补偿移动前文件已再次变化，拒绝移动: {}",
-                        current.to_string_lossy()
-                    )));
-                }
-                if let Some(parent) = original.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::rename(&current, &original)?;
-                Ok(())
-            }
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct MutationJournal {
-    compensations: Vec<MutationCompensation>,
-}
-
-impl MutationJournal {
-    pub(crate) fn mutate_file<T>(
-        &mut self,
-        path: &Path,
-        mutation: impl FnOnce() -> AppResult<T>,
-    ) -> AppResult<T> {
-        let snapshot = FileMutationSnapshot::capture(path)?;
-        let mutation_result = mutation();
-        let compensation_result = snapshot.into_compensation();
-        match compensation_result {
-            Ok(Some(compensation)) => self.compensations.push(compensation),
-            Ok(None) => {}
-            Err(snapshot_error) => {
-                return match mutation_result {
-                    Ok(_) => Err(snapshot_error),
-                    Err(mutation_error) => Err(AppError::Other(format!(
-                        "{mutation_error}; 登记文件补偿失败: {snapshot_error}"
-                    ))),
-                };
-            }
-        }
-        mutation_result
-    }
-
-    fn move_file(&mut self, original: &Path, current: &Path) -> AppResult<()> {
-        fs::rename(original, current)?;
-        match atomic_file::fingerprint(current) {
-            Ok(expected_current) => {
-                self.compensations.push(MutationCompensation::UndoMove {
-                    original: original.to_path_buf(),
-                    current: current.to_path_buf(),
-                    expected_current,
-                });
-                Ok(())
-            }
-            Err(error) => match fs::rename(current, original) {
-                Ok(()) => Err(error),
-                Err(restore_error) => Err(AppError::Other(format!(
-                    "移动后读取文件指纹失败: {error}; 立即移回原位置也失败 {} -> {}: {restore_error}",
-                    current.to_string_lossy(),
-                    original.to_string_lossy()
-                ))),
-            },
-        }
-    }
-
-    fn compensate(self, primary_error: AppError) -> AppError {
-        let mut compensation_errors = Vec::new();
-        for compensation in self.compensations.into_iter().rev() {
-            if let Err(error) = compensation.apply() {
-                compensation_errors.push(error.to_string());
-            }
-        }
-        if compensation_errors.is_empty() {
-            primary_error
-        } else {
-            AppError::Other(format!(
-                "{primary_error}; 补偿失败: {}",
-                compensation_errors.join(" | ")
-            ))
-        }
-    }
-}
-
-pub(crate) fn rollback_transaction_with_compensation(
-    transaction: rusqlite::Transaction<'_>,
-    journal: MutationJournal,
-    primary_error: AppError,
-) -> AppError {
-    let primary_error = match transaction.rollback() {
-        Ok(()) => primary_error,
-        Err(error) => AppError::Other(format!("{primary_error}; SQLite 事务回滚失败: {error}")),
-    };
-    journal.compensate(primary_error)
-}
-
-pub(crate) fn commit_transaction_with_compensation(
-    transaction: rusqlite::Transaction<'_>,
-    journal: MutationJournal,
-) -> AppResult<()> {
-    match transaction.execute_batch("COMMIT") {
-        Ok(()) => {
-            drop(transaction);
-            Ok(())
-        }
-        Err(commit_error) => {
-            let primary_error = AppError::Other(format!("提交 SQLite 事务失败: {commit_error}"));
-            Err(rollback_transaction_with_compensation(
-                transaction,
-                journal,
-                primary_error,
-            ))
-        }
-    }
-}
-
 fn require_unchanged_snapshot(
     path: &Path,
     expected: &atomic_file::FileFingerprint,
@@ -3957,6 +3733,7 @@ fn duplicate_session_locked(
 ) -> AppResult<DuplicateSessionReport> {
     let codex = PathBuf::from(&codex_dir);
     let codex = codex.canonicalize().unwrap_or(codex);
+    crate::codex_projects::ensure_desktop_not_running(&codex)?;
 
     let source = paths::host_path_from_codex_record(&codex, &rollout_path);
     let source_abs = source.canonicalize().map_err(|error| {
@@ -4011,17 +3788,20 @@ fn duplicate_session_locked(
         let thread_name = if new_brief.first_user_message.is_empty() {
             source_brief.first_user_message.clone()
         } else {
-            new_brief.first_user_message
+            new_brief.first_user_message.clone()
         };
         let index_path = paths::session_index_path(&codex);
         journal.mutate_file(&index_path, || {
             append_index_line(&codex, &new_id, &thread_name, &new_abs)
         })?;
-        if let Some(cwd) = new_brief.cwd.as_deref() {
-            let global_state = paths::codex_global_state_json_path(&codex);
-            journal.mutate_file(&global_state, || {
-                ensure_workspace_root_registered(&codex, cwd)
-            })?;
+        if let Some((thread_id, host_cwd)) = project_assignment_record(&codex, &new_brief) {
+            if let Some(receipt) =
+                crate::codex_projects::sync_thread_project_assignment_with_receipt(
+                    &codex, &thread_id, &host_cwd,
+                )?
+            {
+                journal.register_project_state_receipt(receipt);
+            }
         }
 
         let file = fs::File::open(&new_abs)?;
@@ -4068,6 +3848,7 @@ fn fork_session_at_event_locked(
 ) -> AppResult<ForkSessionReport> {
     let codex = PathBuf::from(&codex_dir);
     let codex = codex.canonicalize().unwrap_or(codex);
+    crate::codex_projects::ensure_desktop_not_running(&codex)?;
     let (source_abs, source_brief) =
         resolve_fork_source_rollout(&codex, &session_id, &rollout_path)?;
     let prefix = collect_stable_prefix(&source_abs, event_index)?;
@@ -4134,46 +3915,88 @@ fn fork_session_at_event_locked(
         .map(|p| p.to_path_buf())
         .unwrap_or(fallback_rel);
 
-    let included_lines = write_forked_rollout_prefix(&prefix, &new_abs, &new_id, &provider)?;
-    sync_thread_from_rollout(&codex, &state, &new_abs)?;
-    sync_thread_from_rollout(&codex, &state, &source_abs)?;
-    carry_thread_title(&state, &active_branch.id, &new_id)?;
-
-    family::archive_with_integrity(&mut store, &codex, &family_id, &active_branch.id)?;
     let archived_dir = paths::archived_sessions_dir(&codex);
-    fs::create_dir_all(&archived_dir)?;
     let archived_dest = archived_dir.join(source_abs.file_name().unwrap_or_default());
-    fs::rename(&source_abs, &archived_dest)?;
-    mark_thread_archived(&state, &active_branch.id, &archived_dest)?;
-    remove_index_line(&codex, &active_branch.id)?;
+    if archived_dest.exists() {
+        return Err(AppError::Other(format!(
+            "源分支归档目标已存在，拒绝覆盖: {}",
+            archived_dest.to_string_lossy()
+        )));
+    }
 
-    let new_brief = read_rollout_brief(&codex, &new_abs)?.ok_or_else(|| {
-        AppError::Other(format!(
-            "新分支 rollout 缺少有效 session_meta.id: {}",
-            new_abs.to_string_lossy()
-        ))
-    })?;
-    let thread_name = if new_brief.first_user_message.is_empty() {
-        source_brief.first_user_message.clone()
-    } else {
-        new_brief.first_user_message
+    let transaction =
+        rusqlite::Transaction::new_unchecked(&state, rusqlite::TransactionBehavior::Immediate)?;
+    let mut journal = MutationJournal::default();
+    let operation = (|| -> AppResult<u64> {
+        let included_lines = journal.mutate_file(&new_abs, || {
+            write_forked_rollout_prefix(&prefix, &new_abs, &new_id, &provider)
+        })?;
+        sync_thread_from_rollout(&codex, &transaction, &new_abs)?;
+        sync_thread_from_rollout(&codex, &transaction, &source_abs)?;
+        carry_thread_title(&transaction, &active_branch.id, &new_id)?;
+
+        family::archive_with_integrity(&mut store, &codex, &family_id, &active_branch.id)?;
+        fs::create_dir_all(&archived_dir)?;
+        journal.move_file(&source_abs, &archived_dest)?;
+        mark_thread_archived(&transaction, &active_branch.id, &archived_dest)?;
+        let index_path = paths::session_index_path(&codex);
+        journal.mutate_file(&index_path, || remove_index_line(&codex, &active_branch.id))?;
+
+        let new_brief = read_rollout_brief(&codex, &new_abs)?.ok_or_else(|| {
+            AppError::Other(format!(
+                "新分支 rollout 缺少有效 session_meta.id: {}",
+                new_abs.to_string_lossy()
+            ))
+        })?;
+        let thread_name = if new_brief.first_user_message.is_empty() {
+            source_brief.first_user_message.clone()
+        } else {
+            new_brief.first_user_message.clone()
+        };
+        let new_branch = FamilyBranch {
+            id: new_id.clone(),
+            provider: provider.clone(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            status: BranchStatus::Active,
+            rollout_relpath: new_rel.to_string_lossy().into_owned(),
+            sha256: None,
+            line_count: None,
+            note: Some(format!(
+                "forked_from:{}@line:{}",
+                active_branch.id, event_index
+            )),
+            archive_origin: None,
+        };
+        family::append_branch(&mut store, &family_id, new_branch)?;
+        journal.mutate_file(&index_path, || {
+            append_index_line(&codex, &new_id, &thread_name, &new_abs)
+        })?;
+        let family_path = paths::family_store_path(&codex);
+        journal.mutate_file(&family_path, || family::save(&codex, &store))?;
+        if let Some((thread_id, host_cwd)) = project_assignment_record(&codex, &new_brief) {
+            if let Some(receipt) =
+                crate::codex_projects::sync_thread_project_assignment_with_receipt(
+                    &codex, &thread_id, &host_cwd,
+                )?
+            {
+                journal.register_project_state_receipt(receipt);
+            }
+        }
+        Ok(included_lines)
+    })();
+    let included_lines = match operation {
+        Ok(included_lines) => {
+            commit_transaction_with_compensation(transaction, journal)?;
+            included_lines
+        }
+        Err(error) => {
+            return Err(rollback_transaction_with_compensation(
+                transaction,
+                journal,
+                error,
+            ));
+        }
     };
-    let new_branch = FamilyBranch {
-        id: new_id.clone(),
-        provider: provider.clone(),
-        created_at: chrono::Utc::now().to_rfc3339(),
-        status: BranchStatus::Active,
-        rollout_relpath: new_rel.to_string_lossy().into_owned(),
-        sha256: None,
-        line_count: None,
-        note: Some(format!(
-            "forked_from:{}@line:{}",
-            active_branch.id, event_index
-        )),
-    };
-    family::append_branch(&mut store, &family_id, new_branch)?;
-    append_index_line(&codex, &new_id, &thread_name, &new_abs)?;
-    family::save(&codex, &store)?;
 
     Ok(ForkSessionReport {
         source_id: session_id,
@@ -4227,6 +4050,9 @@ fn clone_session_for_provider_locked_with_hint(
     source_rollout_hint: Option<&Path>,
 ) -> AppResult<CloneReport> {
     let codex = PathBuf::from(&codex_dir);
+    if !dry_run {
+        crate::codex_projects::ensure_desktop_not_running(&codex)?;
+    }
     let configured_provider = effective_current_provider(&codex)?;
     let provider = match target_provider {
         Some(provider) => {
@@ -4318,19 +4144,54 @@ fn clone_session_for_provider_locked_with_hint(
             } else {
                 ensure_state_db_exists(&codex)?;
                 let state = state_db::open(&codex)?;
-                sync_thread_from_rollout(&codex, &state, &src_brief.path)?;
-                append_index_line(
-                    &codex,
-                    &src_brief.id,
-                    &src_brief.first_user_message,
-                    &src_brief.path,
+                let project_assignment = project_assignment_record(&codex, &src_brief);
+                if let Some(record) = project_assignment.as_ref() {
+                    crate::codex_projects::validate_missing_thread_project_assignment_records(
+                        &codex,
+                        std::slice::from_ref(record),
+                    )?;
+                }
+
+                let transaction = rusqlite::Transaction::new_unchecked(
+                    &state,
+                    rusqlite::TransactionBehavior::Immediate,
                 )?;
-                if let Some(cwd) = src_brief.cwd.as_deref() {
-                    ensure_workspace_root_registered(&codex, cwd)?;
+                let mut journal = MutationJournal::default();
+                let operation = (|| -> AppResult<()> {
+                    sync_thread_from_rollout(&codex, &transaction, &src_brief.path)?;
+                    let index_path = paths::session_index_path(&codex);
+                    journal.mutate_file(&index_path, || {
+                        append_index_line(
+                            &codex,
+                            &src_brief.id,
+                            &src_brief.first_user_message,
+                            &src_brief.path,
+                        )
+                    })?;
+                    if let Some(record) = project_assignment.as_ref() {
+                        if let Some(receipt) = crate::codex_projects::sync_missing_thread_project_assignment_records_with_receipt(
+                            &codex,
+                            std::slice::from_ref(record),
+                        )? {
+                            journal.register_project_state_receipt(receipt);
+                        }
+                    }
+                    if !family_was_registered {
+                        let family_path = paths::family_store_path(&codex);
+                        journal.mutate_file(&family_path, || family::save(&codex, &store))?;
+                    }
+                    inject_repair_fault("provider_visibility_after_family_save")?;
+                    Ok(())
+                })();
+                if let Err(error) = operation {
+                    return Err(rollback_transaction_with_compensation(
+                        transaction,
+                        journal,
+                        error,
+                    ));
                 }
-                if !family_was_registered {
-                    family::save(&codex, &store)?;
-                }
+                commit_transaction_with_compensation(transaction, journal)?;
+
                 let states = read_thread_state_map(&codex)?;
                 let index_ids = read_session_index_ids(&codex)?;
                 if !rollout_is_usable_provider_session(
@@ -4382,8 +4243,46 @@ fn clone_session_for_provider_locked_with_hint(
         report.new_id = Some(branch.id.clone());
         report.skipped_reason = Some("目标 provider 已有可用分支".into());
         report.ok = true;
-        if !dry_run && !family_was_registered {
-            family::save(&codex, &store)?;
+        if !dry_run {
+            let target_rollout = codex.join(paths::checked_relative_path(&branch.rollout_relpath)?);
+            let target_cwd =
+                crate::codex_rollout_cwd::read_effective_cwd(&target_rollout, &branch.id)?;
+            let project_assignment = target_cwd
+                .as_deref()
+                .map(str::trim)
+                .filter(|cwd| !cwd.is_empty())
+                .map(|cwd| {
+                    (
+                        branch.id.clone(),
+                        paths::host_path_string_from_codex_record(&codex, cwd),
+                    )
+                });
+            if let Some(record) = project_assignment.as_ref() {
+                crate::codex_projects::validate_missing_thread_project_assignment_records(
+                    &codex,
+                    std::slice::from_ref(record),
+                )?;
+            }
+
+            let mut journal = MutationJournal::default();
+            let operation = (|| -> AppResult<()> {
+                if let Some(record) = project_assignment.as_ref() {
+                    if let Some(receipt) = crate::codex_projects::sync_missing_thread_project_assignment_records_with_receipt(
+                        &codex,
+                        std::slice::from_ref(record),
+                    )? {
+                        journal.register_project_state_receipt(receipt);
+                    }
+                }
+                if !family_was_registered {
+                    let family_path = paths::family_store_path(&codex);
+                    journal.mutate_file(&family_path, || family::save(&codex, &store))?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = operation {
+                return Err(journal.compensate_without_transaction(error));
+            }
         }
         return Ok(report);
     }
@@ -4404,11 +4303,13 @@ fn clone_session_for_provider_locked_with_hint(
             )?;
             let mut journal = MutationJournal::default();
             let operation = (|| -> AppResult<()> {
-                if let Some(cwd) = src_brief.cwd.as_deref() {
-                    let global_state = paths::codex_global_state_json_path(&codex);
-                    journal.mutate_file(&global_state, || {
-                        ensure_workspace_root_registered(&codex, cwd)
-                    })?;
+                if let Some(record) = project_assignment_record(&codex, &src_brief) {
+                    if let Some(receipt) = crate::codex_projects::sync_missing_thread_project_assignment_records_with_receipt(
+                        &codex,
+                        &[record],
+                    )? {
+                        journal.register_project_state_receipt(receipt);
+                    }
                 }
                 journal.mutate_file(&src_brief.path, || {
                     rewrite_provider_inplace(&src_brief.path, &provider)
@@ -4529,13 +4430,6 @@ fn clone_session_for_provider_locked_with_hint(
             )?;
             let mut journal = MutationJournal::default();
             let operation = (|| -> AppResult<()> {
-                if let Some(cwd) = src_brief.cwd.as_deref() {
-                    let global_state = paths::codex_global_state_json_path(&codex);
-                    journal.mutate_file(&global_state, || {
-                        ensure_workspace_root_registered(&codex, cwd)
-                    })?;
-                }
-
                 // 1) 基于固定源快照写新文件并登记新 threads 行。
                 journal.mutate_file(&new_abs, || {
                     write_cloned_rollout(
@@ -4552,6 +4446,21 @@ fn clone_session_for_provider_locked_with_hint(
                 inject_repair_fault("clone_after_new_rollout")?;
                 require_unchanged_snapshot(&source_rollout, &source_snapshot, "克隆源 rollout ")?;
                 sync_thread_from_rollout(&codex, &transaction, &new_abs)?;
+                let new_brief = read_rollout_brief(&codex, &new_abs)?.ok_or_else(|| {
+                    AppError::Other(format!(
+                        "新分支 rollout 缺少有效 session_meta.id: {}",
+                        new_abs.to_string_lossy()
+                    ))
+                })?;
+                if let Some((thread_id, host_cwd)) = project_assignment_record(&codex, &new_brief) {
+                    if let Some(receipt) =
+                        crate::codex_projects::sync_thread_project_assignment_with_receipt(
+                            &codex, &thread_id, &host_cwd,
+                        )?
+                    {
+                        journal.register_project_state_receipt(receipt);
+                    }
+                }
                 carry_thread_title(
                     &transaction,
                     active_branch
@@ -4566,6 +4475,12 @@ fn clone_session_for_provider_locked_with_hint(
                 if let Some((branch_id, old_abs, destination)) = continuous_archive.as_ref() {
                     require_unchanged_snapshot(old_abs, &source_snapshot, "旧 active rollout ")?;
                     family::archive_with_integrity(&mut store, &codex, &family_id, branch_id)?;
+                    family::set_archive_origin(
+                        &mut store,
+                        &family_id,
+                        branch_id,
+                        ArchiveOrigin::ProviderSync,
+                    )?;
                     require_unchanged_snapshot(old_abs, &source_snapshot, "旧 active rollout ")?;
                     if let Some(parent) = destination.parent() {
                         fs::create_dir_all(parent)?;
@@ -4596,6 +4511,7 @@ fn clone_session_for_provider_locked_with_hint(
                     sha256: None,
                     line_count: None,
                     note: Some(format!("cloned_from:{}", cloned_from_id)),
+                    archive_origin: None,
                 };
                 if matches!(strategy, SwitchStrategy::Scatter) {
                     if let Some(f) = store.families.get_mut(&family_id) {
@@ -4958,6 +4874,7 @@ fn rollback_family_active_locked(
     target_branch_id: String,
 ) -> AppResult<()> {
     let codex = PathBuf::from(&codex_dir);
+    crate::codex_projects::ensure_desktop_not_running(&codex)?;
     ensure_state_db_exists(&codex)?;
     let state = state_db::open(&codex)?;
     let mut store = family::load(&codex)?;
@@ -5060,11 +4977,15 @@ fn rollback_family_active_locked(
         rusqlite::Transaction::new_unchecked(&state, rusqlite::TransactionBehavior::Immediate)?;
     let mut journal = MutationJournal::default();
     let operation = (|| -> AppResult<()> {
-        if let Some(cwd) = target_brief.cwd.as_deref() {
-            let global_state = paths::codex_global_state_json_path(&codex);
-            journal.mutate_file(&global_state, || {
-                ensure_workspace_root_registered(&codex, cwd)
-            })?;
+        if let Some(record) = project_assignment_record(&codex, &target_brief) {
+            if let Some(receipt) =
+                crate::codex_projects::sync_missing_thread_project_assignment_records_with_receipt(
+                    &codex,
+                    &[record],
+                )?
+            {
+                journal.register_project_state_receipt(receipt);
+            }
         }
 
         // 当前 active 归档，并在同一 SQLite 事务内更新 threads。
@@ -5333,6 +5254,7 @@ fn append_branch_extras_locked(
     target_branch_id: String,
 ) -> AppResult<BranchSyncReport> {
     let codex = PathBuf::from(&codex_dir);
+    crate::codex_projects::ensure_desktop_not_running(&codex)?;
     let mut store = family::load(&codex)?;
     let family = store
         .families
@@ -5389,66 +5311,95 @@ fn append_branch_extras_locked(
 
     ensure_state_db_exists(&codex)?;
     let state = state_db::open(&codex)?;
+    let transaction =
+        rusqlite::Transaction::new_unchecked(&state, rusqlite::TransactionBehavior::Immediate)?;
+    let mut journal = MutationJournal::default();
+    let operation = (|| -> AppResult<()> {
+        journal.mutate_file(&target_abs, || {
+            atomic_file::replace_with_writer_if_unchanged(
+                &target_abs,
+                &target_fingerprint,
+                |file| {
+                    // 保留目标的 session_meta（首行），后续 body 一律按过滤口径重写
+                    if let Some(first) = target_lines.first() {
+                        writeln!(file, "{}", first)?;
+                    }
+                    for line in target_body.iter() {
+                        if let Some(rewritten) = rewrite_session_meta_identity(
+                            line,
+                            &target_branch.id,
+                            &target_branch.id,
+                            &target_branch.provider,
+                            None,
+                        )? {
+                            writeln!(file, "{rewritten}")?;
+                        } else {
+                            writeln!(file, "{}", line)?;
+                        }
+                    }
+                    for line in extras.iter() {
+                        writeln!(file, "{}", line)?;
+                    }
+                    Ok(())
+                },
+            )
+        })?;
 
-    atomic_file::replace_with_writer_if_unchanged(&target_abs, &target_fingerprint, |file| {
-        // 保留目标的 session_meta（首行），后续 body 一律按过滤口径重写
-        if let Some(first) = target_lines.first() {
-            writeln!(file, "{}", first)?;
-        }
-        for line in target_body.iter() {
-            if let Some(rewritten) = rewrite_session_meta_identity(
-                line,
-                &target_branch.id,
-                &target_branch.id,
-                &target_branch.provider,
-                None,
-            )? {
-                writeln!(file, "{rewritten}")?;
-            } else {
-                writeln!(file, "{}", line)?;
-            }
-        }
-        for line in extras.iter() {
-            writeln!(file, "{}", line)?;
-        }
-        Ok(())
-    })?;
-
-    if !upsert_thread_from_rollout(&codex, &state, &target_abs, target_archived)? {
-        return Err(AppError::InvalidCodexDir(format!(
-            "同步后的 rollout 缺少有效 session_meta.id: {}",
-            target_abs.to_string_lossy()
-        )));
-    }
-    if !target_archived {
-        let brief = read_rollout_brief(&codex, &target_abs)?.ok_or_else(|| {
-            AppError::InvalidCodexDir(format!(
+        if !upsert_thread_from_rollout(&codex, &transaction, &target_abs, target_archived)? {
+            return Err(AppError::InvalidCodexDir(format!(
                 "同步后的 rollout 缺少有效 session_meta.id: {}",
                 target_abs.to_string_lossy()
-            ))
-        })?;
-        let thread_name = brief.first_user_message.clone();
-        append_index_line(&codex, &target_branch.id, &thread_name, &target_abs)?;
-        if let Some(cwd) = brief.cwd.as_deref() {
-            ensure_workspace_root_registered(&codex, cwd)?;
+            )));
         }
-    }
-
-    if let Some(f) = store.families.get_mut(&family_id) {
-        if let Some(b) = f.chain.iter_mut().find(|b| b.id == target_branch_id) {
-            if target_branch.id == family.active_id {
-                b.sha256 = None;
-                b.line_count = None;
-            } else {
-                let (sha, lines) = family::compute_integrity(&target_abs)?;
-                b.sha256 = Some(sha);
-                b.line_count = Some(lines);
+        if !target_archived {
+            let brief = read_rollout_brief(&codex, &target_abs)?.ok_or_else(|| {
+                AppError::InvalidCodexDir(format!(
+                    "同步后的 rollout 缺少有效 session_meta.id: {}",
+                    target_abs.to_string_lossy()
+                ))
+            })?;
+            let thread_name = brief.first_user_message.clone();
+            let index_path = paths::session_index_path(&codex);
+            journal.mutate_file(&index_path, || {
+                append_index_line(&codex, &target_branch.id, &thread_name, &target_abs)
+            })?;
+            if let Some(record) = project_assignment_record(&codex, &brief) {
+                if let Some(receipt) = crate::codex_projects::sync_missing_thread_project_assignment_records_with_receipt(
+                    &codex,
+                    &[record],
+                )? {
+                    journal.register_project_state_receipt(receipt);
+                }
             }
-            b.note = Some(format!("synced_from:{}", source_branch_id));
         }
-        f.updated_at = chrono::Utc::now().to_rfc3339();
+
+        if let Some(f) = store.families.get_mut(&family_id) {
+            if let Some(b) = f.chain.iter_mut().find(|b| b.id == target_branch_id) {
+                if target_branch.id == family.active_id {
+                    b.sha256 = None;
+                    b.line_count = None;
+                } else {
+                    let (sha, lines) = family::compute_integrity(&target_abs)?;
+                    b.sha256 = Some(sha);
+                    b.line_count = Some(lines);
+                }
+                b.note = Some(format!("synced_from:{}", source_branch_id));
+            }
+            f.updated_at = chrono::Utc::now().to_rfc3339();
+        }
+        let family_path = paths::family_store_path(&codex);
+        journal.mutate_file(&family_path, || family::save(&codex, &store))?;
+        inject_repair_fault("branch_sync_after_family_save")?;
+        Ok(())
+    })();
+    if let Err(error) = operation {
+        return Err(rollback_transaction_with_compensation(
+            transaction,
+            journal,
+            error,
+        ));
     }
-    family::save(&codex, &store)?;
+    commit_transaction_with_compensation(transaction, journal)?;
 
     Ok(BranchSyncReport {
         source_id: source_branch_id,
@@ -5593,6 +5544,33 @@ mod tests {
         std::env::temp_dir().join(unique)
     }
 
+    fn write_global_state(codex: &Path, state: Value) -> AppResult<()> {
+        fs::create_dir_all(codex)?;
+        fs::write(
+            paths::codex_global_state_json_path(codex),
+            serde_json::to_vec(&state)?,
+        )?;
+        Ok(())
+    }
+
+    fn thread_project_assignment(codex: &Path, thread_id: &str) -> AppResult<Option<Value>> {
+        let state: Value =
+            serde_json::from_slice(&fs::read(paths::codex_global_state_json_path(codex))?)?;
+        Ok(state
+            .get("thread-project-assignments")
+            .and_then(Value::as_object)
+            .and_then(|assignments| assignments.get(thread_id))
+            .cloned())
+    }
+
+    fn assert_thread_project_cwd(codex: &Path, thread_id: &str, cwd: &str) -> AppResult<()> {
+        let assignment = thread_project_assignment(codex, thread_id)?
+            .unwrap_or_else(|| panic!("missing project assignment for {thread_id}"));
+        assert_eq!(assignment["projectKind"], "local");
+        assert_eq!(assignment["cwd"], cwd);
+        Ok(())
+    }
+
     fn write_rollout_in(codex: &Path, root: &str, id: &str, provider: &str) -> AppResult<()> {
         let rollout_dir = codex.join(root).join("2026").join("04").join("22");
         fs::create_dir_all(&rollout_dir)?;
@@ -5628,6 +5606,118 @@ mod tests {
             }
         });
         fs::write(path, format!("{}\n", serde_json::to_string(&line)?))?;
+        Ok(())
+    }
+
+    #[test]
+    fn rollout_brief_prefers_latest_turn_context_cwd_over_session_meta() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-latest-turn-cwd-test");
+        let rollout_dir = codex.join("sessions").join("2026").join("04").join("22");
+        fs::create_dir_all(&rollout_dir)?;
+        let rollout = rollout_dir.join("rollout-latest-turn-cwd.jsonl");
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-04-22T00:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "latest-turn-cwd",
+                    "model_provider": DEFAULT_PROVIDER,
+                    "cwd": r"F:\project\old"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-04-22T00:00:01Z",
+                "type": "turn_context",
+                "payload": {"cwd": r"F:\project\intermediate"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-04-22T00:00:02Z",
+                "type": "turn_context",
+                "payload": {"cwd": r"F:\project\current"}
+            }),
+        ];
+        fs::write(
+            &rollout,
+            format!(
+                "{}\n",
+                lines
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        )?;
+
+        let brief = read_rollout_brief(&codex, &rollout)?.expect("rollout brief");
+        assert_eq!(brief.cwd.as_deref(), Some(r"F:\project\current"));
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_threads_keeps_cwd_rewritten_by_move_instead_of_restoring_old_turn() -> AppResult<()>
+    {
+        let codex = temp_codex_dir("cc-session-manager-move-repair-cwd-test");
+        let id = "move-then-repair-cwd";
+        let rollout_dir = codex.join("sessions").join("2026").join("04").join("22");
+        fs::create_dir_all(&rollout_dir)?;
+        let rollout = rollout_dir.join(format!("rollout-{id}.jsonl"));
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-04-22T00:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": id, "model_provider": DEFAULT_PROVIDER, "cwd": r"F:\old"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-04-22T00:00:01Z",
+                "type": "turn_context",
+                "payload": {"cwd": r"F:\historical"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-04-22T00:00:02Z",
+                "type": "turn_context",
+                "payload": {"cwd": r"F:\current-before-move"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-04-22T00:00:03Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "repair me"}
+            }),
+        ];
+        fs::write(
+            &rollout,
+            format!(
+                "{}\n",
+                lines
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        )?;
+        let state = create_full_state(&codex)?;
+        drop(state);
+
+        crate::codex_rollout_cwd::rewrite_effective_cwd(&rollout, id, r"F:\moved")?;
+        let report = rebuild_threads_table(codex.to_string_lossy().into_owned(), false)?;
+        assert_eq!(report.upserted, 1);
+
+        let state = state_db::open_ro(&codex)?;
+        let cwd: String = state.query_row("SELECT cwd FROM threads WHERE id = ?", [id], |row| {
+            row.get(0)
+        })?;
+        assert_eq!(cwd, r"F:\moved");
+        let turns = fs::read_to_string(&rollout)?
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|value| value["type"] == "turn_context")
+            .collect::<Vec<_>>();
+        assert_eq!(turns[0]["payload"]["cwd"], r"F:\historical");
+        assert_eq!(turns[1]["payload"]["cwd"], r"F:\moved");
+
+        drop(state);
+        fs::remove_dir_all(&codex).ok();
         Ok(())
     }
 
@@ -5791,6 +5881,7 @@ mod tests {
             sync_thread_from_rollout(codex, &state, &source)?;
         }
         write_index_line(codex, id)?;
+        write_global_state(codex, serde_json::json!({"local-projects": {}}))?;
         Ok(source)
     }
 
@@ -5838,6 +5929,7 @@ mod tests {
                     sha256: None,
                     line_count: None,
                     note: None,
+                    archive_origin: None,
                 },
                 FamilyBranch {
                     id: target_id.to_string(),
@@ -5848,6 +5940,7 @@ mod tests {
                     sha256: None,
                     line_count: None,
                     note: None,
+                    archive_origin: None,
                 },
             ],
             active_id: source_id.to_string(),
@@ -5903,6 +5996,7 @@ mod tests {
             )?);
         }
         write_index_line(codex, &source_id)?;
+        write_global_state(codex, serde_json::json!({"local-projects": {}}))?;
         save_two_branch_family(
             codex,
             &source_id,
@@ -5946,6 +6040,7 @@ mod tests {
         )?;
         drop(state);
         write_index_line(&codex, source_id)?;
+        write_global_state(&codex, serde_json::json!({"local-projects": {}}))?;
         crate::provenance::record_conversion(
             &codex,
             "codex",
@@ -6005,6 +6100,7 @@ mod tests {
         assert_eq!(copied_origin["source_provider"], "claude");
         assert_eq!(copied_origin["source_id"], "claude-source-session");
         assert_eq!(copied_origin["conversion_mode"], "native");
+        assert_thread_project_cwd(&codex, &report.new_id, r"F:\project\example")?;
 
         fs::remove_dir_all(codex).ok();
         Ok(())
@@ -6540,6 +6636,7 @@ mod tests {
             let source = prepare_provider_switch_fixture(&codex, &session_id)?;
             let source_before = fs::read(&source)?;
             let index_before = fs::read(paths::session_index_path(&codex))?;
+            let global_before = fs::read(paths::codex_global_state_json_path(&codex))?;
             assert!(!paths::family_store_path(&codex).exists());
 
             let _fault = RepairTestFaultGuard::error(fault_stage);
@@ -6576,9 +6673,65 @@ mod tests {
             assert_eq!(count, 1, "{label}");
             assert_eq!(provider, "custom", "{label}");
             assert_eq!(archived, 0, "{label}");
+            assert_eq!(
+                fs::read(paths::codex_global_state_json_path(&codex))?,
+                global_before,
+                "{label}"
+            );
 
             fs::remove_dir_all(&codex).ok();
         }
+        Ok(())
+    }
+
+    #[test]
+    fn provider_visibility_repair_compensates_all_state_after_project_sync() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-provider-visibility-compensation-test");
+        let session_id = "provider-visibility-compensation";
+        let source = prepare_provider_switch_fixture(&codex, session_id)?;
+        {
+            let state = state_db::open(&codex)?;
+            state.execute(
+                "UPDATE threads SET rollout_path = 'stale', model_provider = 'stale', \
+                 source = 'subagent', archived = 1 WHERE id = ?",
+                [session_id],
+            )?;
+        }
+        let source_before = fs::read(&source)?;
+        let index_before = fs::read(paths::session_index_path(&codex))?;
+        let global_before = fs::read(paths::codex_global_state_json_path(&codex))?;
+        let thread_before = read_thread_state_map(&codex)?
+            .remove(session_id)
+            .expect("fixture thread state");
+        assert!(!paths::family_store_path(&codex).exists());
+
+        let _fault = RepairTestFaultGuard::error("provider_visibility_after_family_save");
+        let error = clone_session_for_provider_locked(
+            codex.to_string_lossy().into_owned(),
+            session_id.to_string(),
+            Some("custom".to_string()),
+            SwitchStrategy::Continuous,
+            false,
+        )
+        .expect_err("fault after project and family sync must roll back visibility repair");
+
+        assert!(error.to_string().contains("测试故障注入"), "{error}");
+        assert_eq!(fs::read(&source)?, source_before);
+        assert_eq!(fs::read(paths::session_index_path(&codex))?, index_before);
+        assert_eq!(
+            fs::read(paths::codex_global_state_json_path(&codex))?,
+            global_before
+        );
+        assert!(!paths::family_store_path(&codex).exists());
+        let thread_after = read_thread_state_map(&codex)?
+            .remove(session_id)
+            .expect("restored fixture thread state");
+        assert_eq!(thread_after.rollout_path, thread_before.rollout_path);
+        assert_eq!(thread_after.model_provider, thread_before.model_provider);
+        assert_eq!(thread_after.source, thread_before.source);
+        assert_eq!(thread_after.archived, thread_before.archived);
+
+        fs::remove_dir_all(codex).ok();
         Ok(())
     }
 
@@ -6605,6 +6758,7 @@ mod tests {
                 .new_id
                 .clone()
                 .expect("successful provider target id");
+            assert_thread_project_cwd(&codex, &active_id, r"F:\project\example")?;
             let store = family::load(&codex)?;
             let family_id = store.index.get(&source_id).expect("source family id");
             let family = store.families.get(family_id).expect("source family");
@@ -6644,6 +6798,15 @@ mod tests {
                     assert_eq!(read_thread_location(&codex, &active_id)?.1, 0);
                     assert!(!index_ids.contains(&source_id));
                     assert!(index_ids.contains(&active_id));
+                    let archived_branch = family
+                        .chain
+                        .iter()
+                        .find(|branch| branch.id == source_id)
+                        .expect("continuous archived source branch");
+                    assert_eq!(
+                        archived_branch.archive_origin,
+                        Some(ArchiveOrigin::ProviderSync)
+                    );
 
                     rollback_family_active_locked(
                         codex.to_string_lossy().into_owned(),
@@ -6656,6 +6819,14 @@ mod tests {
                         .get(family_id)
                         .expect("restored family");
                     assert_eq!(restored_family.active_id, source_id);
+                    assert_eq!(
+                        restored_family
+                            .chain
+                            .iter()
+                            .find(|branch| branch.id == source_id)
+                            .and_then(|branch| branch.archive_origin.as_ref()),
+                        None
+                    );
                     assert!(source.is_file());
                     let archived_new = paths::archived_sessions_dir(&codex).join(
                         PathBuf::from(report.new_rollout_path.as_deref().unwrap())
@@ -6668,6 +6839,7 @@ mod tests {
                     let restored_index = read_session_index_ids(&codex)?;
                     assert!(restored_index.contains(&source_id));
                     assert!(!restored_index.contains(&active_id));
+                    assert_thread_project_cwd(&codex, &source_id, r"F:\project\example")?;
                 }
                 _ => unreachable!(),
             }
@@ -6821,6 +6993,7 @@ mod tests {
             DEFAULT_PROVIDER,
             target_rel,
         )?;
+        write_global_state(&codex, serde_json::json!({"local-projects": {}}))?;
 
         let report = append_branch_extras_locked(
             codex.to_string_lossy().into_owned(),
@@ -6846,8 +7019,90 @@ mod tests {
         assert_eq!(archived, 0);
         let index = fs::read_to_string(paths::session_index_path(&codex))?;
         assert!(index.contains(target_id));
+        assert_thread_project_cwd(&codex, target_id, r"F:\project\example")?;
 
         fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn branch_sync_compensates_rollout_sqlite_index_project_and_family() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-branch-sync-compensation-test");
+        let source_id = "sync-compensation-source";
+        let target_id = "sync-compensation-target";
+        let source_rel = "sessions/2026/04/24/rollout-sync-compensation-source.jsonl";
+        let target_rel = "sessions/2026/04/24/rollout-sync-compensation-target.jsonl";
+        let source_path = codex.join(source_rel);
+        let target_path = codex.join(target_rel);
+        let common = serde_json::json!({
+            "timestamp": "2026-04-24T00:00:01Z",
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "hello"}
+        })
+        .to_string();
+        let extra = serde_json::json!({
+            "timestamp": "2026-04-24T00:00:02Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "info": {"total_token_usage": {"total_tokens": 99}}
+            }
+        })
+        .to_string();
+        write_sync_rollout(&source_path, source_id, "custom", &[common.clone(), extra])?;
+        write_sync_rollout(&target_path, target_id, DEFAULT_PROVIDER, &[common])?;
+        create_full_state(&codex)?;
+        {
+            let state = state_db::open(&codex)?;
+            sync_thread_from_rollout(&codex, &state, &source_path)?;
+            sync_thread_from_rollout(&codex, &state, &target_path)?;
+        }
+        write_index_line(&codex, source_id)?;
+        save_two_branch_family(
+            &codex,
+            source_id,
+            "custom",
+            source_rel,
+            target_id,
+            DEFAULT_PROVIDER,
+            target_rel,
+        )?;
+        write_global_state(&codex, serde_json::json!({"local-projects": {}}))?;
+
+        let target_before = fs::read(&target_path)?;
+        let index_before = fs::read(paths::session_index_path(&codex))?;
+        let family_before = fs::read(paths::family_store_path(&codex))?;
+        let global_before = fs::read(paths::codex_global_state_json_path(&codex))?;
+        let thread_before = read_thread_state_map(&codex)?
+            .remove(target_id)
+            .expect("fixture target thread state");
+
+        let _fault = RepairTestFaultGuard::error("branch_sync_after_family_save");
+        let error = append_branch_extras_locked(
+            codex.to_string_lossy().into_owned(),
+            source_id.to_string(),
+            source_id.to_string(),
+            target_id.to_string(),
+        )
+        .expect_err("fault after every branch-sync mutation must compensate all stores");
+
+        assert!(error.to_string().contains("测试故障注入"), "{error}");
+        assert_eq!(fs::read(&target_path)?, target_before);
+        assert_eq!(fs::read(paths::session_index_path(&codex))?, index_before);
+        assert_eq!(fs::read(paths::family_store_path(&codex))?, family_before);
+        assert_eq!(
+            fs::read(paths::codex_global_state_json_path(&codex))?,
+            global_before
+        );
+        let thread_after = read_thread_state_map(&codex)?
+            .remove(target_id)
+            .expect("restored target thread state");
+        assert_eq!(thread_after.rollout_path, thread_before.rollout_path);
+        assert_eq!(thread_after.model_provider, thread_before.model_provider);
+        assert_eq!(thread_after.source, thread_before.source);
+        assert_eq!(thread_after.archived, thread_before.archived);
+
+        fs::remove_dir_all(codex).ok();
         Ok(())
     }
 
@@ -7021,6 +7276,7 @@ mod tests {
         let target_before = fs::read(&fixture.target_archived_path)?;
         let source_thread_before = read_thread_location(&codex, &fixture.source_id)?;
         let target_thread_before = read_thread_location(&codex, &fixture.target_id)?;
+        let global_before = fs::read(paths::codex_global_state_json_path(&codex))?;
 
         let _fault = RepairTestFaultGuard::error("rollback_after_family_save");
         let error = rollback_family_active_locked(
@@ -7046,6 +7302,10 @@ mod tests {
             read_thread_location(&codex, &fixture.target_id)?,
             target_thread_before
         );
+        assert_eq!(
+            fs::read(paths::codex_global_state_json_path(&codex))?,
+            global_before
+        );
 
         fs::remove_dir_all(&codex).ok();
         Ok(())
@@ -7068,8 +7328,9 @@ mod tests {
         .expect_err("an occupied original path must be reported as a compensation failure");
         let message = error.to_string();
         assert!(message.contains("测试故障注入"), "{message}");
-        assert!(message.contains("补偿失败"));
-        assert!(message.contains("原位置已被占用"));
+        assert!(message.contains("补偿失败"), "{message}");
+        assert!(message.contains("移动目标已存在"), "{message}");
+        assert!(message.contains("拒绝覆盖"), "{message}");
 
         fs::remove_dir_all(&codex).ok();
         Ok(())
@@ -7094,6 +7355,167 @@ mod tests {
             .position(|name| *name == "tokens_used")
             .expect("tokens_used column");
         assert_eq!(values[token_index], Value::from(2_468_000i64));
+        Ok(())
+    }
+
+    #[test]
+    fn repair_index_and_threads_rebuild_fill_missing_assignments_without_overwriting_pending_moves(
+    ) -> AppResult<()> {
+        for operation in ["index", "threads"] {
+            let codex = temp_codex_dir(&format!(
+                "cc-session-manager-{operation}-project-assignment-test"
+            ));
+            write_rollout(&codex, "repair-missing", DEFAULT_PROVIDER)?;
+            write_rollout(&codex, "repair-pending", DEFAULT_PROVIDER)?;
+            create_full_state(&codex)?;
+            let pending = serde_json::json!({
+                "projectKind": "local",
+                "projectId": "official-pending-project",
+                "cwd": r"F:\official\pending-target",
+                "pendingCoreUpdate": true
+            });
+            write_global_state(
+                &codex,
+                serde_json::json!({
+                    "local-projects": {},
+                    "thread-project-assignments": {"repair-pending": pending.clone()}
+                }),
+            )?;
+
+            if operation == "index" {
+                let report = repair_session_index(codex.to_string_lossy().into_owned(), false)?;
+                assert_eq!(report.written, 2);
+            } else {
+                let report = rebuild_threads_table(codex.to_string_lossy().into_owned(), false)?;
+                assert_eq!(report.upserted, 2);
+            }
+
+            assert_thread_project_cwd(&codex, "repair-missing", r"F:\project\example")?;
+            assert_eq!(
+                thread_project_assignment(&codex, "repair-pending")?,
+                Some(pending),
+                "{operation} must preserve an official pending move"
+            );
+            fs::remove_dir_all(&codex).ok();
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn repair_index_rejects_malformed_project_state_before_rewriting_index() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-index-project-preflight-test");
+        write_rollout(&codex, "repair-index-preflight", DEFAULT_PROVIDER)?;
+        fs::create_dir_all(&codex)?;
+        let index_path = paths::session_index_path(&codex);
+        fs::write(&index_path, b"sentinel-index-bytes\n")?;
+        let before = fs::read(&index_path)?;
+        write_global_state(&codex, serde_json::json!({"local-projects": []}))?;
+
+        let error = repair_session_index(codex.to_string_lossy().into_owned(), false)
+            .expect_err("malformed project state must fail before the index rewrite");
+
+        assert!(error.to_string().contains("必须是对象"), "{error}");
+        assert_eq!(fs::read(&index_path)?, before);
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_threads_rejects_malformed_project_state_before_sqlite_writes() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-threads-project-preflight-test");
+        write_rollout(&codex, "repair-threads-preflight", DEFAULT_PROVIDER)?;
+        let state = create_full_state(&codex)?;
+        state.execute(
+            "INSERT INTO threads (id, rollout_path, archived) VALUES (?1, ?2, 0)",
+            rusqlite::params!["sentinel-thread", "sentinel-rollout"],
+        )?;
+        drop(state);
+        write_global_state(&codex, serde_json::json!({"local-projects": []}))?;
+
+        let error = rebuild_threads_table(codex.to_string_lossy().into_owned(), false)
+            .expect_err("malformed project state must fail before SQLite writes");
+
+        assert!(error.to_string().contains("必须是对象"), "{error}");
+        let state = state_db::open_ro(&codex)?;
+        let rows = state
+            .prepare("SELECT id, rollout_path FROM threads ORDER BY id")?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            rows,
+            vec![(
+                "sentinel-thread".to_string(),
+                "sentinel-rollout".to_string()
+            )]
+        );
+        drop(state);
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn repair_index_compensates_when_project_state_cas_retries_are_exhausted() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-index-project-cas-test");
+        write_rollout(&codex, "repair-index-cas", DEFAULT_PROVIDER)?;
+        fs::create_dir_all(&codex)?;
+        let index_path = paths::session_index_path(&codex);
+        fs::write(&index_path, b"sentinel-index-before-cas\n")?;
+        let before = fs::read(&index_path)?;
+        write_global_state(&codex, serde_json::json!({"local-projects": {}}))?;
+        let _conflict = crate::codex_projects::StateWriteConflictTestGuard::all_attempts();
+
+        let error = repair_session_index(codex.to_string_lossy().into_owned(), false)
+            .expect_err("exhausted project-state CAS retries must abort repair");
+
+        assert!(error.to_string().contains("发生变化"), "{error}");
+        assert_eq!(fs::read(&index_path)?, before);
+        let state: Value =
+            serde_json::from_slice(&fs::read(paths::codex_global_state_json_path(&codex))?)?;
+        assert_eq!(state["test-concurrent-write"], 3);
+        assert!(state.get("thread-project-assignments").is_none());
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_threads_rolls_back_when_project_state_cas_retries_are_exhausted() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-threads-project-cas-test");
+        write_rollout(&codex, "repair-threads-cas", DEFAULT_PROVIDER)?;
+        let state = create_full_state(&codex)?;
+        state.execute(
+            "INSERT INTO threads (id, rollout_path, archived) VALUES (?1, ?2, 0)",
+            rusqlite::params!["sentinel-thread", "sentinel-rollout"],
+        )?;
+        drop(state);
+        write_global_state(&codex, serde_json::json!({"local-projects": {}}))?;
+        let _conflict = crate::codex_projects::StateWriteConflictTestGuard::all_attempts();
+
+        let error = rebuild_threads_table(codex.to_string_lossy().into_owned(), false)
+            .expect_err("exhausted project-state CAS retries must roll back SQLite");
+
+        assert!(error.to_string().contains("发生变化"), "{error}");
+        let state = state_db::open_ro(&codex)?;
+        let rows = state
+            .prepare("SELECT id, rollout_path FROM threads ORDER BY id")?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(
+            rows,
+            vec![(
+                "sentinel-thread".to_string(),
+                "sentinel-rollout".to_string()
+            )]
+        );
+        drop(state);
+        let global: Value =
+            serde_json::from_slice(&fs::read(paths::codex_global_state_json_path(&codex))?)?;
+        assert_eq!(global["test-concurrent-write"], 3);
+        assert!(global.get("thread-project-assignments").is_none());
+        fs::remove_dir_all(&codex).ok();
         Ok(())
     }
 
@@ -7415,6 +7837,7 @@ mod tests {
             sync_thread_from_rollout(&codex, &state, &rollout)?;
         }
         write_index_line(&codex, source_id)?;
+        write_global_state(&codex, serde_json::json!({"local-projects": {}}))?;
 
         let report = fork_session_at_event_locked(
             codex.to_string_lossy().into_owned(),
@@ -7480,6 +7903,7 @@ mod tests {
         )?;
         assert_eq!(old_archived, 1);
         assert_eq!(new_archived, 0);
+        assert_thread_project_cwd(&codex, &report.new_id, r"F:\project\example")?;
 
         fs::remove_dir_all(&codex).ok();
         Ok(())
@@ -7545,6 +7969,7 @@ mod tests {
                         sha256: None,
                         line_count: None,
                         note: None,
+                        archive_origin: None,
                     },
                     FamilyBranch {
                         id: "managed-target".to_string(),
@@ -7556,6 +7981,7 @@ mod tests {
                         sha256: None,
                         line_count: None,
                         note: None,
+                        archive_origin: None,
                     },
                 ],
             },
@@ -7831,6 +8257,304 @@ mod tests {
     }
 
     #[test]
+    fn pruning_orphan_threads_clears_desktop_project_state() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-prune-project-state-test");
+        let conn = create_minimal_state(&codex)?;
+        conn.execute(
+            "INSERT INTO threads (id, model_provider, source, archived) VALUES (?1, ?2, ?3, 0)",
+            ("ghost-thread", DEFAULT_PROVIDER, DEFAULT_THREAD_SOURCE),
+        )?;
+        drop(conn);
+        write_global_state(
+            &codex,
+            serde_json::json!({
+                "local-projects": {},
+                "thread-project-assignments": {
+                    "ghost-thread": {
+                        "projectKind": "local",
+                        "projectId": "ghost-project",
+                        "cwd": r"F:\ghost",
+                        "pendingCoreUpdate": false
+                    }
+                },
+                "projectless-thread-ids": ["ghost-thread"],
+                "thread-workspace-root-hints": {"ghost-thread": r"F:\ghost"},
+                "thread-writable-roots": {"ghost-thread": [r"F:\ghost"]},
+                "electron-persisted-atom-state": {
+                    "thread-workspace-state-v1:ghost-thread": {"pending": {"cwd": r"F:\ghost"}}
+                }
+            }),
+        )?;
+
+        let report =
+            prune_orphan_entries(codex.to_string_lossy().into_owned(), false, true, false)?;
+
+        assert_eq!(report.threads_removed, 1);
+        assert!(thread_project_assignment(&codex, "ghost-thread")?.is_none());
+        let global: Value =
+            serde_json::from_slice(&fs::read(paths::codex_global_state_json_path(&codex))?)?;
+        assert!(!global["projectless-thread-ids"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id == "ghost-thread")));
+        assert_eq!(
+            global["thread-workspace-root-hints"]["ghost-thread"],
+            r"F:\ghost"
+        );
+        assert_eq!(
+            global["thread-writable-roots"]["ghost-thread"],
+            serde_json::json!([r"F:\ghost"])
+        );
+        assert!(
+            global["electron-persisted-atom-state"]["thread-workspace-state-v1:ghost-thread"]
+                .is_object()
+        );
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn prune_rejects_broken_project_state_before_any_core_write() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-prune-broken-project-state-test");
+        let live_id = "live-thread";
+        let orphan_id = "orphan-thread";
+        write_rollout(&codex, live_id, DEFAULT_PROVIDER)?;
+        let rollout = family::scan_rollouts(&codex)?
+            .into_iter()
+            .next()
+            .expect("live rollout");
+        let conn = create_minimal_state(&codex)?;
+        conn.execute(
+            "INSERT INTO threads (id, model_provider, source, archived) VALUES (?1, ?2, ?3, 0)",
+            (live_id, DEFAULT_PROVIDER, DEFAULT_THREAD_SOURCE),
+        )?;
+        conn.execute(
+            "INSERT INTO threads (id, model_provider, source, archived) VALUES (?1, ?2, ?3, 0)",
+            (orphan_id, DEFAULT_PROVIDER, DEFAULT_THREAD_SOURCE),
+        )?;
+        drop(conn);
+        fs::write(
+            paths::session_index_path(&codex),
+            format!("{{\"id\":\"{live_id}\"}}\n{{\"id\":\"{orphan_id}\"}}\n"),
+        )?;
+        let global_state_path = paths::codex_global_state_json_path(&codex);
+        fs::write(&global_state_path, "{broken global state")?;
+
+        let rollout_before = fs::read(&rollout)?;
+        let state_path = paths::state_db_path(&codex);
+        let state_before = fs::read(&state_path)?;
+        let index_path = paths::session_index_path(&codex);
+        let index_before = fs::read(&index_path)?;
+        let global_before = fs::read(&global_state_path)?;
+
+        let error = prune_orphan_entries(codex.to_string_lossy().into_owned(), true, true, false)
+            .expect_err("broken project state must abort before pruning Core data");
+
+        assert!(error.to_string().contains("全局状态 JSON 损坏"), "{error}");
+        assert_eq!(fs::read(&rollout)?, rollout_before);
+        assert_eq!(fs::read(&state_path)?, state_before);
+        assert_eq!(fs::read(&index_path)?, index_before);
+        assert_eq!(fs::read(&global_state_path)?, global_before);
+        let state = state_db::open_ro(&codex)?;
+        let ids = state
+            .prepare("SELECT id FROM threads ORDER BY id")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(ids, vec![live_id.to_string(), orphan_id.to_string()]);
+        drop(state);
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn prune_compensates_family_index_threads_and_project_state_after_late_failure() -> AppResult<()>
+    {
+        let codex = temp_codex_dir("cc-session-manager-prune-compensation-test");
+        let live_id = "prune-live";
+        let orphan_id = "prune-orphan";
+        write_rollout(&codex, live_id, DEFAULT_PROVIDER)?;
+        save_two_branch_family(
+            &codex,
+            live_id,
+            DEFAULT_PROVIDER,
+            "sessions/2026/04/22/rollout-prune-live.jsonl",
+            orphan_id,
+            "custom",
+            "archived_sessions/rollout-prune-orphan.jsonl",
+        )?;
+        let conn = create_minimal_state(&codex)?;
+        for id in [live_id, orphan_id] {
+            conn.execute(
+                "INSERT INTO threads (id, model_provider, source, archived) VALUES (?1, ?2, ?3, 0)",
+                (id, DEFAULT_PROVIDER, DEFAULT_THREAD_SOURCE),
+            )?;
+        }
+        drop(conn);
+        fs::write(
+            paths::session_index_path(&codex),
+            format!("{{\"id\":\"{live_id}\"}}\n{{\"id\":\"{orphan_id}\"}}\n"),
+        )?;
+        write_global_state(
+            &codex,
+            serde_json::json!({
+                "thread-project-assignments": {
+                    (orphan_id): {
+                        "projectKind": "local",
+                        "projectId": "prune-project",
+                        "cwd": r"F:\prune",
+                        "pendingCoreUpdate": false
+                    }
+                }
+            }),
+        )?;
+
+        let family_path = paths::family_store_path(&codex);
+        let index_path = paths::session_index_path(&codex);
+        let global_path = paths::codex_global_state_json_path(&codex);
+        let family_before = fs::read(&family_path)?;
+        let index_before = fs::read(&index_path)?;
+        let global_before = fs::read(&global_path)?;
+        let _fault = RepairTestFaultGuard::error("prune_after_project_state");
+
+        let error = prune_orphan_entries_with_lock(
+            codex.to_string_lossy().into_owned(),
+            true,
+            true,
+            true,
+            false,
+            &family::FamilyLock::default(),
+        )
+        .expect_err("late prune failure must compensate every store");
+
+        assert!(error.to_string().contains("测试故障注入"), "{error}");
+        assert_eq!(fs::read(&family_path)?, family_before);
+        assert_eq!(fs::read(&index_path)?, index_before);
+        assert_eq!(fs::read(&global_path)?, global_before);
+        let state = state_db::open_ro(&codex)?;
+        let ids = state
+            .prepare("SELECT id FROM threads ORDER BY id")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(ids, vec![live_id.to_string(), orphan_id.to_string()]);
+        drop(state);
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn prune_compensates_core_when_desktop_starts_after_preflight() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-prune-desktop-race-test");
+        let live_id = "prune-race-live";
+        let orphan_id = "prune-race-orphan";
+        write_rollout(&codex, live_id, DEFAULT_PROVIDER)?;
+        let conn = create_minimal_state(&codex)?;
+        for id in [live_id, orphan_id] {
+            conn.execute(
+                "INSERT INTO threads (id, model_provider, source, archived) VALUES (?1, ?2, ?3, 0)",
+                (id, DEFAULT_PROVIDER, DEFAULT_THREAD_SOURCE),
+            )?;
+        }
+        drop(conn);
+        fs::write(
+            paths::session_index_path(&codex),
+            format!("{{\"id\":\"{live_id}\"}}\n{{\"id\":\"{orphan_id}\"}}\n"),
+        )?;
+        write_global_state(
+            &codex,
+            serde_json::json!({
+                "thread-project-assignments": {(orphan_id): {}},
+                "projectless-thread-ids": []
+            }),
+        )?;
+        let index_path = paths::session_index_path(&codex);
+        let global_path = paths::codex_global_state_json_path(&codex);
+        let index_before = fs::read(&index_path)?;
+        let global_before = fs::read(&global_path)?;
+        // First probe is the business preflight; the second is the guarded state mutation.
+        let _desktop = crate::codex_projects::DesktopTestProbeGuard::running_after_not_running(1);
+
+        let error = prune_orphan_entries_with_lock(
+            codex.to_string_lossy().into_owned(),
+            true,
+            true,
+            false,
+            false,
+            &family::FamilyLock::default(),
+        )
+        .expect_err("Desktop start after preflight must abort and compensate Core changes");
+
+        assert!(error.to_string().contains("完全退出桌面应用"), "{error}");
+        assert_eq!(fs::read(&index_path)?, index_before);
+        assert_eq!(fs::read(&global_path)?, global_before);
+        let state = state_db::open_ro(&codex)?;
+        let ids = state
+            .prepare("SELECT id FROM threads ORDER BY id")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(ids, vec![live_id.to_string(), orphan_id.to_string()]);
+        drop(state);
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn prune_compensates_core_when_project_state_cas_retries_are_exhausted() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-prune-cas-compensation-test");
+        let live_id = "prune-cas-live";
+        let orphan_id = "prune-cas-orphan";
+        write_rollout(&codex, live_id, DEFAULT_PROVIDER)?;
+        let conn = create_minimal_state(&codex)?;
+        for id in [live_id, orphan_id] {
+            conn.execute(
+                "INSERT INTO threads (id, model_provider, source, archived) VALUES (?1, ?2, ?3, 0)",
+                (id, DEFAULT_PROVIDER, DEFAULT_THREAD_SOURCE),
+            )?;
+        }
+        drop(conn);
+        let index_path = paths::session_index_path(&codex);
+        fs::write(
+            &index_path,
+            format!("{{\"id\":\"{live_id}\"}}\n{{\"id\":\"{orphan_id}\"}}\n"),
+        )?;
+        write_global_state(
+            &codex,
+            serde_json::json!({"thread-project-assignments": {(orphan_id): {}}}),
+        )?;
+        let index_before = fs::read(&index_path)?;
+        let _conflict = crate::codex_projects::StateWriteConflictTestGuard::all_attempts();
+
+        let error = prune_orphan_entries_with_lock(
+            codex.to_string_lossy().into_owned(),
+            true,
+            true,
+            false,
+            false,
+            &family::FamilyLock::default(),
+        )
+        .expect_err("exhausted project-state CAS retries must compensate Core changes");
+
+        assert!(error.to_string().contains("发生变化"), "{error}");
+        assert_eq!(fs::read(&index_path)?, index_before);
+        let state = state_db::open_ro(&codex)?;
+        let ids = state
+            .prepare("SELECT id FROM threads ORDER BY id")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(ids, vec![live_id.to_string(), orphan_id.to_string()]);
+        drop(state);
+        let global: Value =
+            serde_json::from_slice(&fs::read(paths::codex_global_state_json_path(&codex))?)?;
+        assert_eq!(global["test-concurrent-write"], 3);
+        assert!(global["thread-project-assignments"][orphan_id].is_object());
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
     fn prune_family_orphans_removes_fully_missing_families() -> AppResult<()> {
         let codex = temp_codex_dir("cc-session-manager-prune-missing-family-test");
         fs::create_dir_all(&codex)?;
@@ -7971,6 +8695,7 @@ mod tests {
             sha256: None,
             line_count: None,
             note: None,
+            archive_origin: None,
         };
         let make_family = |family_id: &str, active_id: &str| Family {
             family_id: family_id.to_string(),
@@ -7986,6 +8711,7 @@ mod tests {
                     sha256: None,
                     line_count: None,
                     note: None,
+                    archive_origin: None,
                 },
                 dup_branch.clone(),
             ],

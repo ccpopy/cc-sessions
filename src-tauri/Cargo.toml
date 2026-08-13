@@ -1,6 +1,6 @@
 [package]
 name = "cc-session-manager"
-version = "0.5.5"
+version = "0.5.6"
 description = "CC Sessions"
 authors = ["zjsmew"]
 edition = "2021"
@@ -57,8 +57,10 @@ tiny_http = "0.12"
 url = "2"
 getrandom = "0.2"
 base64 = "0.22"
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_Packaging_Appx", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading"] }
 winreg = { version = "0.55", optional = true }
 
 [profile.release]

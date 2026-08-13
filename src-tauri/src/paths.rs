@@ -187,8 +187,9 @@ pub fn config_toml_path(codex: &Path) -> PathBuf {
     codex.join("config.toml")
 }
 
-/// Codex App 的 Electron 全局状态文件：维护 workspace-roots / project-order。
-/// 修复时若不同步该文件，官方 App 左侧项目列表不会显示新会话。
+/// Codex App 的 Electron 全局状态文件：维护当前的本地项目定义、会话项目归属和
+/// project-order；写回时保留应用拥有的其他未知字段。只更新 rollout/SQLite cwd 时，
+/// 官方 App 的左侧项目列表不会把会话移动到目标项目。
 pub fn codex_global_state_json_path(codex: &Path) -> PathBuf {
     codex.join(".codex-global-state.json")
 }

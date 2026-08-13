@@ -683,7 +683,11 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
           >
             <RotateCw className={cloning ? "h-3.5 w-3.5 animate-spin" : "h-3.5 w-3.5"} />
             {providerSyncProgress
-              ? `处理中 ${providerSyncProgress.completed}/${providerSyncProgress.total || clonableCount}`
+              ? providerSyncProgress.total > 0
+                ? `处理中 ${providerSyncProgress.completed}/${providerSyncProgress.total}`
+                : "正在扫描…"
+              : providerSyncState.batchActive
+                ? "正在准备…"
               : "一键处理"}
           </Button>
         </div>
@@ -855,6 +859,9 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
                     ? `（移动 ${r.artifacts_moved} 项会话资产）`
                     : ""),
             );
+            if (provider === "codex" && !r.desktop_project_synced) {
+              toast.warning("Core 已移动，但 Codex App 全局状态未初始化，项目归属未同步");
+            }
             if (r.requires_project_open) {
               toast.info("首次在目标目录启动 OpenCode 时，会由 OpenCode 自动登记真实项目 ID");
             }

@@ -6,6 +6,8 @@ pub mod bundle;
 pub mod claude_memory;
 pub mod claude_sessions;
 pub mod claude_transfer;
+pub mod codex_projects;
+pub mod codex_rollout_cwd;
 #[cfg(feature = "desktop")]
 pub mod commands;
 pub mod content_search;
@@ -18,6 +20,7 @@ pub mod history;
 pub mod logs_db;
 pub mod markdown_export;
 pub mod models;
+pub(crate) mod mutation_journal;
 pub mod opencode_edit;
 pub mod opencode_sessions;
 pub mod opencode_transfer;

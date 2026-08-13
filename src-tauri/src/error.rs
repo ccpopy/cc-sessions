@@ -18,8 +18,37 @@ pub enum AppError {
     NotFound(String),
     #[error("cancelled")]
     Cancelled,
+    /// An atomic writer rejected the operation before replacing the destination because another
+    /// writer won the compare-and-swap/create race. Callers may retry from a fresh snapshot.
+    #[error("{0}")]
+    AtomicWriteConflict(String),
+    /// An atomic writer failed before replacing the destination for a non-retryable reason.
+    /// Compensation layers must not claim any concurrently changed destination bytes as theirs.
+    #[error("{0}")]
+    AtomicWriteNotCommitted(String),
+    /// The destination was replaced successfully, but a durability/cleanup step failed later.
+    /// Compensation layers must treat the new destination bytes as belonging to this operation.
+    #[error("{0}")]
+    AtomicWriteCommitted(String),
     #[error("{0}")]
     Other(String),
+}
+
+impl AppError {
+    pub(crate) fn atomic_write_not_committed(&self) -> bool {
+        matches!(
+            self,
+            Self::AtomicWriteConflict(_) | Self::AtomicWriteNotCommitted(_)
+        )
+    }
+
+    pub(crate) fn retryable_atomic_write_conflict(&self) -> bool {
+        matches!(self, Self::AtomicWriteConflict(_))
+    }
+
+    pub(crate) fn atomic_write_committed(&self) -> bool {
+        matches!(self, Self::AtomicWriteCommitted(_))
+    }
 }
 
 impl From<anyhow::Error> for AppError {

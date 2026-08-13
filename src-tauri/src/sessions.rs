@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
@@ -17,6 +17,11 @@ use crate::models::{
 use crate::paths;
 use crate::provenance;
 use crate::state_db;
+
+mod codex_delete;
+
+pub(crate) use codex_delete::delete_codex_artifacts;
+use codex_delete::delete_codex_artifacts_batch_with_family_store;
 
 fn provider_or_codex(provider: Option<String>) -> String {
     provider.unwrap_or_else(|| "codex".to_string())
@@ -728,92 +733,8 @@ fn rename_session_locked(codex_dir: String, id: String, title: String) -> AppRes
 
 // ========================= 移动工作目录 (move session cwd) =========================
 
-fn json_line_bounds(line: &[u8]) -> (usize, usize) {
-    if line.ends_with(b"\r\n") {
-        (line.len() - 2, 2)
-    } else if line.ends_with(b"\n") {
-        (line.len() - 1, 1)
-    } else {
-        (line.len(), 0)
-    }
-}
-
-fn matching_session_meta_cwd<'a>(
-    value: &'a serde_json::Value,
-    session_id: &str,
-) -> Option<&'a str> {
-    if value.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
-        return None;
-    }
-    let payload = value.get("payload")?.as_object()?;
-    (payload.get("id").and_then(serde_json::Value::as_str) == Some(session_id)).then(|| {
-        payload
-            .get("cwd")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-    })
-}
-
-/// 流式重写属于当前会话 id 的全部 session_meta.cwd；祖先/嵌套历史元数据保持不变。
 fn rewrite_rollout_cwd(path: &Path, session_id: &str, new_cwd: &str) -> AppResult<bool> {
-    let fp = atomic_file::fingerprint(path)?;
-    let mut source = BufReader::new(File::open(path)?);
-    let mut matched = false;
-    let mut needs_rewrite = false;
-    loop {
-        let mut line = Vec::new();
-        if source.read_until(b'\n', &mut line)? == 0 {
-            break;
-        }
-        let (json_end, _) = json_line_bounds(&line);
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&line[..json_end]) else {
-            continue;
-        };
-        if let Some(cwd) = matching_session_meta_cwd(&value, session_id) {
-            matched = true;
-            needs_rewrite |= cwd != new_cwd;
-        }
-    }
-    if !matched {
-        return Err(AppError::Other(format!(
-            "rollout 缺少会话 {session_id} 的 session_meta，无法修改工作目录: {}",
-            path.to_string_lossy()
-        )));
-    }
-    if !needs_rewrite {
-        return Ok(false);
-    }
-
-    atomic_file::replace_with_writer_if_unchanged(path, &fp, |file| {
-        let mut source = BufReader::new(File::open(path)?);
-        loop {
-            let mut line = Vec::new();
-            if source.read_until(b'\n', &mut line)? == 0 {
-                break;
-            }
-            let (json_end, ending_len) = json_line_bounds(&line);
-            let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&line[..json_end])
-            else {
-                file.write_all(&line)?;
-                continue;
-            };
-            if matching_session_meta_cwd(&value, session_id).is_none() {
-                file.write_all(&line)?;
-                continue;
-            }
-            let payload = value
-                .get_mut("payload")
-                .and_then(serde_json::Value::as_object_mut)
-                .ok_or_else(|| AppError::Other("rollout session_meta 缺少 payload 字段".into()))?;
-            payload.insert("cwd".into(), serde_json::Value::String(new_cwd.to_owned()));
-            file.write_all(&serde_json::to_vec(&value)?)?;
-            if ending_len > 0 {
-                file.write_all(&line[line.len() - ending_len..])?;
-            }
-        }
-        Ok(())
-    })?;
-    Ok(true)
+    crate::codex_rollout_cwd::rewrite_effective_cwd(path, session_id, new_cwd)
 }
 
 fn resolve_family_ids_for_move(
@@ -916,6 +837,29 @@ fn move_session_cwd_locked(
     id: String,
     target_cwd: String,
 ) -> AppResult<MoveSessionCwdReport> {
+    move_session_cwd_locked_with_post_project_sync(codex_dir, id, target_cwd, || Ok(()))
+}
+
+fn sync_codex_desktop_project_assignments(
+    codex: &Path,
+    ids: &[String],
+    host_cwd: &str,
+) -> AppResult<(bool, Option<crate::codex_projects::StateMutationReceipt>)> {
+    // The project helper reports whether it changed the JSON. The move report instead tells the
+    // caller whether Desktop had initialized its state and accepted the sync; an already-correct
+    // assignment is therefore still synchronized successfully.
+    let desktop_state_initialized = crate::codex_projects::desktop_state_initialized(codex)?;
+    let receipt =
+        crate::codex_projects::sync_thread_project_assignments_with_receipt(codex, ids, host_cwd)?;
+    Ok((desktop_state_initialized, receipt))
+}
+
+fn move_session_cwd_locked_with_post_project_sync(
+    codex_dir: String,
+    id: String,
+    target_cwd: String,
+    after_project_sync: impl FnOnce() -> AppResult<()>,
+) -> AppResult<MoveSessionCwdReport> {
     let codex = PathBuf::from(&codex_dir);
     if !paths::state_db_path(&codex).is_file() {
         return Err(AppError::InvalidCodexDir(format!(
@@ -923,22 +867,19 @@ fn move_session_cwd_locked(
             paths::state_db_path(&codex).to_string_lossy()
         )));
     }
+    crate::codex_projects::ensure_desktop_not_running(&codex)?;
 
     let (target_host, target_record) = normalize_move_target_cwd(&codex, &target_cwd)?;
     let new_cwd = paths::strip_verbatim(&target_host.to_string_lossy());
     let mut store = family::load(&codex)?;
     let (family_id, ids) = resolve_family_ids_for_move(&store, &id)?;
+    crate::codex_projects::validate_thread_project_assignments(&codex, &ids, &new_cwd)?;
     let mut rollouts = HashMap::new();
     let mut old_cwd = String::new();
     for sid in &ids {
         let rollout = locate_session_rollout(&codex, sid)?;
-        let meta = family::read_session_meta(&rollout)?;
-        let current_cwd = meta
-            .get("payload")
-            .and_then(|payload| payload.get("cwd"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let current_cwd =
+            crate::codex_rollout_cwd::read_effective_cwd(&rollout, sid)?.unwrap_or_default();
         if sid == &id {
             old_cwd = paths::host_path_string_from_codex_record(&codex, &current_cwd);
         }
@@ -956,9 +897,9 @@ fn move_session_cwd_locked(
     };
     let transaction =
         rusqlite::Transaction::new_unchecked(&state, rusqlite::TransactionBehavior::Immediate)?;
-    let mut journal = crate::repair::MutationJournal::default();
+    let mut journal = crate::mutation_journal::MutationJournal::default();
     let mut rollout_rewritten = false;
-    let operation = (|| -> AppResult<u32> {
+    let operation = (|| -> AppResult<(u32, bool)> {
         for sid in &ids {
             let rollout = rollouts
                 .get(sid)
@@ -993,10 +934,12 @@ fn move_session_cwd_locked(
             threads_updated += updated;
         }
 
-        let global_state = paths::codex_global_state_json_path(&codex);
-        journal.mutate_file(&global_state, || {
-            crate::repair::ensure_workspace_root_registered(&codex, &target_record)
-        })?;
+        let (desktop_project_synced, project_state_receipt) =
+            sync_codex_desktop_project_assignments(&codex, &ids, &new_cwd)?;
+        if let Some(receipt) = project_state_receipt {
+            journal.register_project_state_receipt(receipt);
+        }
+        after_project_sync()?;
 
         if rollout_rewritten {
             if let Some(family_id) = family_id.as_ref() {
@@ -1034,20 +977,22 @@ fn move_session_cwd_locked(
                 Ok(())
             })?;
         }
-        Ok(threads_updated)
+        Ok((threads_updated, desktop_project_synced))
     })();
 
-    let threads_updated = match operation {
-        Ok(threads_updated) => {
-            crate::repair::commit_transaction_with_compensation(transaction, journal)?;
-            threads_updated
+    let (threads_updated, desktop_project_synced) = match operation {
+        Ok(result) => {
+            crate::mutation_journal::commit_transaction_with_compensation(transaction, journal)?;
+            result
         }
         Err(error) => {
-            return Err(crate::repair::rollback_transaction_with_compensation(
-                transaction,
-                journal,
-                error,
-            ));
+            return Err(
+                crate::mutation_journal::rollback_transaction_with_compensation(
+                    transaction,
+                    journal,
+                    error,
+                ),
+            );
         }
     };
 
@@ -1056,6 +1001,7 @@ fn move_session_cwd_locked(
         new_cwd,
         threads_updated,
         rollout_rewritten,
+        desktop_project_synced,
         artifacts_moved: 0,
         history_rows_updated: 0,
         target_project_id: None,
@@ -1659,7 +1605,7 @@ fn delete_codex_targets_locked(
     codex_dir: &Path,
     targets: Vec<DeleteTarget>,
 ) -> AppResult<Vec<DeleteResult>> {
-    let mut store = family::load(codex_dir)?;
+    let store = family::load(codex_dir)?;
     // Resolve every target before the first destructive write. A broken family/index mapping
     // must never leave a half-deleted logical conversation.
     let resolved = targets
@@ -1707,196 +1653,128 @@ fn delete_codex_targets_locked(
         })
         .collect::<Vec<_>>();
 
+    let mut unique_keys = Vec::new();
+    let mut seen_keys = HashSet::new();
+    for key in plans.iter().filter_map(|plan| plan.as_ref().ok()) {
+        if seen_keys.insert(key.clone()) {
+            unique_keys.push(key.clone());
+        }
+    }
+
+    let mut physical_ids = Vec::new();
+    let mut seen_physical_ids = HashSet::new();
+    let mut next_store = store.clone();
+    let mut family_changed = false;
+    for key in &unique_keys {
+        match key {
+            CodexDeletePlanKey::Family(family_id) => {
+                let family_record = store
+                    .families
+                    .get(family_id)
+                    .ok_or_else(|| AppError::NotFound(format!("family: {family_id}")))?;
+                for branch in &family_record.chain {
+                    if seen_physical_ids.insert(branch.id.clone()) {
+                        physical_ids.push(branch.id.clone());
+                    }
+                }
+                family::remove_family(&mut next_store, family_id)?;
+                family_changed = true;
+            }
+            CodexDeletePlanKey::Branch {
+                family_id,
+                branch_id,
+            } => {
+                if seen_physical_ids.insert(branch_id.clone()) {
+                    physical_ids.push(branch_id.clone());
+                }
+                family::remove_non_active_branch(&mut next_store, family_id, branch_id)?;
+                family_changed = true;
+            }
+            CodexDeletePlanKey::Session(id) => {
+                if seen_physical_ids.insert(id.clone()) {
+                    physical_ids.push(id.clone());
+                }
+            }
+        }
+    }
+
+    let batch = delete_codex_artifacts_batch_with_family_store(
+        codex_dir,
+        &physical_ids,
+        family_changed.then_some(&next_store),
+    );
     let mut executed = HashMap::<CodexDeletePlanKey, DeleteResult>::new();
+    match batch {
+        Ok(outcomes) => {
+            let by_id = outcomes
+                .into_iter()
+                .map(|outcome| (outcome.result.id.clone(), outcome.result))
+                .collect::<HashMap<_, _>>();
+            for key in &unique_keys {
+                let key_ids = match key {
+                    CodexDeletePlanKey::Family(family_id) => store
+                        .families
+                        .get(family_id)
+                        .into_iter()
+                        .flat_map(|family| family.chain.iter().map(|branch| branch.id.clone()))
+                        .collect::<Vec<_>>(),
+                    CodexDeletePlanKey::Branch { branch_id, .. }
+                    | CodexDeletePlanKey::Session(branch_id) => vec![branch_id.clone()],
+                };
+                let target = DeleteTarget {
+                    id: key_ids.first().cloned().unwrap_or_default(),
+                    rollout_path: None,
+                };
+                let mut aggregate = empty_delete_result(&target);
+                for branch_id in key_ids {
+                    let result = by_id.get(&branch_id).cloned().ok_or_else(|| {
+                        AppError::Other(format!("Codex 删除未返回会话 {branch_id} 的结果"))
+                    })?;
+                    merge_codex_delete_result(&mut aggregate, &branch_id, result);
+                }
+                aggregate.ok = aggregate.error.is_none();
+                executed.insert(key.clone(), aggregate);
+            }
+        }
+        Err(error) => {
+            let message = error.to_string();
+            for key in &unique_keys {
+                let id = match key {
+                    CodexDeletePlanKey::Family(family_id) => store
+                        .families
+                        .get(family_id)
+                        .map(|family| family.active_id.clone())
+                        .unwrap_or_else(|| family_id.clone()),
+                    CodexDeletePlanKey::Branch { branch_id, .. }
+                    | CodexDeletePlanKey::Session(branch_id) => branch_id.clone(),
+                };
+                executed.insert(
+                    key.clone(),
+                    failed_delete_result(
+                        &DeleteTarget {
+                            id,
+                            rollout_path: None,
+                        },
+                        message.clone(),
+                    ),
+                );
+            }
+        }
+    }
+
     let mut results = Vec::with_capacity(targets.len());
     for (target, plan) in targets.iter().zip(plans) {
-        let key = match plan {
-            Ok(key) => key,
-            Err(error) => {
-                results.push(failed_delete_result(target, error));
-                continue;
-            }
+        let mut result = match plan {
+            Ok(key) => executed
+                .get(&key)
+                .cloned()
+                .ok_or_else(|| AppError::Other("Codex 删除计划未产生结果".to_string()))?,
+            Err(error) => failed_delete_result(target, error),
         };
-        if !executed.contains_key(&key) {
-            let result = match &key {
-                CodexDeletePlanKey::Family(family_id) => {
-                    delete_codex_family_locked(codex_dir, &mut store, family_id, &target.id)
-                        .unwrap_or_else(|error| failed_delete_result(target, error.to_string()))
-                }
-                CodexDeletePlanKey::Branch {
-                    family_id,
-                    branch_id,
-                } => delete_codex_family_branch_locked(codex_dir, &mut store, family_id, branch_id)
-                    .unwrap_or_else(|error| failed_delete_result(target, error.to_string())),
-                CodexDeletePlanKey::Session(id) => delete_codex_artifacts(codex_dir, id)
-                    .map(|outcome| outcome.result)
-                    .unwrap_or_else(|error| failed_delete_result(target, error.to_string())),
-            };
-            executed.insert(key.clone(), result);
-        }
-        let mut result = executed
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| AppError::Other("Codex 删除计划未产生结果".to_string()))?;
         result.id.clone_from(&target.id);
         results.push(result);
     }
     Ok(results)
-}
-
-fn delete_codex_family_branch_locked(
-    codex_dir: &Path,
-    store: &mut crate::models::FamilyStore,
-    family_id: &str,
-    branch_id: &str,
-) -> AppResult<DeleteResult> {
-    let resolved_family_id = family::resolve_family_id_strict(store, branch_id)?
-        .ok_or_else(|| AppError::NotFound(format!("family branch: {branch_id}")))?;
-    if resolved_family_id != family_id {
-        return Err(AppError::Other(format!(
-            "分支 {branch_id} 属于 family {resolved_family_id}，请求却指定了 {family_id}"
-        )));
-    }
-    let family = store
-        .families
-        .get(family_id)
-        .ok_or_else(|| AppError::NotFound(format!("family: {family_id}")))?;
-    if family.active_id == branch_id {
-        return Err(AppError::Other(format!(
-            "不能单独删除 active 分支 {branch_id}"
-        )));
-    }
-
-    // 在删除物理数据前确认 family store 可写，避免普通权限问题留下半完成状态。
-    family::save(codex_dir, store)?;
-    let outcome = delete_codex_artifacts(codex_dir, branch_id)?;
-    let mut result = outcome.result;
-    if !outcome.structurally_removed {
-        if result.error.is_none() {
-            append_error(
-                &mut result,
-                format!("分支 {branch_id} 的核心记录未删除干净，family 元数据已保留"),
-            );
-        }
-        result.ok = false;
-        return Ok(result);
-    }
-
-    let before_metadata = store.clone();
-    if let Err(error) = family::remove_non_active_branch(store, family_id, branch_id)
-        .and_then(|_| family::save(codex_dir, store))
-    {
-        *store = before_metadata;
-        append_error(
-            &mut result,
-            format!("分支 {branch_id} 的文件已删除，但 family 元数据保存失败: {error}"),
-        );
-        result.ok = false;
-        return Ok(result);
-    }
-    result.ok = result.error.is_none();
-    Ok(result)
-}
-
-fn delete_codex_family_locked(
-    codex_dir: &Path,
-    store: &mut crate::models::FamilyStore,
-    family_id: &str,
-    requested_id: &str,
-) -> AppResult<DeleteResult> {
-    let snapshot = store
-        .families
-        .get(family_id)
-        .cloned()
-        .ok_or_else(|| AppError::NotFound(format!("family: {family_id}")))?;
-    let target = DeleteTarget {
-        id: requested_id.to_string(),
-        rollout_path: None,
-    };
-    let mut aggregate = empty_delete_result(&target);
-    // Confirm the family store is writable before deleting the first physical artifact. A later
-    // external sharing violation can still occur, but ordinary permission/read-only failures are
-    // surfaced before any branch is touched.
-    family::save(codex_dir, store)?;
-
-    // Historical branches first. If any core artifact survives, keep the active branch intact.
-    for branch in snapshot
-        .chain
-        .iter()
-        .filter(|branch| branch.id != snapshot.active_id)
-    {
-        let outcome = match delete_codex_artifacts(codex_dir, &branch.id) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                append_error(
-                    &mut aggregate,
-                    format!("分支 {} 删除失败: {error}", branch.id),
-                );
-                return Ok(aggregate);
-            }
-        };
-        merge_codex_delete_result(&mut aggregate, &branch.id, outcome.result);
-        if !outcome.structurally_removed {
-            if aggregate.error.is_none() {
-                append_error(
-                    &mut aggregate,
-                    format!("分支 {} 的核心记录未删除干净，已保留当前分支", branch.id),
-                );
-            }
-            aggregate.ok = false;
-            return Ok(aggregate);
-        }
-        let before_metadata = store.clone();
-        if let Err(error) = family::remove_non_active_branch(store, family_id, &branch.id)
-            .and_then(|_| family::save(codex_dir, store))
-        {
-            *store = before_metadata;
-            append_error(
-                &mut aggregate,
-                format!(
-                    "分支 {} 的文件已删除，但 family 元数据保存失败: {error}",
-                    branch.id
-                ),
-            );
-            return Ok(aggregate);
-        }
-    }
-
-    let active_outcome = match delete_codex_artifacts(codex_dir, &snapshot.active_id) {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            append_error(
-                &mut aggregate,
-                format!("当前分支 {} 删除失败: {error}", snapshot.active_id),
-            );
-            return Ok(aggregate);
-        }
-    };
-    let active_removed = active_outcome.structurally_removed;
-    merge_codex_delete_result(&mut aggregate, &snapshot.active_id, active_outcome.result);
-    if active_removed {
-        let before_metadata = store.clone();
-        if let Err(error) =
-            family::remove_family(store, family_id).and_then(|_| family::save(codex_dir, store))
-        {
-            *store = before_metadata;
-            append_error(
-                &mut aggregate,
-                format!(
-                    "当前分支 {} 的文件已删除，但 family 元数据保存失败: {error}",
-                    snapshot.active_id
-                ),
-            );
-            return Ok(aggregate);
-        }
-    } else if aggregate.error.is_none() {
-        append_error(
-            &mut aggregate,
-            format!("当前分支 {} 的核心记录未删除干净", snapshot.active_id),
-        );
-    }
-    aggregate.ok = active_removed && aggregate.error.is_none();
-    Ok(aggregate)
 }
 
 fn merge_codex_delete_result(target: &mut DeleteResult, branch_id: &str, source: DeleteResult) {
@@ -2252,160 +2130,6 @@ fn claude_session_identity(path: &Path) -> AppResult<Option<String>> {
     Ok(stem)
 }
 
-pub(crate) struct CodexDeleteOutcome {
-    pub(crate) result: DeleteResult,
-    pub(crate) structurally_removed: bool,
-}
-
-pub(crate) fn delete_codex_artifacts(codex_dir: &Path, id: &str) -> AppResult<CodexDeleteOutcome> {
-    let mut result = DeleteResult {
-        id: id.to_string(),
-        rollout_path: None,
-        threads_rows_deleted: 0,
-        logs_rows_deleted: 0,
-        history_rows_deleted: 0,
-        rollout_deleted: false,
-        rollout_missing: false,
-        sidecar_deleted: false,
-        tasks_deleted: false,
-        file_history_deleted: false,
-        shared_data_preserved: false,
-        ok: false,
-        error: None,
-    };
-
-    // Preflight every fallible lookup that can be checked before the first write.
-    let state = state_db::open(codex_dir)?;
-    let rollout_path: Option<String> = match state.query_row(
-        "SELECT rollout_path FROM threads WHERE id = ?",
-        [id],
-        |row| row.get(0),
-    ) {
-        Ok(path) => Some(path),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(error) => return Err(error.into()),
-    };
-    let mut rollout_files = rollout_files_by_id(codex_dir, id)?;
-    if let Some(raw_path) = rollout_path.as_deref() {
-        let db_path = PathBuf::from(paths::strip_verbatim(
-            &paths::host_path_string_from_codex_record(codex_dir, raw_path),
-        ));
-        if db_path.is_file() {
-            validate_codex_rollout_path(codex_dir, &db_path, id)?;
-            rollout_files.push(db_path);
-        }
-    }
-    let mut canonical_files = Vec::with_capacity(rollout_files.len());
-    for path in rollout_files {
-        validate_codex_rollout_path(codex_dir, &path, id)?;
-        let canonical = path.canonicalize()?;
-        if !canonical_files.contains(&canonical) {
-            canonical_files.push(canonical);
-        }
-    }
-    let logs = if codex_dir.join("logs_2.sqlite").is_file() {
-        Some(logs_db::open(codex_dir)?)
-    } else {
-        None
-    };
-
-    // 1) threads（外键级联 thread_dynamic_tools / stage1_outputs / thread_spawn_edges）
-    let rows = {
-        let tx = state.unchecked_transaction()?;
-        let n = tx.execute("DELETE FROM threads WHERE id = ?", [id])?;
-        tx.commit()?;
-        n
-    };
-    result.threads_rows_deleted = rows as u32;
-
-    // 2) logs_2.sqlite 在部分 Codex 版本中不存在；不存在就没有待清理记录。
-    if let Some(logs) = logs {
-        let logs_result: AppResult<usize> = (|| {
-            let tx = logs.unchecked_transaction()?;
-            let n = tx.execute("DELETE FROM logs WHERE thread_id = ?", [id])?;
-            tx.commit()?;
-            Ok(n)
-        })();
-        match logs_result {
-            Ok(rows_logs) => result.logs_rows_deleted = rows_logs as u32,
-            Err(error) => append_error(&mut result, format!("logs delete failed: {error}")),
-        }
-    }
-
-    // 3) 删除 sessions/ 与 archived_sessions/ 中全部同 ID rollout，避免漂移副本残留。
-    if canonical_files.is_empty() {
-        result.rollout_missing = true;
-    } else {
-        result.rollout_path = canonical_files
-            .first()
-            .map(|path| path.to_string_lossy().into_owned());
-        for rollout in canonical_files {
-            match fs::remove_file(&rollout) {
-                Ok(()) => {
-                    result.rollout_deleted = true;
-                    cleanup_empty_rollout_ancestors(codex_dir, &rollout, &mut result);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    result.rollout_missing = true;
-                }
-                Err(error) => append_error(
-                    &mut result,
-                    format!(
-                        "rollout remove failed {}: {error}",
-                        rollout.to_string_lossy()
-                    ),
-                ),
-            }
-        }
-    }
-
-    // 4) session_index.jsonl
-    let index_path = paths::session_index_path(codex_dir);
-    if index_path.exists() {
-        if let Err(error) = filter_index_file(&index_path, id) {
-            append_error(&mut result, format!("session_index filter failed: {error}"));
-        }
-    }
-
-    // Verify the three core locations from disk/database truth before touching family metadata.
-    let threads_remaining: i64 =
-        state.query_row("SELECT COUNT(*) FROM threads WHERE id = ?", [id], |row| {
-            row.get(0)
-        })?;
-    let rollout_remaining = match rollout_files_by_id(codex_dir, id) {
-        Ok(paths) => !paths.is_empty(),
-        Err(error) => {
-            append_error(
-                &mut result,
-                format!("rollout deletion verification failed: {error}"),
-            );
-            true
-        }
-    };
-    let index_remaining = match index_contains_id(&index_path, id) {
-        Ok(remaining) => remaining,
-        Err(error) => {
-            append_error(
-                &mut result,
-                format!("session_index deletion verification failed: {error}"),
-            );
-            true
-        }
-    };
-    let structurally_removed = threads_remaining == 0 && !rollout_remaining && !index_remaining;
-    if !structurally_removed && result.error.is_none() {
-        append_error(
-            &mut result,
-            "Codex 会话仍有核心记录残留（threads、rollout 或 session_index）".to_string(),
-        );
-    }
-    result.ok = structurally_removed && result.error.is_none();
-    Ok(CodexDeleteOutcome {
-        result,
-        structurally_removed,
-    })
-}
-
 #[cfg(test)]
 fn delete_one(codex_dir: &Path, id: &str) -> AppResult<DeleteResult> {
     Ok(delete_codex_artifacts(codex_dir, id)?.result)
@@ -2474,52 +2198,6 @@ pub(crate) fn validate_codex_rollout_path(
         "Codex rollout 不在 sessions 或 archived_sessions 内，拒绝操作: {}",
         path.to_string_lossy()
     )))
-}
-
-fn cleanup_empty_rollout_ancestors(codex_dir: &Path, rollout: &Path, result: &mut DeleteResult) {
-    let sessions_root = paths::sessions_dir(codex_dir);
-    let mut current = rollout.parent();
-    while let Some(dir) = current {
-        if dir == sessions_root || !dir.starts_with(&sessions_root) {
-            break;
-        }
-        match fs::remove_dir(dir) {
-            Ok(()) => current = dir.parent(),
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
-                ) =>
-            {
-                break;
-            }
-            Err(error) => {
-                append_error(
-                    result,
-                    format!("清理空 rollout 目录失败 {}: {error}", dir.to_string_lossy()),
-                );
-                break;
-            }
-        }
-    }
-}
-
-fn index_contains_id(path: &Path, id: &str) -> AppResult<bool> {
-    if !path.is_file() {
-        return Ok(false);
-    }
-    for line in BufReader::new(File::open(path)?).lines() {
-        let line = line?;
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        if value.get("id").and_then(serde_json::Value::as_str) == Some(id)
-            || value.get("session_id").and_then(serde_json::Value::as_str) == Some(id)
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 fn append_error(result: &mut DeleteResult, msg: String) {
@@ -2628,6 +2306,85 @@ mod tests {
             [],
         )?;
         Ok(conn)
+    }
+
+    fn write_codex_project_state_fixture(codex: &Path, ids: &[&str]) -> AppResult<()> {
+        let mut state = serde_json::json!({
+            "thread-project-assignments": {},
+            "thread-workspace-root-hints": {},
+            "thread-writable-roots": {},
+            "projectless-thread-ids": [],
+            "electron-persisted-atom-state": {},
+            "unrelated-setting": { "keep": true }
+        });
+        for id in ids {
+            state["thread-project-assignments"][*id] = serde_json::json!({
+                "projectKind": "local",
+                "projectId": "local-test",
+                "cwd": "F:\\work"
+            });
+            state["thread-workspace-root-hints"][*id] = serde_json::json!("F:\\work");
+            state["thread-writable-roots"][*id] = serde_json::json!(["F:\\work"]);
+            state["projectless-thread-ids"]
+                .as_array_mut()
+                .expect("projectless fixture array")
+                .push(serde_json::json!(id));
+            state["electron-persisted-atom-state"]
+                .as_object_mut()
+                .expect("persisted atom fixture object")
+                .insert(
+                    format!("thread-workspace-state-v1:{id}"),
+                    serde_json::json!({ "pending": { "cwd": "F:\\work" } }),
+                );
+        }
+        fs::write(
+            paths::codex_global_state_json_path(codex),
+            serde_json::to_vec_pretty(&state)?,
+        )?;
+        Ok(())
+    }
+
+    fn assert_codex_project_state_membership(
+        codex: &Path,
+        id: &str,
+        expected: bool,
+    ) -> AppResult<()> {
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(paths::codex_global_state_json_path(codex))?)?;
+        let assignment_present = state
+            .get("thread-project-assignments")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|entries| entries.contains_key(id));
+        assert_eq!(
+            assignment_present, expected,
+            "unexpected project assignment membership for {id}"
+        );
+        let projectless = state
+            .get("projectless-thread-ids")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|entries| entries.iter().any(|entry| entry.as_str() == Some(id)));
+        assert_eq!(
+            projectless, expected,
+            "unexpected projectless membership for {id}"
+        );
+        for field in ["thread-workspace-root-hints", "thread-writable-roots"] {
+            assert!(
+                state[field]
+                    .as_object()
+                    .is_some_and(|entries| entries.contains_key(id)),
+                "unknown field {field} must be preserved for {id}"
+            );
+        }
+        assert!(
+            state["electron-persisted-atom-state"]
+                .as_object()
+                .is_some_and(|object| {
+                    object.contains_key(&format!("thread-workspace-state-v1:{id}"))
+                }),
+            "unknown workspace-state field must be preserved for {id}"
+        );
+        assert_eq!(state["unrelated-setting"]["keep"], true);
+        Ok(())
     }
 
     fn write_claude_session(path: &Path, id: &str) -> AppResult<()> {
@@ -3554,6 +3311,7 @@ mod tests {
                 sha256,
                 line_count,
                 note: None,
+                archive_origin: None,
             });
             index.insert(branch.id.to_string(), family_id.to_string());
             if !branch.archived {
@@ -3683,7 +3441,8 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_rollout_cwd_updates_every_matching_meta_but_preserves_ancestors() -> AppResult<()> {
+    fn rewrite_rollout_cwd_updates_matching_meta_and_latest_turn_but_preserves_history(
+    ) -> AppResult<()> {
         let root = temp_dir("rewrite-rollout-cwd-repeated-meta");
         let path = root.join("repeated.jsonl");
         fs::create_dir_all(&root)?;
@@ -3705,6 +3464,16 @@ mod tests {
             }),
             serde_json::json!({
                 "timestamp": "2026-05-10T10:00:03Z",
+                "type": "turn_context",
+                "payload": {"cwd": "F:\\historical"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-10T10:00:04Z",
+                "type": "turn_context",
+                "payload": {"cwd": "F:\\current-before-move"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-10T10:00:05Z",
                 "type": "event_msg",
                 "payload": {"type": "token_count"}
             }),
@@ -3732,13 +3501,21 @@ mod tests {
         assert_eq!(metas[0]["payload"]["cwd"], "F:\\new");
         assert_eq!(metas[1]["payload"]["cwd"], "F:\\ancestor");
         assert_eq!(metas[2]["payload"]["cwd"], "F:\\new");
+        let turns = fs::read_to_string(&path)?
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|value| value["type"] == "turn_context")
+            .collect::<Vec<_>>();
+        assert_eq!(turns[0]["payload"]["cwd"], "F:\\historical");
+        assert_eq!(turns[1]["payload"]["cwd"], "F:\\new");
 
         fs::remove_dir_all(root).ok();
         Ok(())
     }
 
     #[test]
-    fn move_family_cwd_updates_all_rollouts_threads_workspace_and_integrity() -> AppResult<()> {
+    fn move_family_cwd_updates_all_rollouts_threads_project_assignments_and_integrity(
+    ) -> AppResult<()> {
         let codex = temp_dir("move-family-cwd");
         let family_id = "family-move-cwd";
         let active_id = "019d-family-move-active";
@@ -3758,10 +3535,42 @@ mod tests {
                 },
             ],
         )?;
-        fs::write(paths::codex_global_state_json_path(&codex), "{}")?;
         let target = codex.join("projects").join("new-workspace");
         fs::create_dir_all(&target)?;
         let expected_cwd = paths::strip_verbatim(&target.canonicalize()?.to_string_lossy());
+        let target_project_id = "local-existing-target";
+        fs::write(
+            paths::codex_global_state_json_path(&codex),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "local-projects": {
+                    (target_project_id): {
+                        "id": target_project_id,
+                        "name": "new-workspace",
+                        "rootPaths": [expected_cwd]
+                    }
+                },
+                "thread-project-assignments": {
+                    (active_id): {
+                        "projectKind": "local",
+                        "projectId": "local-old",
+                        "cwd": "F:\\w",
+                        "pendingCoreUpdate": false
+                    },
+                    (archived_id): {
+                        "projectKind": "local",
+                        "projectId": "local-old",
+                        "cwd": "F:\\w",
+                        "pendingCoreUpdate": false
+                    }
+                },
+                "thread-workspace-root-hints": {
+                    (active_id): "F:\\w",
+                    (archived_id): "F:\\w"
+                },
+                "projectless-thread-ids": [active_id, archived_id, "keep-projectless"],
+                "project-order": ["local-old"]
+            }))?,
+        )?;
         let archived_before = family::load(&codex)?
             .families
             .get(family_id)
@@ -3780,6 +3589,7 @@ mod tests {
         assert!(report.rollout_rewritten);
         assert_eq!(report.threads_updated, 2);
         assert_eq!(report.new_cwd, expected_cwd);
+        assert!(report.desktop_project_synced);
         for id in [active_id, archived_id] {
             assert_eq!(
                 rollout_cwd(paths_by_id.get(id).expect("fixture path"))?,
@@ -3801,18 +3611,38 @@ mod tests {
 
         let global: serde_json::Value =
             serde_json::from_slice(&fs::read(paths::codex_global_state_json_path(&codex))?)?;
-        for key in [
-            "electron-saved-workspace-roots",
-            "active-workspace-roots",
-            "project-order",
-        ] {
+        for id in [active_id, archived_id] {
+            let assignment = &global["thread-project-assignments"][id];
+            assert_eq!(assignment["projectKind"], "local", "{id}");
+            assert_eq!(assignment["projectId"], target_project_id, "{id}");
+            assert_eq!(assignment["cwd"], expected_cwd, "{id}");
+            assert_eq!(assignment["pendingCoreUpdate"], false, "{id}");
+            assert_eq!(global["thread-workspace-root-hints"][id], "F:\\w", "{id}");
             assert!(
-                global[key].as_array().is_some_and(|values| values
-                    .iter()
-                    .any(|value| value.as_str() == Some(expected_cwd.as_str()))),
-                "workspace key {key} must contain the new cwd"
+                !global["projectless-thread-ids"]
+                    .as_array()
+                    .is_some_and(|ids| ids.iter().any(|value| value.as_str() == Some(id))),
+                "{id} must no longer be projectless"
             );
         }
+        assert!(global["projectless-thread-ids"]
+            .as_array()
+            .is_some_and(|ids| ids
+                .iter()
+                .any(|value| value.as_str() == Some("keep-projectless"))));
+        assert_eq!(
+            global["project-order"]
+                .as_array()
+                .and_then(|ids| ids.first())
+                .and_then(serde_json::Value::as_str),
+            Some(target_project_id),
+            "the destination project must be promoted to the front of the Desktop sidebar"
+        );
+        assert!(!global["project-order"]
+            .as_array()
+            .is_some_and(|values| values
+                .iter()
+                .any(|value| value.as_str() == Some(expected_cwd.as_str()))));
 
         let store = family::load(&codex)?;
         let archived_branch = store
@@ -3835,6 +3665,182 @@ mod tests {
         let index_ids = crate::repair::read_session_index_ids(&codex)?;
         assert!(index_ids.contains(active_id));
         assert!(!index_ids.contains(archived_id));
+
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn move_session_cwd_registers_unadded_directory_as_a_desktop_project() -> AppResult<()> {
+        let codex = temp_dir("move-cwd-register-new-project");
+        let session_id = "019d-move-register-new-project";
+        let paths_by_id = codex_family_fixture(
+            &codex,
+            "family-move-register-new-project",
+            session_id,
+            &[FamilyBranchFixture {
+                id: session_id,
+                archived: false,
+            }],
+        )?;
+        let old_project_id = "local-old";
+        fs::write(
+            paths::codex_global_state_json_path(&codex),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "local-projects": {
+                    (old_project_id): {
+                        "id": old_project_id,
+                        "name": "old-project",
+                        "rootPaths": [r"F:\w"]
+                    }
+                },
+                "thread-project-assignments": {
+                    (session_id): {
+                        "projectKind": "local",
+                        "projectId": old_project_id,
+                        "cwd": r"F:\w",
+                        "pendingCoreUpdate": false
+                    }
+                },
+                "projectless-thread-ids": [session_id],
+                "project-order": [old_project_id],
+                "unrelated-setting": {"keep": true}
+            }))?,
+        )?;
+        let target = codex.join("projects").join("not-yet-added");
+        fs::create_dir_all(&target)?;
+        let expected_cwd = paths::strip_verbatim(&target.canonicalize()?.to_string_lossy());
+
+        let report = move_session_cwd_with_lock(
+            Some("codex".into()),
+            codex.to_string_lossy().into_owned(),
+            session_id.into(),
+            target.to_string_lossy().into_owned(),
+            &family::FamilyLock::default(),
+        )?;
+
+        assert!(report.desktop_project_synced);
+        assert_eq!(report.new_cwd, expected_cwd);
+        assert_eq!(
+            rollout_cwd(paths_by_id.get(session_id).expect("fixture rollout"))?,
+            expected_cwd
+        );
+        let global: serde_json::Value =
+            serde_json::from_slice(&fs::read(paths::codex_global_state_json_path(&codex))?)?;
+        let assignment = &global["thread-project-assignments"][session_id];
+        let project_id = assignment["projectId"]
+            .as_str()
+            .expect("new Desktop project id");
+        assert_ne!(project_id, old_project_id);
+        assert_eq!(assignment["projectKind"], "local");
+        assert_eq!(assignment["cwd"], expected_cwd);
+        assert_eq!(assignment["pendingCoreUpdate"], false);
+        assert_eq!(
+            global["local-projects"][project_id]["rootPaths"],
+            serde_json::json!([expected_cwd])
+        );
+        assert_eq!(
+            global["local-projects"][project_id]["name"],
+            "not-yet-added"
+        );
+        assert_eq!(global["project-order"][0], project_id);
+        assert_eq!(global["project-order"][1], old_project_id);
+        assert_eq!(global["unrelated-setting"]["keep"], true);
+        assert!(global["projectless-thread-ids"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().all(|value| value.as_str() != Some(session_id))));
+
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn move_session_cwd_without_global_state_updates_core_records_without_creating_state(
+    ) -> AppResult<()> {
+        let codex = temp_dir("move-cwd-without-global-state");
+        let session_id = "019d-move-without-global-state";
+        let paths_by_id = codex_family_fixture(
+            &codex,
+            "family-move-without-global-state",
+            session_id,
+            &[FamilyBranchFixture {
+                id: session_id,
+                archived: false,
+            }],
+        )?;
+        let global_state = paths::codex_global_state_json_path(&codex);
+        assert!(
+            !global_state.exists(),
+            "fixture must not create global state"
+        );
+        let index_before = fs::read(paths::session_index_path(&codex))?;
+        let target = codex.join("projects").join("new-workspace");
+        fs::create_dir_all(&target)?;
+        let expected_cwd = paths::strip_verbatim(&target.canonicalize()?.to_string_lossy());
+
+        let report = move_session_cwd_with_lock(
+            Some("codex".into()),
+            codex.to_string_lossy().into_owned(),
+            session_id.into(),
+            target.to_string_lossy().into_owned(),
+            &family::FamilyLock::default(),
+        )?;
+
+        assert!(report.rollout_rewritten);
+        assert_eq!(report.threads_updated, 1);
+        assert_eq!(report.new_cwd, expected_cwd);
+        assert!(!report.desktop_project_synced);
+        assert_eq!(
+            rollout_cwd(paths_by_id.get(session_id).expect("fixture rollout"))?,
+            expected_cwd
+        );
+        let state = state_db::open_ro(&codex)?;
+        let cwd: String = state.query_row(
+            "SELECT cwd FROM threads WHERE id = ?",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(cwd, expected_cwd);
+        drop(state);
+        let index_after = fs::read(paths::session_index_path(&codex))?;
+        assert_ne!(index_after, index_before, "session index must be refreshed");
+        assert!(crate::repair::read_session_index_ids(&codex)?.contains(session_id));
+        assert!(
+            !global_state.exists(),
+            "a missing global state file must remain absent"
+        );
+
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn desktop_project_sync_reports_true_when_existing_assignment_needs_no_write() -> AppResult<()>
+    {
+        let codex = temp_dir("desktop-project-sync-noop");
+        fs::create_dir_all(&codex)?;
+        let target = codex.join("projects").join("already-assigned");
+        fs::create_dir_all(&target)?;
+        let target_cwd = paths::strip_verbatim(&target.canonicalize()?.to_string_lossy());
+        let ids = vec!["019d-desktop-project-sync-noop".to_string()];
+        let global_state = paths::codex_global_state_json_path(&codex);
+        fs::write(&global_state, "{}")?;
+
+        let (initial_sync_reported, initial_receipt) =
+            sync_codex_desktop_project_assignments(&codex, &ids, &target_cwd)?;
+        assert!(initial_sync_reported);
+        assert!(initial_receipt.is_some());
+        let state_after_initial_sync = fs::read(&global_state)?;
+
+        let (noop_sync_reported, noop_receipt) =
+            sync_codex_desktop_project_assignments(&codex, &ids, &target_cwd)?;
+        assert!(noop_sync_reported);
+        assert!(noop_receipt.is_none());
+        assert_eq!(
+            fs::read(&global_state)?,
+            state_after_initial_sync,
+            "an already-correct assignment must be a no-op"
+        );
 
         fs::remove_dir_all(codex).ok();
         Ok(())
@@ -3908,6 +3914,121 @@ mod tests {
     }
 
     #[test]
+    fn move_family_cwd_rolls_back_project_assignments_after_later_failure() -> AppResult<()> {
+        let codex = temp_dir("move-family-cwd-project-state-rollback");
+        let active_id = "019d-family-project-rollback-active";
+        let archived_id = "019d-family-project-rollback-archived";
+        let paths_by_id = codex_family_fixture(
+            &codex,
+            "family-move-project-state-rollback",
+            active_id,
+            &[
+                FamilyBranchFixture {
+                    id: active_id,
+                    archived: false,
+                },
+                FamilyBranchFixture {
+                    id: archived_id,
+                    archived: true,
+                },
+            ],
+        )?;
+        write_codex_project_state_fixture(&codex, &[active_id, archived_id])?;
+        let rollout_before = paths_by_id
+            .iter()
+            .map(|(id, path)| fs::read(path).map(|bytes| (id.clone(), bytes)))
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let family_before = fs::read(paths::family_store_path(&codex))?;
+        let index_before = fs::read(paths::session_index_path(&codex))?;
+        let global_before = fs::read(paths::codex_global_state_json_path(&codex))?;
+        let target = codex.join("projects").join("project-rollback-target");
+        fs::create_dir_all(&target)?;
+        let expected_new_cwd = paths::strip_verbatim(&target.canonicalize()?.to_string_lossy());
+
+        let error = move_session_cwd_locked_with_post_project_sync(
+            codex.to_string_lossy().into_owned(),
+            active_id.to_string(),
+            target.to_string_lossy().into_owned(),
+            || {
+                Err(AppError::Other(
+                    "injected failure after project assignment sync".to_string(),
+                ))
+            },
+        )
+        .expect_err("a failure after project sync must roll back every file and SQLite");
+
+        assert!(error.to_string().contains("injected failure"), "{error}");
+        assert_eq!(
+            fs::read(paths::codex_global_state_json_path(&codex))?,
+            global_before,
+            "global project assignments must be compensated"
+        );
+        assert_eq!(fs::read(paths::family_store_path(&codex))?, family_before);
+        assert_eq!(fs::read(paths::session_index_path(&codex))?, index_before);
+        for (id, path) in &paths_by_id {
+            assert_eq!(fs::read(path)?, rollout_before[id], "{id}");
+            assert_eq!(rollout_cwd(path)?, "F:\\w", "{id}");
+        }
+        let state = state_db::open_ro(&codex)?;
+        for id in [active_id, archived_id] {
+            let cwd: String =
+                state.query_row("SELECT cwd FROM threads WHERE id = ?", [id], |row| {
+                    row.get(0)
+                })?;
+            assert_eq!(cwd, "F:\\w", "{id}");
+        }
+        assert_ne!(expected_new_cwd, "F:\\w");
+
+        drop(state);
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn move_family_cwd_never_overwrites_desktop_state_changed_after_assignment() -> AppResult<()> {
+        let codex = temp_dir("move-family-cwd-project-state-concurrent");
+        let active_id = "019d-family-project-concurrent-active";
+        codex_family_fixture(
+            &codex,
+            "family-move-project-state-concurrent",
+            active_id,
+            &[FamilyBranchFixture {
+                id: active_id,
+                archived: false,
+            }],
+        )?;
+        write_codex_project_state_fixture(&codex, &[active_id])?;
+        let target = codex.join("projects").join("project-concurrent-target");
+        fs::create_dir_all(&target)?;
+        let global_state_path = paths::codex_global_state_json_path(&codex);
+
+        let error = move_session_cwd_locked_with_post_project_sync(
+            codex.to_string_lossy().into_owned(),
+            active_id.to_string(),
+            target.to_string_lossy().into_owned(),
+            || {
+                let mut concurrent: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&global_state_path)?)?;
+                concurrent["desktop-concurrent-update"] =
+                    serde_json::Value::String("must survive".to_string());
+                fs::write(&global_state_path, serde_json::to_vec(&concurrent)?)?;
+                Err(AppError::Other(
+                    "injected failure after concurrent Desktop write".to_string(),
+                ))
+            },
+        )
+        .expect_err("the injected late failure must trigger conditional compensation");
+
+        assert!(error.to_string().contains("拒绝补偿并发数据"), "{error}");
+        let state: serde_json::Value = serde_json::from_slice(&fs::read(&global_state_path)?)?;
+        assert_eq!(state["desktop-concurrent-update"], "must survive");
+        assert!(state["thread-project-assignments"][active_id].is_object());
+
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
     fn move_session_cwd_rejects_invalid_targets_before_writing() -> AppResult<()> {
         let codex = temp_dir("move-cwd-invalid-target");
         let session_id = "019d-move-invalid-target";
@@ -3961,6 +4082,57 @@ mod tests {
             }
         }
 
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn move_session_cwd_rejects_running_desktop_before_writing_core_state() -> AppResult<()> {
+        let codex = temp_dir("move-cwd-desktop-running");
+        let session_id = "019d-move-desktop-running";
+        let paths_by_id = codex_family_fixture(
+            &codex,
+            "family-move-desktop-running",
+            session_id,
+            &[FamilyBranchFixture {
+                id: session_id,
+                archived: false,
+            }],
+        )?;
+        fs::write(paths::codex_global_state_json_path(&codex), "{}")?;
+        let target = codex.join("projects").join("blocked-target");
+        fs::create_dir_all(&target)?;
+        let tracked_paths = [
+            paths_by_id[session_id].clone(),
+            paths::state_db_path(&codex),
+            paths::session_index_path(&codex),
+            paths::family_store_path(&codex),
+            paths::codex_global_state_json_path(&codex),
+        ];
+        let before = tracked_paths
+            .iter()
+            .map(|path| fs::read(path).map(|bytes| (path.clone(), bytes)))
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let _desktop = crate::codex_projects::DesktopTestProbeGuard::running();
+
+        let error = move_session_cwd_with_lock(
+            Some("codex".into()),
+            codex.to_string_lossy().into_owned(),
+            session_id.into(),
+            target.to_string_lossy().into_owned(),
+            &family::FamilyLock::default(),
+        )
+        .expect_err("running Desktop must reject the whole move");
+
+        assert!(error.to_string().contains("完全退出桌面应用"), "{error}");
+        for (path, expected) in before {
+            assert_eq!(
+                fs::read(&path)?,
+                expected,
+                "must not modify {}",
+                path.display()
+            );
+        }
         fs::remove_dir_all(codex).ok();
         Ok(())
     }
@@ -4683,6 +4855,268 @@ mod tests {
         assert_eq!(result.threads_rows_deleted, 0);
         assert!(!orphan.exists());
 
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn delete_codex_session_clears_only_its_project_state() -> AppResult<()> {
+        let codex = temp_dir("codex-delete-project-state");
+        let rollout = archive_fixture(&codex);
+        let other_id = "019d-project-state-other-7000-8000-000000000002";
+        write_codex_project_state_fixture(&codex, &[ARCHIVE_TEST_ID, other_id])?;
+
+        let result = delete_one(&codex, ARCHIVE_TEST_ID)?;
+
+        assert!(result.ok, "{:?}", result.error);
+        assert!(!rollout.exists());
+        assert_codex_project_state_membership(&codex, ARCHIVE_TEST_ID, false)?;
+        assert_codex_project_state_membership(&codex, other_id, true)?;
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn delete_codex_family_clears_project_state_for_every_branch() -> AppResult<()> {
+        let codex = temp_dir("codex-delete-family-project-state");
+        let family_id = "family-project-state";
+        let archived_id = "019d-family-project-state-history";
+        let active_id = "019d-family-project-state-active";
+        let other_id = "019d-family-project-state-other";
+        codex_family_fixture(
+            &codex,
+            family_id,
+            active_id,
+            &[
+                FamilyBranchFixture {
+                    id: archived_id,
+                    archived: true,
+                },
+                FamilyBranchFixture {
+                    id: active_id,
+                    archived: false,
+                },
+            ],
+        )?;
+        write_codex_project_state_fixture(&codex, &[archived_id, active_id, other_id])?;
+
+        let results = delete_sessions_with_lock(
+            Some("codex".to_string()),
+            codex.to_string_lossy().into_owned(),
+            None,
+            vec![active_id.to_string()],
+            None,
+            &family::FamilyLock::default(),
+        )?;
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].ok, "{:?}", results[0].error);
+        assert_codex_project_state_membership(&codex, archived_id, false)?;
+        assert_codex_project_state_membership(&codex, active_id, false)?;
+        assert_codex_project_state_membership(&codex, other_id, true)?;
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn batch_delete_codex_sessions_clears_each_project_state_entry() -> AppResult<()> {
+        let codex = temp_dir("codex-batch-delete-project-state");
+        let first_id = "019d-batch-project-state-first";
+        let second_id = "019d-batch-project-state-second";
+        let first = codex
+            .join("sessions/2026/05/10")
+            .join(format!("rollout-2026-05-10T10-00-00-{first_id}.jsonl"));
+        let second = codex
+            .join("sessions/2026/05/10")
+            .join(format!("rollout-2026-05-10T10-00-00-{second_id}.jsonl"));
+        write_test_rollout(&first, first_id, "first");
+        write_test_rollout(&second, second_id, "second");
+        let conn = create_codex_threads_table(&codex)?;
+        for (id, rollout) in [(first_id, &first), (second_id, &second)] {
+            conn.execute(
+                "INSERT INTO threads (
+                    id, rollout_path, cwd, title, first_user_message, model, reasoning_effort,
+                    tokens_used, created_at, updated_at, archived, archived_at, git_branch, source,
+                    agent_nickname, agent_role
+                ) VALUES (?1, ?2, 'F:\\work', ?1, ?1, 'gpt-5', NULL, 0,
+                    1770000000, 1770000300, 0, NULL, NULL, NULL, NULL, NULL)",
+                params![id, rollout.to_string_lossy().into_owned()],
+            )?;
+        }
+        drop(conn);
+        write_codex_project_state_fixture(&codex, &[first_id, second_id])?;
+
+        let results = delete_sessions_with_lock(
+            Some("codex".to_string()),
+            codex.to_string_lossy().into_owned(),
+            None,
+            vec![first_id.to_string(), second_id.to_string()],
+            None,
+            &family::FamilyLock::default(),
+        )?;
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| result.ok));
+        assert_codex_project_state_membership(&codex, first_id, false)?;
+        assert_codex_project_state_membership(&codex, second_id, false)?;
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn delete_codex_rejects_broken_project_state_before_core_removal() -> AppResult<()> {
+        let codex = temp_dir("codex-delete-project-state-failure");
+        let rollout = archive_fixture(&codex);
+        let index_path = paths::session_index_path(&codex);
+        let state_path = paths::state_db_path(&codex);
+        let global_state_path = paths::codex_global_state_json_path(&codex);
+        fs::write(&global_state_path, "{broken global state")?;
+        let rollout_before = fs::read(&rollout)?;
+        let index_before = fs::read(&index_path)?;
+        let state_before = fs::read(&state_path)?;
+        let global_before = fs::read(&global_state_path)?;
+
+        let error = delete_one(&codex, ARCHIVE_TEST_ID)
+            .expect_err("broken project state must abort before deleting Core data");
+
+        assert!(error.to_string().contains("全局状态 JSON 损坏"), "{error}");
+        assert_eq!(fs::read(&rollout)?, rollout_before);
+        assert_eq!(fs::read(&index_path)?, index_before);
+        assert_eq!(fs::read(&state_path)?, state_before);
+        assert_eq!(fs::read(&global_state_path)?, global_before);
+        let state = state_db::open_ro(&codex)?;
+        let remaining: i64 = state.query_row(
+            "SELECT COUNT(*) FROM threads WHERE id = ?",
+            [ARCHIVE_TEST_ID],
+            |row| row.get(0),
+        )?;
+        assert_eq!(remaining, 1);
+
+        drop(state);
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn delete_codex_rolls_back_core_when_desktop_starts_after_preflight() -> AppResult<()> {
+        let codex = temp_dir("codex-delete-desktop-race-rollback");
+        let rollout = archive_fixture(&codex);
+        write_codex_project_state_fixture(&codex, &[ARCHIVE_TEST_ID])?;
+        let logs = rusqlite::Connection::open(codex.join("logs_2.sqlite"))?;
+        logs.execute(
+            "CREATE TABLE logs (id INTEGER PRIMARY KEY, thread_id TEXT NOT NULL)",
+            [],
+        )?;
+        logs.execute(
+            "INSERT INTO logs (thread_id) VALUES (?1)",
+            [ARCHIVE_TEST_ID],
+        )?;
+        drop(logs);
+
+        let rollout_before = fs::read(&rollout)?;
+        let index_path = paths::session_index_path(&codex);
+        let index_before = fs::read(&index_path)?;
+        let global_path = paths::codex_global_state_json_path(&codex);
+        let global_before = fs::read(&global_path)?;
+        // batch pre-check, mutation-entry check, then the final pre-CAS check observes Desktop.
+        let _desktop = crate::codex_projects::DesktopTestProbeGuard::running_after_not_running(2);
+
+        let error = delete_one(&codex, ARCHIVE_TEST_ID)
+            .expect_err("a Desktop start immediately before project-state CAS must abort delete");
+
+        assert!(error.to_string().contains("完全退出桌面应用"), "{error}");
+        assert_eq!(fs::read(&rollout)?, rollout_before);
+        assert_eq!(fs::read(&index_path)?, index_before);
+        assert_eq!(fs::read(&global_path)?, global_before);
+        let state = state_db::open_ro(&codex)?;
+        let threads: i64 = state.query_row(
+            "SELECT COUNT(*) FROM threads WHERE id = ?1",
+            [ARCHIVE_TEST_ID],
+            |row| row.get(0),
+        )?;
+        assert_eq!(threads, 1);
+        let logs = logs_db::open_ro(&codex)?;
+        let log_rows: i64 = logs.query_row(
+            "SELECT COUNT(*) FROM logs WHERE thread_id = ?1",
+            [ARCHIVE_TEST_ID],
+            |row| row.get(0),
+        )?;
+        assert_eq!(log_rows, 1);
+        drop((state, logs));
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn delete_codex_family_rolls_back_every_branch_when_project_cas_exhausts() -> AppResult<()> {
+        let codex = temp_dir("codex-delete-family-project-cas-rollback");
+        let family_id = "family-project-cas-rollback";
+        let archived_id = "019d-family-project-cas-rollback-history";
+        let active_id = "019d-family-project-cas-rollback-active";
+        let paths_by_id = codex_family_fixture(
+            &codex,
+            family_id,
+            active_id,
+            &[
+                FamilyBranchFixture {
+                    id: archived_id,
+                    archived: true,
+                },
+                FamilyBranchFixture {
+                    id: active_id,
+                    archived: false,
+                },
+            ],
+        )?;
+        write_codex_project_state_fixture(&codex, &[archived_id, active_id])?;
+        let rollout_before = paths_by_id
+            .iter()
+            .map(|(id, path)| Ok((id.to_string(), fs::read(path)?)))
+            .collect::<AppResult<HashMap<_, _>>>()?;
+        let index_path = paths::session_index_path(&codex);
+        let index_before = fs::read(&index_path)?;
+        let family_path = paths::family_store_path(&codex);
+        let family_before = fs::read(&family_path)?;
+        let _conflict = crate::codex_projects::StateWriteConflictTestGuard::all_attempts();
+
+        let results = delete_sessions_with_lock(
+            Some("codex".to_string()),
+            codex.to_string_lossy().into_owned(),
+            None,
+            vec![active_id.to_string()],
+            None,
+            &family::FamilyLock::default(),
+        )?;
+
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].ok);
+        assert!(results[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("发生变化"));
+        for (id, path) in &paths_by_id {
+            assert_eq!(fs::read(path)?, rollout_before[id]);
+        }
+        assert_eq!(fs::read(&index_path)?, index_before);
+        assert_eq!(fs::read(&family_path)?, family_before);
+        let state = state_db::open_ro(&codex)?;
+        let rows: i64 = state.query_row(
+            "SELECT COUNT(*) FROM threads WHERE id IN (?1, ?2)",
+            params![archived_id, active_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(rows, 2);
+        assert_codex_project_state_membership(&codex, archived_id, true)?;
+        assert_codex_project_state_membership(&codex, active_id, true)?;
+        let global: serde_json::Value =
+            serde_json::from_slice(&fs::read(paths::codex_global_state_json_path(&codex))?)?;
+        assert_eq!(global["test-concurrent-write"], 3);
+
+        drop(state);
         fs::remove_dir_all(&codex).ok();
         Ok(())
     }

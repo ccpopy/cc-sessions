@@ -639,6 +639,9 @@ fn move_session_cwd(ctx: &MenuContext, provider: &str, session: &SessionSummary)
     if report.history_rows_updated > 0 {
         println!("更新 history.jsonl {} 行。", report.history_rows_updated);
     }
+    if provider == "codex" && !report.desktop_project_synced {
+        println!("警告：Core 已移动，但 Codex App 全局状态未初始化，项目归属未同步。");
+    }
     if report.requires_project_open {
         println!("提示：首次在目标目录启动 OpenCode 后，会自动登记真实项目 ID。");
     }
