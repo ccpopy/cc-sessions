@@ -107,7 +107,10 @@ pub fn remove(codex_dir: &Path, session_id: &str) -> AppResult<()> {
 /// 由前端降级为"未知来源"，损坏可由 backfill 修复工具重建）。
 pub fn origin_for(codex_dir: &Path, session_id: &str) -> Option<ArchiveOrigin> {
     let ledger = load(codex_dir).ok()?;
-    ledger.entries.get(session_id).map(|entry| entry.origin.clone())
+    ledger
+        .entries
+        .get(session_id)
+        .map(|entry| entry.origin.clone())
 }
 
 /// 只读返回全部记录（供 Tauri 命令 get_archive_ledger 与 backfill 使用）。

@@ -18,13 +18,12 @@ use crate::atomic_file;
 use crate::error::{ensure_not_cancelled, AppError, AppResult};
 use crate::family;
 use crate::models::{
-    ArchiveLedgerEntry, ArchiveOrigin, ArchiveOriginBackfillReport, BranchStatus,
-    BranchSyncReport, BranchSyncState, CloneReport, DiagnosticReport, DuplicateSessionReport,
-    Family, FamilyBranch, FamilyStore, ForkSessionReport, GuiVisibilityFixReport,
-    GuiVisibilityIssue, GuiVisibilityReport, HistoryOrphanReport, HistoryPruneReport,
-    IndexRepairReport, OrphanPruneReport, ProjectConfigIssue, ProjectConfigRepairItem,
-    ProjectConfigRepairReport, ProjectConfigReport, ProviderInfo, SwitchStrategy, SyncBranchReport,
-    ThreadsRebuildReport,
+    ArchiveLedgerEntry, ArchiveOrigin, ArchiveOriginBackfillReport, BranchStatus, BranchSyncReport,
+    BranchSyncState, CloneReport, DiagnosticReport, DuplicateSessionReport, Family, FamilyBranch,
+    FamilyStore, ForkSessionReport, GuiVisibilityFixReport, GuiVisibilityIssue,
+    GuiVisibilityReport, HistoryOrphanReport, HistoryPruneReport, IndexRepairReport,
+    OrphanPruneReport, ProjectConfigIssue, ProjectConfigRepairItem, ProjectConfigRepairReport,
+    ProjectConfigReport, ProviderInfo, SwitchStrategy, SyncBranchReport, ThreadsRebuildReport,
 };
 use crate::mutation_journal::{
     commit_transaction_with_compensation, rollback_transaction_with_compensation, MutationJournal,
@@ -1597,7 +1596,9 @@ pub fn backfill_archive_origins_with_lock(
     dry_run: bool,
     lock: &family::FamilyLock,
 ) -> AppResult<ArchiveOriginBackfillReport> {
-    family::with_lock(lock, |_g| backfill_archive_origins_locked(codex_dir, dry_run))
+    family::with_lock(lock, |_g| {
+        backfill_archive_origins_locked(codex_dir, dry_run)
+    })
 }
 
 fn backfill_archive_origins_locked(
@@ -8557,7 +8558,9 @@ mod tests {
                     provider: DEFAULT_PROVIDER.to_string(),
                     created_at: "2026-04-22T00:00:00Z".to_string(),
                     status: BranchStatus::Archived,
-                    rollout_relpath: format!("archived_sessions/2026/04/22/rollout-{fork_id}.jsonl"),
+                    rollout_relpath: format!(
+                        "archived_sessions/2026/04/22/rollout-{fork_id}.jsonl"
+                    ),
                     sha256: None,
                     line_count: None,
                     note: Some("forked_from:some-origin@line:0".to_string()),
@@ -8568,7 +8571,9 @@ mod tests {
                     provider: "custom".to_string(),
                     created_at: "2026-04-22T00:00:00Z".to_string(),
                     status: BranchStatus::Archived,
-                    rollout_relpath: format!("archived_sessions/2026/04/22/rollout-{sync_id}.jsonl"),
+                    rollout_relpath: format!(
+                        "archived_sessions/2026/04/22/rollout-{sync_id}.jsonl"
+                    ),
                     sha256: None,
                     line_count: None,
                     note: None,
@@ -8596,7 +8601,9 @@ mod tests {
             known_id,
             ArchiveOrigin::Manual,
             Some(1_700_000_000),
-            Some(format!("archived_sessions/2026/04/22/rollout-{known_id}.jsonl")),
+            Some(format!(
+                "archived_sessions/2026/04/22/rollout-{known_id}.jsonl"
+            )),
             None,
         )?;
 

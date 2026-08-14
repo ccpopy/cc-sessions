@@ -12,8 +12,7 @@ use crate::family;
 use crate::history;
 use crate::logs_db;
 use crate::models::{
-    ArchiveOrigin, DeleteResult, DeleteTarget, MoveSessionCwdReport, ProjectGroup,
-    SessionSummary,
+    ArchiveOrigin, DeleteResult, DeleteTarget, MoveSessionCwdReport, ProjectGroup, SessionSummary,
 };
 use crate::paths;
 use crate::provenance;
@@ -1199,16 +1198,15 @@ fn set_archived_codex_locked(codex_dir: String, id: String, v: bool) -> AppResul
     //    既有代码没有 MutationJournal，因此放在所有文件/数据库写入成功之后，
     //    ledger 失败不会影响主流程已完成的状态，用户重试即可补齐。
     if v {
-        let sha256 = family::resolve_family_id_strict(&family_store, &id)?
-            .and_then(|family_id| {
-                family_store
-                    .families
-                    .get(&family_id)?
-                    .chain
-                    .iter()
-                    .find(|branch| branch.id == id)
-                    .and_then(|branch| branch.sha256.clone())
-            });
+        let sha256 = family::resolve_family_id_strict(&family_store, &id)?.and_then(|family_id| {
+            family_store
+                .families
+                .get(&family_id)?
+                .chain
+                .iter()
+                .find(|branch| branch.id == id)
+                .and_then(|branch| branch.sha256.clone())
+        });
         crate::archive_ledger::record(
             &codex,
             &id,
@@ -4208,7 +4206,8 @@ mod tests {
     #[test]
     fn archive_moves_rollout_updates_threads_and_index() -> AppResult<()> {
         let codex = temp_dir("codex-archive");
-        let active = archive_fixture(&codex);        let codex_str = codex.to_string_lossy().into_owned();
+        let active = archive_fixture(&codex);
+        let codex_str = codex.to_string_lossy().into_owned();
         let family_lock = family::FamilyLock::default();
 
         set_archived_with_lock(

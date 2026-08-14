@@ -2461,9 +2461,7 @@ fn restore_one(
             Some(dest.to_string_lossy().into_owned()),
             Some(target.sha256_rollout.clone()),
         ) {
-            result.error = Some(format!(
-                "Codex 会话已完整还原，但登记归档来源失败: {error}"
-            ));
+            result.error = Some(format!("Codex 会话已完整还原，但登记归档来源失败: {error}"));
         }
     }
     if let Err(error) = snapshots.cleanup() {
