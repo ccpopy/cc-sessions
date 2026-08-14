@@ -200,12 +200,11 @@ pub(crate) fn validate_missing_thread_project_assignment_records(
     validate_project_assignment_records(codex, records, true)
 }
 
-/// Fill only threads that do not already have a valid explicit project membership.
+/// Fill only threads that have neither a valid project membership nor an explicit projectless state.
 ///
-/// This is intended for full index/database repair: rollout cwd may lag behind an official
-/// Desktop move while its assignment is pending. Existing valid assignments, including pending
-/// ones, are therefore preserved byte-for-byte. A non-object assignment is malformed current
-/// state and aborts the mutation instead of being silently overwritten.
+/// Rollout cwd may lag behind Desktop-owned state. Existing assignments, including pending ones,
+/// and an explicit `projectless-thread-ids` entry are therefore preserved byte-for-byte. A
+/// malformed current field aborts the mutation instead of being silently overwritten.
 #[cfg(test)]
 fn sync_missing_thread_project_assignment_records(
     codex: &Path,
@@ -319,6 +318,23 @@ fn should_preserve_thread_project_assignment(
     thread_id: &str,
     core_cwd: &str,
 ) -> AppResult<bool> {
+    match state.get(PROJECTLESS_THREADS) {
+        Some(Value::Array(projectless)) => {
+            if projectless
+                .iter()
+                .any(|entry| entry.as_str() == Some(thread_id))
+            {
+                return Ok(true);
+            }
+        }
+        Some(_) => {
+            return Err(AppError::Other(format!(
+                "Codex 全局状态字段 {PROJECTLESS_THREADS} 必须是数组"
+            )))
+        }
+        None => {}
+    }
+
     let Some(assignments) = state.get(THREAD_ASSIGNMENTS) else {
         return Ok(false);
     };
@@ -1349,6 +1365,28 @@ mod tests {
             state[THREAD_ASSIGNMENTS]["invalid-thread"]["cwd"],
             r"F:\repaired\repo"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_only_batch_preserves_explicit_projectless_state() -> AppResult<()> {
+        let codex = TestDir::new("preserve-explicit-projectless-state")?;
+        codex.write_state(&json!({
+            LOCAL_PROJECTS: {},
+            PROJECT_ORDER: [],
+            PROJECTLESS_THREADS: ["projectless-thread"]
+        }))?;
+        let before = fs::read(codex.state_path())?;
+
+        assert!(!sync_missing_thread_project_assignment_records(
+            &codex.0,
+            &[(
+                "projectless-thread".to_string(),
+                r"F:\should-not-become-a-project".to_string(),
+            )]
+        )?);
+
+        assert_eq!(fs::read(codex.state_path())?, before);
         Ok(())
     }
 
