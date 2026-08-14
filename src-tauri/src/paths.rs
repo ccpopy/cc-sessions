@@ -199,6 +199,13 @@ pub fn family_store_path(codex: &Path) -> PathBuf {
     codex.join("session_family.json")
 }
 
+/// CC Sessions 自己维护的归档来源登记，Codex/Claude 原生均不读取。
+/// 放在 codex_home 根目录（与 session_family.json 平级），不放 sessions/ 或
+/// archived_sessions/——官方 `codex doctor` 的 scan_rollout_files 会扫描这两个根。
+pub fn archive_ledger_path(codex: &Path) -> PathBuf {
+    codex.join("archive_ledger.json")
+}
+
 /// CC Sessions 自己维护的转换来源登记，Codex/Claude 原生均不读取。
 pub fn session_provenance_path(codex: &Path) -> PathBuf {
     codex.join("session_provenance.json")

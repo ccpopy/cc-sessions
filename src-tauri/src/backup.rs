@@ -9,8 +9,8 @@ use crate::atomic_file;
 use crate::error::{AppError, AppResult};
 use crate::logs_db;
 use crate::models::{
-    BackupDetail, BackupSummary, BundleExportTarget, Manifest, ManifestArtifact, ManifestSession,
-    RestoreResult, VerifyItem, VerifyReport,
+    ArchiveOrigin, BackupDetail, BackupSummary, BundleExportTarget, Manifest, ManifestArtifact,
+    ManifestSession, RestoreResult, VerifyItem, VerifyReport,
 };
 use crate::path_safety::{self, EntryKind};
 use crate::paths;
@@ -2449,6 +2449,23 @@ fn restore_one(
     }
 
     result.ok = true;
+    // 归档来源账本：还原到 archived_sessions/ 的会话记录为 Restore（D10）。
+    // 无 MutationJournal（RestoreFileSnapshots 补偿），因此放在 commit 之后最后一步，
+    // 失败仅记入 result.error，不回滚已成功的主流程（与 cleanup 失败同模式）。
+    if target_rel.starts_with("archived_sessions") {
+        if let Err(error) = crate::archive_ledger::record(
+            codex,
+            &target.id,
+            ArchiveOrigin::Restore,
+            Some(chrono::Utc::now().timestamp()),
+            Some(dest.to_string_lossy().into_owned()),
+            Some(target.sha256_rollout.clone()),
+        ) {
+            result.error = Some(format!(
+                "Codex 会话已完整还原，但登记归档来源失败: {error}"
+            ));
+        }
+    }
     if let Err(error) = snapshots.cleanup() {
         result.error = Some(format!("Codex 会话已完整还原，但 {error}"));
     }
@@ -3429,6 +3446,62 @@ mod tests {
                 row.get(0)
             })?;
         assert_eq!(restored_cwd, row_cwd);
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn codex_restore_to_archived_sessions_records_restore_origin() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-codex-restore-archived-ledger-test");
+        let backup = root.join("backup");
+        let codex = root.join("codex");
+        let id = "restore-archived-origin";
+        let relative = PathBuf::from(format!("archived_sessions/rollout-{id}.jsonl"));
+        fs::create_dir_all(&codex)?;
+
+        let state = rusqlite::Connection::open(codex.join("state_5.sqlite"))?;
+        state.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT, archived INTEGER, archived_at INTEGER)",
+            [],
+        )?;
+        drop(state);
+
+        let target = write_codex_restore_backup(
+            &backup,
+            id,
+            &relative,
+            serde_json::json!({
+                "id": id,
+                "rollout_path": backup.join(&relative).to_string_lossy(),
+                "cwd": r"F:\work\sample",
+                "title": "restored archived thread",
+                "archived": 1,
+                "archived_at": 1770000400
+            }),
+            r"F:\work\sample",
+        )?;
+
+        let restored = restore_one(&backup, &codex, &target, false)?;
+        assert!(restored.ok, "restore failed: {:?}", restored.error);
+
+        // 归档来源账本：还原到 archived_sessions/ 应记录 Restore，校验和与备份一致
+        let ledger = crate::archive_ledger::load(&codex)?;
+        let entry = ledger
+            .entries
+            .get(id)
+            .expect("归档路径还原应记录 ArchiveOrigin::Restore");
+        assert_eq!(entry.origin, ArchiveOrigin::Restore);
+        assert!(entry.archived_at.is_some());
+        assert_eq!(
+            entry.sha256.as_deref(),
+            Some(target.sha256_rollout.as_str())
+        );
+        assert!(entry
+            .source_path
+            .as_deref()
+            .unwrap_or_default()
+            .contains("archived_sessions"));
 
         fs::remove_dir_all(root).ok();
         Ok(())

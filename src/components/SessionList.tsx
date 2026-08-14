@@ -1,12 +1,14 @@
 import { memo, useMemo, type RefObject } from "react";
 
+import { ArchivedSessionView } from "@/components/ArchivedSessionView";
 import { ProjectSessionView } from "@/components/ProjectSessionView";
 import type { SessionCardHandlers } from "@/components/SelectableSessionCard";
 import { SizeSessionView } from "@/components/SizeSessionView";
 import { TimeSessionView } from "@/components/TimeSessionView";
 import type { SessionListViewProps } from "@/components/SessionListRowCard";
-import type { FamilyOverlay, SessionSummary } from "@/lib/api";
+import type { ArchiveOrigin, FamilyOverlay, SessionSummary } from "@/lib/api";
 import { sessionIdentity } from "@/lib/sessionIdentity";
+import type { ArchivedOriginGroupKey } from "@/lib/sessionVisibility";
 import { useView } from "@/stores/view";
 
 type Props = SessionCardHandlers & {
@@ -18,6 +20,10 @@ type Props = SessionCardHandlers & {
   syncingSessionIds?: ReadonlySet<string>;
   syncActionsDisabled?: boolean;
   duplicatingSessionIds?: ReadonlySet<string>;
+  archivedGrouping?: {
+    ledgerBySession: ReadonlyMap<string, ArchiveOrigin>;
+    originFilter: ArchivedOriginGroupKey | "all";
+  } | null;
 };
 
 export const SessionList = memo(function SessionList({
@@ -29,6 +35,7 @@ export const SessionList = memo(function SessionList({
   syncingSessionIds,
   syncActionsDisabled,
   duplicatingSessionIds,
+  archivedGrouping,
   ...handlers
 }: Props) {
   const view = useView((state) => state.view);
@@ -59,6 +66,15 @@ export const SessionList = memo(function SessionList({
     duplicatingSessionIds,
   };
 
+  if (archivedGrouping) {
+    return (
+      <ArchivedSessionView
+        {...viewProps}
+        ledgerBySession={archivedGrouping.ledgerBySession}
+        originFilter={archivedGrouping.originFilter}
+      />
+    );
+  }
   if (view === "project") return <ProjectSessionView {...viewProps} />;
   if (view === "size") return <SizeSessionView {...viewProps} />;
   return <TimeSessionView {...viewProps} />;

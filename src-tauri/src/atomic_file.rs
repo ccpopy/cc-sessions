@@ -58,6 +58,43 @@ pub fn create_with_writer_if_absent(
     replace_with_writer(path, None, writer)
 }
 
+/// Atomically create-or-overwrite `path` with the writer's content.
+///
+/// Unlike `replace_with_writer_if_unchanged` there is no fingerprint precondition:
+/// callers must serialize writers themselves (e.g. under the family lock), because
+/// the target is a CC Sessions-owned JSON store that Codex/Claude never write.
+pub fn overwrite_with_writer(
+    path: &Path,
+    writer: impl FnOnce(&mut File) -> AppResult<()>,
+) -> AppResult<()> {
+    let (temp_path, mut temp_file) = create_unique_temp(path)?;
+    let write_result = writer(&mut temp_file).and_then(|()| {
+        temp_file.flush()?;
+        temp_file.sync_all()?;
+        Ok(())
+    });
+    drop(temp_file);
+    if let Err(error) = write_result {
+        return Err(cleanup_after_error(
+            &temp_path,
+            atomic_write_not_committed(error),
+        ));
+    }
+    replace_file_atomically(&temp_path, path, true).map_err(|error| {
+        AppError::AtomicWriteNotCommitted(format!(
+            "原子替换目标文件失败 {}: {error}",
+            path.to_string_lossy()
+        ))
+    })?;
+    sync_parent(path).map_err(|error| {
+        AppError::AtomicWriteCommitted(format!(
+            "文件已写入，但同步父目录失败 {}: {error}",
+            path.to_string_lossy()
+        ))
+    })?;
+    Ok(())
+}
+
 /// Move an existing file without ever replacing an existing destination entry.
 ///
 /// The platform no-replace rename is the atomic commit point. This is intentionally limited to

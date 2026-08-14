@@ -129,6 +129,12 @@ pub(super) fn delete_codex_artifacts_batch_with_family_store(
                 })?;
             }
 
+            // C5：删除会话后同步归档来源账本，经 journal 纳入同一补偿（M3 一致）。
+            // 无记录时 remove 是 no-op 且不写盘，不会因此创建账本文件。
+            journal.mutate_file(&paths::archive_ledger_path(codex_dir), || {
+                crate::archive_ledger::remove(codex_dir, &prepared.id)
+            })?;
+
             outcomes.push(CodexDeleteOutcome {
                 result: DeleteResult {
                     id: prepared.id.clone(),

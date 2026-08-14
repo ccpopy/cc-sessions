@@ -1,5 +1,6 @@
 #[cfg(feature = "desktop")]
 pub mod app_update;
+pub mod archive_ledger;
 pub mod atomic_file;
 pub mod backup;
 pub mod bundle;
@@ -124,6 +125,8 @@ pub fn run() {
             commands::repair_session_index,
             commands::rebuild_threads_table,
             commands::prune_orphan_entries,
+            commands::backfill_archive_origins,
+            commands::get_archive_ledger,
             commands::diagnose_claude_history_orphans,
             commands::prune_claude_history_orphans,
             commands::diagnose_claude_gui_visibility,

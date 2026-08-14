@@ -7,6 +7,7 @@
 //! 业务实现仍在各自模块（`*_with_lock` / 同名同步函数），CLI 与 WebUI 继续
 //! 直接调用同步版本；本模块仅在 desktop feature 下编译。
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::error::{AppError, AppResult};
@@ -498,6 +499,24 @@ pub async fn prune_orphan_entries(
 #[tauri::command]
 pub async fn diagnose_claude_history_orphans(claude_dir: String) -> AppResult<HistoryOrphanReport> {
     run_blocking(move || crate::repair::diagnose_claude_history_orphans(claude_dir)).await
+}
+
+#[tauri::command]
+pub async fn backfill_archive_origins(
+    codex_dir: String,
+    dry_run: bool,
+    lock: SharedLock<'_>,
+) -> AppResult<ArchiveOriginBackfillReport> {
+    let lock = lock.inner().clone();
+    run_blocking(move || {
+        crate::repair::backfill_archive_origins_with_lock(codex_dir, dry_run, &lock)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn get_archive_ledger(codex_dir: String) -> AppResult<Vec<ArchiveLedgerEntry>> {
+    run_blocking(move || crate::archive_ledger::entries(&PathBuf::from(codex_dir))).await
 }
 
 #[tauri::command]

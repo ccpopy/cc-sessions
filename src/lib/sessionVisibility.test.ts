@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { FamilyOverlay, SessionSummary } from "./api";
-import { selectNormalFamilySessions, selectSessionsForView } from "./sessionVisibility.ts";
+import type { ArchiveOrigin, FamilyOverlay, SessionSummary } from "./api";
+import {
+  groupArchivedByOrigin,
+  selectNormalFamilySessions,
+  selectSessionsForView,
+} from "./sessionVisibility.ts";
 
 function session(id: string, updatedAt: number): SessionSummary {
   return {
@@ -203,5 +207,51 @@ test("search scope honors overlay-only subagent classification", () => {
       showArchivedSessions: false,
     }).map((item) => item.id),
     ["overlay-subagent"],
+  );
+});
+
+test("archived view groups sessions by origin into the four fixed groups", () => {
+  const mine = { ...session("mine-a", 100), archived: true };
+  const fork = { ...session("fork-b", 200), archived: true };
+  const auto = { ...session("auto-c", 300), archived: true };
+  const migrated = { ...session("migrated-d", 400), archived: true };
+  const unknown = { ...session("unknown-e", 500), archived: true };
+  const ledger = new Map<string, ArchiveOrigin>([
+    [mine.id, "manual"],
+    [fork.id, "fork"],
+    [auto.id, "provider_sync"],
+    [migrated.id, "restore"],
+    // unknown-e 无 ledger 记录
+  ]);
+
+  const groups = groupArchivedByOrigin([mine, fork, auto, migrated, unknown], ledger);
+  assert.deepEqual(
+    groups.map((g) => [g.key, g.sessions.map((s) => s.id)]),
+    [
+      ["mine", ["mine-a", "fork-b"]],
+      ["auto", ["auto-c"]],
+      ["migrated", ["migrated-d"]],
+      ["unknown", ["unknown-e"]],
+    ],
+  );
+});
+
+test("groupArchivedByOrigin drops empty groups and keeps input order within a group", () => {
+  const first = { ...session("first", 300), archived: true };
+  const second = { ...session("second", 100), archived: true };
+  const groups = groupArchivedByOrigin(
+    [first, second],
+    new Map<string, ArchiveOrigin>([
+      [first.id, "provider_sync"],
+      [second.id, "import"],
+    ]),
+  );
+  // auto 与 migrated 组内保持传入顺序；mine/unknown 为空组被过滤
+  assert.deepEqual(
+    groups.map((g) => [g.key, g.sessions.map((s) => s.id)]),
+    [
+      ["auto", ["first"]],
+      ["migrated", ["second"]],
+    ],
   );
 });

@@ -32,8 +32,8 @@ use crate::atomic_file;
 use crate::error::{AppError, AppResult};
 use crate::family;
 use crate::models::{
-    BundleExportTarget, BundleListItem, BundleManifest, ExportReport, ImportMode, ImportReport,
-    ManifestArtifact, ProjectPathMapping, SessionSummary,
+    ArchiveOrigin, BundleExportTarget, BundleListItem, BundleManifest, ExportReport, ImportMode,
+    ImportReport, ManifestArtifact, ProjectPathMapping, SessionSummary,
 };
 use crate::paths;
 use crate::state_db;
@@ -3131,6 +3131,23 @@ fn import_one(
             )
         })?;
 
+        // 归档来源账本：导入到 archived_sessions/ 的会话记录为 Import（D9）。
+        // 纳入同一 journal，失败回滚时 ledger 一并还原（与 C2 同模式）。
+        if dest_abs.starts_with(paths::archived_sessions_dir(codex)) {
+            let ledger_path = paths::archive_ledger_path(codex);
+            journal.mutate_file(&ledger_path, || {
+                let sha = sha256_file(&dest_abs)?;
+                crate::archive_ledger::record(
+                    codex,
+                    &item.manifest.session_id,
+                    ArchiveOrigin::Import,
+                    Some(chrono::Utc::now().timestamp()),
+                    Some(dest_abs.to_string_lossy().into_owned()),
+                    Some(sha),
+                )
+            })?;
+        }
+
         let history_appended = if hist_src.is_file() {
             let history_path = paths::history_path(codex);
             journal.mutate_file(&history_path, || {
@@ -3265,7 +3282,8 @@ fn ensure_codex_import_visible(
 ) -> AppResult<(bool, bool)> {
     let threads_upserted = if has_state_db {
         if use_manifest_metadata {
-            upsert_threads_minimal_on_connection(state, manifest, rollout, core_cwd)?;
+            let archived = rollout.starts_with(paths::archived_sessions_dir(codex));
+            upsert_threads_minimal_on_connection(state, manifest, rollout, core_cwd, archived)?;
         } else {
             if !crate::repair::upsert_thread_from_rollout(codex, state, rollout, false)? {
                 return Err(AppError::InvalidCodexDir(format!(
@@ -3566,6 +3584,7 @@ fn upsert_threads_minimal_on_connection(
     m: &BundleManifest,
     dest_abs: &Path,
     import_cwd: &str,
+    archived: bool,
 ) -> AppResult<()> {
     let updated_at = m.updated_at;
     let source = m
@@ -3574,19 +3593,29 @@ fn upsert_threads_minimal_on_connection(
         .filter(|source| crate::repair::is_desktop_visible_source(Some(source)))
         .unwrap_or("cli")
         .to_string();
+    // D9：archived 不再硬编码 0——目标在 archived_sessions/ 时导入的就是归档会话。
+    // archived_at 用导入时刻（官方语义为归档操作时刻，D15）。
+    let archived_value: i64 = if archived { 1 } else { 0 };
+    let archived_at: Option<i64> = if archived {
+        Some(chrono::Utc::now().timestamp())
+    } else {
+        None
+    };
     let sql = "INSERT INTO threads (
             id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
-            sandbox_policy, approval_mode, memory_mode, archived, tokens_used, has_user_event,
-            first_user_message, cli_version
+            sandbox_policy, approval_mode, memory_mode, archived, archived_at, tokens_used,
+            has_user_event, first_user_message, cli_version
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 1, ?, '')
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, '')
         ON CONFLICT(id) DO UPDATE SET
             rollout_path=excluded.rollout_path,
             updated_at=excluded.updated_at,
             model_provider=excluded.model_provider,
             cwd=excluded.cwd,
             title=excluded.title,
-            first_user_message=excluded.first_user_message";
+            first_user_message=excluded.first_user_message,
+            archived=excluded.archived,
+            archived_at=excluded.archived_at";
     conn.execute(
         sql,
         params![
@@ -3601,6 +3630,8 @@ fn upsert_threads_minimal_on_connection(
             DEFAULT_SANDBOX_POLICY,
             DEFAULT_APPROVAL_MODE,
             DEFAULT_MEMORY_MODE,
+            archived_value,
+            archived_at,
             m.thread_name,
         ],
     )?;
@@ -4331,6 +4362,7 @@ mod tests {
                 approval_mode TEXT,
                 memory_mode TEXT,
                 archived INTEGER,
+                archived_at INTEGER,
                 tokens_used INTEGER,
                 has_user_event INTEGER,
                 first_user_message TEXT,
@@ -5248,6 +5280,85 @@ mod tests {
             Some(unix_seconds_to_rfc3339(updated_at)?.as_str())
         );
         assert!(index_line.get("rollout_path").is_none());
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn codex_import_to_archived_sessions_records_import_origin() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-codex-bundle-archived-import-test");
+        let source_codex = root.join("source-codex");
+        let import_codex = root.join("import-codex");
+        let bundle_dir = root.join("bundles");
+        let id = "codex-bundle-archived-import";
+        write_codex_rollout_only(
+            &source_codex.join("archived_sessions"),
+            id,
+            "archived import",
+        )?;
+
+        let reports = export_session_bundles(
+            Some(PROVIDER_CODEX.to_string()),
+            source_codex.to_string_lossy().into_owned(),
+            None,
+            bundle_dir.to_string_lossy().into_owned(),
+            vec![id.to_string()],
+            None,
+            Some("test-machine".to_string()),
+            Some("default".to_string()),
+        )?;
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].ok);
+
+        drop(create_bundle_state(&import_codex)?);
+        let imported = import_session_bundles(
+            Some(PROVIDER_CODEX.to_string()),
+            bundle_dir.to_string_lossy().into_owned(),
+            import_codex.to_string_lossy().into_owned(),
+            None,
+            ImportMode::Overwrite,
+            true,
+            true,
+            vec![],
+        )?;
+        assert_eq!(imported.len(), 1);
+        assert!(imported[0].ok);
+        assert!(imported[0].threads_upserted);
+
+        // D9：导入到 archived_sessions/ 的会话在 threads 中必须保持 archived=1，
+        // 不能像普通会话一样被 make_visible 展开为活跃会话。
+        let conn = rusqlite::Connection::open(import_codex.join("state_5.sqlite"))?;
+        let archived: i64 =
+            conn.query_row("SELECT archived FROM threads WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })?;
+        assert_eq!(archived, 1);
+        let archived_at: Option<i64> =
+            conn.query_row("SELECT archived_at FROM threads WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })?;
+        assert!(archived_at.is_some());
+
+        // C4：归档来源账本记录 Import，sha256 为导入后的实际文件哈希。
+        let origin = crate::archive_ledger::origin_for(&import_codex, id);
+        assert_eq!(origin, Some(ArchiveOrigin::Import));
+        let ledger_entries = crate::archive_ledger::entries(&import_codex)?;
+        let entry = ledger_entries
+            .iter()
+            .find(|entry| entry.session_id == id)
+            .expect("ledger 应包含导入会话");
+        assert!(entry.archived_at.is_some());
+        assert!(entry.source_path.as_deref().is_some_and(|path| {
+            path.ends_with("archived_sessions")
+                || path.contains("/archived_sessions/")
+                || path.contains("\\archived_sessions\\")
+        }));
+        let dest = import_codex
+            .join("archived_sessions")
+            .join(format!("rollout-{id}.jsonl"));
+        let expected_sha = sha256_file(&dest)?;
+        assert_eq!(entry.sha256.as_deref(), Some(expected_sha.as_str()));
 
         fs::remove_dir_all(root).ok();
         Ok(())

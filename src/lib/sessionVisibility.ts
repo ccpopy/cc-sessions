@@ -1,4 +1,4 @@
-import type { FamilyOverlay, SessionSummary } from "./api";
+import type { ArchiveOrigin, FamilyOverlay, SessionSummary } from "./api";
 import { isSubagentSession } from "./sessionSource.ts";
 
 export type SessionVisibilityOptions = {
@@ -133,4 +133,67 @@ function compareSessionActivityDesc(left: SessionSummary, right: SessionSummary)
   const createdDelta = right.created_at - left.created_at;
   if (createdDelta !== 0) return createdDelta;
   return left.id.localeCompare(right.id);
+}
+
+/** 归档视图的分组键：按归档来源聚合，是跨 provider 的统一维度（计划 §F3）。 */
+export type ArchivedOriginGroupKey = "mine" | "auto" | "migrated" | "unknown";
+
+export type ArchivedOriginGroup = {
+  key: ArchivedOriginGroupKey;
+  label: string;
+  sessions: SessionSummary[];
+};
+
+const ARCHIVED_GROUP_LABELS: Record<ArchivedOriginGroupKey, string> = {
+  mine: "我的归档",
+  auto: "工具自动归档",
+  migrated: "迁移记录",
+  unknown: "未知来源",
+};
+
+/**
+ * 把归档会话按来源分成四个固定分组（空组不返回）：
+ * - mine：manual/official/fork，用户主动归档的高价值来源
+ * - auto：provider_sync，切换模型服务配置时由工具自动归档
+ * - migrated：restore/import，备份恢复或会话包导入产生的归档
+ * - unknown：unknown 或无 ledger 记录，来源无法判定
+ *
+ * 分组天然跨 provider：各 provider 的归档分支按 origin 混入同一组，
+ * 这正是 ledger 的价值——origin 是跨 provider 统一维度。组内保持传入顺序
+ * （调用方已按 updated_at 排序）。
+ */
+export function groupArchivedByOrigin(
+  sessions: readonly SessionSummary[],
+  ledgerBySession: ReadonlyMap<string, ArchiveOrigin>,
+): ArchivedOriginGroup[] {
+  const buckets: Record<ArchivedOriginGroupKey, SessionSummary[]> = {
+    mine: [],
+    auto: [],
+    migrated: [],
+    unknown: [],
+  };
+  for (const session of sessions) {
+    const key = archiveOriginGroupKey(ledgerBySession.get(session.id));
+    buckets[key].push(session);
+  }
+  return (Object.keys(ARCHIVED_GROUP_LABELS) as ArchivedOriginGroupKey[])
+    .filter((key) => buckets[key].length > 0)
+    .map((key) => ({ key, label: ARCHIVED_GROUP_LABELS[key], sessions: buckets[key] }));
+}
+
+function archiveOriginGroupKey(origin: ArchiveOrigin | undefined): ArchivedOriginGroupKey {
+  switch (origin) {
+    case "manual":
+    case "official":
+    case "fork":
+      return "mine";
+    case "provider_sync":
+      return "auto";
+    case "restore":
+    case "import":
+      return "migrated";
+    default:
+      // unknown 或 ledger 中无记录（undefined）：归入"未知来源"
+      return "unknown";
+  }
 }

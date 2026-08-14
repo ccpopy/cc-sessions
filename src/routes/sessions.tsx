@@ -43,6 +43,8 @@ import { useView } from "@/stores/view";
 import { useHotkeys } from "@/hooks/useHotkeys";
 import {
   api,
+  type ArchiveLedgerEntry,
+  type ArchiveOrigin,
   type ContentSearchMatch,
   type DeleteResult,
   type FamilyOverlay,
@@ -61,7 +63,17 @@ import {
 import { SessionActionRegistry } from "@/lib/sessionActionRegistry";
 import {
   selectSessionsForView,
+  type ArchivedOriginGroupKey,
 } from "@/lib/sessionVisibility";
+
+// 归档视图来源筛选 chips：单选互斥，"all" 表示不过滤
+const archiveOriginFilters: { key: ArchivedOriginGroupKey | "all"; label: string }[] = [
+  { key: "all", label: "全部" },
+  { key: "mine", label: "我的归档" },
+  { key: "auto", label: "工具自动归档" },
+  { key: "migrated", label: "迁移记录" },
+  { key: "unknown", label: "未知来源" },
+];
 
 export default function SessionsRoute({ provider = "codex" }: { provider?: SessionProvider }) {
   const navigate = useNavigate();
@@ -113,6 +125,11 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const [maintenanceError, setMaintenanceError] = useState<string | null>(null);
   const [providerSyncProgress, setProviderSyncProgress] = useState<ProviderSyncStatus | null>(null);
   const [familySheetId, setFamilySheetId] = useState<string | null>(null);
+  // 归档来源 ledger：归档视图按来源分组的前置数据；读取失败时回退为全部"未知来源"
+  const [ledgerBySession, setLedgerBySession] = useState<Map<string, ArchiveOrigin>>(new Map());
+  const [archiveLedgerError, setArchiveLedgerError] = useState<string | null>(null);
+  // 归档视图来源筛选 chips：单选互斥，"all" 表示不过滤
+  const [originFilter, setOriginFilter] = useState<ArchivedOriginGroupKey | "all">("all");
   const providerSyncRegistry = useRef(new ProviderSyncRegistry());
   const duplicateRegistry = useRef(new SessionActionRegistry());
   const [providerSyncState, setProviderSyncState] = useState<ProviderSyncSnapshot>(() =>
@@ -185,10 +202,25 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     if (active?.scope === overlayScope) return active.promise;
 
     const requestId = ++overlayRequestSeq.current;
+    // ledger 单独捕获失败：来源分组是展示层增强，读取失败只降级为"全部未知来源"，
+    // 不能连带 overlay/provider 状态一起失败（计划 §F3 失败降级要求）。
+    const ledgerPromise = api
+      .getArchiveLedger(codexDir)
+      .then((ledger) => {
+        if (overlayScopeRef.current !== overlayScope) return;
+        setLedgerBySession(new Map(ledger.map((entry) => [entry.session_id, entry.origin])));
+        setArchiveLedgerError(null);
+      })
+      .catch((error) => {
+        if (overlayScopeRef.current !== overlayScope) return;
+        setLedgerBySession(new Map());
+        setArchiveLedgerError(String((error as Error)?.message ?? error));
+      });
     const promise: Promise<void> = Promise.all([
       api.getSessionFamilyOverlay(codexDir),
       api.getProviderInfo(codexDir),
       api.getProviderSyncPlan(codexDir),
+      ledgerPromise,
     ])
       .then(([ov, info, syncPlan]) => {
         if (overlayScopeRef.current !== overlayScope) return;
@@ -693,6 +725,36 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         </div>
       )}
 
+      {isCodex && showArchivedSessions && (
+        <>
+          {archiveLedgerError && (
+            <div className="flex shrink-0 items-start gap-2 border-b border-amber-500/30 bg-amber-500/10 px-6 py-2 text-xs text-amber-800 dark:text-amber-300">
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span className="min-w-0 break-words">
+                归档来源读取失败，已按"未知来源"分组显示：{archiveLedgerError}
+              </span>
+            </div>
+          )}
+          <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-b bg-muted/20 px-6 py-2 text-xs">
+            <span className="text-muted-foreground">归档来源：</span>
+            {archiveOriginFilters.map((filter) => (
+              <button
+                key={filter.key}
+                type="button"
+                onClick={() => setOriginFilter(filter.key)}
+                className={`rounded-full border px-2.5 py-0.5 text-[11px] transition-colors ${
+                  originFilter === filter.key
+                    ? "border-foreground/30 bg-foreground/10 text-foreground"
+                    : "border-border/60 text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                {filter.label}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+
       <ScrollArea className="flex-1" viewportRef={sessionScrollRef}>
         {error ? (
           <EmptyState
@@ -740,6 +802,9 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             syncingSessionIds={providerSyncState.sessionIds}
             syncActionsDisabled={providerSyncState.batchActive}
             duplicatingSessionIds={duplicatingSessionIds}
+            archivedGrouping={
+              isCodex && showArchivedSessions ? { ledgerBySession, originFilter } : undefined
+            }
             onPreview={onPreview}
             onCopyResume={onCopyResume}
             onRevealCwd={onReveal}

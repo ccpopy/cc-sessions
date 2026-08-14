@@ -32,6 +32,7 @@ import {
 } from "@/components/ui/alert-dialog";
 
 import { api, type BranchSyncState, type Family, type FamilyBranch } from "@/lib/api";
+import { ArchiveOriginBadge } from "@/components/ArchiveOriginBadge";
 
 type SyncTarget = {
   branch: FamilyBranch;
@@ -302,11 +303,7 @@ export function FamilyHistorySheet({
                                 {inactiveBranchStatusLabel(b.status)}
                               </Badge>
                             )}
-                            {!isActive && b.archive_origin === "provider_sync" && (
-                              <Badge variant="outline" className="h-5 px-1.5 font-normal text-blue-600">
-                                同步分支
-                              </Badge>
-                            )}
+                            {!isActive && <ArchiveOriginBadge origin={b.archive_origin ?? null} />}
                             <span className="text-muted-foreground">
                               {safeDate(b.created_at)}
                             </span>
