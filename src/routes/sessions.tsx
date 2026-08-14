@@ -28,6 +28,7 @@ import { EmptyState } from "@/components/EmptyState";
 import { FamilyHistorySheet } from "@/components/FamilyHistorySheet";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
+import { FilterTabs } from "@/components/ui/filter-tabs";
 import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
@@ -735,22 +736,16 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
               </span>
             </div>
           )}
-          <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-b bg-muted/20 px-6 py-2 text-xs">
-            <span className="text-muted-foreground">归档来源：</span>
-            {archiveOriginFilters.map((filter) => (
-              <button
-                key={filter.key}
-                type="button"
-                onClick={() => setOriginFilter(filter.key)}
-                className={`rounded-full border px-2.5 py-0.5 text-[11px] transition-colors ${
-                  originFilter === filter.key
-                    ? "border-foreground/30 bg-foreground/10 text-foreground"
-                    : "border-border/60 text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                {filter.label}
-              </button>
-            ))}
+          <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-b bg-muted/20 px-6 py-2">
+            <FilterTabs
+              label="归档来源"
+              value={originFilter}
+              options={archiveOriginFilters.map((filter) => ({
+                value: filter.key,
+                label: filter.label,
+              }))}
+              onChange={setOriginFilter}
+            />
           </div>
         </>
       )}
