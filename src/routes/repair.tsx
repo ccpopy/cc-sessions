@@ -302,7 +302,7 @@ function CodexRepairRoute() {
                       <TooltipContent className="max-w-sm text-xs">
                         扫描所有本地会话文件，重新生成
                         <code>session_index.jsonl</code> 索引文件。适用于：会话列表出现条目遗漏、排序错乱，
-                        或是不小心删除了索引文件的情况。
+                        或是不小心删除了索引文件的情况。不会修改 Codex Desktop 的项目或目录归属。
                       </TooltipContent>
                     </Tooltip>
 
@@ -333,6 +333,7 @@ function CodexRepairRoute() {
                         读取所有的会话文件，将它们的信息批量同步到
                         应用数据库中。
                         适用于：当你发现左侧边栏的历史会话消失或列表变为空白时，可以使用此功能进行修复。
+                        不会修改 Codex Desktop 的项目或目录归属。
                       </TooltipContent>
                     </Tooltip>
 

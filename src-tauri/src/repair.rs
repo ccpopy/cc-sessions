@@ -1038,27 +1038,15 @@ pub fn diagnose_codex_state(codex_dir: String) -> AppResult<DiagnosticReport> {
 
 pub fn repair_session_index(codex_dir: String, dry_run: bool) -> AppResult<IndexRepairReport> {
     let codex = PathBuf::from(&codex_dir);
-    if !dry_run {
-        crate::codex_projects::ensure_desktop_not_running(&codex)?;
-    }
     let rollouts = family::scan_rollouts(&codex)?;
     let mut written = 0u32;
     let mut salvaged = 0u32;
     let mut errors: Vec<String> = Vec::new();
-    let mut project_assignments = Vec::new();
 
     let mut entries: Vec<Value> = Vec::with_capacity(rollouts.len());
     for p in &rollouts {
         match read_rollout_brief(&codex, p) {
             Ok(Some(b)) => {
-                if let Some(record) = project_assignment_record(&codex, &b) {
-                    project_assignments.push(record);
-                } else {
-                    errors.push(format!(
-                        "{}: rollout 缺少有效 cwd，已跳过 Codex Desktop 项目归属修复",
-                        p.to_string_lossy()
-                    ));
-                }
                 let updated = if b.updated_at_ms > 0 {
                     b.updated_at_ms
                 } else if b.created_at_ms > 0 {
@@ -1100,31 +1088,12 @@ pub fn repair_session_index(codex_dir: String, dry_run: bool) -> AppResult<Index
     }
 
     if !dry_run {
-        crate::codex_projects::validate_missing_thread_project_assignment_records(
-            &codex,
-            &project_assignments,
-        )?;
         let out_path = paths::session_index_path(&codex);
         let lines = entries
             .iter()
             .map(serde_json::to_string)
             .collect::<Result<Vec<_>, _>>()?;
-        let mut journal = MutationJournal::default();
-        let operation = (|| -> AppResult<()> {
-            journal.mutate_file(&out_path, || rewrite_lines_atomically(&out_path, &lines))?;
-            if let Some(receipt) =
-                crate::codex_projects::sync_missing_thread_project_assignment_records_with_receipt(
-                    &codex,
-                    &project_assignments,
-                )?
-            {
-                journal.register_project_state_receipt(receipt);
-            }
-            Ok(())
-        })();
-        if let Err(error) = operation {
-            return Err(journal.compensate_without_transaction(error));
-        }
+        rewrite_lines_atomically(&out_path, &lines)?;
     }
 
     Ok(IndexRepairReport {
@@ -2236,16 +2205,12 @@ fn effective_threads_cols(state: &rusqlite::Connection) -> AppResult<Vec<&'stati
 
 pub fn rebuild_threads_table(codex_dir: String, dry_run: bool) -> AppResult<ThreadsRebuildReport> {
     let codex = PathBuf::from(&codex_dir);
-    if !dry_run {
-        crate::codex_projects::ensure_desktop_not_running(&codex)?;
-    }
     let active_rollouts = family::scan_rollouts(&codex)?;
     let archived_rollouts = family::scan_archived_rollouts(&codex)?;
     let mut scanned = 0u32;
     let mut upserted = 0u32;
     let mut skipped = 0u32;
     let mut errors: Vec<String> = Vec::new();
-    let mut project_assignments = Vec::new();
 
     if !paths::state_db_path(&codex).is_file() {
         return Err(AppError::InvalidCodexDir(format!(
@@ -2267,20 +2232,6 @@ pub fn rebuild_threads_table(codex_dir: String, dry_run: bool) -> AppResult<Thre
         match thread_values_from_rollout(&codex, p, archived, &effective_cols) {
             Ok(Some(values)) => {
                 upserted += 1;
-                match read_rollout_brief(&codex, p) {
-                    Ok(Some(brief)) => {
-                        if let Some(record) = project_assignment_record(&codex, &brief) {
-                            project_assignments.push(record);
-                        } else {
-                            errors.push(format!(
-                                "{}: rollout 缺少有效 cwd，已跳过 Codex Desktop 项目归属修复",
-                                p.to_string_lossy()
-                            ));
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => errors.push(format!("{}: {}", p.to_string_lossy(), e)),
-                }
                 if !dry_run {
                     planned_upserts.push(values);
                 }
@@ -2294,35 +2245,12 @@ pub fn rebuild_threads_table(codex_dir: String, dry_run: bool) -> AppResult<Thre
     }
 
     if !dry_run {
-        crate::codex_projects::validate_missing_thread_project_assignment_records(
-            &codex,
-            &project_assignments,
-        )?;
         let transaction =
             rusqlite::Transaction::new_unchecked(&state, rusqlite::TransactionBehavior::Immediate)?;
-        let mut journal = MutationJournal::default();
-        let operation = (|| -> AppResult<()> {
-            for values in &planned_upserts {
-                upsert_thread_values(&transaction, &effective_cols, values)?;
-            }
-            if let Some(receipt) =
-                crate::codex_projects::sync_missing_thread_project_assignment_records_with_receipt(
-                    &codex,
-                    &project_assignments,
-                )?
-            {
-                journal.register_project_state_receipt(receipt);
-            }
-            Ok(())
-        })();
-        if let Err(error) = operation {
-            return Err(rollback_transaction_with_compensation(
-                transaction,
-                journal,
-                error,
-            ));
+        for values in &planned_upserts {
+            upsert_thread_values(&transaction, &effective_cols, values)?;
         }
-        commit_transaction_with_compensation(transaction, journal)?;
+        transaction.commit()?;
     }
 
     Ok(ThreadsRebuildReport {
@@ -7369,28 +7297,31 @@ mod tests {
     }
 
     #[test]
-    fn repair_index_and_threads_rebuild_fill_missing_assignments_without_overwriting_pending_moves(
-    ) -> AppResult<()> {
+    fn repair_index_and_threads_rebuild_do_not_modify_desktop_project_state() -> AppResult<()> {
         for operation in ["index", "threads"] {
             let codex = temp_codex_dir(&format!(
-                "cc-session-manager-{operation}-project-assignment-test"
+                "cc-session-manager-{operation}-project-state-boundary-test"
             ));
-            write_rollout(&codex, "repair-missing", DEFAULT_PROVIDER)?;
-            write_rollout(&codex, "repair-pending", DEFAULT_PROVIDER)?;
+            write_rollout(&codex, "repair-projectless", DEFAULT_PROVIDER)?;
+            write_rollout(&codex, "repair-unassigned", DEFAULT_PROVIDER)?;
             create_full_state(&codex)?;
-            let pending = serde_json::json!({
-                "projectKind": "local",
-                "projectId": "official-pending-project",
-                "cwd": r"F:\official\pending-target",
-                "pendingCoreUpdate": true
-            });
             write_global_state(
                 &codex,
                 serde_json::json!({
-                    "local-projects": {},
-                    "thread-project-assignments": {"repair-pending": pending.clone()}
+                    "local-projects": {
+                        "keep-project": {
+                            "id": "keep-project",
+                            "rootPaths": [r"F:\keep"]
+                        }
+                    },
+                    "project-order": ["keep-project"],
+                    "projectless-thread-ids": ["repair-projectless"],
+                    "future-desktop-field": {"keep": true}
                 }),
             )?;
+            let global_path = paths::codex_global_state_json_path(&codex);
+            let global_before = fs::read(&global_path)?;
+            let _desktop = crate::codex_projects::DesktopTestProbeGuard::running();
 
             if operation == "index" {
                 let report = repair_session_index(codex.to_string_lossy().into_owned(), false)?;
@@ -7400,38 +7331,34 @@ mod tests {
                 assert_eq!(report.upserted, 2);
             }
 
-            assert_thread_project_cwd(&codex, "repair-missing", r"F:\project\example")?;
-            assert_eq!(
-                thread_project_assignment(&codex, "repair-pending")?,
-                Some(pending),
-                "{operation} must preserve an official pending move"
-            );
+            assert_eq!(fs::read(&global_path)?, global_before);
             fs::remove_dir_all(&codex).ok();
         }
         Ok(())
     }
 
     #[test]
-    fn repair_index_rejects_malformed_project_state_before_rewriting_index() -> AppResult<()> {
+    fn repair_index_ignores_malformed_desktop_project_state() -> AppResult<()> {
         let codex = temp_codex_dir("cc-session-manager-index-project-preflight-test");
         write_rollout(&codex, "repair-index-preflight", DEFAULT_PROVIDER)?;
         fs::create_dir_all(&codex)?;
         let index_path = paths::session_index_path(&codex);
         fs::write(&index_path, b"sentinel-index-bytes\n")?;
-        let before = fs::read(&index_path)?;
         write_global_state(&codex, serde_json::json!({"local-projects": []}))?;
+        let global_path = paths::codex_global_state_json_path(&codex);
+        let global_before = fs::read(&global_path)?;
 
-        let error = repair_session_index(codex.to_string_lossy().into_owned(), false)
-            .expect_err("malformed project state must fail before the index rewrite");
+        let report = repair_session_index(codex.to_string_lossy().into_owned(), false)?;
 
-        assert!(error.to_string().contains("必须是对象"), "{error}");
-        assert_eq!(fs::read(&index_path)?, before);
+        assert_eq!(report.written, 1);
+        assert_ne!(fs::read(&index_path)?, b"sentinel-index-bytes\n");
+        assert_eq!(fs::read(&global_path)?, global_before);
         fs::remove_dir_all(&codex).ok();
         Ok(())
     }
 
     #[test]
-    fn rebuild_threads_rejects_malformed_project_state_before_sqlite_writes() -> AppResult<()> {
+    fn rebuild_threads_ignores_malformed_desktop_project_state() -> AppResult<()> {
         let codex = temp_codex_dir("cc-session-manager-threads-project-preflight-test");
         write_rollout(&codex, "repair-threads-preflight", DEFAULT_PROVIDER)?;
         let state = create_full_state(&codex)?;
@@ -7441,90 +7368,21 @@ mod tests {
         )?;
         drop(state);
         write_global_state(&codex, serde_json::json!({"local-projects": []}))?;
+        let global_path = paths::codex_global_state_json_path(&codex);
+        let global_before = fs::read(&global_path)?;
 
-        let error = rebuild_threads_table(codex.to_string_lossy().into_owned(), false)
-            .expect_err("malformed project state must fail before SQLite writes");
+        let report = rebuild_threads_table(codex.to_string_lossy().into_owned(), false)?;
 
-        assert!(error.to_string().contains("必须是对象"), "{error}");
+        assert_eq!(report.upserted, 1);
         let state = state_db::open_ro(&codex)?;
-        let rows = state
-            .prepare("SELECT id, rollout_path FROM threads ORDER BY id")?
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        assert_eq!(
-            rows,
-            vec![(
-                "sentinel-thread".to_string(),
-                "sentinel-rollout".to_string()
-            )]
-        );
-        drop(state);
-        fs::remove_dir_all(&codex).ok();
-        Ok(())
-    }
-
-    #[test]
-    fn repair_index_compensates_when_project_state_cas_retries_are_exhausted() -> AppResult<()> {
-        let codex = temp_codex_dir("cc-session-manager-index-project-cas-test");
-        write_rollout(&codex, "repair-index-cas", DEFAULT_PROVIDER)?;
-        fs::create_dir_all(&codex)?;
-        let index_path = paths::session_index_path(&codex);
-        fs::write(&index_path, b"sentinel-index-before-cas\n")?;
-        let before = fs::read(&index_path)?;
-        write_global_state(&codex, serde_json::json!({"local-projects": {}}))?;
-        let _conflict = crate::codex_projects::StateWriteConflictTestGuard::all_attempts();
-
-        let error = repair_session_index(codex.to_string_lossy().into_owned(), false)
-            .expect_err("exhausted project-state CAS retries must abort repair");
-
-        assert!(error.to_string().contains("发生变化"), "{error}");
-        assert_eq!(fs::read(&index_path)?, before);
-        let state: Value =
-            serde_json::from_slice(&fs::read(paths::codex_global_state_json_path(&codex))?)?;
-        assert_eq!(state["test-concurrent-write"], 3);
-        assert!(state.get("thread-project-assignments").is_none());
-        fs::remove_dir_all(&codex).ok();
-        Ok(())
-    }
-
-    #[test]
-    fn rebuild_threads_rolls_back_when_project_state_cas_retries_are_exhausted() -> AppResult<()> {
-        let codex = temp_codex_dir("cc-session-manager-threads-project-cas-test");
-        write_rollout(&codex, "repair-threads-cas", DEFAULT_PROVIDER)?;
-        let state = create_full_state(&codex)?;
-        state.execute(
-            "INSERT INTO threads (id, rollout_path, archived) VALUES (?1, ?2, 0)",
-            rusqlite::params!["sentinel-thread", "sentinel-rollout"],
+        let rebuilt: u32 = state.query_row(
+            "SELECT COUNT(*) FROM threads WHERE id = 'repair-threads-preflight'",
+            [],
+            |row| row.get(0),
         )?;
+        assert_eq!(rebuilt, 1);
         drop(state);
-        write_global_state(&codex, serde_json::json!({"local-projects": {}}))?;
-        let _conflict = crate::codex_projects::StateWriteConflictTestGuard::all_attempts();
-
-        let error = rebuild_threads_table(codex.to_string_lossy().into_owned(), false)
-            .expect_err("exhausted project-state CAS retries must roll back SQLite");
-
-        assert!(error.to_string().contains("发生变化"), "{error}");
-        let state = state_db::open_ro(&codex)?;
-        let rows = state
-            .prepare("SELECT id, rollout_path FROM threads ORDER BY id")?
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        assert_eq!(
-            rows,
-            vec![(
-                "sentinel-thread".to_string(),
-                "sentinel-rollout".to_string()
-            )]
-        );
-        drop(state);
-        let global: Value =
-            serde_json::from_slice(&fs::read(paths::codex_global_state_json_path(&codex))?)?;
-        assert_eq!(global["test-concurrent-write"], 3);
-        assert!(global.get("thread-project-assignments").is_none());
+        assert_eq!(fs::read(&global_path)?, global_before);
         fs::remove_dir_all(&codex).ok();
         Ok(())
     }
