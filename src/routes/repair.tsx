@@ -59,6 +59,7 @@ import {
 import { useSettings } from "@/stores/settings";
 import {
   api,
+  type ArchiveOriginBackfillReport,
   type DiagnosticReport,
   type FamilyIntegrityReport,
   type GuiVisibilityReport,
@@ -85,6 +86,7 @@ function CodexRepairRoute() {
   const [projectConfig, setProjectConfig] = useState<ProjectConfigReport | null>(null);
   const [integrity, setIntegrity] = useState<FamilyIntegrityReport | null>(null);
   const [familyPrunePreview, setFamilyPrunePreview] = useState<OrphanPruneReport | null>(null);
+  const [backfillPreview, setBackfillPreview] = useState<ArchiveOriginBackfillReport | null>(null);
   const [loading, setLoading] = useState(false);
   const [strategy, setStrategy] = useState<SwitchStrategy>("continuous");
   const [confirmBatch, setConfirmBatch] = useState(false);
@@ -92,6 +94,7 @@ function CodexRepairRoute() {
   const [confirmPrune, setConfirmPrune] = useState<null | "index" | "threads" | "family">(
     null,
   );
+  const [confirmBackfill, setConfirmBackfill] = useState(false);
   const [running, setRunning] = useState<string | null>(null);
   const [providerSyncProgress, setProviderSyncProgress] = useState<ProviderSyncStatus | null>(null);
   const [dryRun, setDryRun] = useState(false);
@@ -113,7 +116,7 @@ function CodexRepairRoute() {
     if (!codexDir) return;
     setLoading(true);
     try {
-      const [d, p, c, i, familyPreview] = await Promise.all([
+      const [d, p, c, i, familyPreview, backfillPreview] = await Promise.all([
         api.diagnoseCodexState(codexDir),
         api.getProviderInfo(codexDir),
         api.diagnoseProjectConfigs(codexDir),
@@ -125,12 +128,14 @@ function CodexRepairRoute() {
           prune_family: true,
           dry_run: true,
         }),
+        api.backfillArchiveOrigins(codexDir, true),
       ]);
       setDiag(d);
       setProvider(p);
       setProjectConfig(c);
       setIntegrity(i);
       setFamilyPrunePreview(familyPreview);
+      setBackfillPreview(backfillPreview);
     } catch (e) {
       toast.error(`诊断失败：${String((e as Error)?.message ?? e)}`);
     } finally {
@@ -169,6 +174,21 @@ function CodexRepairRoute() {
       });
     } else {
       toast.success(message);
+    }
+  };
+
+  const showBackfillResult = (report: ArchiveOriginBackfillReport, preview: boolean) => {
+    const marked = report.fork_marked + report.provider_sync_marked + report.unknown_marked;
+    const action = preview ? "预览：将为" : "已为";
+    const suffix = preview
+      ? ""
+      : `；跳过已有记录 ${report.skipped_existing} 条`;
+    if (marked > 0) {
+      toast.success(
+        `${action} ${marked} 个归档会话补写来源标记（Fork ${report.fork_marked}、ProviderSync ${report.provider_sync_marked}、未知 ${report.unknown_marked}）${suffix}`,
+      );
+    } else {
+      toast.success(`扫描 ${report.scanned} 个归档会话，无缺失来源标记`);
     }
   };
 
@@ -873,6 +893,77 @@ function CodexRepairRoute() {
                   )}
                 </CardContent>
               </Card>
+
+              <Card className="min-w-0 overflow-hidden">
+                <CardHeader className="pb-3">
+                  <CardTitle className="flex min-w-0 flex-wrap items-center gap-2 text-base">
+                    <ShieldCheck className="h-4 w-4" />
+                    归档来源标记
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Info className="h-3.5 w-3.5 text-muted-foreground" />
+                      </TooltipTrigger>
+                      <TooltipContent className="max-w-sm text-xs">
+                        为 <code>archived_sessions/</code> 下缺少记录的归档会话补写来源标记
+                        （Fork / ProviderSync / 未知）。只写 CC Sessions 自己的归档账本，
+                        不修改任何官方会话数据。
+                      </TooltipContent>
+                    </Tooltip>
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="min-w-0 space-y-2">
+                  {backfillPreview == null ? (
+                    <div className="text-xs text-muted-foreground">—</div>
+                  ) : (
+                    <div className="space-y-1.5">
+                      <div className="flex flex-wrap items-center gap-2 text-xs">
+                        <span className="text-muted-foreground">
+                          扫描 {backfillPreview.scanned} 个归档会话，其中{" "}
+                          {backfillPreview.fork_marked +
+                            backfillPreview.provider_sync_marked +
+                            backfillPreview.unknown_marked}{" "}
+                          个缺少来源标记
+                        </span>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              size="sm"
+                              variant={dryRun ? "outline" : "default"}
+                              onClick={() => {
+                                if (dryRun) {
+                                  void run("backfill_origins", async () => {
+                                    const report = await api.backfillArchiveOrigins(codexDir, true);
+                                    setBackfillPreview(report);
+                                    showBackfillResult(report, true);
+                                  });
+                                } else {
+                                  setConfirmBackfill(true);
+                                }
+                              }}
+                              disabled={!!running || backfillPreview.scanned === 0}
+                              className="ml-auto gap-1.5"
+                            >
+                              <Wand2 className="h-3.5 w-3.5" />
+                              补全归档来源标记
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent className="max-w-sm text-xs">
+                            为缺少记录的归档会话补写来源标记。打开"效果预览"时只统计不写入。
+                          </TooltipContent>
+                        </Tooltip>
+                      </div>
+                      {backfillPreview.scanned > 0 && (
+                        <div className="rounded-md border border-border/60 bg-muted/20 px-3 py-2 text-[11px] leading-5 text-muted-foreground">
+                          将标记：Fork {backfillPreview.fork_marked} 个、ProviderSync{" "}
+                          {backfillPreview.provider_sync_marked} 个、未知{" "}
+                          {backfillPreview.unknown_marked} 个；跳过已有记录{" "}
+                          {backfillPreview.skipped_existing} 个
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
             </>
           )}
         </div>
@@ -1036,7 +1127,42 @@ function CodexRepairRoute() {
                 });
               }}
             >
-              确认清理
+               确认清理
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={confirmBackfill} onOpenChange={setConfirmBackfill}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>补全归档来源标记</AlertDialogTitle>
+            <AlertDialogDescription>
+              即将为{" "}
+              <b>
+                {(backfillPreview?.fork_marked ?? 0) +
+                  (backfillPreview?.provider_sync_marked ?? 0) +
+                  (backfillPreview?.unknown_marked ?? 0)}
+              </b>{" "}
+              个归档会话写入来源标记（Fork {(backfillPreview?.fork_marked ?? 0)}、
+              ProviderSync {(backfillPreview?.provider_sync_marked ?? 0)}、未知{" "}
+              {(backfillPreview?.unknown_marked ?? 0)}）。该标记写入 CC Sessions 自己的归档
+              账本，不修改任何官方会话数据；已有记录不会被覆盖。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                setConfirmBackfill(false);
+                void run("backfill_origins", async () => {
+                  const r = await api.backfillArchiveOrigins(codexDir, false);
+                  setBackfillPreview(r);
+                  showBackfillResult(r, false);
+                });
+              }}
+            >
+              确认补全
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

@@ -480,6 +480,15 @@ export type OrphanPruneReport = {
   dry_run: boolean;
 };
 
+export type ArchiveOriginBackfillReport = {
+  scanned: number;
+  skipped_existing: number;
+  fork_marked: number;
+  provider_sync_marked: number;
+  unknown_marked: number;
+  dry_run: boolean;
+};
+
 export type HistoryOrphanReport = {
   provider: SessionProvider;
   history_path: string;
@@ -657,7 +666,22 @@ export type SwitchStrategy = "continuous" | "scatter" | "follow";
 // ========================= 家族树 =========================
 
 export type BranchStatus = "active" | "archived" | "deleted";
-export type ArchiveOrigin = "provider_sync";
+export type ArchiveOrigin =
+  | "manual"
+  | "official"
+  | "fork"
+  | "provider_sync"
+  | "restore"
+  | "import"
+  | "unknown";
+
+export type ArchiveLedgerEntry = {
+  session_id: string;
+  origin: ArchiveOrigin;
+  archived_at: number | null;
+  source_path: string | null;
+  sha256: string | null;
+};
 
 export type FamilyBranch = {
   id: string;
@@ -1167,6 +1191,13 @@ export const api = {
       pruneFamily: p.prune_family,
       dryRun: p.dry_run,
     }),
+  backfillArchiveOrigins: (codexDir: string, dryRun: boolean) =>
+    invokeCommand<ArchiveOriginBackfillReport>("backfill_archive_origins", {
+      codexDir,
+      dryRun,
+    }),
+  getArchiveLedger: (codexDir: string) =>
+    invokeCommand<ArchiveLedgerEntry[]>("get_archive_ledger", { codexDir }),
   diagnoseClaudeHistoryOrphans: (claudeDir: string) =>
     invokeCommand<HistoryOrphanReport>("diagnose_claude_history_orphans", { claudeDir }),
   pruneClaudeHistoryOrphans: (claudeDir: string, dryRun: boolean) =>
