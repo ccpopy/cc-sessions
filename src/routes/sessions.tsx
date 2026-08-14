@@ -506,11 +506,11 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         settings.opencode_dir,
       );
       toast.success(s.archived ? "已取消归档" : "已归档");
-      await refresh();
+      await refreshAll();
     } catch (e: any) {
       toast.error(String(e?.message ?? e));
     }
-  }, [provider, refresh, settings]);
+  }, [provider, refreshAll, settings]);
 
   const onBulkBackup = () => {
     if (selectedItems.length === 0) return;

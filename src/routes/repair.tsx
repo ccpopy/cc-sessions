@@ -724,8 +724,9 @@ function CodexRepairRoute() {
                         <Info className="h-3.5 w-3.5 text-muted-foreground" />
                       </TooltipTrigger>
                       <TooltipContent className="max-w-sm text-xs">
-                        检查 family 中各分支的 rollout 是否存在，并对已归档旧分支做 sha256 +
-                        行数校验。文件被外部改过或丢失时会在这里亮红。
+                        检查 family 中各分支的 rollout 是否存在，并对已固化 sha256
+                        的归档分支做 sha256 + 行数校验（未固化的分支只检查存在性，
+                        不计入结果）。文件被外部改过或丢失时会在这里亮红。
                       </TooltipContent>
                     </Tooltip>
                   </CardTitle>

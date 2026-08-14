@@ -36,14 +36,6 @@ export function selectSessionsForView(
     ) {
       continue;
     }
-    if (
-      isCodex
-      && !includeHiddenRecords
-      && options.showArchivedSessions
-      && isHiddenArchivedFamilyBranch(overlay, currentProvider)
-    ) {
-      continue;
-    }
     candidates.push(session);
   }
 
@@ -141,18 +133,4 @@ function compareSessionActivityDesc(left: SessionSummary, right: SessionSummary)
   const createdDelta = right.created_at - left.created_at;
   if (createdDelta !== 0) return createdDelta;
   return left.id.localeCompare(right.id);
-}
-
-/**
- * Archived view mirrors Codex App by showing the current provider's family
- * branch. If provider metadata is unavailable, fall back to the stored active
- * branch so one logical family still has one row.
- */
-function isHiddenArchivedFamilyBranch(
-  overlay: FamilyOverlay | undefined,
-  currentProvider: string | null,
-): boolean {
-  if (!overlay?.family_id) return false;
-  if (currentProvider) return overlay.provider !== currentProvider;
-  return !overlay.is_active_branch;
 }

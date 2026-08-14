@@ -153,7 +153,7 @@ test("content search scope uses the same normal-family representative as the pag
   );
 });
 
-test("archived search scope hides family branches from other providers", () => {
+test("archived view keeps family branches from other providers visible", () => {
   const currentBranch = { ...session("openai-current", 100), archived: true };
   const otherBranch = { ...session("custom-history", 500), archived: true };
   const overlay = new Map<string, FamilyOverlay>([
@@ -167,7 +167,7 @@ test("archived search scope hides family branches from other providers", () => {
       showSubagentSessions: false,
       showArchivedSessions: true,
     }).map((item) => item.id),
-    ["openai-current"],
+    ["custom-history", "openai-current"],
   );
 });
 

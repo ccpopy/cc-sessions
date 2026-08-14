@@ -330,6 +330,8 @@ pub fn set_active(store: &mut FamilyStore, family_id: &str, branch_id: &str) -> 
     for b in family.chain.iter_mut() {
         if b.id == branch_id {
             b.status = BranchStatus::Active;
+            b.sha256 = None;
+            b.line_count = None;
             b.archive_origin = None;
             found = true;
         } else if matches!(b.status, BranchStatus::Active) {
@@ -745,7 +747,7 @@ pub fn verify_integrity(codex_dir: &Path) -> AppResult<FamilyIntegrityReport> {
         for b in family.chain.iter() {
             let expected_sha = b.sha256.clone();
             let expected_lines = b.line_count;
-            let unsealed_active = expected_sha.is_none() && b.id == family.active_id;
+            let unsealed = expected_sha.is_none();
             let rel = paths::checked_relative_path(&b.rollout_relpath)?;
             let abs_main = codex_dir.join(&rel);
             let abs_archived =
@@ -768,8 +770,8 @@ pub fn verify_integrity(codex_dir: &Path) -> AppResult<FamilyIntegrityReport> {
                 });
                 continue;
             };
-            if unsealed_active {
-                continue; // 当前可写分支只检查是否存在，不做 sha256/行数校验
+            if unsealed {
+                continue; // 未固化 sha256 的分支（当前可写分支、迁移前的旧数据）只检查是否存在，不做 sha256/行数校验
             }
             match compute_integrity(&candidate) {
                 Ok((sha, lines)) => {
@@ -1146,6 +1148,38 @@ mod tests {
     }
 
     #[test]
+    fn set_active_clears_restored_branch_integrity_snapshot() -> AppResult<()> {
+        let mut store = two_branch_store();
+        let history = store
+            .families
+            .get_mut("family-a")
+            .expect("family fixture")
+            .chain
+            .iter_mut()
+            .find(|branch| branch.id == "history-a")
+            .expect("history branch");
+        history.sha256 = Some("archived-sha".to_string());
+        history.line_count = Some(42);
+
+        set_active(&mut store, "family-a", "history-a")?;
+
+        let family = store.families.get("family-a").expect("family remains");
+        let restored = family
+            .chain
+            .iter()
+            .find(|branch| branch.id == "history-a")
+            .expect("restored branch");
+        assert_eq!(family.active_id, "history-a");
+        assert!(matches!(restored.status, BranchStatus::Active));
+        assert_eq!(restored.sha256, None);
+        assert_eq!(restored.line_count, None);
+        assert!(family.chain.iter().any(
+            |branch| branch.id == "active-a" && matches!(branch.status, BranchStatus::Archived)
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn family_store_without_archive_origin_remains_compatible() -> AppResult<()> {
         let codex = temp_codex_dir("cc-session-manager-family-origin-compat-test");
         fs::create_dir_all(&codex)?;
@@ -1362,6 +1396,26 @@ mod tests {
         assert_eq!(report.items.len(), 1);
         assert_eq!(report.items[0].branch_id, "missing-active");
         assert!(report.items[0].missing);
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn verify_integrity_skips_unsealed_non_active_branch() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-family-unsealed-history-integrity-test");
+        let store = two_branch_store();
+        for b in &store.families["family-a"].chain {
+            let abs = codex.join(&b.rollout_relpath);
+            fs::create_dir_all(abs.parent().unwrap())?;
+            fs::write(&abs, "line\n")?;
+        }
+        save(&codex, &store)?;
+
+        let report = verify_integrity(&codex)?;
+
+        // history-a 已归档但从未固化 sha256（旧数据/外部写入），只检查存在性，不算失败。
+        assert!(report.all_ok);
+        assert!(report.items.is_empty());
         fs::remove_dir_all(codex).ok();
         Ok(())
     }

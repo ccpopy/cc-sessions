@@ -23,8 +23,9 @@ use crate::atomic_file;
 pub(crate) use desktop_guard::DesktopTestProbeGuard;
 #[cfg(test)]
 use desktop_guard::{
-    is_linux_desktop_candidate, is_linux_desktop_executable, is_official_windows_desktop,
-    is_windows_desktop_candidate, official_desktop_is_running, TestDesktopProbe,
+    is_linux_desktop_candidate, is_linux_desktop_executable, is_macos_desktop_executable,
+    is_official_windows_desktop, is_windows_desktop_candidate, official_desktop_is_running,
+    TestDesktopProbe,
 };
 #[cfg(test)]
 use std::path::PathBuf;
@@ -962,6 +963,23 @@ mod tests {
         assert!(is_linux_desktop_candidate("ChatGPT\n"));
         assert!(!is_linux_desktop_candidate("chatgpt\n"));
         assert!(!is_linux_desktop_candidate("codex\n"));
+
+        assert!(is_macos_desktop_executable(
+            "/Applications/Codex.app/Contents/MacOS/Codex"
+        ));
+        assert!(is_macos_desktop_executable(
+            "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+        ));
+        assert!(is_macos_desktop_executable(
+            "/Users/dev/Applications/Codex.app/Contents/MacOS/ChatGPT"
+        ));
+        assert!(!is_macos_desktop_executable(
+            "/Applications/Codex.app/Contents/MacOS/Codex Helper"
+        ));
+        assert!(!is_macos_desktop_executable(
+            "/Applications/Other.app/Contents/MacOS/Codex"
+        ));
+        assert!(!is_macos_desktop_executable("/usr/local/bin/codex"));
     }
 
     #[test]

@@ -4518,6 +4518,7 @@ fn clone_session_for_provider_locked_with_hint(
                         for b in f.chain.iter_mut() {
                             if matches!(b.status, BranchStatus::Active) {
                                 b.status = BranchStatus::Archived;
+                                b.archive_origin = Some(ArchiveOrigin::ProviderSync);
                             }
                         }
                         f.chain.push(new_branch);
@@ -6785,6 +6786,15 @@ mod tests {
                     assert_eq!(read_thread_location(&codex, &active_id)?.1, 0);
                     assert!(index_ids.contains(&source_id));
                     assert!(index_ids.contains(&active_id));
+                    let scatter_archived_branch = family
+                        .chain
+                        .iter()
+                        .find(|branch| branch.id == source_id)
+                        .expect("scatter archived source branch");
+                    assert_eq!(
+                        scatter_archived_branch.archive_origin,
+                        Some(ArchiveOrigin::ProviderSync)
+                    );
                 }
                 "continuous" => {
                     assert_ne!(active_id, source_id);

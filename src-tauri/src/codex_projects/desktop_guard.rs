@@ -357,7 +357,58 @@ pub(super) fn is_linux_desktop_executable(executable: &Path, expected_executable
 
 #[cfg(all(target_os = "macos", not(test)))]
 fn macos_desktop_is_running() -> AppResult<bool> {
-    Err(AppError::Other(
-        "当前版本尚无法安全确认 macOS Codex App 是否运行，已拒绝修改项目状态".to_string(),
-    ))
+    // libproc 枚举当前可见进程；proc_pidpath 对已退出或无权限（他人用户）的
+    // 进程会失败，这类进程不可能以当前用户身份持有 Desktop 状态，跳过即可。
+    unsafe {
+        let needed = libc::proc_listallpids(std::ptr::null_mut(), 0);
+        if needed <= 0 {
+            return Err(AppError::Other(format!(
+                "无法安全确认 Codex App 是否运行（枚举进程失败: {}），已拒绝修改项目状态",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // 两次调用之间可能有新进程产生，预留余量。
+        let capacity = (needed as usize) + 64;
+        let mut pids = vec![0 as libc::pid_t; capacity];
+        let count = libc::proc_listallpids(
+            pids.as_mut_ptr() as *mut libc::c_void,
+            (capacity * std::mem::size_of::<libc::pid_t>()) as libc::c_int,
+        );
+        if count <= 0 {
+            return Err(AppError::Other(format!(
+                "无法安全确认 Codex App 是否运行（枚举进程失败: {}），已拒绝修改项目状态",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let mut path_buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        for &pid in &pids[..(count as usize).min(capacity)] {
+            if pid <= 0 {
+                continue;
+            }
+            let len = libc::proc_pidpath(
+                pid,
+                path_buffer.as_mut_ptr() as *mut libc::c_void,
+                path_buffer.len() as u32,
+            );
+            if len <= 0 {
+                continue;
+            }
+            let executable = String::from_utf8_lossy(&path_buffer[..len as usize]);
+            if is_macos_desktop_executable(&executable) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Codex Desktop 与 ChatGPT Desktop 共享同一份 `.codex-global-state.json` 写入
+/// 行为，两者任一在运行都必须拒绝写入。
+#[cfg(any(target_os = "macos", test))]
+pub(super) fn is_macos_desktop_executable(executable: &str) -> bool {
+    let Some((bundle_prefix, binary)) = executable.rsplit_once("/Contents/MacOS/") else {
+        return false;
+    };
+    let bundle = bundle_prefix.rsplit('/').next().unwrap_or("");
+    matches!(bundle, "Codex.app" | "ChatGPT.app") && matches!(binary, "Codex" | "ChatGPT")
 }
