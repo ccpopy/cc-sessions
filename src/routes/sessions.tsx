@@ -127,7 +127,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const [maintenanceError, setMaintenanceError] = useState<string | null>(null);
   const [providerSyncProgress, setProviderSyncProgress] = useState<ProviderSyncStatus | null>(null);
   const [familySheetId, setFamilySheetId] = useState<string | null>(null);
-  // 归档来源 ledger：归档视图按来源分组的前置数据；读取失败时回退为全部"未知来源"
+  // 归档来源 ledger：归档视图按来源分组的前置数据；读取失败时回退为全部归入"我的归档"
   const [ledgerBySession, setLedgerBySession] = useState<Map<string, ArchiveOrigin>>(new Map());
   const [archiveLedgerError, setArchiveLedgerError] = useState<string | null>(null);
   // 归档视图来源筛选 chips：单选互斥，"all" 表示不过滤
@@ -204,8 +204,9 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     if (active?.scope === overlayScope) return active.promise;
 
     const requestId = ++overlayRequestSeq.current;
-    // ledger 单独捕获失败：来源分组是展示层增强，读取失败只降级为"全部未知来源"，
-    // 不能连带 overlay/provider 状态一起失败（计划 §F3 失败降级要求）。
+    // ledger 单独捕获失败：来源分组是展示层增强，读取失败只降级为全部归入
+    // "我的归档"（无记录即按用户主动归档处理），不能连带 overlay/provider 状态
+    // 一起失败（计划 §F3 失败降级要求）。
     const ledgerPromise = api
       .getArchiveLedger(codexDir)
       .then((ledger) => {
@@ -767,7 +768,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             <div className="flex shrink-0 items-start gap-2 border-b border-amber-500/30 bg-amber-500/10 px-6 py-2 text-xs text-amber-800 dark:text-amber-300">
               <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
               <span className="min-w-0 break-words">
-                归档来源读取失败，已按"未知来源"分组显示：{archiveLedgerError}
+                归档来源读取失败，会话已全部归入"我的归档"分组：{archiveLedgerError}
               </span>
             </div>
           )}
