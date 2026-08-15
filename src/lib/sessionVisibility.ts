@@ -1,6 +1,27 @@
 import type { ArchiveOrigin, FamilyOverlay, SessionSummary } from "./api";
 import { isSubagentSession } from "./sessionSource.ts";
 
+/**
+ * 把 ledger 的归档来源合并进 overlay，统一"徽标显示"与"来源筛选"两个数据源。
+ *
+ * 为什么需要合并：family 分支的 archive_origin 字段只在用户显式指定来源
+ * （set_archive_origin 命令同步写 ledger + 分支字段）时更新；backfill 和 fork
+ * 创建路径只写 ledger（repair.rs），分支字段仍是 None。若不合并，会出现徽标显示
+ * "来源未知"（分支字段为空）但筛选 unknown 时该会话被 ledger 归入其他组的矛盾。
+ *
+ * 合并规则：ledger 有记录优先用 ledger 值；ledger 缺失时回退 family 分支字段
+ * （再回退 null）。返回新数组，不修改入参。
+ */
+export function mergeLedgerIntoOverlay(
+  overlays: readonly FamilyOverlay[],
+  ledgerBySession: ReadonlyMap<string, ArchiveOrigin>,
+): FamilyOverlay[] {
+  return overlays.map((o) => ({
+    ...o,
+    archive_origin: ledgerBySession.get(o.session_id) ?? o.archive_origin ?? null,
+  }));
+}
+
 export type SessionVisibilityOptions = {
   provider: SessionSummary["provider"];
   showSubagentSessions: boolean;

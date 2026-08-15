@@ -63,6 +63,7 @@ import {
 } from "@/lib/providerSyncRegistry";
 import { SessionActionRegistry } from "@/lib/sessionActionRegistry";
 import {
+  mergeLedgerIntoOverlay,
   selectSessionsForView,
   type ArchivedOriginGroupKey,
 } from "@/lib/sessionVisibility";
@@ -208,14 +209,16 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     const ledgerPromise = api
       .getArchiveLedger(codexDir)
       .then((ledger) => {
-        if (overlayScopeRef.current !== overlayScope) return;
+        if (overlayScopeRef.current !== overlayScope) return undefined;
         setLedgerBySession(new Map(ledger.map((entry) => [entry.session_id, entry.origin])));
         setArchiveLedgerError(null);
+        return ledger;
       })
       .catch((error) => {
-        if (overlayScopeRef.current !== overlayScope) return;
+        if (overlayScopeRef.current !== overlayScope) return undefined;
         setLedgerBySession(new Map());
         setArchiveLedgerError(String((error as Error)?.message ?? error));
+        return undefined;
       });
     const promise: Promise<void> = Promise.all([
       api.getSessionFamilyOverlay(codexDir),
@@ -223,9 +226,19 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
       api.getProviderSyncPlan(codexDir),
       ledgerPromise,
     ])
-      .then(([ov, info, syncPlan]) => {
+      .then(([ov, info, syncPlan, ledgerEntries]) => {
         if (overlayScopeRef.current !== overlayScope) return;
-        setOverlay(new Map(ov.map((o) => [o.session_id, o])));
+        // 徽标显示与来源筛选共用同一数据源：ledger 优先（fork/manual 等由
+        // backfill 只写 ledger 未同步 family 分支字段，若用分支字段会显示
+        // "来源未知" 却筛不出）。family 分支字段仅在 ledger 缺失时兜底。
+        const ledgerOriginBySession = new Map(
+          (ledgerEntries ?? []).map((entry) => [entry.session_id, entry.origin]),
+        );
+        setOverlay(
+          new Map(
+            mergeLedgerIntoOverlay(ov, ledgerOriginBySession).map((o) => [o.session_id, o]),
+          ),
+        );
         setCurrentProvider(info.current);
         setProviderSyncPlan(syncPlan);
         setMaintenanceError(null);

@@ -1643,7 +1643,7 @@ fn backfill_archive_origins_locked(
                 brief.id.clone(),
                 ArchiveLedgerEntry {
                     session_id: brief.id.clone(),
-                    origin,
+                    origin: origin.clone(),
                     archived_at,
                     source_path: Some(source_path),
                     // backfill 不固化 sha256：存量文件未固化，保持 None（与
@@ -1651,6 +1651,11 @@ fn backfill_archive_origins_locked(
                     sha256: None,
                 },
             );
+            // 同步 family 分支字段（与 set_archive_origin 命令语义一致）：
+            // 徽标显示读分支字段、来源筛选读 ledger，两处必须一致，否则会出现
+            // 徽标显示"来源未知"却按 ledger 归入其他组的矛盾（fork/manual 会话
+            // 的 backfill 典型场景）。会话不属于任何 family 时 no-op。
+            family::set_archive_origin_for_session(&codex, &brief.id, origin)?;
         }
     }
     if !dry_run && !ledger.entries.is_empty() {
