@@ -146,7 +146,7 @@ export type ArchivedOriginGroup = {
 
 const ARCHIVED_GROUP_LABELS: Record<ArchivedOriginGroupKey, string> = {
   mine: "我的归档",
-  auto: "工具自动归档",
+  auto: "同步归档",
   migrated: "迁移记录",
   unknown: "未知来源",
 };

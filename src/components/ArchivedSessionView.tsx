@@ -37,7 +37,7 @@ type ArchivedOriginRow =
  *
  * 为什么独立成视图：归档会话来自多个来源（手动/自动/迁移/未知），把组头行与
  * 会话行混合进同一个 VirtualList（沿用 TimeSessionView 的 bucket 行模式），
- * 既能显示"我的归档 / 工具自动归档 / 迁移记录 / 未知来源"四个分组，又保持
+ * 既能显示"我的归档 / 同步归档 / 迁移记录 / 未知来源"四个分组，又保持
  * 虚拟滚动在单个滚动容器内工作。
  */
 export function ArchivedSessionView({
