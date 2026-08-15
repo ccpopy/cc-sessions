@@ -25,8 +25,9 @@ test("restore/import 映射为「迁移记录」徽标", () => {
   }
 });
 
-test("unknown 与 null 兜底为「来源未知」，不 panic", () => {
-  const fallback = { label: "来源未知", className: "border-border text-muted-foreground" };
-  assert.deepEqual(archiveOriginPresentation("unknown"), fallback);
-  assert.deepEqual(archiveOriginPresentation(null), fallback);
+test("unknown 与 null 返回 null，视为用户主动归档，不叠加徽标", () => {
+  // 无来源标识的归档（官方应用归档、旧版手动归档）归入"我的归档"组，
+  // 与 mine 同策略：不显示"来源未知"徽标
+  assert.equal(archiveOriginPresentation("unknown"), null);
+  assert.equal(archiveOriginPresentation(null), null);
 });

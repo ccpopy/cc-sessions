@@ -1669,6 +1669,9 @@ fn backfill_archive_origins_locked(
 ///   （fork 写入 note 且不清空，repair.rs:3964-3967；已知近似：被手动归档的
 ///    fork 分支也会被启发式标为 Fork——存量数据的合理近似，dry_run 预览可兜底）
 /// - family 分支存在且 archive_origin 有值 → 保留原值（ProviderSync 等）
+/// - family 分支存在且 note 含 `cloned_from:` 前缀 → `ProviderSync`
+///   （provider_sync 克隆写入 note 且不清空；旧版分支没有 archive_origin 字段，
+///    clone 的 note 是唯一可区分信号——与 forked_from 同属存量近似）
 /// - 其余 → `Unknown`（保守不臆测，无法区分 Manual/Official）
 fn infer_backfill_origin(store: &FamilyStore, session_id: &str) -> ArchiveOrigin {
     for family in store.families.values() {
@@ -1682,6 +1685,13 @@ fn infer_backfill_origin(store: &FamilyStore, session_id: &str) -> ArchiveOrigin
             }
             if let Some(origin) = &branch.archive_origin {
                 return origin.clone();
+            }
+            if branch
+                .note
+                .as_deref()
+                .is_some_and(|note| note.starts_with("cloned_from:"))
+            {
+                return ArchiveOrigin::ProviderSync;
             }
         }
     }
@@ -8540,16 +8550,19 @@ mod tests {
         let codex = temp_codex_dir("cc-session-manager-backfill-origins-test");
         fs::create_dir_all(&codex)?;
 
-        // 构造三类存量归档 + 一条已有 ledger 记录：
+        // 构造四类存量归档 + 一条已有 ledger 记录：
         // - orphan：无 family 分支记录 → 应推断 Unknown
         // - fork：family 分支 note 含 forked_from: 前缀 → 应推断 Fork
         // - sync：family 分支 archive_origin=ProviderSync → 应保留原值
+        // - clone：family 分支 note 含 cloned_from: 前缀（旧版 provider_sync
+        //   克隆，archive_origin 字段缺失）→ 应推断 ProviderSync
         // - known：ledger 已有 Manual 记录 → 应跳过（skipped_existing）
         let orphan_id = "backfill-orphan";
         let fork_id = "backfill-fork";
         let sync_id = "backfill-sync";
+        let clone_id = "backfill-clone";
         let known_id = "backfill-known";
-        for id in [orphan_id, fork_id, sync_id, known_id] {
+        for id in [orphan_id, fork_id, sync_id, clone_id, known_id] {
             write_rollout_in(&codex, "archived_sessions", id, DEFAULT_PROVIDER)?;
         }
 
@@ -8584,6 +8597,20 @@ mod tests {
                     note: None,
                     archive_origin: Some(ArchiveOrigin::ProviderSync),
                 },
+                FamilyBranch {
+                    id: clone_id.to_string(),
+                    provider: "custom".to_string(),
+                    created_at: "2026-04-22T00:00:00Z".to_string(),
+                    status: BranchStatus::Archived,
+                    rollout_relpath: format!(
+                        "archived_sessions/2026/04/22/rollout-{clone_id}.jsonl"
+                    ),
+                    sha256: None,
+                    line_count: None,
+                    // 旧版 provider_sync 克隆：无 archive_origin 字段，只有 cloned_from note
+                    note: Some("cloned_from:backfill-fork@line:0".to_string()),
+                    archive_origin: None,
+                },
             ],
             active_id: fork_id.to_string(),
             updated_at: "2026-04-22T00:00:00Z".to_string(),
@@ -8593,6 +8620,7 @@ mod tests {
         let mut index = BTreeMap::new();
         index.insert(fork_id.to_string(), "backfill-family".to_string());
         index.insert(sync_id.to_string(), "backfill-family".to_string());
+        index.insert(clone_id.to_string(), "backfill-family".to_string());
         family::save(
             &codex,
             &FamilyStore {
@@ -8615,10 +8643,10 @@ mod tests {
         // dry_run：只统计不写盘，孤儿记录不得落入 ledger。
         let dry = backfill_archive_origins(codex.to_string_lossy().into_owned(), true)?;
         assert!(dry.dry_run);
-        assert_eq!(dry.scanned, 4);
+        assert_eq!(dry.scanned, 5);
         assert_eq!(dry.skipped_existing, 1);
         assert_eq!(dry.fork_marked, 1);
-        assert_eq!(dry.provider_sync_marked, 1);
+        assert_eq!(dry.provider_sync_marked, 2);
         assert_eq!(dry.unknown_marked, 1);
         assert_eq!(
             crate::archive_ledger::origin_for(&codex, orphan_id),
@@ -8641,6 +8669,11 @@ mod tests {
         assert_eq!(
             crate::archive_ledger::origin_for(&codex, sync_id),
             Some(ArchiveOrigin::ProviderSync)
+        );
+        assert_eq!(
+            crate::archive_ledger::origin_for(&codex, clone_id),
+            Some(ArchiveOrigin::ProviderSync),
+            "旧版 provider_sync 克隆（cloned_from note、无 archive_origin）应推断为 ProviderSync"
         );
         assert_eq!(
             crate::archive_ledger::origin_for(&codex, known_id),

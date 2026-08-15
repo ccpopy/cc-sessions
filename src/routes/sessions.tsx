@@ -69,12 +69,12 @@ import {
 } from "@/lib/sessionVisibility";
 
 // 归档视图来源筛选 chips：单选互斥，"all" 表示不过滤
+// 无来源标识的归档归入"我的归档"（方案 A），不再有"未知来源"筛选项
 const archiveOriginFilters: { key: ArchivedOriginGroupKey | "all"; label: string }[] = [
   { key: "all", label: "全部" },
   { key: "mine", label: "我的归档" },
   { key: "auto", label: "同步归档" },
   { key: "migrated", label: "迁移记录" },
-  { key: "unknown", label: "未知来源" },
 ];
 
 export default function SessionsRoute({ provider = "codex" }: { provider?: SessionProvider }) {

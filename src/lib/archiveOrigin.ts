@@ -20,7 +20,8 @@ export type ArchiveOriginPresentation = {
  *   会话卡片上已有"已归档"徽标表达，不再叠加来源徽标。
  * - provider_sync → "同步分支"：切换模型服务配置时由工具自动归档。
  * - restore/import → "迁移记录"：备份恢复或会话包导入产生的归档。
- * - unknown / null / 未知字符串 → "来源未知"（兜底，不 panic，便于排查）。
+ * - unknown / null / 未知字符串 → null：无来源标识的归档视为用户主动归档
+ *   （官方应用归档、旧版手动归档都不写来源标识），与 mine 组同样不叠加徽标。
  */
 export function archiveOriginPresentation(
   origin: ArchiveOrigin | null,
@@ -29,6 +30,7 @@ export function archiveOriginPresentation(
     case "manual":
     case "official":
     case "fork":
+    case "unknown":
       return null;
     case "provider_sync":
       return { label: "同步分支", className: "border-blue-500/30 text-blue-600" };
@@ -36,7 +38,7 @@ export function archiveOriginPresentation(
     case "import":
       return { label: "迁移记录", className: "border-border text-muted-foreground" };
     default:
-      // unknown、null 或未来新增的枚举值：统一兜底为"来源未知"
-      return { label: "来源未知", className: "border-border text-muted-foreground" };
+      // null 或未来新增的枚举值：与"无标识即用户主动归档"语义一致，不叠加徽标
+      return null;
   }
 }

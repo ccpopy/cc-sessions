@@ -156,8 +156,10 @@ function compareSessionActivityDesc(left: SessionSummary, right: SessionSummary)
   return left.id.localeCompare(right.id);
 }
 
-/** 归档视图的分组键：按归档来源聚合，是跨 provider 的统一维度（计划 §F3）。 */
-export type ArchivedOriginGroupKey = "mine" | "auto" | "migrated" | "unknown";
+/** 归档视图的分组键：按归档来源聚合，是跨 provider 的统一维度（计划 §F3）。
+ *  只有三组：未知/无 ledger 记录的归档视为用户主动归档（官方应用归档、旧版
+ *  手动归档都不写来源标识），归入 mine，不再单列 unknown 分组。 */
+export type ArchivedOriginGroupKey = "mine" | "auto" | "migrated";
 
 export type ArchivedOriginGroup = {
   key: ArchivedOriginGroupKey;
@@ -187,15 +189,14 @@ const ARCHIVED_GROUP_LABELS: Record<ArchivedOriginGroupKey, string> = {
   mine: "我的归档",
   auto: "同步归档",
   migrated: "迁移记录",
-  unknown: "未知来源",
 };
 
 /**
- * 把归档会话按来源分成四个固定分组（空组不返回）：
- * - mine：manual/official/fork，用户主动归档的高价值来源
+ * 把归档会话按来源分成三个固定分组（空组不返回）：
+ * - mine：manual/official/fork，以及 unknown/无 ledger 记录（官方应用归档、
+ *   旧版手动归档都不写来源标识，视为用户主动归档）——用户主动归档的高价值来源
  * - auto：provider_sync，切换模型服务配置时由工具自动归档
  * - migrated：restore/import，备份恢复或会话包导入产生的归档
- * - unknown：unknown 或无 ledger 记录，来源无法判定
  *
  * 分组天然跨 provider：各 provider 的归档分支按 origin 混入同一组，
  * 这正是 ledger 的价值——origin 是跨 provider 统一维度。组内保持传入顺序
@@ -209,7 +210,6 @@ export function groupArchivedByOrigin(
     mine: [],
     auto: [],
     migrated: [],
-    unknown: [],
   };
   for (const session of sessions) {
     const key = archiveOriginGroupKey(ledgerBySession.get(session.id));
@@ -232,7 +232,8 @@ function archiveOriginGroupKey(origin: ArchiveOrigin | undefined): ArchivedOrigi
     case "import":
       return "migrated";
     default:
-      // unknown 或 ledger 中无记录（undefined）：归入"未知来源"
-      return "unknown";
+      // unknown 或 ledger 中无记录（undefined）：视为用户主动归档
+      // （Codex 官方应用归档与旧版手动归档都不写来源标识），归入"我的归档"
+      return "mine";
   }
 }
