@@ -531,9 +531,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             arg::<u64>(&args, "jobId")?,
         )),
         "active_provider_sync" => to_result_value(crate::provider_sync::active_provider_sync()),
-        "set_archive_origin" => {
-            to_result_value(webui_set_archive_origin(&state, &args))
-        }
+        "set_archive_origin" => to_result_value(webui_set_archive_origin(&state, &args)),
         "rollback_family_active" => to_result_value(repair::rollback_family_active_with_lock(
             string_arg(&args, "codexDir")?,
             string_arg(&args, "familyId")?,
@@ -901,8 +899,11 @@ fn webui_set_archive_origin(state: &WebuiState, args: &Value) -> AppResult<SetAr
             &session_id,
             origin.clone(),
         )?;
-        let family_synced =
-            family::set_archive_origin_for_session(Path::new(&codex_dir), &session_id, origin.clone())?;
+        let family_synced = family::set_archive_origin_for_session(
+            Path::new(&codex_dir),
+            &session_id,
+            origin.clone(),
+        )?;
         Ok(SetArchiveOriginReport {
             session_id,
             origin,
