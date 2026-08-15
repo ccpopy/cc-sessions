@@ -144,6 +144,24 @@ export type ArchivedOriginGroup = {
   sessions: SessionSummary[];
 };
 
+/**
+ * 按归档来源过滤会话列表（"all" 表示不过滤，原样返回）。
+ *
+ * 为什么独立成函数：归档来源筛选只是归档视图内部的会话过滤器，不能劫持
+ * 工具栏的视图切换（时间/项目/大小）。工具栏视图优先决定分组方式，这里
+ * 只负责把不匹配来源的会话剔除，再由对应视图组件去分组/排序。
+ */
+export function filterSessionsByOrigin(
+  sessions: readonly SessionSummary[],
+  ledgerBySession: ReadonlyMap<string, ArchiveOrigin>,
+  originFilter: ArchivedOriginGroupKey | "all",
+): SessionSummary[] {
+  if (originFilter === "all") return [...sessions];
+  return sessions.filter(
+    (session) => archiveOriginGroupKey(ledgerBySession.get(session.id)) === originFilter,
+  );
+}
+
 const ARCHIVED_GROUP_LABELS: Record<ArchivedOriginGroupKey, string> = {
   mine: "我的归档",
   auto: "同步归档",

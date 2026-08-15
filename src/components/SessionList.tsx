@@ -8,7 +8,10 @@ import { TimeSessionView } from "@/components/TimeSessionView";
 import type { SessionListViewProps } from "@/components/SessionListRowCard";
 import type { ArchiveOrigin, FamilyOverlay, SessionSummary } from "@/lib/api";
 import { sessionIdentity } from "@/lib/sessionIdentity";
-import type { ArchivedOriginGroupKey } from "@/lib/sessionVisibility";
+import {
+  filterSessionsByOrigin,
+  type ArchivedOriginGroupKey,
+} from "@/lib/sessionVisibility";
 import { useView } from "@/stores/view";
 
 type Props = SessionCardHandlers & {
@@ -54,8 +57,19 @@ export const SessionList = memo(function SessionList({
     }));
   }, [backupIndex, prefillCwd, sessions]);
 
+  // 归档来源筛选只过滤会话集合，不改变视图分组方式：
+  // 工具栏的视图切换（时间/项目/大小）始终优先。
+  const viewSessions = useMemo(() => {
+    if (!archivedGrouping) return visibleSessions;
+    return filterSessionsByOrigin(
+      visibleSessions,
+      archivedGrouping.ledgerBySession,
+      archivedGrouping.originFilter,
+    );
+  }, [archivedGrouping, visibleSessions]);
+
   const viewProps: SessionListViewProps = {
-    sessions: visibleSessions,
+    sessions: viewSessions,
     handlers,
     query,
     scrollElementRef,
@@ -66,6 +80,8 @@ export const SessionList = memo(function SessionList({
     duplicatingSessionIds,
   };
 
+  if (view === "project") return <ProjectSessionView {...viewProps} />;
+  if (view === "size") return <SizeSessionView {...viewProps} />;
   if (archivedGrouping) {
     return (
       <ArchivedSessionView
@@ -75,7 +91,5 @@ export const SessionList = memo(function SessionList({
       />
     );
   }
-  if (view === "project") return <ProjectSessionView {...viewProps} />;
-  if (view === "size") return <SizeSessionView {...viewProps} />;
   return <TimeSessionView {...viewProps} />;
 });

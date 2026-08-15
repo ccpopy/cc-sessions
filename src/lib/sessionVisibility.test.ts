@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { ArchiveOrigin, FamilyOverlay, SessionSummary } from "./api";
 import {
+  filterSessionsByOrigin,
   groupArchivedByOrigin,
   selectNormalFamilySessions,
   selectSessionsForView,
@@ -254,4 +255,69 @@ test("groupArchivedByOrigin drops empty groups and keeps input order within a gr
       ["migrated", ["second"]],
     ],
   );
+});
+
+test("filterSessionsByOrigin with all keeps every session in input order", () => {
+  const mine = { ...session("mine-a", 100), archived: true };
+  const auto = { ...session("auto-c", 300), archived: true };
+  const ledger = new Map<string, ArchiveOrigin>([
+    [mine.id, "manual"],
+    [auto.id, "provider_sync"],
+  ]);
+  assert.deepEqual(
+    filterSessionsByOrigin([mine, auto], ledger, "all").map((s) => s.id),
+    ["mine-a", "auto-c"],
+  );
+});
+
+test("filterSessionsByOrigin keeps only sessions matching the selected group", () => {
+  const mine = { ...session("mine-a", 100), archived: true };
+  const fork = { ...session("fork-b", 200), archived: true };
+  const auto = { ...session("auto-c", 300), archived: true };
+  const migrated = { ...session("migrated-d", 400), archived: true };
+  const unknown = { ...session("unknown-e", 500), archived: true };
+  const ledger = new Map<string, ArchiveOrigin>([
+    [mine.id, "manual"],
+    [fork.id, "fork"],
+    [auto.id, "provider_sync"],
+    [migrated.id, "restore"],
+    // unknown-e 无 ledger 记录
+  ]);
+
+  assert.deepEqual(
+    filterSessionsByOrigin([mine, fork, auto, migrated, unknown], ledger, "mine").map(
+      (s) => s.id,
+    ),
+    ["mine-a", "fork-b"],
+  );
+  assert.deepEqual(
+    filterSessionsByOrigin([mine, fork, auto, migrated, unknown], ledger, "auto").map(
+      (s) => s.id,
+    ),
+    ["auto-c"],
+  );
+  assert.deepEqual(
+    filterSessionsByOrigin([mine, fork, auto, migrated, unknown], ledger, "migrated").map(
+      (s) => s.id,
+    ),
+    ["migrated-d"],
+  );
+  assert.deepEqual(
+    filterSessionsByOrigin([mine, fork, auto, migrated, unknown], ledger, "unknown").map(
+      (s) => s.id,
+    ),
+    ["unknown-e"],
+  );
+});
+
+test("filterSessionsByOrigin leaves input sessions unchanged", () => {
+  const mine = { ...session("mine-a", 100), archived: true };
+  const auto = { ...session("auto-c", 300), archived: true };
+  const ledger = new Map<string, ArchiveOrigin>([
+    [mine.id, "manual"],
+    [auto.id, "provider_sync"],
+  ]);
+  filterSessionsByOrigin([mine, auto], ledger, "auto");
+  assert.deepEqual([mine.id, auto.id], ["mine-a", "auto-c"]);
+  assert.deepEqual([mine.archived, auto.archived], [true, true]);
 });
