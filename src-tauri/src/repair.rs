@@ -1621,6 +1621,12 @@ fn backfill_archive_origins_locked(
             report.skipped_existing += 1;
             continue;
         }
+        // 子代理会话不参与归档来源登记（归档视图按设计不展示子代理，前端
+        // selectSessionsForView 强制过滤）。静默跳过：不写 ledger，也不计入
+        // 报告任何类别——子代理来源无法也无须推断。
+        if is_subagent_source(brief.source.as_deref()) {
+            continue;
+        }
         let origin = infer_backfill_origin(&store, &brief.id);
         match origin {
             ArchiveOrigin::Fork => report.fork_marked += 1,
@@ -5703,6 +5709,31 @@ mod tests {
         write_rollout_in(codex, "sessions", id, provider)
     }
 
+    /// 与 write_rollout_in 相同，但 session_meta 带 source 字段（子代理场景）。
+    fn write_rollout_with_source(
+        codex: &Path,
+        root: &str,
+        id: &str,
+        provider: &str,
+        source: &str,
+    ) -> AppResult<()> {
+        let rollout_dir = codex.join(root).join("2026").join("04").join("22");
+        fs::create_dir_all(&rollout_dir)?;
+        let path = rollout_dir.join(format!("rollout-{id}.jsonl"));
+        let line = serde_json::json!({
+            "timestamp": "2026-04-22T00:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": id,
+                "model_provider": provider,
+                "cwd": "F:\\project\\example",
+                "source": source
+            }
+        });
+        fs::write(path, format!("{}\n", serde_json::to_string(&line)?))?;
+        Ok(())
+    }
+
     fn write_rollout_with_cwd(codex: &Path, id: &str, cwd: &Path) -> AppResult<()> {
         let rollout_dir = codex.join("sessions").join("2026").join("04").join("22");
         fs::create_dir_all(&rollout_dir)?;
@@ -8550,21 +8581,30 @@ mod tests {
         let codex = temp_codex_dir("cc-session-manager-backfill-origins-test");
         fs::create_dir_all(&codex)?;
 
-        // 构造四类存量归档 + 一条已有 ledger 记录：
+        // 构造四类存量归档 + 一条已有 ledger 记录 + 一个子代理归档：
         // - orphan：无 family 分支记录 → 应推断 Unknown
         // - fork：family 分支 note 含 forked_from: 前缀 → 应推断 Fork
         // - sync：family 分支 archive_origin=ProviderSync → 应保留原值
         // - clone：family 分支 note 含 cloned_from: 前缀（旧版 provider_sync
         //   克隆，archive_origin 字段缺失）→ 应推断 ProviderSync
         // - known：ledger 已有 Manual 记录 → 应跳过（skipped_existing）
+        // - subagent：source 为 subagent JSON → 静默跳过，不写 ledger
         let orphan_id = "backfill-orphan";
         let fork_id = "backfill-fork";
         let sync_id = "backfill-sync";
         let clone_id = "backfill-clone";
         let known_id = "backfill-known";
+        let sub_id = "backfill-subagent";
         for id in [orphan_id, fork_id, sync_id, clone_id, known_id] {
             write_rollout_in(&codex, "archived_sessions", id, DEFAULT_PROVIDER)?;
         }
+        write_rollout_with_source(
+            &codex,
+            "archived_sessions",
+            sub_id,
+            DEFAULT_PROVIDER,
+            "{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"backfill-fork\",\"depth\":1,\"agent_path\":\"/orchestrator\"}}}",
+        )?;
 
         let family = Family {
             family_id: "backfill-family".to_string(),
@@ -8643,7 +8683,7 @@ mod tests {
         // dry_run：只统计不写盘，孤儿记录不得落入 ledger。
         let dry = backfill_archive_origins(codex.to_string_lossy().into_owned(), true)?;
         assert!(dry.dry_run);
-        assert_eq!(dry.scanned, 5);
+        assert_eq!(dry.scanned, 6);
         assert_eq!(dry.skipped_existing, 1);
         assert_eq!(dry.fork_marked, 1);
         assert_eq!(dry.provider_sync_marked, 2);
@@ -8678,6 +8718,11 @@ mod tests {
         assert_eq!(
             crate::archive_ledger::origin_for(&codex, known_id),
             Some(ArchiveOrigin::Manual)
+        );
+        assert_eq!(
+            crate::archive_ledger::origin_for(&codex, sub_id),
+            None,
+            "子代理归档不得写入 ledger"
         );
 
         fs::remove_dir_all(&codex).ok();
