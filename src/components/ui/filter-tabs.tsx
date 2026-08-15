@@ -23,7 +23,7 @@ export function FilterTabs<T extends string>({
           <TabsTrigger
             key={item.value}
             value={item.value}
-            className="h-8 px-2 text-xs data-[state=active]:bg-foreground data-[state=active]:text-background sm:px-2.5"
+            className="h-8 px-2 text-xs data-[state=active]:bg-primary data-[state=active]:text-primary-foreground sm:px-2.5"
           >
             {item.label}
           </TabsTrigger>
