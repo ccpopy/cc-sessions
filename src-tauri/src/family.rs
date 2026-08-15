@@ -738,6 +738,26 @@ pub fn set_archive_origin(
     Ok(())
 }
 
+/// 按 session_id 定位 family 分支并设置归档来源（用户手动切换来源时同步分支字段）。
+/// 会话不属于任何 family 时 no-op（返回 false）。调用方必须持有 FamilyLock。
+pub fn set_archive_origin_for_session(
+    codex_dir: &Path,
+    session_id: &str,
+    origin: ArchiveOrigin,
+) -> AppResult<bool> {
+    let mut store = load(codex_dir)?;
+    let family_ids = family_ids_containing_session(&store, session_id)?;
+    let Some(family_id) = family_ids.first() else {
+        return Ok(false);
+    };
+    set_archive_origin(&mut store, family_id, session_id, origin)?;
+    if let Some(family) = store.families.get_mut(family_id) {
+        family.updated_at = now_iso();
+    }
+    save(codex_dir, &store)?;
+    Ok(true)
+}
+
 /// 扫描 family store，对每个已固化的分支比对 rollout 文件。
 pub fn verify_integrity(codex_dir: &Path) -> AppResult<FamilyIntegrityReport> {
     let store = load(codex_dir)?;

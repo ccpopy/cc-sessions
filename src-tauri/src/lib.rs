@@ -127,6 +127,7 @@ pub fn run() {
             commands::prune_orphan_entries,
             commands::backfill_archive_origins,
             commands::get_archive_ledger,
+            commands::set_archive_origin,
             commands::diagnose_claude_history_orphans,
             commands::prune_claude_history_orphans,
             commands::diagnose_claude_gui_visibility,

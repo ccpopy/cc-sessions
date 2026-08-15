@@ -489,6 +489,13 @@ export type ArchiveOriginBackfillReport = {
   dry_run: boolean;
 };
 
+export type SetArchiveOriginReport = {
+  session_id: string;
+  origin: ArchiveOrigin;
+  family_synced: boolean;
+  error: string | null;
+};
+
 export type HistoryOrphanReport = {
   provider: SessionProvider;
   history_path: string;
@@ -1198,6 +1205,12 @@ export const api = {
     }),
   getArchiveLedger: (codexDir: string) =>
     invokeCommand<ArchiveLedgerEntry[]>("get_archive_ledger", { codexDir }),
+  setArchiveOrigin: (codexDir: string, sessionId: string, origin: ArchiveOrigin) =>
+    invokeCommand<SetArchiveOriginReport>("set_archive_origin", {
+      codexDir,
+      sessionId,
+      origin,
+    }),
   diagnoseClaudeHistoryOrphans: (claudeDir: string) =>
     invokeCommand<HistoryOrphanReport>("diagnose_claude_history_orphans", { claudeDir }),
   pruneClaudeHistoryOrphans: (claudeDir: string, dryRun: boolean) =>

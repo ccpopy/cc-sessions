@@ -874,6 +874,16 @@ pub struct ArchiveOriginBackfillReport {
     pub dry_run: bool,
 }
 
+/// 手动切换归档来源报告（前端"来源未知"徽标下拉指定来源）。
+#[derive(Debug, Clone, Serialize)]
+pub struct SetArchiveOriginReport {
+    pub session_id: String,
+    pub origin: ArchiveOrigin,
+    /// 是否同时同步了 family 分支的 archive_origin 字段（会话不在任何 family 时为 false）
+    pub family_synced: bool,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct HistoryOrphanReport {
     pub provider: String,

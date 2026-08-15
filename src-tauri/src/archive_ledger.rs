@@ -94,6 +94,36 @@ pub fn record(
     save(codex_dir, &ledger)
 }
 
+/// 用户显式指定的归档来源（前端"来源未知"徽标下拉手动切换）：**绕过 D13 优先级**，
+/// 无条件覆盖 origin 字段。与 `record` 的区别：record 只在优先级更高时覆盖；本函数是
+/// 用户显式操作，直接写入目标 origin，保留已有 archived_at/source_path/sha256；
+/// 无记录时新建一条（archive 相关字段为 None）。调用方必须持有 FamilyLock。
+pub fn set_archive_origin(
+    codex_dir: &Path,
+    session_id: &str,
+    origin: ArchiveOrigin,
+) -> AppResult<()> {
+    let mut ledger = load(codex_dir)?;
+    match ledger.entries.get_mut(session_id) {
+        Some(entry) => {
+            entry.origin = origin;
+        }
+        None => {
+            ledger.entries.insert(
+                session_id.to_string(),
+                ArchiveLedgerEntry {
+                    session_id: session_id.to_string(),
+                    origin,
+                    archived_at: None,
+                    source_path: None,
+                    sha256: None,
+                },
+            );
+        }
+    }
+    save(codex_dir, &ledger)
+}
+
 /// 删除一条记录（取消归档/删除会话时调用）。无记录时 no-op。调用方必须持有 FamilyLock。
 pub fn remove(codex_dir: &Path, session_id: &str) -> AppResult<()> {
     let mut ledger = load(codex_dir)?;

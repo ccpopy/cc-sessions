@@ -303,7 +303,16 @@ export function FamilyHistorySheet({
                                 {inactiveBranchStatusLabel(b.status)}
                               </Badge>
                             )}
-                            {!isActive && <ArchiveOriginBadge origin={b.archive_origin ?? null} />}
+                            {!isActive && (
+                              <ArchiveOriginBadge
+                                origin={b.archive_origin ?? null}
+                                onSetOrigin={async (origin) => {
+                                  await api.setArchiveOrigin(codexDir, b.id, origin);
+                                  await load();
+                                  await onChanged?.();
+                                }}
+                              />
+                            )}
                             <span className="text-muted-foreground">
                               {safeDate(b.created_at)}
                             </span>

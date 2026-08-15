@@ -519,6 +519,39 @@ pub async fn get_archive_ledger(codex_dir: String) -> AppResult<Vec<ArchiveLedge
     run_blocking(move || crate::archive_ledger::entries(&PathBuf::from(codex_dir))).await
 }
 
+/// 用户显式指定归档来源（前端"来源未知"徽标下拉）：强制覆盖 ledger 记录（绕 D13），
+/// 并同步 family 分支字段（若该会话属于某 family）。
+#[tauri::command]
+pub async fn set_archive_origin(
+    codex_dir: String,
+    session_id: String,
+    origin: ArchiveOrigin,
+    lock: SharedLock<'_>,
+) -> AppResult<SetArchiveOriginReport> {
+    let lock = lock.inner().clone();
+    run_blocking(move || {
+        crate::family::with_lock(&lock, |_g| {
+            crate::archive_ledger::set_archive_origin(
+                &PathBuf::from(&codex_dir),
+                &session_id,
+                origin.clone(),
+            )?;
+            let family_synced = crate::family::set_archive_origin_for_session(
+                &PathBuf::from(&codex_dir),
+                &session_id,
+                origin.clone(),
+            )?;
+            Ok(SetArchiveOriginReport {
+                session_id,
+                origin,
+                family_synced,
+                error: None,
+            })
+        })
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn prune_claude_history_orphans(
     claude_dir: String,

@@ -71,7 +71,7 @@ import {
 const archiveOriginFilters: { key: ArchivedOriginGroupKey | "all"; label: string }[] = [
   { key: "all", label: "全部" },
   { key: "mine", label: "我的归档" },
-  { key: "auto", label: "工具自动归档" },
+  { key: "auto", label: "同步归档" },
   { key: "migrated", label: "迁移记录" },
   { key: "unknown", label: "未知来源" },
 ];
@@ -545,6 +545,28 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     }
   }, [provider, refreshAll, settings]);
 
+  const onSetArchiveOrigin = useCallback(
+    async (s: SessionSummary, origin: ArchiveOrigin) => {
+      if (!settings || !isCodex) return;
+      try {
+        const report = await api.setArchiveOrigin(settings.codex_dir, s.id, origin);
+        if (report.error) {
+          toast.error(`更新归档来源失败：${report.error}`);
+          return;
+        }
+        toast.success(
+          report.family_synced
+            ? "已更新归档来源"
+            : "已更新归档来源（该会话没有 family 记录）",
+        );
+        await refreshAll();
+      } catch (e: any) {
+        toast.error("更新归档来源失败：" + String(e?.message ?? e));
+      }
+    },
+    [isCodex, refreshAll, settings],
+  );
+
   const onBulkBackup = () => {
     if (selectedItems.length === 0) return;
     setBackupTargets(selectedItems);
@@ -813,6 +835,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             onConvert={isOpenCode ? undefined : setConvertTarget}
             onRename={setRenameTarget}
             onMoveCwd={setMoveTarget}
+            onSetArchiveOrigin={isCodex ? onSetArchiveOrigin : undefined}
           />
         )}
       </ScrollArea>
