@@ -975,6 +975,9 @@ pub fn diagnose_codex_state(codex_dir: String) -> AppResult<DiagnosticReport> {
     let mut threads_ids: Vec<String> = Vec::new();
     let mut threads_active_ids: Vec<String> = Vec::new();
     let mut threads_archived_ids: Vec<String> = Vec::new();
+    // 孤儿子代理：thread_spawn_edges 中父会话已不在 threads 表的 child。
+    // 父在 threads 表（含 archived=1 的本工具归档）说明父会话仍存在，不算孤儿。
+    let mut orphan_subagent_ids: Vec<String> = Vec::new();
     if paths::state_db_path(&codex).is_file() {
         let conn = state_db::open_ro(&codex)?;
         let mut stmt = conn.prepare("SELECT id, COALESCE(archived,0) FROM threads")?;
@@ -990,6 +993,27 @@ pub fn diagnose_codex_state(codex_dir: String) -> AppResult<DiagnosticReport> {
             }
             threads_ids.push(id);
         }
+        let has_edges: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='thread_spawn_edges')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_edges {
+            let mut stmt = conn.prepare(
+                "WITH RECURSIVE orphan_set(id) AS (
+                    SELECT e.child_thread_id FROM thread_spawn_edges e
+                    WHERE e.parent_thread_id NOT IN (SELECT id FROM threads)
+                    UNION
+                    SELECT e.child_thread_id FROM thread_spawn_edges e
+                    JOIN orphan_set o ON e.parent_thread_id = o.id
+                )
+                SELECT id FROM orphan_set",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            for r in rows.flatten() {
+                orphan_subagent_ids.push(r);
+            }
+        }
     }
     threads_ids.sort();
     threads_ids.dedup();
@@ -997,6 +1021,8 @@ pub fn diagnose_codex_state(codex_dir: String) -> AppResult<DiagnosticReport> {
     threads_active_ids.dedup();
     threads_archived_ids.sort();
     threads_archived_ids.dedup();
+    orphan_subagent_ids.sort();
+    orphan_subagent_ids.dedup();
 
     // 5) 差集
     let rs: BTreeSet<&String> = rollout_ids.iter().collect();
@@ -1029,6 +1055,8 @@ pub fn diagnose_codex_state(codex_dir: String) -> AppResult<DiagnosticReport> {
         missing_in_threads,
         orphan_in_index,
         orphan_in_threads,
+        orphan_subagent_count: orphan_subagent_ids.len() as u32,
+        orphan_subagent_ids,
         current_provider: Some(cur_provider),
         provider_mismatched_families: mismatch,
     })
@@ -1115,6 +1143,8 @@ pub fn prune_orphan_entries(
     codex_dir: String,
     prune_index: bool,
     prune_threads: bool,
+    prune_family: bool,
+    prune_subagents: bool,
     dry_run: bool,
 ) -> AppResult<OrphanPruneReport> {
     let lock = family::FamilyLock::default();
@@ -1122,7 +1152,8 @@ pub fn prune_orphan_entries(
         codex_dir,
         prune_index,
         prune_threads,
-        prune_index || prune_threads,
+        prune_family,
+        prune_subagents,
         dry_run,
         &lock,
     )
@@ -1133,11 +1164,19 @@ pub fn prune_orphan_entries_with_lock(
     prune_index: bool,
     prune_threads: bool,
     prune_family: bool,
+    prune_subagents: bool,
     dry_run: bool,
     lock: &family::FamilyLock,
 ) -> AppResult<OrphanPruneReport> {
     family::with_lock(lock, |_g| {
-        prune_orphan_entries_locked(codex_dir, prune_index, prune_threads, prune_family, dry_run)
+        prune_orphan_entries_locked(
+            codex_dir,
+            prune_index,
+            prune_threads,
+            prune_family,
+            prune_subagents,
+            dry_run,
+        )
     })
 }
 
@@ -1343,6 +1382,7 @@ fn prune_orphan_entries_locked(
     prune_index: bool,
     prune_threads: bool,
     prune_family: bool,
+    prune_subagents: bool,
     dry_run: bool,
 ) -> AppResult<OrphanPruneReport> {
     let codex = PathBuf::from(&codex_dir);
@@ -1374,11 +1414,50 @@ fn prune_orphan_entries_locked(
     } else {
         Vec::new()
     };
-    if !dry_run && prune_threads {
-        crate::codex_projects::preflight_thread_project_state_cleanup(&codex, &orphan_ids)?;
+    // 孤儿子代理：thread_spawn_edges 中父会话已不在 threads 表的 child（含纯边残留）。
+    // 父在 threads 表（含 archived=1 的本工具归档）说明父会话仍存在，不算孤儿。
+    let orphan_subagent_ids = if prune_subagents && state_db_exists {
+        let state = state_db::open_ro(&codex)?;
+        let has_edges: bool = state.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='thread_spawn_edges')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_edges {
+            let mut stmt = state.prepare(
+                "WITH RECURSIVE orphan_set(id) AS (
+                    SELECT e.child_thread_id FROM thread_spawn_edges e
+                    WHERE e.parent_thread_id NOT IN (SELECT id FROM threads)
+                    UNION
+                    SELECT e.child_thread_id FROM thread_spawn_edges e
+                    JOIN orphan_set o ON e.parent_thread_id = o.id
+                )
+                SELECT id FROM orphan_set",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    if !dry_run && (prune_threads || prune_subagents) {
+        let mut preflight_ids = orphan_ids.clone();
+        preflight_ids.extend(orphan_subagent_ids.iter().cloned());
+        crate::codex_projects::preflight_thread_project_state_cleanup(&codex, &preflight_ids)?;
         if crate::codex_projects::desktop_state_initialized(&codex)? {
             crate::codex_projects::ensure_desktop_not_running(&codex)?;
         }
+    }
+    // 孤儿子代理清理复用会话删除的完整补偿路径（threads 行 + rollout 文件 +
+    // session_index + 归档账本 + project state + logs + 子代理关系边）。
+    if !dry_run && prune_subagents && !orphan_subagent_ids.is_empty() {
+        crate::sessions::codex_delete::delete_codex_artifacts_batch_with_family_store(
+            &codex,
+            &orphan_subagent_ids,
+            None,
+        )?;
     }
 
     let mut index_removed = 0u32;
@@ -1568,6 +1647,7 @@ fn prune_orphan_entries_locked(
     Ok(OrphanPruneReport {
         index_removed,
         threads_removed,
+        subagents_removed: orphan_subagent_ids.len() as u32,
         family_branches_removed,
         families_removed,
         families_recovered,
@@ -8377,7 +8457,14 @@ mod tests {
         )?;
 
         let diag = diagnose_codex_state(codex.to_string_lossy().into_owned())?;
-        let prune = prune_orphan_entries(codex.to_string_lossy().into_owned(), false, true, true)?;
+        let prune = prune_orphan_entries(
+            codex.to_string_lossy().into_owned(),
+            false,
+            true,
+            false,
+            false,
+            true,
+        )?;
         fs::remove_dir_all(&codex).ok();
 
         assert_eq!(diag.archived_rollout_count, 1);
@@ -8419,8 +8506,14 @@ mod tests {
             }),
         )?;
 
-        let report =
-            prune_orphan_entries(codex.to_string_lossy().into_owned(), false, true, false)?;
+        let report = prune_orphan_entries(
+            codex.to_string_lossy().into_owned(),
+            false,
+            true,
+            false,
+            false,
+            false,
+        )?;
 
         assert_eq!(report.threads_removed, 1);
         assert!(thread_project_assignment(&codex, "ghost-thread")?.is_none());
@@ -8442,6 +8535,121 @@ mod tests {
                 .is_object()
         );
 
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn diagnosing_counts_orphan_subagents_when_parent_chain_is_gone() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-orphan-subagent-diag-test");
+        let parent = "orphan-parent";
+        let child = "orphan-child";
+        let grandchild = "orphan-grandchild";
+        let live_parent = "live-parent";
+        let live_child = "live-child";
+        write_rollout(&codex, child, DEFAULT_PROVIDER)?;
+        write_rollout(&codex, grandchild, DEFAULT_PROVIDER)?;
+        write_rollout(&codex, live_child, DEFAULT_PROVIDER)?;
+        let conn = create_minimal_state(&codex)?;
+        for id in [child, grandchild, live_parent, live_child] {
+            conn.execute(
+                "INSERT INTO threads (id, model_provider, source, archived) VALUES (?1, ?2, ?3, 0)",
+                (id, DEFAULT_PROVIDER, DEFAULT_THREAD_SOURCE),
+            )?;
+        }
+        conn.execute(
+            "CREATE TABLE thread_spawn_edges (
+                parent_thread_id TEXT NOT NULL,
+                child_thread_id TEXT NOT NULL PRIMARY KEY,
+                status TEXT NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status) VALUES (?1, ?2, 'open')",
+            (parent, child),
+        )?;
+        conn.execute(
+            "INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status) VALUES (?1, ?2, 'open')",
+            (child, grandchild),
+        )?;
+        conn.execute(
+            "INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status) VALUES (?1, ?2, 'open')",
+            (live_parent, live_child),
+        )?;
+        drop(conn);
+
+        let diag = diagnose_codex_state(codex.to_string_lossy().into_owned())?;
+        fs::remove_dir_all(&codex).ok();
+
+        // child/grandchild 的父链都触不到存活父 → 孤儿；live_child 有存活父 → 不是
+        assert_eq!(diag.orphan_subagent_count, 2);
+        assert_eq!(
+            diag.orphan_subagent_ids,
+            vec![child.to_string(), grandchild.to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pruning_orphan_subagents_removes_threads_rollouts_and_edges() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-prune-subagent-test");
+        let parent = "prune-sub-parent";
+        let child = "prune-sub-child";
+        let grandchild = "prune-sub-grandchild";
+        write_rollout(&codex, child, DEFAULT_PROVIDER)?;
+        write_rollout(&codex, grandchild, DEFAULT_PROVIDER)?;
+        let conn = create_minimal_state(&codex)?;
+        for id in [child, grandchild] {
+            conn.execute(
+                "INSERT INTO threads (id, model_provider, source, archived) VALUES (?1, ?2, ?3, 0)",
+                (id, DEFAULT_PROVIDER, DEFAULT_THREAD_SOURCE),
+            )?;
+        }
+        conn.execute(
+            "CREATE TABLE thread_spawn_edges (
+                parent_thread_id TEXT NOT NULL,
+                child_thread_id TEXT NOT NULL PRIMARY KEY,
+                status TEXT NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status) VALUES (?1, ?2, 'open')",
+            (parent, child),
+        )?;
+        conn.execute(
+            "INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status) VALUES (?1, ?2, 'open')",
+            (child, grandchild),
+        )?;
+        drop(conn);
+
+        let report = prune_orphan_entries(
+            codex.to_string_lossy().into_owned(),
+            false,
+            false,
+            false,
+            true,
+            false,
+        )?;
+        assert_eq!(report.subagents_removed, 2);
+
+        let state = state_db::open_ro(&codex)?;
+        let remaining: Vec<String> = state
+            .prepare("SELECT id FROM threads")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(remaining.is_empty(), "threads 行应全部删除: {remaining:?}");
+        let edges: Vec<String> = state
+            .prepare("SELECT child_thread_id FROM thread_spawn_edges")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(edges.is_empty(), "子代理关系边应全部删除: {edges:?}");
+        drop(state);
+        assert!(
+            family::scan_rollouts(&codex)?.is_empty(),
+            "孤儿 rollout 文件应被删除"
+        );
         fs::remove_dir_all(&codex).ok();
         Ok(())
     }
@@ -8480,8 +8688,15 @@ mod tests {
         let index_before = fs::read(&index_path)?;
         let global_before = fs::read(&global_state_path)?;
 
-        let error = prune_orphan_entries(codex.to_string_lossy().into_owned(), true, true, false)
-            .expect_err("broken project state must abort before pruning Core data");
+        let error = prune_orphan_entries(
+            codex.to_string_lossy().into_owned(),
+            true,
+            true,
+            false,
+            false,
+            false,
+        )
+        .expect_err("broken project state must abort before pruning Core data");
 
         assert!(error.to_string().contains("全局状态 JSON 损坏"), "{error}");
         assert_eq!(fs::read(&rollout)?, rollout_before);
@@ -8555,6 +8770,7 @@ mod tests {
             true,
             true,
             true,
+            false,
             false,
             &family::FamilyLock::default(),
         )
@@ -8767,6 +8983,7 @@ mod tests {
             true,
             false,
             false,
+            false,
             &family::FamilyLock::default(),
         )
         .expect_err("Desktop start after preflight must abort and compensate Core changes");
@@ -8818,6 +9035,7 @@ mod tests {
             true,
             false,
             false,
+            false,
             &family::FamilyLock::default(),
         )
         .expect_err("exhausted project-state CAS retries must compensate Core changes");
@@ -8859,6 +9077,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             &family::FamilyLock::default(),
         )?;
@@ -8903,6 +9122,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             true,
             &lock,
         )?;
@@ -8914,6 +9134,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             &lock,
         )?;
@@ -8955,6 +9176,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             &family::FamilyLock::default(),
         )?;
@@ -9027,6 +9249,7 @@ mod tests {
             false,
             true,
             false,
+            false,
             &family::FamilyLock::default(),
         )?;
 
@@ -9061,6 +9284,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             &family::FamilyLock::default(),
         )?;
@@ -9104,6 +9328,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             true,
             &lock,
         )?;
@@ -9115,6 +9340,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             &lock,
         )?;
@@ -9157,6 +9383,7 @@ mod tests {
             false,
             true,
             false,
+            false,
             &family::FamilyLock::default(),
         )?;
 
@@ -9196,6 +9423,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             true,
             &family::FamilyLock::default(),
         )?;
@@ -9213,6 +9441,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             &family::FamilyLock::default(),
         )?;

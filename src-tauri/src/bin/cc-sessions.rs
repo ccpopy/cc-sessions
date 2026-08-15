@@ -1072,11 +1072,12 @@ fn cmd_repair(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             let prune_index = take_flag(&mut args, "--index");
             let prune_threads = take_flag(&mut args, "--threads");
             let prune_family = take_flag(&mut args, "--family");
+            let prune_subagents = take_flag(&mut args, "--subagents");
             let dry_run = take_flag(&mut args, "--dry-run");
             ensure_no_args(&args)?;
-            if !prune_index && !prune_threads && !prune_family {
+            if !prune_index && !prune_threads && !prune_family && !prune_subagents {
                 return Err(CliError::message(
-                    "prune 需要显式指定 --index、--threads 或 --family",
+                    "prune 需要显式指定 --index、--threads、--family 或 --subagents",
                 ));
             }
             let report = repair::prune_orphan_entries_with_lock(
@@ -1084,14 +1085,16 @@ fn cmd_repair(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
                 prune_index,
                 prune_threads,
                 prune_family,
+                prune_subagents,
                 dry_run,
                 &ctx.family_lock,
             )?;
             output(ctx, &report, |report| {
                 println!(
-                    "index_removed={}\tthreads_removed={}\tfamily_branches_removed={}\tfamilies_removed={}\tfamilies_recovered={}\tfamilies_normalized={}\tfamilies_skipped={}\tdry_run={}",
+                    "index_removed={}\tthreads_removed={}\tsubagents_removed={}\tfamily_branches_removed={}\tfamilies_removed={}\tfamilies_recovered={}\tfamilies_normalized={}\tfamilies_skipped={}\tdry_run={}",
                     report.index_removed,
                     report.threads_removed,
+                    report.subagents_removed,
                     report.family_branches_removed,
                     report.families_removed,
                     report.families_recovered,

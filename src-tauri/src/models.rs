@@ -441,6 +441,10 @@ pub struct DiagnosticReport {
     pub orphan_in_index: Vec<String>,
     /// 在 threads 但 rollout 已没了
     pub orphan_in_threads: Vec<String>,
+    /// 子代理会话的父会话已不存在（thread_spawn_edges 中 parent 不在 threads 表）
+    pub orphan_subagent_count: u32,
+    /// 上述孤儿子代理的 id 列表
+    pub orphan_subagent_ids: Vec<String>,
     /// 当前 `config.toml` 读出的 model_provider
     pub current_provider: Option<String>,
     /// 每个 family 的 active 节点对应 provider 不是 current_provider
@@ -850,6 +854,8 @@ pub struct ProjectConfigRepairReport {
 pub struct OrphanPruneReport {
     pub index_removed: u32,
     pub threads_removed: u32,
+    /// 清理的孤儿子代理会话数（父会话已消失的子代理，含其会话文件与关系记录）
+    pub subagents_removed: u32,
     pub family_branches_removed: u32,
     pub families_removed: u32,
     pub families_recovered: u32,

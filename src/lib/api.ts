@@ -472,6 +472,7 @@ export type ProjectConfigRepairReport = {
 export type OrphanPruneReport = {
   index_removed: number;
   threads_removed: number;
+  subagents_removed: number;
   family_branches_removed: number;
   families_removed: number;
   families_recovered: number;
@@ -559,6 +560,8 @@ export type DiagnosticReport = {
   missing_in_threads: string[];
   orphan_in_index: string[];
   orphan_in_threads: string[];
+  orphan_subagent_count: number;
+  orphan_subagent_ids: string[];
   current_provider: string | null;
   provider_mismatched_families: number;
 };
@@ -1189,6 +1192,7 @@ export const api = {
     prune_index: boolean;
     prune_threads: boolean;
     prune_family: boolean;
+    prune_subagents: boolean;
     dry_run: boolean;
   }) =>
     invokeCommand<OrphanPruneReport>("prune_orphan_entries", {
@@ -1196,6 +1200,7 @@ export const api = {
       pruneIndex: p.prune_index,
       pruneThreads: p.prune_threads,
       pruneFamily: p.prune_family,
+      pruneSubagents: p.prune_subagents,
       dryRun: p.dry_run,
     }),
   backfillArchiveOrigins: (codexDir: string, dryRun: boolean) =>

@@ -11,6 +11,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   Trash2,
+  Users,
   Wand2,
   Wrench,
 } from "lucide-react";
@@ -91,9 +92,9 @@ function CodexRepairRoute() {
   const [strategy, setStrategy] = useState<SwitchStrategy>("continuous");
   const [confirmBatch, setConfirmBatch] = useState(false);
   const [confirmProjectConfigRepair, setConfirmProjectConfigRepair] = useState(false);
-  const [confirmPrune, setConfirmPrune] = useState<null | "index" | "threads" | "family">(
-    null,
-  );
+  const [confirmPrune, setConfirmPrune] = useState<
+    null | "index" | "threads" | "family" | "subagents"
+  >(null);
   const [confirmBackfill, setConfirmBackfill] = useState(false);
   const [running, setRunning] = useState<string | null>(null);
   const [providerSyncProgress, setProviderSyncProgress] = useState<ProviderSyncStatus | null>(null);
@@ -126,6 +127,7 @@ function CodexRepairRoute() {
           prune_index: false,
           prune_threads: false,
           prune_family: true,
+          prune_subagents: false,
           dry_run: true,
         }),
         api.backfillArchiveOrigins(codexDir, true),
@@ -372,6 +374,7 @@ function CodexRepairRoute() {
                                   prune_index: true,
                                   prune_threads: false,
                                   prune_family: false,
+                                  prune_subagents: false,
                                   dry_run: true,
                                 });
                                 toast.success(
@@ -418,6 +421,7 @@ function CodexRepairRoute() {
                                   prune_index: false,
                                   prune_threads: true,
                                   prune_family: false,
+                                  prune_subagents: false,
                                   dry_run: true,
                                 });
                                 toast.success(
@@ -448,6 +452,54 @@ function CodexRepairRoute() {
                       <TooltipContent className="max-w-sm text-xs">
                         仅从应用数据库的 <code>threads</code> 表删除指向已消失会话文件的行，
                         不会重建，不动索引文件。适合不打算恢复这些会话、只想把左侧边栏清干净的场景。
+                      </TooltipContent>
+                    </Tooltip>
+
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          size="sm"
+                          variant={dryRun ? "outline" : "destructive"}
+                          onClick={() => {
+                            if (dryRun) {
+                              void run("prune_subagents", async () => {
+                                const r = await api.pruneOrphanEntries({
+                                  codex_dir: codexDir,
+                                  prune_index: false,
+                                  prune_threads: false,
+                                  prune_family: false,
+                                  prune_subagents: true,
+                                  dry_run: true,
+                                });
+                                toast.success(
+                                  `预览：将删除 ${r.subagents_removed} 个孤儿子代理会话`,
+                                );
+                              });
+                            } else {
+                              setConfirmPrune("subagents");
+                            }
+                          }}
+                          disabled={
+                            !!running || (diag?.orphan_subagent_count ?? 0) === 0
+                          }
+                          className="gap-1.5"
+                        >
+                          <Users className="h-3.5 w-3.5" />
+                          清理孤儿子代理
+                          {(diag?.orphan_subagent_count ?? 0) > 0 && (
+                            <Badge
+                              variant="outline"
+                              className="ml-0.5 h-4 border-current/30 bg-background/20 px-1 text-[10px] font-normal"
+                            >
+                              {diag?.orphan_subagent_count}
+                            </Badge>
+                          )}
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent className="max-w-sm text-xs">
+                        删除父会话已消失的子代理会话：应用数据库 <code>threads</code> 行、
+                        本地会话文件（rollout）和子代理关系记录一并移除，嵌套的子代理后代也会一起删除。
+                        仍存活（含已归档）会话的子代理不会被清理。
                       </TooltipContent>
                     </Tooltip>
                   </div>
@@ -789,6 +841,7 @@ function CodexRepairRoute() {
                                       prune_index: false,
                                       prune_threads: false,
                                       prune_family: true,
+                                      prune_subagents: false,
                                       dry_run: true,
                                     });
                                     setFamilyPrunePreview(report);
@@ -1068,7 +1121,9 @@ function CodexRepairRoute() {
                 ? "清理索引残留"
                 : confirmPrune === "threads"
                   ? "清理数据库残留"
-                  : "清理 family 残留"}
+                  : confirmPrune === "subagents"
+                    ? "清理孤儿子代理"
+                    : "清理 family 残留"}
             </AlertDialogTitle>
             <AlertDialogDescription>
               {confirmPrune === "index" ? (
@@ -1082,6 +1137,13 @@ function CodexRepairRoute() {
                   即将从应用数据库的 <code>threads</code> 表删除{" "}
                   <b>{diag?.orphan_in_threads.length ?? 0}</b> 行。这些条目指向的会话文件已经不存在，
                   删除后不可撤销。对应的历史会话文件不会因此被再次修改。
+                </>
+              ) : confirmPrune === "subagents" ? (
+                <>
+                  即将删除 <b>{diag?.orphan_subagent_count ?? 0}</b> 个父会话已消失的子代理会话：
+                  应用数据库 <code>threads</code> 行、本地会话文件（rollout）和子代理关系记录一并移除，
+                  嵌套的子代理后代也会一起删除。删除后不可撤销。若父会话仍存在（含已归档），
+                  其子代理不会计入此数量。
                 </>
               ) : (
                 <>
@@ -1108,19 +1170,24 @@ function CodexRepairRoute() {
                     ? "prune_index"
                     : kind === "threads"
                       ? "prune_threads"
-                      : "prune_family";
+                      : kind === "subagents"
+                        ? "prune_subagents"
+                        : "prune_family";
                 void run(runKey, async () => {
                   const r = await api.pruneOrphanEntries({
                     codex_dir: codexDir,
                     prune_index: kind === "index",
                     prune_threads: kind === "threads",
                     prune_family: kind === "family",
+                    prune_subagents: kind === "subagents",
                     dry_run: false,
                   });
                   if (kind === "index") {
                     toast.success(`已从 session_index 删除 ${r.index_removed} 行`);
                   } else if (kind === "threads") {
                     toast.success(`已从 threads 表删除 ${r.threads_removed} 行`);
+                  } else if (kind === "subagents") {
+                    toast.success(`已删除 ${r.subagents_removed} 个孤儿子代理会话`);
                   } else {
                     showFamilyPruneResult(r, false);
                   }

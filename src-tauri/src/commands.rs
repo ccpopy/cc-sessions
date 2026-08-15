@@ -479,6 +479,7 @@ pub async fn prune_orphan_entries(
     prune_index: bool,
     prune_threads: bool,
     prune_family: bool,
+    prune_subagents: bool,
     dry_run: bool,
     lock: SharedLock<'_>,
 ) -> AppResult<OrphanPruneReport> {
@@ -489,6 +490,7 @@ pub async fn prune_orphan_entries(
             prune_index,
             prune_threads,
             prune_family,
+            prune_subagents,
             dry_run,
             &lock,
         )

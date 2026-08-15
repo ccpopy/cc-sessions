@@ -460,6 +460,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             bool_arg(&args, "pruneIndex")?,
             bool_arg(&args, "pruneThreads")?,
             bool_arg(&args, "pruneFamily")?,
+            bool_arg(&args, "pruneSubagents")?,
             bool_arg(&args, "dryRun")?,
             &state.family_lock,
         )),

@@ -18,7 +18,7 @@ use crate::paths;
 use crate::provenance;
 use crate::state_db;
 
-mod codex_delete;
+pub(crate) mod codex_delete;
 
 pub(crate) use codex_delete::delete_codex_artifacts;
 use codex_delete::delete_codex_artifacts_batch_with_family_store;
