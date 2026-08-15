@@ -1,7 +1,7 @@
 {
   "name": "cc-session-manager",
   "private": true,
-  "version": "0.5.8.1",
+  "version": "0.5.8.2",
   "type": "module",
   "engines": {
     "node": ">=20"
