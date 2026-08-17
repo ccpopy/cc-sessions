@@ -1585,6 +1585,7 @@ fn empty_delete_result(target: &DeleteTarget) -> DeleteResult {
         tasks_deleted: false,
         file_history_deleted: false,
         shared_data_preserved: false,
+        desktop_restart_required: false,
         ok: false,
         error: None,
     }
@@ -1821,6 +1822,7 @@ fn merge_codex_delete_result(target: &mut DeleteResult, branch_id: &str, source:
     } else if source.rollout_missing && !target.rollout_deleted {
         target.rollout_missing = true;
     }
+    target.desktop_restart_required |= source.desktop_restart_required;
     if let Some(error) = source.error {
         append_error(target, format!("分支 {branch_id}: {error}"));
     }
@@ -2367,6 +2369,73 @@ mod tests {
             serde_json::to_vec_pretty(&state)?,
         )?;
         Ok(())
+    }
+
+    fn write_codex_desktop_thread_cache_fixture(codex: &Path, ids: &[&str]) -> AppResult<()> {
+        let sqlite_dir = codex.join("sqlite");
+        fs::create_dir_all(&sqlite_dir)?;
+
+        let catalog = rusqlite::Connection::open(sqlite_dir.join("codex-dev.db"))?;
+        catalog.execute_batch(
+            "CREATE TABLE local_thread_catalog (
+                host_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                display_title TEXT NOT NULL,
+                PRIMARY KEY (host_id, thread_id)
+            );",
+        )?;
+        for id in ids {
+            catalog.execute(
+                "INSERT INTO local_thread_catalog (host_id, thread_id, display_title)
+                 VALUES ('local', ?1, 'fixture')",
+                [id],
+            )?;
+        }
+        drop(catalog);
+
+        let summaries =
+            rusqlite::Connection::open(sqlite_dir.join("codex-thread-summaries-dev.db"))?;
+        summaries.execute_batch(
+            "CREATE TABLE thread_turn_summaries (
+                principal_key TEXT NOT NULL,
+                host_key TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                PRIMARY KEY (principal_key, host_key, thread_id)
+            );",
+        )?;
+        for id in ids {
+            summaries.execute(
+                "INSERT INTO thread_turn_summaries
+                    (principal_key, host_key, thread_id, summary)
+                 VALUES ('principal', 'local', ?1, 'fixture')",
+                [id],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn desktop_thread_cache_rows(codex: &Path, id: &str) -> AppResult<(u32, u32)> {
+        let sqlite_dir = codex.join("sqlite");
+        let catalog = rusqlite::Connection::open_with_flags(
+            sqlite_dir.join("codex-dev.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let catalog_rows = catalog.query_row(
+            "SELECT COUNT(*) FROM local_thread_catalog WHERE thread_id = ?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        let summaries = rusqlite::Connection::open_with_flags(
+            sqlite_dir.join("codex-thread-summaries-dev.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let summary_rows = summaries.query_row(
+            "SELECT COUNT(*) FROM thread_turn_summaries WHERE thread_id = ?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        Ok((catalog_rows, summary_rows))
     }
 
     fn assert_codex_project_state_membership(
@@ -4941,6 +5010,38 @@ mod tests {
     }
 
     #[test]
+    fn delete_codex_while_desktop_running_clears_cache_and_defers_global_state() -> AppResult<()> {
+        let codex = temp_dir("codex-delete-running-desktop");
+        let rollout = archive_fixture(&codex);
+        let other_id = "019d-desktop-cache-other-7000-8000-000000000002";
+        write_codex_project_state_fixture(&codex, &[ARCHIVE_TEST_ID])?;
+        write_codex_desktop_thread_cache_fixture(&codex, &[ARCHIVE_TEST_ID, other_id])?;
+        let global_state_path = paths::codex_global_state_json_path(&codex);
+        let global_state_before = fs::read(&global_state_path)?;
+        let _desktop = crate::codex_projects::DesktopTestProbeGuard::running();
+
+        let result = delete_one(&codex, ARCHIVE_TEST_ID)?;
+
+        assert!(result.ok, "{:?}", result.error);
+        assert!(result.desktop_restart_required);
+        assert!(!rollout.exists());
+        assert_eq!(fs::read(&global_state_path)?, global_state_before);
+        let state = state_db::open_ro(&codex)?;
+        let remaining: i64 = state.query_row(
+            "SELECT COUNT(*) FROM threads WHERE id = ?",
+            [ARCHIVE_TEST_ID],
+            |row| row.get(0),
+        )?;
+        assert_eq!(remaining, 0);
+        assert_eq!(desktop_thread_cache_rows(&codex, ARCHIVE_TEST_ID)?, (0, 0));
+        assert_eq!(desktop_thread_cache_rows(&codex, other_id)?, (1, 1));
+
+        drop(state);
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
     fn delete_codex_session_removes_archive_ledger_entry() -> AppResult<()> {
         let codex = temp_dir("codex-delete-archive-ledger");
         let rollout = archive_fixture(&codex);
@@ -4968,6 +5069,63 @@ mod tests {
             None
         );
 
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_a_parent_preserves_its_outgoing_edge_for_orphan_cleanup() -> AppResult<()> {
+        let codex = temp_dir("codex-delete-parent-edge");
+        archive_fixture(&codex);
+        let child_id = "019d-child-edge-7000-8000-000000000002";
+        let child_rollout = codex
+            .join("sessions/2026/05/10")
+            .join(format!("rollout-2026-05-10T10-00-01-{child_id}.jsonl"));
+        write_test_rollout(&child_rollout, child_id, "child");
+        let state = state_db::open(&codex)?;
+        state.execute(
+            "ALTER TABLE threads ADD COLUMN model_provider TEXT NOT NULL DEFAULT 'openai'",
+            [],
+        )?;
+        state.execute(
+            "INSERT INTO threads (
+                id, rollout_path, cwd, title, first_user_message, model, reasoning_effort,
+                tokens_used, created_at, updated_at, archived, archived_at, git_branch, source,
+                agent_nickname, agent_role
+            ) VALUES (?1, ?2, 'F:\\w', 'child', 'child', 'gpt-5', NULL, 0,
+                1770000001, 1770000301, 0, NULL, NULL, 'subagent', NULL, NULL)",
+            (child_id, child_rollout.to_string_lossy().into_owned()),
+        )?;
+        state.execute(
+            "CREATE TABLE thread_spawn_edges (
+                parent_thread_id TEXT NOT NULL,
+                child_thread_id TEXT NOT NULL PRIMARY KEY,
+                status TEXT NOT NULL
+            )",
+            [],
+        )?;
+        state.execute(
+            "INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status)
+             VALUES (?1, ?2, 'completed')",
+            (ARCHIVE_TEST_ID, child_id),
+        )?;
+        drop(state);
+
+        let result = delete_one(&codex, ARCHIVE_TEST_ID)?;
+
+        assert!(result.ok, "{:?}", result.error);
+        assert!(child_rollout.is_file());
+        let state = state_db::open_ro(&codex)?;
+        let edge_rows: i64 = state.query_row(
+            "SELECT COUNT(*) FROM thread_spawn_edges
+             WHERE parent_thread_id = ?1 AND child_thread_id = ?2",
+            (ARCHIVE_TEST_ID, child_id),
+            |row| row.get(0),
+        )?;
+        assert_eq!(edge_rows, 1);
+        drop(state);
+        let diagnostic = crate::repair::diagnose_codex_state(codex.to_string_lossy().into_owned())?;
+        assert_eq!(diagnostic.orphan_subagent_ids, vec![child_id.to_string()]);
         fs::remove_dir_all(&codex).ok();
         Ok(())
     }

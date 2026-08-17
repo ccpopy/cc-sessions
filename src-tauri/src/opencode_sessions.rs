@@ -234,6 +234,7 @@ pub fn delete_session(data_dir: &Path, id: &str) -> AppResult<DeleteResult> {
             tasks_deleted: false,
             file_history_deleted: false,
             shared_data_preserved: false,
+            desktop_restart_required: false,
             ok: true,
             error: None,
         });
@@ -288,6 +289,7 @@ pub fn delete_session(data_dir: &Path, id: &str) -> AppResult<DeleteResult> {
         tasks_deleted: false,
         file_history_deleted: false,
         shared_data_preserved: false,
+        desktop_restart_required: false,
         ok: true,
         error: None,
     })

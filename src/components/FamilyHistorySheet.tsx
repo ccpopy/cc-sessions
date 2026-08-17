@@ -8,6 +8,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
+import { DESKTOP_DELETE_RESTART_NOTICE } from "@/lib/desktopRestart";
 
 import {
   Sheet,
@@ -87,8 +88,7 @@ export function FamilyHistorySheet({
       ]);
       if (requestSeq.current !== requestId) return;
       // 徽标显示与来源筛选共用同一数据源：ledger 优先（与列表 SessionCard 一致）。
-      // 存量 fork/manual 会话只有 ledger 记录、family 分支字段为空（repair.rs
-      // backfill/fork 创建只写 ledger），直接用分支字段会显示"来源未知"。
+      // 历史版本的存量会话可能只有 ledger 记录，family 分支字段为空。
       setLedgerOriginBySession(new Map(ledgerEntries.map((e) => [e.session_id, e.origin])));
       const fid = store.index[sessionId];
       if (!fid) {
@@ -170,7 +170,13 @@ export function FamilyHistorySheet({
       if (!result.ok) {
         throw new Error(result.error ?? `分支 ${deleteTarget.id} 未删除干净`);
       }
-      toast.success(`已删除 ${deleteTarget.provider} 分支`);
+      if (result.desktop_restart_required) {
+        toast.warning(`已删除 ${deleteTarget.provider} 分支，但 Desktop 列表尚未刷新`, {
+          description: DESKTOP_DELETE_RESTART_NOTICE,
+        });
+      } else {
+        toast.success(`已删除 ${deleteTarget.provider} 分支`);
+      }
       setDeleteTarget(null);
     } catch (e) {
       toast.error(String((e as Error)?.message ?? e));
@@ -313,7 +319,7 @@ export function FamilyHistorySheet({
                                 {inactiveBranchStatusLabel(b.status)}
                               </Badge>
                             )}
-                            {!isActive && (
+                            {!isActive && b.status === "archived" && (
                               <ArchiveOriginBadge
                                 origin={ledgerOriginBySession.get(b.id) ?? b.archive_origin ?? null}
                                 onSetOrigin={async (origin) => {

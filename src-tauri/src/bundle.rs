@@ -1572,6 +1572,34 @@ pub fn import_session_bundles_with_opencode(
     Ok(reports)
 }
 
+/// 产品入口必须持有共享 FamilyLock，覆盖完整 import，避免归档来源账本并发丢写。
+pub fn import_session_bundles_with_lock(
+    provider: Option<String>,
+    src_dir: String,
+    codex_dir: String,
+    claude_dir: Option<String>,
+    opencode_dir: Option<String>,
+    mode: ImportMode,
+    make_visible: bool,
+    strict: bool,
+    project_mappings: Vec<ProjectPathMapping>,
+    lock: &crate::family::FamilyLock,
+) -> AppResult<Vec<ImportReport>> {
+    crate::family::with_lock(lock, |_guard| {
+        import_session_bundles_with_opencode(
+            provider,
+            src_dir,
+            codex_dir,
+            claude_dir,
+            opencode_dir,
+            mode,
+            make_visible,
+            strict,
+            project_mappings,
+        )
+    })
+}
+
 fn build_project_mapping(items: Vec<ProjectPathMapping>) -> AppResult<HashMap<String, String>> {
     let mut out = HashMap::new();
     for item in items {
@@ -3757,6 +3785,39 @@ fn remove_path_recursive(path: &Path) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_product_entrypoint_waits_for_family_lock() {
+        let lock = std::sync::Arc::new(crate::family::FamilyLock::default());
+        let guard = lock.0.lock().unwrap();
+        let worker_lock = std::sync::Arc::clone(&lock);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = import_session_bundles_with_lock(
+                None,
+                "missing-bundles".into(),
+                "missing-codex".into(),
+                None,
+                None,
+                ImportMode::Skip,
+                false,
+                false,
+                Vec::new(),
+                &worker_lock,
+            );
+            sender.send(result.map(|_| ())).unwrap();
+        });
+
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(guard);
+        let _ = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("import should continue after releasing FamilyLock");
+        worker.join().unwrap();
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

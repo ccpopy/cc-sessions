@@ -52,11 +52,11 @@ pub(crate) fn delete_codex_artifacts_batch_with_family_store(
         }
     }
 
-    // This preflight deliberately precedes a read/write SQLite open: opening SQLite may update
-    // connection metadata, which would violate the zero-change contract for malformed state.
-    crate::codex_projects::preflight_thread_project_state_cleanup(codex_dir, &unique_ids)?;
-    if crate::codex_projects::desktop_state_initialized(codex_dir)? {
-        crate::codex_projects::ensure_desktop_not_running(codex_dir)?;
+    // Desktop 运行时仍删除 Core 数据，但不写它持有的私有项目状态。Desktop 关闭时继续
+    // 保持原有严格预检：必须在打开可写 SQLite 前发现损坏状态，确保失败零改动。
+    let desktop_restart_required = crate::codex_projects::should_defer_desktop_state_cleanup();
+    if !desktop_restart_required {
+        crate::codex_projects::preflight_thread_project_state_cleanup(codex_dir, &unique_ids)?;
     }
 
     struct DeletePreparation {
@@ -119,9 +119,10 @@ pub(crate) fn delete_codex_artifacts_batch_with_family_store(
         for prepared in &preparations {
             let rows = transaction.execute("DELETE FROM threads WHERE id = ?", [&prepared.id])?;
             if spawn_edges_attached {
-                // 子代理关系记录与主会话同生命周期：删除以本会话为父或子的一切边。
+                // 删除会话作为 child 的入边；若它仍有未删除的子代理，则保留出边，
+                // 让孤儿诊断/清理仍能发现这些后代。批量删除后代时，其入边会随之删除。
                 transaction.execute(
-                    "DELETE FROM thread_spawn_edges WHERE parent_thread_id = ?1 OR child_thread_id = ?1",
+                    "DELETE FROM thread_spawn_edges WHERE child_thread_id = ?1",
                     [&prepared.id],
                 )?;
             }
@@ -162,6 +163,7 @@ pub(crate) fn delete_codex_artifacts_batch_with_family_store(
                     tasks_deleted: false,
                     file_history_deleted: false,
                     shared_data_preserved: false,
+                    desktop_restart_required,
                     ok: true,
                     error: None,
                 },
@@ -171,10 +173,13 @@ pub(crate) fn delete_codex_artifacts_batch_with_family_store(
 
         // Keep this after every Core file mutation so late Desktop/CAS failures exercise the same
         // compensation path as other write failures.
-        if let Some(receipt) =
-            crate::codex_projects::clear_thread_project_states_with_receipt(codex_dir, &unique_ids)?
-        {
-            journal.register_project_state_receipt(receipt);
+        if !desktop_restart_required {
+            if let Some(receipt) = crate::codex_projects::clear_thread_project_states_with_receipt(
+                codex_dir,
+                &unique_ids,
+            )? {
+                journal.register_project_state_receipt(receipt);
+            }
         }
         if let Some(family_store) = family_store {
             let family_path = paths::family_store_path(codex_dir);
@@ -183,7 +188,7 @@ pub(crate) fn delete_codex_artifacts_batch_with_family_store(
         Ok(outcomes)
     })();
 
-    let outcomes = match operation {
+    let mut outcomes = match operation {
         Ok(outcomes) => {
             crate::mutation_journal::commit_transaction_with_compensation(transaction, journal)?;
             outcomes
@@ -198,6 +203,21 @@ pub(crate) fn delete_codex_artifacts_batch_with_family_store(
             );
         }
     };
+
+    // Desktop's catalog and generated summaries live outside Core's state database. SQLite safely
+    // coordinates this external writer even while Desktop is running, so clear these rows now.
+    // Keep the cleanup after the compensated Core commit: a Core failure must never hide a thread
+    // that still exists. If this separate cleanup fails, report an explicit partial deletion so a
+    // missing rollout is not mistaken for a fully successful operation.
+    if let Err(error) =
+        crate::codex_projects::clear_deleted_thread_cache_rows(codex_dir, &unique_ids)
+    {
+        let message = format!("会话主体已删除，但 Codex Desktop 目录缓存清理失败: {error}");
+        for outcome in &mut outcomes {
+            outcome.result.ok = false;
+            outcome.result.error = Some(message.clone());
+        }
+    }
 
     // Empty date directories are cosmetic and deliberately outside the transaction. Failure to
     // remove one cannot make the conversation visible again, so it must not downgrade deletion.

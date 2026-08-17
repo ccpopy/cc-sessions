@@ -5,21 +5,25 @@
 //! （与 family store 相同的纪律，见 family.rs `with_lock`）；load/origin_for 为只读，无需锁。
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::atomic_file;
 use crate::error::{AppError, AppResult};
 use crate::models::{ArchiveLedger, ArchiveLedgerEntry, ArchiveOrigin};
 use crate::paths;
 
-/// 读取账本。文件不存在时返回空账本（升级前没有 ledger 属正常）；
-/// 空文件/非法 JSON 拒绝静默降级——避免损坏时把所有归档误判为"无记录"。
-pub fn load(codex_dir: &Path) -> AppResult<ArchiveLedger> {
+enum LedgerFile {
+    Missing,
+    Valid(ArchiveLedger),
+    Corrupt(String),
+}
+
+fn read_file(codex_dir: &Path) -> AppResult<LedgerFile> {
     let p = paths::archive_ledger_path(codex_dir);
     let metadata = match std::fs::metadata(&p) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ArchiveLedger::default())
+            return Ok(LedgerFile::Missing)
         }
         Err(error) => return Err(error.into()),
     };
@@ -31,17 +35,91 @@ pub fn load(codex_dir: &Path) -> AppResult<ArchiveLedger> {
     }
     let raw = std::fs::read_to_string(&p)?;
     if raw.trim().is_empty() {
-        return Err(AppError::Other(format!(
+        return Ok(LedgerFile::Corrupt(format!(
             "归档来源账本内容为空，拒绝按空账本降级处理: {}",
             p.to_string_lossy()
         )));
     }
-    serde_json::from_str(&raw).map_err(|error| {
-        AppError::Other(format!(
+    match serde_json::from_str(&raw) {
+        Ok(ledger) => Ok(LedgerFile::Valid(ledger)),
+        Err(error) => Ok(LedgerFile::Corrupt(format!(
             "解析归档来源账本失败 {}: {error}",
             p.to_string_lossy()
-        ))
-    })
+        ))),
+    }
+}
+
+/// 读取账本。文件不存在时返回空账本（升级前没有 ledger 属正常）；
+/// 空文件/非法 JSON 拒绝静默降级——避免损坏时把所有归档误判为"无记录"。
+pub fn load(codex_dir: &Path) -> AppResult<ArchiveLedger> {
+    match read_file(codex_dir)? {
+        LedgerFile::Missing => Ok(ArchiveLedger::default()),
+        LedgerFile::Valid(ledger) => Ok(ledger),
+        LedgerFile::Corrupt(message) => Err(AppError::Other(message)),
+    }
+}
+
+/// Backfill 是损坏账本的显式恢复入口：预览时按空账本推演，实际应用时由
+/// `save_rebuilt` 先保留损坏原件，再安装完整重建结果。
+pub(crate) fn load_for_rebuild(codex_dir: &Path) -> AppResult<(ArchiveLedger, bool)> {
+    match read_file(codex_dir)? {
+        LedgerFile::Missing => Ok((ArchiveLedger::default(), false)),
+        LedgerFile::Valid(ledger) => Ok((ledger, false)),
+        LedgerFile::Corrupt(_) => Ok((ArchiveLedger::default(), true)),
+    }
+}
+
+fn corrupt_backup_path(ledger_path: &Path) -> AppResult<PathBuf> {
+    let file_name = ledger_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            AppError::Path(format!("归档来源账本缺少文件名: {}", ledger_path.display()))
+        })?;
+    let stamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    for attempt in 0..1000u32 {
+        let candidate = ledger_path.with_file_name(format!(
+            "{file_name}.corrupt-{stamp}-{}-{attempt}",
+            std::process::id()
+        ));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(AppError::Other(format!(
+        "无法为损坏的归档来源账本分配备份路径: {}",
+        ledger_path.display()
+    )))
+}
+
+/// 保存 backfill 的完整重建结果。若原账本损坏，先以 no-replace 原子移动保留原件；
+/// 新账本在提交点前写入失败时会把原件恢复到原路径。
+pub(crate) fn save_rebuilt(
+    codex_dir: &Path,
+    ledger: &ArchiveLedger,
+    replace_corrupt: bool,
+) -> AppResult<Option<PathBuf>> {
+    if !replace_corrupt {
+        save(codex_dir, ledger)?;
+        return Ok(None);
+    }
+
+    let ledger_path = paths::archive_ledger_path(codex_dir);
+    let backup_path = corrupt_backup_path(&ledger_path)?;
+    atomic_file::move_file_if_absent(&ledger_path, &backup_path)?;
+    match save(codex_dir, ledger) {
+        Ok(()) => Ok(Some(backup_path)),
+        Err(error) if error.atomic_write_not_committed() && !ledger_path.exists() => {
+            match atomic_file::move_file_if_absent(&backup_path, &ledger_path) {
+                Ok(()) => Err(error),
+                Err(restore_error) => Err(AppError::Other(format!(
+                    "{error}; 恢复损坏账本原件也失败，原件保留在 {}: {restore_error}",
+                    backup_path.display()
+                ))),
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// 原子写账本（覆盖或新建）。调用方必须持有 FamilyLock。
@@ -126,7 +204,13 @@ pub fn set_archive_origin(
 
 /// 删除一条记录（取消归档/删除会话时调用）。无记录时 no-op。调用方必须持有 FamilyLock。
 pub fn remove(codex_dir: &Path, session_id: &str) -> AppResult<()> {
-    let mut ledger = load(codex_dir)?;
+    let mut ledger = match read_file(codex_dir)? {
+        LedgerFile::Missing => return Ok(()),
+        LedgerFile::Valid(ledger) => ledger,
+        // 账本是 CC Sessions 的辅助索引；删除/取消归档不能因它已损坏而回滚
+        // Core 会话数据。保留原字节，交由 backfill 显式重建并留存损坏副本。
+        LedgerFile::Corrupt(_) => return Ok(()),
+    };
     if ledger.entries.remove(session_id).is_none() {
         return Ok(()); // 本来就没有记录，不需要写盘
     }
@@ -221,6 +305,20 @@ mod tests {
             "error should mention the file path: {error}"
         );
         assert_eq!(origin_for(&codex, "sess-1"), None);
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn removing_an_entry_does_not_block_on_or_overwrite_a_corrupt_ledger() -> AppResult<()> {
+        let codex = temp_codex_dir("ledger-corrupt-remove");
+        let ledger_path = paths::archive_ledger_path(&codex);
+        let corrupt = b"{not-json";
+        fs::write(&ledger_path, corrupt)?;
+
+        remove(&codex, "sess-1")?;
+
+        assert_eq!(fs::read(&ledger_path)?, corrupt);
         fs::remove_dir_all(&codex).ok();
         Ok(())
     }

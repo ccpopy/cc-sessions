@@ -239,6 +239,7 @@ export type DeleteResult = {
   tasks_deleted: boolean;
   file_history_deleted: boolean;
   shared_data_preserved: boolean;
+  desktop_restart_required: boolean;
   ok: boolean;
   error: string | null;
 };
@@ -478,6 +479,7 @@ export type OrphanPruneReport = {
   families_recovered: number;
   families_normalized: number;
   families_skipped: string[];
+  desktop_restart_required: boolean;
   dry_run: boolean;
 };
 
@@ -494,7 +496,6 @@ export type SetArchiveOriginReport = {
   session_id: string;
   origin: ArchiveOrigin;
   family_synced: boolean;
-  error: string | null;
 };
 
 export type HistoryOrphanReport = {

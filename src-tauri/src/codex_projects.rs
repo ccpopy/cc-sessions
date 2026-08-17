@@ -8,6 +8,7 @@ use crate::error::{AppError, AppResult};
 use crate::paths;
 
 mod desktop_guard;
+mod desktop_thread_state;
 mod state_store;
 
 pub(crate) use state_store::StateMutationReceipt;
@@ -64,6 +65,24 @@ pub(crate) fn desktop_state_initialized(codex: &Path) -> AppResult<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
     }
+}
+
+/// Delete/prune may safely defer Desktop-owned project-state cleanup. If Desktop is running or
+/// its process state cannot be determined, callers should remove Core data without writing the
+/// private global state and tell the user to restart Desktop before relying on its cached list.
+pub(crate) fn should_defer_desktop_state_cleanup() -> bool {
+    desktop_guard::official_desktop_is_running().unwrap_or(true)
+}
+
+/// Remove current Desktop catalog/summary rows after Core deletion.
+///
+/// Unlike the global JSON state, these SQLite stores coordinate concurrent writers. They can be
+/// updated while Desktop is running; its already-rendered list still requires a restart to refresh.
+pub(crate) fn clear_deleted_thread_cache_rows(
+    codex: &Path,
+    thread_ids: &[String],
+) -> AppResult<()> {
+    desktop_thread_state::clear_deleted_thread_rows(codex, thread_ids)
 }
 
 /// Validate the Desktop state that a delete/prune operation will later clean up, without writing.

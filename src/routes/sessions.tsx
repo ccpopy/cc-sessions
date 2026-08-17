@@ -62,8 +62,10 @@ import {
   type ProviderSyncSnapshot,
 } from "@/lib/providerSyncRegistry";
 import { SessionActionRegistry } from "@/lib/sessionActionRegistry";
+import { DESKTOP_DELETE_RESTART_NOTICE } from "@/lib/desktopRestart";
 import {
   mergeLedgerIntoOverlay,
+  resolveArchiveOrigins,
   selectSessionsForView,
   type ArchivedOriginGroupKey,
 } from "@/lib/sessionVisibility";
@@ -127,7 +129,8 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const [maintenanceError, setMaintenanceError] = useState<string | null>(null);
   const [providerSyncProgress, setProviderSyncProgress] = useState<ProviderSyncStatus | null>(null);
   const [familySheetId, setFamilySheetId] = useState<string | null>(null);
-  // 归档来源 ledger：归档视图按来源分组的前置数据；读取失败时回退为全部归入"我的归档"
+  // 归档来源 ledger：归档视图按来源分组的前置数据；读取失败时回退 family 字段，
+  // 两者都缺失才归入“我的归档”。
   const [ledgerBySession, setLedgerBySession] = useState<Map<string, ArchiveOrigin>>(new Map());
   const [archiveLedgerError, setArchiveLedgerError] = useState<string | null>(null);
   // 归档视图来源筛选 chips：单选互斥，"all" 表示不过滤
@@ -204,9 +207,8 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     if (active?.scope === overlayScope) return active.promise;
 
     const requestId = ++overlayRequestSeq.current;
-    // ledger 单独捕获失败：来源分组是展示层增强，读取失败只降级为全部归入
-    // "我的归档"（无记录即按用户主动归档处理），不能连带 overlay/provider 状态
-    // 一起失败（计划 §F3 失败降级要求）。
+    // ledger 单独捕获失败：来源分组是展示层增强，读取失败时回退 family 字段，
+    // 不能连带 overlay/provider 状态一起失败（计划 §F3 失败降级要求）。
     const ledgerPromise = api
       .getArchiveLedger(codexDir)
       .then((ledger) => {
@@ -229,15 +231,16 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     ])
       .then(([ov, info, syncPlan, ledgerEntries]) => {
         if (overlayScopeRef.current !== overlayScope) return;
-        // 徽标显示与来源筛选共用同一数据源：ledger 优先（fork/manual 等由
-        // backfill 只写 ledger 未同步 family 分支字段，若用分支字段会显示
-        // "来源未知" 却筛不出）。family 分支字段仅在 ledger 缺失时兜底。
+        // 徽标显示与来源筛选共用同一数据源：ledger 优先。历史版本或不属于
+        // family 的会话可能只有 ledger 记录；family 分支字段仅在 ledger 缺失时兜底。
         const ledgerOriginBySession = new Map(
           (ledgerEntries ?? []).map((entry) => [entry.session_id, entry.origin]),
         );
+        const resolvedOrigins = resolveArchiveOrigins(ov, ledgerOriginBySession);
+        setLedgerBySession(resolvedOrigins);
         setOverlay(
           new Map(
-            mergeLedgerIntoOverlay(ov, ledgerOriginBySession).map((o) => [o.session_id, o]),
+            mergeLedgerIntoOverlay(ov, resolvedOrigins).map((o) => [o.session_id, o]),
           ),
         );
         setCurrentProvider(info.current);
@@ -564,10 +567,6 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
       if (!settings || !isCodex) return;
       try {
         const report = await api.setArchiveOrigin(settings.codex_dir, s.id, origin);
-        if (report.error) {
-          toast.error(`更新归档来源失败：${report.error}`);
-          return;
-        }
         toast.success(
           report.family_synced
             ? "已更新归档来源"
@@ -1033,6 +1032,9 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             settings.opencode_dir,
           );
           const okCount = r.filter((x) => x.ok).length;
+          const desktopRestartRequired = r.some(
+            (x) => x.ok && x.desktop_restart_required,
+          );
           const failed = r.filter((x) => !x.ok);
           const partiallyDeleted = failed.filter(deleteResultHasMutation);
           const rolloutMissing = r.filter((x) => x.ok && x.rollout_missing);
@@ -1041,6 +1043,11 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
           clearSelection();
           await refreshAll();
           if (okCount > 0) toast.success(`已删除 ${okCount}/${r.length}`);
+          if (desktopRestartRequired) {
+            toast.warning("删除已完成，但 Desktop 列表尚未刷新", {
+              description: DESKTOP_DELETE_RESTART_NOTICE,
+            });
+          }
           if (sharedPreserved.length) {
             toast.info(
               `${sharedPreserved.length} 个会话文件原本不存在，但同 ID 副本仍在，共享历史与附属数据已保留`,
@@ -1158,6 +1165,11 @@ function DeleteSummary({
         )}
       </div>
       <div className="text-destructive">此操作不可撤销，也不会自动备份。</div>
+      {provider === "codex" && (
+        <div className="text-amber-600 dark:text-amber-400">
+          Codex/ChatGPT Desktop 正在运行时仍会执行删除；{DESKTOP_DELETE_RESTART_NOTICE}
+        </div>
+      )}
       {targets.length > 1 && (
         <ul className="max-h-36 min-w-0 max-w-full space-y-0.5 overflow-y-auto overflow-x-hidden rounded-md border bg-muted/30 p-2 text-xs">
           {targets.slice(0, 5).map((t) => (

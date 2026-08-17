@@ -123,9 +123,11 @@ pub async fn restore_session(
     id: String,
     backup_rollout_relpath: Option<String>,
     overwrite: bool,
+    lock: SharedLock<'_>,
 ) -> AppResult<RestoreResult> {
+    let lock = lock.inner().clone();
     run_blocking(move || {
-        crate::backup::restore_session_with_opencode(
+        crate::backup::restore_session_with_lock(
             provider,
             backup_dir,
             backup_path,
@@ -135,6 +137,7 @@ pub async fn restore_session(
             id,
             backup_rollout_relpath,
             overwrite,
+            &lock,
         )
     })
     .await
@@ -149,9 +152,11 @@ pub async fn restore_all(
     claude_dir: Option<String>,
     opencode_dir: Option<String>,
     overwrite: bool,
+    lock: SharedLock<'_>,
 ) -> AppResult<Vec<RestoreResult>> {
+    let lock = lock.inner().clone();
     run_blocking(move || {
-        crate::backup::restore_all_with_opencode(
+        crate::backup::restore_all_with_lock(
             provider,
             backup_dir,
             backup_path,
@@ -159,6 +164,7 @@ pub async fn restore_all(
             claude_dir,
             opencode_dir,
             overwrite,
+            &lock,
         )
     })
     .await
@@ -245,9 +251,11 @@ pub async fn import_session_bundles(
     make_visible: bool,
     strict: bool,
     project_mappings: Vec<ProjectPathMapping>,
+    lock: SharedLock<'_>,
 ) -> AppResult<Vec<ImportReport>> {
+    let lock = lock.inner().clone();
     run_blocking(move || {
-        crate::bundle::import_session_bundles_with_opencode(
+        crate::bundle::import_session_bundles_with_lock(
             provider,
             src_dir,
             codex_dir,
@@ -257,6 +265,7 @@ pub async fn import_session_bundles(
             make_visible,
             strict,
             project_mappings,
+            &lock,
         )
     })
     .await
@@ -547,7 +556,6 @@ pub async fn set_archive_origin(
                 session_id,
                 origin,
                 family_synced,
-                error: None,
             })
         })
     })

@@ -1714,6 +1714,34 @@ pub fn restore_session_with_opencode(
     }
 }
 
+/// 产品入口必须持有共享 FamilyLock，覆盖完整 restore，避免归档来源账本并发丢写。
+pub fn restore_session_with_lock(
+    provider: Option<String>,
+    backup_dir: String,
+    backup_path: String,
+    codex_dir: String,
+    claude_dir: Option<String>,
+    opencode_dir: Option<String>,
+    id: String,
+    backup_rollout_relpath: Option<String>,
+    overwrite: bool,
+    lock: &crate::family::FamilyLock,
+) -> AppResult<RestoreResult> {
+    crate::family::with_lock(lock, |_guard| {
+        restore_session_with_opencode(
+            provider,
+            backup_dir,
+            backup_path,
+            codex_dir,
+            claude_dir,
+            opencode_dir,
+            id,
+            backup_rollout_relpath,
+            overwrite,
+        )
+    })
+}
+
 pub fn restore_all(
     provider: Option<String>,
     backup_dir: String,
@@ -1788,6 +1816,30 @@ pub fn restore_all_with_opencode(
         );
     }
     Ok(out)
+}
+
+/// 产品入口必须持有共享 FamilyLock，覆盖完整 restore-all，避免归档来源账本并发丢写。
+pub fn restore_all_with_lock(
+    provider: Option<String>,
+    backup_dir: String,
+    backup_path: String,
+    codex_dir: String,
+    claude_dir: Option<String>,
+    opencode_dir: Option<String>,
+    overwrite: bool,
+    lock: &crate::family::FamilyLock,
+) -> AppResult<Vec<RestoreResult>> {
+    crate::family::with_lock(lock, |_guard| {
+        restore_all_with_opencode(
+            provider,
+            backup_dir,
+            backup_path,
+            codex_dir,
+            claude_dir,
+            opencode_dir,
+            overwrite,
+        )
+    })
 }
 
 fn backup_provider(provider: &Option<String>) -> &str {
@@ -2536,6 +2588,59 @@ fn _unused() {
 mod tests {
     use super::restore_snapshot::RestoreFileTestFaultGuard;
     use super::*;
+
+    fn assert_waits_for_family_lock<T: Send + 'static>(
+        run: impl FnOnce(std::sync::Arc<crate::family::FamilyLock>) -> AppResult<T> + Send + 'static,
+    ) {
+        let lock = std::sync::Arc::new(crate::family::FamilyLock::default());
+        let guard = lock.0.lock().unwrap();
+        let worker_lock = std::sync::Arc::clone(&lock);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender.send(run(worker_lock).map(|_| ())).unwrap();
+        });
+
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(guard);
+        assert!(receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("restore should continue after releasing FamilyLock")
+            .is_err());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn restore_product_entrypoints_wait_for_family_lock() {
+        assert_waits_for_family_lock(|lock| {
+            restore_session_with_lock(
+                None,
+                "missing-backup-root".into(),
+                "missing-backup".into(),
+                "missing-codex".into(),
+                None,
+                None,
+                "missing-session".into(),
+                None,
+                false,
+                &lock,
+            )
+        });
+        assert_waits_for_family_lock(|lock| {
+            restore_all_with_lock(
+                None,
+                "missing-backup-root".into(),
+                "missing-backup".into(),
+                "missing-codex".into(),
+                None,
+                None,
+                false,
+                &lock,
+            )
+        });
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

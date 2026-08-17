@@ -384,7 +384,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "backupDir")?,
             string_arg(&args, "backupPath")?,
         )),
-        "restore_session" => to_result_value(backup::restore_session_with_opencode(
+        "restore_session" => to_result_value(backup::restore_session_with_lock(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "backupDir")?,
             string_arg(&args, "backupPath")?,
@@ -394,8 +394,9 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "id")?,
             opt_string_arg(&args, "backupRolloutRelpath")?,
             bool_arg(&args, "overwrite")?,
+            &state.family_lock,
         )),
-        "restore_all" => to_result_value(backup::restore_all_with_opencode(
+        "restore_all" => to_result_value(backup::restore_all_with_lock(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "backupDir")?,
             string_arg(&args, "backupPath")?,
@@ -403,6 +404,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             opt_string_arg(&args, "claudeDir")?,
             opt_string_arg(&args, "opencodeDir")?,
             bool_arg(&args, "overwrite")?,
+            &state.family_lock,
         )),
         "delete_backup" => to_result_value(backup::delete_backup(
             string_arg(&args, "backupDir")?,
@@ -464,6 +466,14 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             bool_arg(&args, "dryRun")?,
             &state.family_lock,
         )),
+        "backfill_archive_origins" => to_result_value(repair::backfill_archive_origins_with_lock(
+            string_arg(&args, "codexDir")?,
+            bool_arg(&args, "dryRun")?,
+            &state.family_lock,
+        )),
+        "get_archive_ledger" => to_result_value(crate::archive_ledger::entries(Path::new(
+            &string_arg(&args, "codexDir")?,
+        ))),
         "diagnose_claude_history_orphans" => to_result_value(
             repair::diagnose_claude_history_orphans(string_arg(&args, "claudeDir")?),
         ),
@@ -607,7 +617,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "srcDir")?,
             opt_string_arg(&args, "provider")?,
         )),
-        "import_session_bundles" => to_result_value(bundle::import_session_bundles_with_opencode(
+        "import_session_bundles" => to_result_value(bundle::import_session_bundles_with_lock(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "srcDir")?,
             string_arg(&args, "codexDir")?,
@@ -617,6 +627,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             bool_arg(&args, "makeVisible")?,
             bool_arg(&args, "strict")?,
             arg::<Vec<ProjectPathMapping>>(&args, "projectMappings")?,
+            &state.family_lock,
         )),
         "pack_bundles_zip" => to_result_value(bundle::pack_bundles_zip(
             string_arg(&args, "srcDir")?,
@@ -909,7 +920,6 @@ fn webui_set_archive_origin(state: &WebuiState, args: &Value) -> AppResult<SetAr
             session_id,
             origin,
             family_synced,
-            error: None,
         })
     })
 }
@@ -975,4 +985,49 @@ pub fn validate_host(host: &str) -> AppResult<()> {
     host.parse::<IpAddr>()
         .map(|_| ())
         .map_err(|_| AppError::Other(format!("无效 host: {host}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_codex_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "cc-session-manager-{name}-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ))
+    }
+
+    fn test_state(root: &Path) -> WebuiState {
+        WebuiState {
+            settings: Mutex::new(Settings::default()),
+            settings_file: root.join("settings.json"),
+            family_lock: Arc::new(family::FamilyLock::default()),
+            dist_dir: root.join("dist"),
+            api_token: "test-token".to_string(),
+            default_provider: "codex".to_string(),
+        }
+    }
+
+    #[test]
+    fn webui_dispatches_archive_ledger_read_and_backfill_commands() -> AppResult<()> {
+        let codex = temp_codex_dir("webui-archive-commands");
+        fs::create_dir_all(&codex)?;
+        let state = test_state(&codex);
+        let args = json!({ "codexDir": codex.to_string_lossy() });
+
+        let entries = dispatch_invoke(&state, "get_archive_ledger", args.clone())?;
+        assert_eq!(entries, json!([]));
+        let report = dispatch_invoke(
+            &state,
+            "backfill_archive_origins",
+            json!({ "codexDir": codex.to_string_lossy(), "dryRun": true }),
+        )?;
+        assert_eq!(report["scanned"], 0);
+        assert_eq!(report["dry_run"], true);
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
 }

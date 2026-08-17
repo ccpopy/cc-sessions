@@ -12,6 +12,8 @@ use cc_session_manager_lib::{
 type MenuResult<T> = Result<T, String>;
 
 const PAGE_SIZE: usize = 15;
+const DESKTOP_DELETE_RESTART_NOTICE: &str =
+    "重启 Codex/ChatGPT 桌面应用后，已删除的会话才会从列表中消失；请勿继续在已删除的会话中对话。";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Flow {
@@ -1150,6 +1152,12 @@ fn delete_selected_sessions(
         .map(|result| result.id.clone())
         .collect::<Vec<_>>();
     println!("已删除 {}/{} 条。", deleted.len(), results.len());
+    if results
+        .iter()
+        .any(|result| result.ok && result.desktop_restart_required)
+    {
+        println!("提示：{DESKTOP_DELETE_RESTART_NOTICE}");
+    }
     for result in results
         .iter()
         .filter(|result| !result.ok || result.error.is_some())
@@ -1466,7 +1474,7 @@ fn backup_restore_one(ctx: &MenuContext) -> MenuResult<()> {
     let id = prompt_required("session id: ")?;
     let overwrite = confirm_yes("如目标已存在，是否允许覆盖？输入 yes 才会覆盖。")?;
     let backup_root = explicit_backup_root(&path)?;
-    let result = backup::restore_session_with_opencode(
+    let result = backup::restore_session_with_lock(
         Some(provider),
         backup_root,
         path,
@@ -1476,6 +1484,7 @@ fn backup_restore_one(ctx: &MenuContext) -> MenuResult<()> {
         id,
         None,
         overwrite,
+        &ctx.family_lock,
     )
     .map_err(to_string)?;
     println!("{} ok={}", result.id, result.ok);
@@ -1495,7 +1504,7 @@ fn backup_restore_all(ctx: &MenuContext) -> MenuResult<()> {
     }
     let overwrite = confirm_yes("如目标已存在，是否允许覆盖？输入 yes 才会覆盖。")?;
     let backup_root = explicit_backup_root(&path)?;
-    let results = backup::restore_all_with_opencode(
+    let results = backup::restore_all_with_lock(
         Some(provider),
         backup_root,
         path,
@@ -1503,6 +1512,7 @@ fn backup_restore_all(ctx: &MenuContext) -> MenuResult<()> {
         Some(ctx.claude_dir.clone()),
         Some(ctx.opencode_dir.clone()),
         overwrite,
+        &ctx.family_lock,
     )
     .map_err(to_string)?;
     for result in results {
@@ -1640,7 +1650,7 @@ fn bundle_import(ctx: &MenuContext) -> MenuResult<()> {
         false
     };
     let strict = confirm_default_no("是否启用严格校验？")?;
-    let reports = bundle::import_session_bundles_with_opencode(
+    let reports = bundle::import_session_bundles_with_lock(
         Some(provider),
         src_dir,
         ctx.codex_dir.clone(),
@@ -1650,6 +1660,7 @@ fn bundle_import(ctx: &MenuContext) -> MenuResult<()> {
         make_visible,
         strict,
         Vec::new(),
+        &ctx.family_lock,
     )
     .map_err(to_string)?;
     for report in reports {
@@ -1851,6 +1862,10 @@ fn repair_diagnose(ctx: &MenuContext) -> MenuResult<()> {
         report.orphan_in_threads.len()
     );
     println!(
+        "orphan_subagent_count          {}",
+        report.orphan_subagent_count
+    );
+    println!(
         "provider_mismatched_families   {}",
         report.provider_mismatched_families
     );
@@ -1908,15 +1923,20 @@ fn repair_prune(ctx: &MenuContext) -> MenuResult<()> {
     )
     .map_err(to_string)?;
     println!(
-        "index_removed={} threads_removed={} subagents_removed={} family_branches_removed={} families_removed={} families_skipped={} dry_run={}",
+        "index_removed={} threads_removed={} subagents_removed={} family_branches_removed={} families_removed={} families_recovered={} families_normalized={} families_skipped={} dry_run={}",
         report.index_removed,
         report.threads_removed,
         report.subagents_removed,
         report.family_branches_removed,
         report.families_removed,
+        report.families_recovered,
+        report.families_normalized,
         report.families_skipped.len(),
         report.dry_run
     );
+    if report.desktop_restart_required {
+        println!("提示：{DESKTOP_DELETE_RESTART_NOTICE}");
+    }
     for family_id in report.families_skipped {
         println!("family_skipped {family_id}");
     }

@@ -173,6 +173,8 @@ pub struct DeleteResult {
     pub tasks_deleted: bool,
     pub file_history_deleted: bool,
     pub shared_data_preserved: bool,
+    /// Desktop 正在运行或无法安全探测，私有项目状态未同步；需重启刷新其内存列表。
+    pub desktop_restart_required: bool,
     pub ok: bool,
     pub error: Option<String>,
 }
@@ -441,7 +443,7 @@ pub struct DiagnosticReport {
     pub orphan_in_index: Vec<String>,
     /// 在 threads 但 rollout 已没了
     pub orphan_in_threads: Vec<String>,
-    /// 子代理会话的父会话已不存在（thread_spawn_edges 中 parent 不在 threads 表）
+    /// 子代理会话的父会话已不存在（parent 既不在 threads，也没有 rollout）
     pub orphan_subagent_count: u32,
     /// 上述孤儿子代理的 id 列表
     pub orphan_subagent_ids: Vec<String>,
@@ -861,6 +863,8 @@ pub struct OrphanPruneReport {
     pub families_recovered: u32,
     pub families_normalized: u32,
     pub families_skipped: Vec<String>,
+    /// Desktop 私有项目状态因运行中或探测不确定而未同步。
+    pub desktop_restart_required: bool,
     pub dry_run: bool,
 }
 
@@ -887,7 +891,6 @@ pub struct SetArchiveOriginReport {
     pub origin: ArchiveOrigin,
     /// 是否同时同步了 family 分支的 archive_origin 字段（会话不在任何 family 时为 false）
     pub family_synced: bool,
-    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

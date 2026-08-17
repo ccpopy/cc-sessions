@@ -16,6 +16,7 @@ import {
   Wrench,
 } from "lucide-react";
 import { toast } from "sonner";
+import { DESKTOP_DELETE_RESTART_NOTICE } from "@/lib/desktopRestart";
 
 import { TopBar } from "@/components/TopBar";
 import { EmptyState } from "@/components/EmptyState";
@@ -884,64 +885,77 @@ function CodexRepairRoute() {
                         </div>
                       )}
                       {integrity.items.length > 0 && (
-                        <div className="max-h-64 max-w-full overflow-auto rounded-md border">
-                        <table className="w-full text-xs">
-                          <thead className="bg-muted/40 text-left">
-                            <tr>
-                              <th className="px-2 py-1">对话分组(family)</th>
-                              <th className="px-2 py-1">发展分支(branch)</th>
-                              <th className="px-2 py-1">状态</th>
-                              <th className="px-2 py-1">sha256</th>
-                              <th className="px-2 py-1">行数</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {integrity.items.map((it) => (
-                              <tr
-                                key={`${it.family_id}-${it.branch_id}`}
-                                className={it.ok ? "" : "bg-rose-500/5"}
-                              >
-                                <td className="truncate px-2 py-1 font-mono">
-                                  {it.family_id.slice(0, 8)}…
-                                </td>
-                                <td className="truncate px-2 py-1 font-mono">
-                                  {it.branch_id.slice(0, 8)}…
-                                </td>
-                                <td className="px-2 py-1">
-                                  {it.missing ? (
-                                    <Badge
-                                      variant="outline"
-                                      className="h-5 border-rose-500/30 px-1.5 text-rose-500"
-                                    >
-                                      文件缺失
-                                    </Badge>
-                                  ) : it.ok ? (
-                                    <Badge
-                                      variant="outline"
-                                      className="h-5 border-emerald-500/30 px-1.5 text-emerald-600"
-                                    >
-                                      OK
-                                    </Badge>
-                                  ) : (
-                                    <Badge
-                                      variant="outline"
-                                      className="h-5 border-amber-500/30 px-1.5 text-amber-600"
-                                    >
-                                      不一致
-                                    </Badge>
-                                  )}
-                                </td>
-                                <td className="px-2 py-1 font-mono">
-                                  {it.actual_sha?.slice(0, 10) ?? "-"}
-                                </td>
-                                <td className="px-2 py-1 tabular-nums">
-                                  {it.actual_lines ?? "-"}
-                                </td>
+                        <ScrollArea
+                          className="max-w-full rounded-md border"
+                          viewportClassName="max-h-64"
+                        >
+                          <table className="w-full text-xs">
+                            <thead className="text-left">
+                              <tr>
+                                <th className="sticky top-0 z-10 border-b bg-muted px-2 py-1">
+                                  对话分组(family)
+                                </th>
+                                <th className="sticky top-0 z-10 border-b bg-muted px-2 py-1">
+                                  发展分支(branch)
+                                </th>
+                                <th className="sticky top-0 z-10 border-b bg-muted px-2 py-1">
+                                  状态
+                                </th>
+                                <th className="sticky top-0 z-10 border-b bg-muted px-2 py-1">
+                                  sha256
+                                </th>
+                                <th className="sticky top-0 z-10 border-b bg-muted px-2 py-1">
+                                  行数
+                                </th>
                               </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
+                            </thead>
+                            <tbody>
+                              {integrity.items.map((it) => (
+                                <tr
+                                  key={`${it.family_id}-${it.branch_id}`}
+                                  className={it.ok ? "" : "bg-rose-500/5"}
+                                >
+                                  <td className="truncate px-2 py-1 font-mono">
+                                    {it.family_id.slice(0, 8)}…
+                                  </td>
+                                  <td className="truncate px-2 py-1 font-mono">
+                                    {it.branch_id.slice(0, 8)}…
+                                  </td>
+                                  <td className="px-2 py-1">
+                                    {it.missing ? (
+                                      <Badge
+                                        variant="outline"
+                                        className="h-5 border-rose-500/30 px-1.5 text-rose-500"
+                                      >
+                                        文件缺失
+                                      </Badge>
+                                    ) : it.ok ? (
+                                      <Badge
+                                        variant="outline"
+                                        className="h-5 border-emerald-500/30 px-1.5 text-emerald-600"
+                                      >
+                                        OK
+                                      </Badge>
+                                    ) : (
+                                      <Badge
+                                        variant="outline"
+                                        className="h-5 border-amber-500/30 px-1.5 text-amber-600"
+                                      >
+                                        不一致
+                                      </Badge>
+                                    )}
+                                  </td>
+                                  <td className="px-2 py-1 font-mono">
+                                    {it.actual_sha?.slice(0, 10) ?? "-"}
+                                  </td>
+                                  <td className="px-2 py-1 tabular-nums">
+                                    {it.actual_lines ?? "-"}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </ScrollArea>
                       )}
                     </div>
                   )}
@@ -1190,6 +1204,11 @@ function CodexRepairRoute() {
                     toast.success(`已删除 ${r.subagents_removed} 个孤儿子代理会话`);
                   } else {
                     showFamilyPruneResult(r, false);
+                  }
+                  if (r.desktop_restart_required) {
+                    toast.warning("清理已完成，但 Desktop 列表尚未刷新", {
+                      description: DESKTOP_DELETE_RESTART_NOTICE,
+                    });
                   }
                   await refresh();
                 });

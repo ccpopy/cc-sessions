@@ -4,10 +4,9 @@ import { isSubagentSession } from "./sessionSource.ts";
 /**
  * 把 ledger 的归档来源合并进 overlay，统一"徽标显示"与"来源筛选"两个数据源。
  *
- * 为什么需要合并：family 分支的 archive_origin 字段只在用户显式指定来源
- * （set_archive_origin 命令同步写 ledger + 分支字段）时更新；backfill 和 fork
- * 创建路径只写 ledger（repair.rs），分支字段仍是 None。若不合并，会出现徽标显示
- * "来源未知"（分支字段为空）但筛选 unknown 时该会话被 ledger 归入其他组的矛盾。
+ * 为什么需要合并：历史版本或不属于 family 的存量会话可能只有 ledger 记录，
+ * 分支字段仍是 None。若不合并，会出现徽标显示"来源未知"（分支字段为空）但
+ * 来源筛选按 ledger 归入其他组的矛盾。
  *
  * 合并规则：ledger 有记录优先用 ledger 值；ledger 缺失时回退 family 分支字段
  * （再回退 null）。返回新数组，不修改入参。
@@ -16,10 +15,25 @@ export function mergeLedgerIntoOverlay(
   overlays: readonly FamilyOverlay[],
   ledgerBySession: ReadonlyMap<string, ArchiveOrigin>,
 ): FamilyOverlay[] {
+  const resolved = resolveArchiveOrigins(overlays, ledgerBySession);
   return overlays.map((o) => ({
     ...o,
-    archive_origin: ledgerBySession.get(o.session_id) ?? o.archive_origin ?? null,
+    archive_origin: resolved.get(o.session_id) ?? null,
   }));
+}
+
+/** Resolve the one archive-origin map used by badges, filtering, and grouping. */
+export function resolveArchiveOrigins(
+  overlays: readonly FamilyOverlay[],
+  ledgerBySession: ReadonlyMap<string, ArchiveOrigin>,
+): Map<string, ArchiveOrigin> {
+  const resolved = new Map(ledgerBySession);
+  for (const overlay of overlays) {
+    if (!resolved.has(overlay.session_id) && overlay.archive_origin) {
+      resolved.set(overlay.session_id, overlay.archive_origin);
+    }
+  }
+  return resolved;
 }
 
 export type SessionVisibilityOptions = {

@@ -769,7 +769,7 @@ fn cmd_backup(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             let overwrite = take_flag(&mut args, "--overwrite");
             ensure_no_args(&args)?;
             let backup_root = explicit_backup_root(&backup_path)?;
-            let result = backup::restore_session_with_opencode(
+            let result = backup::restore_session_with_lock(
                 Some(concrete_provider(ctx)?),
                 backup_root,
                 backup_path,
@@ -779,6 +779,7 @@ fn cmd_backup(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
                 id,
                 None,
                 overwrite,
+                &ctx.family_lock,
             )?;
             output(ctx, &result, |result| {
                 println!(
@@ -795,7 +796,7 @@ fn cmd_backup(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             let overwrite = take_flag(&mut args, "--overwrite");
             ensure_no_args(&args)?;
             let backup_root = explicit_backup_root(&backup_path)?;
-            let results = backup::restore_all_with_opencode(
+            let results = backup::restore_all_with_lock(
                 Some(concrete_provider(ctx)?),
                 backup_root,
                 backup_path,
@@ -803,6 +804,7 @@ fn cmd_backup(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
                 Some(ctx.claude_dir.clone()),
                 Some(ctx.opencode_dir.clone()),
                 overwrite,
+                &ctx.family_lock,
             )?;
             output(ctx, &results, |items| {
                 for item in items {
@@ -905,7 +907,7 @@ fn cmd_bundle(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             let make_visible = take_flag(&mut args, "--make-visible");
             let strict = take_flag(&mut args, "--strict");
             ensure_no_args(&args)?;
-            let reports = bundle::import_session_bundles_with_opencode(
+            let reports = bundle::import_session_bundles_with_lock(
                 Some(concrete_provider(ctx)?),
                 src_dir,
                 ctx.codex_dir.clone(),
@@ -915,6 +917,7 @@ fn cmd_bundle(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
                 make_visible,
                 strict,
                 Vec::new(),
+                &ctx.family_lock,
             )?;
             output(ctx, &reports, |reports| {
                 for report in reports {
@@ -1034,6 +1037,7 @@ fn cmd_repair(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
                 println!("missing_in_threads\t{}", report.missing_in_threads.len());
                 println!("orphan_in_index\t{}", report.orphan_in_index.len());
                 println!("orphan_in_threads\t{}", report.orphan_in_threads.len());
+                println!("orphan_subagent_count\t{}", report.orphan_subagent_count);
                 println!(
                     "provider_mismatched_families\t{}",
                     report.provider_mismatched_families
@@ -1091,7 +1095,7 @@ fn cmd_repair(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             )?;
             output(ctx, &report, |report| {
                 println!(
-                    "index_removed={}\tthreads_removed={}\tsubagents_removed={}\tfamily_branches_removed={}\tfamilies_removed={}\tfamilies_recovered={}\tfamilies_normalized={}\tfamilies_skipped={}\tdry_run={}",
+                    "index_removed={}\tthreads_removed={}\tsubagents_removed={}\tfamily_branches_removed={}\tfamilies_removed={}\tfamilies_recovered={}\tfamilies_normalized={}\tfamilies_skipped={}\tdesktop_restart_required={}\tdry_run={}",
                     report.index_removed,
                     report.threads_removed,
                     report.subagents_removed,
@@ -1100,6 +1104,7 @@ fn cmd_repair(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
                     report.families_recovered,
                     report.families_normalized,
                     report.families_skipped.len(),
+                    report.desktop_restart_required,
                     report.dry_run
                 );
                 for family_id in &report.families_skipped {
@@ -1345,6 +1350,9 @@ fn cmd_family(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             )?;
             output(ctx, &result, |result| {
                 println!("{}\tok={}", result.id, result.ok);
+                if result.ok && result.desktop_restart_required {
+                    println!("desktop_restart_required\ttrue");
+                }
                 if let Some(error) = &result.error {
                     println!("error\t{error}");
                 }

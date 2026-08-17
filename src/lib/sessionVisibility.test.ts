@@ -5,6 +5,7 @@ import {
   filterSessionsByOrigin,
   groupArchivedByOrigin,
   mergeLedgerIntoOverlay,
+  resolveArchiveOrigins,
   selectNormalFamilySessions,
   selectSessionsForView,
 } from "./sessionVisibility.ts";
@@ -317,7 +318,7 @@ test("filterSessionsByOrigin leaves input sessions unchanged", () => {
 });
 
 test("mergeLedgerIntoOverlay prefers ledger origin when family branch field is missing", () => {
-  // fork/manual 会话：backfill 只写 ledger 未同步 family 分支字段（分支字段为 null）。
+  // 历史版本中仅有 ledger 记录的会话（family 分支字段为 null）。
   // 修复前徽标显示"来源未知"，但筛选 mine 时被 ledger 归入 mine 组 → 筛不出来。
   const forkSession = { ...session("fork-b", 200), archived: true };
   const overlay = new Map<string, FamilyOverlay>([
@@ -382,4 +383,31 @@ test("mergeLedgerIntoOverlay does not mutate input overlays", () => {
 
   mergeLedgerIntoOverlay([...overlay.values()], ledger);
   assert.equal(overlay.get(mine.id)?.archive_origin, null);
+});
+
+test("resolved archive origins use ledger first and family metadata as a grouping fallback", () => {
+  const familyFallback = familyOverlay("family-only", "family-1", "openai", false);
+  familyFallback.archive_origin = "provider_sync";
+  const ledgerWins = familyOverlay("ledger-wins", "family-2", "openai", false);
+  ledgerWins.archive_origin = "provider_sync";
+  const ledger = new Map<string, ArchiveOrigin>([
+    ["ledger-wins", "restore"],
+    ["standalone", "fork"],
+  ]);
+
+  const resolved = resolveArchiveOrigins([familyFallback, ledgerWins], ledger);
+
+  assert.deepEqual(Array.from(resolved.entries()), [
+    ["ledger-wins", "restore"],
+    ["standalone", "fork"],
+    ["family-only", "provider_sync"],
+  ]);
+  assert.deepEqual(
+    filterSessionsByOrigin(
+      [{ ...session("family-only", 100), archived: true }],
+      resolved,
+      "auto",
+    ).map((item) => item.id),
+    ["family-only"],
+  );
 });

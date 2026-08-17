@@ -80,12 +80,15 @@ pub fn overwrite_with_writer(
             atomic_write_not_committed(error),
         ));
     }
-    replace_file_atomically(&temp_path, path, true).map_err(|error| {
-        AppError::AtomicWriteNotCommitted(format!(
-            "原子替换目标文件失败 {}: {error}",
-            path.to_string_lossy()
-        ))
-    })?;
+    if let Err(error) = replace_file_atomically(&temp_path, path, true) {
+        return Err(cleanup_after_error(
+            &temp_path,
+            AppError::AtomicWriteNotCommitted(format!(
+                "原子替换目标文件失败 {}: {error}",
+                path.to_string_lossy()
+            )),
+        ));
+    }
     sync_parent(path).map_err(|error| {
         AppError::AtomicWriteCommitted(format!(
             "文件已写入，但同步父目录失败 {}: {error}",
@@ -677,6 +680,34 @@ fn sync_parent(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overwrite_failure_removes_temporary_file() -> AppResult<()> {
+        let root = std::env::temp_dir().join(format!(
+            "cc-session-manager-atomic-overwrite-failure-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir_all(&root)?;
+        let destination = root.join("archive_ledger.json");
+        fs::create_dir(&destination)?;
+
+        let error = overwrite_with_writer(&destination, |file| {
+            file.write_all(b"replacement\n")?;
+            Ok(())
+        })
+        .expect_err("replacing a directory with a file must fail");
+
+        assert!(error.atomic_write_not_committed(), "{error}");
+        let temp_files = fs::read_dir(&root)?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|entry| entry.file_name().to_string_lossy().contains("rewrite.tmp"))
+            .count();
+        assert_eq!(temp_files, 0);
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
 
     #[test]
     fn refuses_to_replace_a_file_changed_after_snapshot() -> AppResult<()> {
