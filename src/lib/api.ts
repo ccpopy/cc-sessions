@@ -472,12 +472,29 @@ export type ProjectConfigRepairReport = {
 export type OrphanPruneReport = {
   index_removed: number;
   threads_removed: number;
+  subagents_removed: number;
   family_branches_removed: number;
   families_removed: number;
   families_recovered: number;
   families_normalized: number;
   families_skipped: string[];
   dry_run: boolean;
+};
+
+export type ArchiveOriginBackfillReport = {
+  scanned: number;
+  skipped_existing: number;
+  fork_marked: number;
+  provider_sync_marked: number;
+  unknown_marked: number;
+  dry_run: boolean;
+};
+
+export type SetArchiveOriginReport = {
+  session_id: string;
+  origin: ArchiveOrigin;
+  family_synced: boolean;
+  error: string | null;
 };
 
 export type HistoryOrphanReport = {
@@ -543,6 +560,8 @@ export type DiagnosticReport = {
   missing_in_threads: string[];
   orphan_in_index: string[];
   orphan_in_threads: string[];
+  orphan_subagent_count: number;
+  orphan_subagent_ids: string[];
   current_provider: string | null;
   provider_mismatched_families: number;
 };
@@ -657,7 +676,22 @@ export type SwitchStrategy = "continuous" | "scatter" | "follow";
 // ========================= 家族树 =========================
 
 export type BranchStatus = "active" | "archived" | "deleted";
-export type ArchiveOrigin = "provider_sync";
+export type ArchiveOrigin =
+  | "manual"
+  | "official"
+  | "fork"
+  | "provider_sync"
+  | "restore"
+  | "import"
+  | "unknown";
+
+export type ArchiveLedgerEntry = {
+  session_id: string;
+  origin: ArchiveOrigin;
+  archived_at: number | null;
+  source_path: string | null;
+  sha256: string | null;
+};
 
 export type FamilyBranch = {
   id: string;
@@ -1158,6 +1192,7 @@ export const api = {
     prune_index: boolean;
     prune_threads: boolean;
     prune_family: boolean;
+    prune_subagents: boolean;
     dry_run: boolean;
   }) =>
     invokeCommand<OrphanPruneReport>("prune_orphan_entries", {
@@ -1165,7 +1200,21 @@ export const api = {
       pruneIndex: p.prune_index,
       pruneThreads: p.prune_threads,
       pruneFamily: p.prune_family,
+      pruneSubagents: p.prune_subagents,
       dryRun: p.dry_run,
+    }),
+  backfillArchiveOrigins: (codexDir: string, dryRun: boolean) =>
+    invokeCommand<ArchiveOriginBackfillReport>("backfill_archive_origins", {
+      codexDir,
+      dryRun,
+    }),
+  getArchiveLedger: (codexDir: string) =>
+    invokeCommand<ArchiveLedgerEntry[]>("get_archive_ledger", { codexDir }),
+  setArchiveOrigin: (codexDir: string, sessionId: string, origin: ArchiveOrigin) =>
+    invokeCommand<SetArchiveOriginReport>("set_archive_origin", {
+      codexDir,
+      sessionId,
+      origin,
     }),
   diagnoseClaudeHistoryOrphans: (claudeDir: string) =>
     invokeCommand<HistoryOrphanReport>("diagnose_claude_history_orphans", { claudeDir }),

@@ -11,6 +11,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   Trash2,
+  Users,
   Wand2,
   Wrench,
 } from "lucide-react";
@@ -59,6 +60,7 @@ import {
 import { useSettings } from "@/stores/settings";
 import {
   api,
+  type ArchiveOriginBackfillReport,
   type DiagnosticReport,
   type FamilyIntegrityReport,
   type GuiVisibilityReport,
@@ -85,13 +87,15 @@ function CodexRepairRoute() {
   const [projectConfig, setProjectConfig] = useState<ProjectConfigReport | null>(null);
   const [integrity, setIntegrity] = useState<FamilyIntegrityReport | null>(null);
   const [familyPrunePreview, setFamilyPrunePreview] = useState<OrphanPruneReport | null>(null);
+  const [backfillPreview, setBackfillPreview] = useState<ArchiveOriginBackfillReport | null>(null);
   const [loading, setLoading] = useState(false);
   const [strategy, setStrategy] = useState<SwitchStrategy>("continuous");
   const [confirmBatch, setConfirmBatch] = useState(false);
   const [confirmProjectConfigRepair, setConfirmProjectConfigRepair] = useState(false);
-  const [confirmPrune, setConfirmPrune] = useState<null | "index" | "threads" | "family">(
-    null,
-  );
+  const [confirmPrune, setConfirmPrune] = useState<
+    null | "index" | "threads" | "family" | "subagents"
+  >(null);
+  const [confirmBackfill, setConfirmBackfill] = useState(false);
   const [running, setRunning] = useState<string | null>(null);
   const [providerSyncProgress, setProviderSyncProgress] = useState<ProviderSyncStatus | null>(null);
   const [dryRun, setDryRun] = useState(false);
@@ -113,7 +117,7 @@ function CodexRepairRoute() {
     if (!codexDir) return;
     setLoading(true);
     try {
-      const [d, p, c, i, familyPreview] = await Promise.all([
+      const [d, p, c, i, familyPreview, backfillPreview] = await Promise.all([
         api.diagnoseCodexState(codexDir),
         api.getProviderInfo(codexDir),
         api.diagnoseProjectConfigs(codexDir),
@@ -123,14 +127,17 @@ function CodexRepairRoute() {
           prune_index: false,
           prune_threads: false,
           prune_family: true,
+          prune_subagents: false,
           dry_run: true,
         }),
+        api.backfillArchiveOrigins(codexDir, true),
       ]);
       setDiag(d);
       setProvider(p);
       setProjectConfig(c);
       setIntegrity(i);
       setFamilyPrunePreview(familyPreview);
+      setBackfillPreview(backfillPreview);
     } catch (e) {
       toast.error(`诊断失败：${String((e as Error)?.message ?? e)}`);
     } finally {
@@ -169,6 +176,21 @@ function CodexRepairRoute() {
       });
     } else {
       toast.success(message);
+    }
+  };
+
+  const showBackfillResult = (report: ArchiveOriginBackfillReport, preview: boolean) => {
+    const marked = report.fork_marked + report.provider_sync_marked + report.unknown_marked;
+    const action = preview ? "预览：将为" : "已为";
+    const suffix = preview
+      ? ""
+      : `；跳过已有记录 ${report.skipped_existing} 条`;
+    if (marked > 0) {
+      toast.success(
+        `${action} ${marked} 个归档会话补写来源标记（Fork ${report.fork_marked}、ProviderSync ${report.provider_sync_marked}、未知 ${report.unknown_marked}）${suffix}`,
+      );
+    } else {
+      toast.success(`扫描 ${report.scanned} 个归档会话，无缺失来源标记`);
     }
   };
 
@@ -352,6 +374,7 @@ function CodexRepairRoute() {
                                   prune_index: true,
                                   prune_threads: false,
                                   prune_family: false,
+                                  prune_subagents: false,
                                   dry_run: true,
                                 });
                                 toast.success(
@@ -398,6 +421,7 @@ function CodexRepairRoute() {
                                   prune_index: false,
                                   prune_threads: true,
                                   prune_family: false,
+                                  prune_subagents: false,
                                   dry_run: true,
                                 });
                                 toast.success(
@@ -428,6 +452,54 @@ function CodexRepairRoute() {
                       <TooltipContent className="max-w-sm text-xs">
                         仅从应用数据库的 <code>threads</code> 表删除指向已消失会话文件的行，
                         不会重建，不动索引文件。适合不打算恢复这些会话、只想把左侧边栏清干净的场景。
+                      </TooltipContent>
+                    </Tooltip>
+
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          size="sm"
+                          variant={dryRun ? "outline" : "destructive"}
+                          onClick={() => {
+                            if (dryRun) {
+                              void run("prune_subagents", async () => {
+                                const r = await api.pruneOrphanEntries({
+                                  codex_dir: codexDir,
+                                  prune_index: false,
+                                  prune_threads: false,
+                                  prune_family: false,
+                                  prune_subagents: true,
+                                  dry_run: true,
+                                });
+                                toast.success(
+                                  `预览：将删除 ${r.subagents_removed} 个孤儿子代理会话`,
+                                );
+                              });
+                            } else {
+                              setConfirmPrune("subagents");
+                            }
+                          }}
+                          disabled={
+                            !!running || (diag?.orphan_subagent_count ?? 0) === 0
+                          }
+                          className="gap-1.5"
+                        >
+                          <Users className="h-3.5 w-3.5" />
+                          清理孤儿子代理
+                          {(diag?.orphan_subagent_count ?? 0) > 0 && (
+                            <Badge
+                              variant="outline"
+                              className="ml-0.5 h-4 border-current/30 bg-background/20 px-1 text-[10px] font-normal"
+                            >
+                              {diag?.orphan_subagent_count}
+                            </Badge>
+                          )}
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent className="max-w-sm text-xs">
+                        删除父会话已消失的子代理会话：应用数据库 <code>threads</code> 行、
+                        本地会话文件（rollout）和子代理关系记录一并移除，嵌套的子代理后代也会一起删除。
+                        仍存活（含已归档）会话的子代理不会被清理。
                       </TooltipContent>
                     </Tooltip>
                   </div>
@@ -769,6 +841,7 @@ function CodexRepairRoute() {
                                       prune_index: false,
                                       prune_threads: false,
                                       prune_family: true,
+                                      prune_subagents: false,
                                       dry_run: true,
                                     });
                                     setFamilyPrunePreview(report);
@@ -869,6 +942,77 @@ function CodexRepairRoute() {
                           </tbody>
                         </table>
                       </div>
+                      )}
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+
+              <Card className="min-w-0 overflow-hidden">
+                <CardHeader className="pb-3">
+                  <CardTitle className="flex min-w-0 flex-wrap items-center gap-2 text-base">
+                    <ShieldCheck className="h-4 w-4" />
+                    归档来源标记
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Info className="h-3.5 w-3.5 text-muted-foreground" />
+                      </TooltipTrigger>
+                      <TooltipContent className="max-w-sm text-xs">
+                        为 <code>archived_sessions/</code> 下缺少记录的归档会话补写来源标记
+                        （Fork / ProviderSync / 未知）。只写 CC Sessions 自己的归档账本，
+                        不修改任何官方会话数据。
+                      </TooltipContent>
+                    </Tooltip>
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="min-w-0 space-y-2">
+                  {backfillPreview == null ? (
+                    <div className="text-xs text-muted-foreground">—</div>
+                  ) : (
+                    <div className="space-y-1.5">
+                      <div className="flex flex-wrap items-center gap-2 text-xs">
+                        <span className="text-muted-foreground">
+                          扫描 {backfillPreview.scanned} 个归档会话，其中{" "}
+                          {backfillPreview.fork_marked +
+                            backfillPreview.provider_sync_marked +
+                            backfillPreview.unknown_marked}{" "}
+                          个缺少来源标记
+                        </span>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              size="sm"
+                              variant={dryRun ? "outline" : "default"}
+                              onClick={() => {
+                                if (dryRun) {
+                                  void run("backfill_origins", async () => {
+                                    const report = await api.backfillArchiveOrigins(codexDir, true);
+                                    setBackfillPreview(report);
+                                    showBackfillResult(report, true);
+                                  });
+                                } else {
+                                  setConfirmBackfill(true);
+                                }
+                              }}
+                              disabled={!!running || backfillPreview.scanned === 0}
+                              className="ml-auto gap-1.5"
+                            >
+                              <Wand2 className="h-3.5 w-3.5" />
+                              补全归档来源标记
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent className="max-w-sm text-xs">
+                            为缺少记录的归档会话补写来源标记。打开"效果预览"时只统计不写入。
+                          </TooltipContent>
+                        </Tooltip>
+                      </div>
+                      {backfillPreview.scanned > 0 && (
+                        <div className="rounded-md border border-border/60 bg-muted/20 px-3 py-2 text-[11px] leading-5 text-muted-foreground">
+                          将标记：Fork {backfillPreview.fork_marked} 个、ProviderSync{" "}
+                          {backfillPreview.provider_sync_marked} 个、未知{" "}
+                          {backfillPreview.unknown_marked} 个；跳过已有记录{" "}
+                          {backfillPreview.skipped_existing} 个
+                        </div>
                       )}
                     </div>
                   )}
@@ -977,7 +1121,9 @@ function CodexRepairRoute() {
                 ? "清理索引残留"
                 : confirmPrune === "threads"
                   ? "清理数据库残留"
-                  : "清理 family 残留"}
+                  : confirmPrune === "subagents"
+                    ? "清理孤儿子代理"
+                    : "清理 family 残留"}
             </AlertDialogTitle>
             <AlertDialogDescription>
               {confirmPrune === "index" ? (
@@ -991,6 +1137,13 @@ function CodexRepairRoute() {
                   即将从应用数据库的 <code>threads</code> 表删除{" "}
                   <b>{diag?.orphan_in_threads.length ?? 0}</b> 行。这些条目指向的会话文件已经不存在，
                   删除后不可撤销。对应的历史会话文件不会因此被再次修改。
+                </>
+              ) : confirmPrune === "subagents" ? (
+                <>
+                  即将删除 <b>{diag?.orphan_subagent_count ?? 0}</b> 个父会话已消失的子代理会话：
+                  应用数据库 <code>threads</code> 行、本地会话文件（rollout）和子代理关系记录一并移除，
+                  嵌套的子代理后代也会一起删除。删除后不可撤销。若父会话仍存在（含已归档），
+                  其子代理不会计入此数量。
                 </>
               ) : (
                 <>
@@ -1017,19 +1170,24 @@ function CodexRepairRoute() {
                     ? "prune_index"
                     : kind === "threads"
                       ? "prune_threads"
-                      : "prune_family";
+                      : kind === "subagents"
+                        ? "prune_subagents"
+                        : "prune_family";
                 void run(runKey, async () => {
                   const r = await api.pruneOrphanEntries({
                     codex_dir: codexDir,
                     prune_index: kind === "index",
                     prune_threads: kind === "threads",
                     prune_family: kind === "family",
+                    prune_subagents: kind === "subagents",
                     dry_run: false,
                   });
                   if (kind === "index") {
                     toast.success(`已从 session_index 删除 ${r.index_removed} 行`);
                   } else if (kind === "threads") {
                     toast.success(`已从 threads 表删除 ${r.threads_removed} 行`);
+                  } else if (kind === "subagents") {
+                    toast.success(`已删除 ${r.subagents_removed} 个孤儿子代理会话`);
                   } else {
                     showFamilyPruneResult(r, false);
                   }
@@ -1037,7 +1195,42 @@ function CodexRepairRoute() {
                 });
               }}
             >
-              确认清理
+               确认清理
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={confirmBackfill} onOpenChange={setConfirmBackfill}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>补全归档来源标记</AlertDialogTitle>
+            <AlertDialogDescription>
+              即将为{" "}
+              <b>
+                {(backfillPreview?.fork_marked ?? 0) +
+                  (backfillPreview?.provider_sync_marked ?? 0) +
+                  (backfillPreview?.unknown_marked ?? 0)}
+              </b>{" "}
+              个归档会话写入来源标记（Fork {(backfillPreview?.fork_marked ?? 0)}、
+              ProviderSync {(backfillPreview?.provider_sync_marked ?? 0)}、未知{" "}
+              {(backfillPreview?.unknown_marked ?? 0)}）。该标记写入 CC Sessions 自己的归档
+              账本，不修改任何官方会话数据；已有记录不会被覆盖。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                setConfirmBackfill(false);
+                void run("backfill_origins", async () => {
+                  const r = await api.backfillArchiveOrigins(codexDir, false);
+                  setBackfillPreview(r);
+                  showBackfillResult(r, false);
+                });
+              }}
+            >
+              确认补全
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

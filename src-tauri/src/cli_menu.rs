@@ -1891,7 +1891,8 @@ fn repair_prune(ctx: &MenuContext) -> MenuResult<()> {
     let prune_index = confirm_default_no("是否清理 session_index.jsonl 里的 orphan？")?;
     let prune_threads = confirm_default_no("是否清理 threads 表里的 orphan？")?;
     let prune_family = confirm_default_no("是否清理 session_family.json 里可安全确认的 orphan？")?;
-    if !prune_index && !prune_threads && !prune_family {
+    let prune_subagents = confirm_default_no("是否清理父会话已消失的孤儿子代理会话？")?;
+    if !prune_index && !prune_threads && !prune_family && !prune_subagents {
         println!("未选择任何清理目标。");
         return pause().map(|_| ());
     }
@@ -1901,14 +1902,16 @@ fn repair_prune(ctx: &MenuContext) -> MenuResult<()> {
         prune_index,
         prune_threads,
         prune_family,
+        prune_subagents,
         dry_run,
         &ctx.family_lock,
     )
     .map_err(to_string)?;
     println!(
-        "index_removed={} threads_removed={} family_branches_removed={} families_removed={} families_skipped={} dry_run={}",
+        "index_removed={} threads_removed={} subagents_removed={} family_branches_removed={} families_removed={} families_skipped={} dry_run={}",
         report.index_removed,
         report.threads_removed,
+        report.subagents_removed,
         report.family_branches_removed,
         report.families_removed,
         report.families_skipped.len(),

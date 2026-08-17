@@ -1,12 +1,17 @@
 import { memo, useMemo, type RefObject } from "react";
 
+import { ArchivedSessionView } from "@/components/ArchivedSessionView";
 import { ProjectSessionView } from "@/components/ProjectSessionView";
 import type { SessionCardHandlers } from "@/components/SelectableSessionCard";
 import { SizeSessionView } from "@/components/SizeSessionView";
 import { TimeSessionView } from "@/components/TimeSessionView";
 import type { SessionListViewProps } from "@/components/SessionListRowCard";
-import type { FamilyOverlay, SessionSummary } from "@/lib/api";
+import type { ArchiveOrigin, FamilyOverlay, SessionSummary } from "@/lib/api";
 import { sessionIdentity } from "@/lib/sessionIdentity";
+import {
+  filterSessionsByOrigin,
+  type ArchivedOriginGroupKey,
+} from "@/lib/sessionVisibility";
 import { useView } from "@/stores/view";
 
 type Props = SessionCardHandlers & {
@@ -18,6 +23,10 @@ type Props = SessionCardHandlers & {
   syncingSessionIds?: ReadonlySet<string>;
   syncActionsDisabled?: boolean;
   duplicatingSessionIds?: ReadonlySet<string>;
+  archivedGrouping?: {
+    ledgerBySession: ReadonlyMap<string, ArchiveOrigin>;
+    originFilter: ArchivedOriginGroupKey | "all";
+  } | null;
 };
 
 export const SessionList = memo(function SessionList({
@@ -29,6 +38,7 @@ export const SessionList = memo(function SessionList({
   syncingSessionIds,
   syncActionsDisabled,
   duplicatingSessionIds,
+  archivedGrouping,
   ...handlers
 }: Props) {
   const view = useView((state) => state.view);
@@ -47,8 +57,19 @@ export const SessionList = memo(function SessionList({
     }));
   }, [backupIndex, prefillCwd, sessions]);
 
+  // 归档来源筛选只过滤会话集合，不改变视图分组方式：
+  // 工具栏的视图切换（时间/项目/大小）始终优先。
+  const viewSessions = useMemo(() => {
+    if (!archivedGrouping) return visibleSessions;
+    return filterSessionsByOrigin(
+      visibleSessions,
+      archivedGrouping.ledgerBySession,
+      archivedGrouping.originFilter,
+    );
+  }, [archivedGrouping, visibleSessions]);
+
   const viewProps: SessionListViewProps = {
-    sessions: visibleSessions,
+    sessions: viewSessions,
     handlers,
     query,
     scrollElementRef,
@@ -61,5 +82,14 @@ export const SessionList = memo(function SessionList({
 
   if (view === "project") return <ProjectSessionView {...viewProps} />;
   if (view === "size") return <SizeSessionView {...viewProps} />;
+  if (archivedGrouping) {
+    return (
+      <ArchivedSessionView
+        {...viewProps}
+        ledgerBySession={archivedGrouping.ledgerBySession}
+        originFilter={archivedGrouping.originFilter}
+      />
+    );
+  }
   return <TimeSessionView {...viewProps} />;
 });

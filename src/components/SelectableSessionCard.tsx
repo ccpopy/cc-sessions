@@ -1,7 +1,7 @@
 import { memo, useCallback } from "react";
 
 import { SessionCard } from "@/components/SessionCard";
-import type { FamilyOverlay, SessionSummary } from "@/lib/api";
+import type { ArchiveOrigin, FamilyOverlay, SessionSummary } from "@/lib/api";
 import { sessionIdentity } from "@/lib/sessionIdentity";
 import { useSelection } from "@/stores/selection";
 
@@ -19,6 +19,7 @@ export type SessionCardHandlers = {
   onConvert?: (session: SessionSummary) => void;
   onRename?: (session: SessionSummary) => void;
   onMoveCwd?: (session: SessionSummary) => void;
+  onSetArchiveOrigin?: (session: SessionSummary, origin: ArchiveOrigin) => Promise<void> | void;
 };
 
 type Props = SessionCardHandlers & {

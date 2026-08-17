@@ -18,12 +18,12 @@ use crate::atomic_file;
 use crate::error::{ensure_not_cancelled, AppError, AppResult};
 use crate::family;
 use crate::models::{
-    ArchiveOrigin, BranchStatus, BranchSyncReport, BranchSyncState, CloneReport, DiagnosticReport,
-    DuplicateSessionReport, Family, FamilyBranch, ForkSessionReport, GuiVisibilityFixReport,
-    GuiVisibilityIssue, GuiVisibilityReport, HistoryOrphanReport, HistoryPruneReport,
-    IndexRepairReport, OrphanPruneReport, ProjectConfigIssue, ProjectConfigRepairItem,
-    ProjectConfigRepairReport, ProjectConfigReport, ProviderInfo, SwitchStrategy, SyncBranchReport,
-    ThreadsRebuildReport,
+    ArchiveLedgerEntry, ArchiveOrigin, ArchiveOriginBackfillReport, BranchStatus, BranchSyncReport,
+    BranchSyncState, CloneReport, DiagnosticReport, DuplicateSessionReport, Family, FamilyBranch,
+    FamilyStore, ForkSessionReport, GuiVisibilityFixReport, GuiVisibilityIssue,
+    GuiVisibilityReport, HistoryOrphanReport, HistoryPruneReport, IndexRepairReport,
+    OrphanPruneReport, ProjectConfigIssue, ProjectConfigRepairItem, ProjectConfigRepairReport,
+    ProjectConfigReport, ProviderInfo, SwitchStrategy, SyncBranchReport, ThreadsRebuildReport,
 };
 use crate::mutation_journal::{
     commit_transaction_with_compensation, rollback_transaction_with_compensation, MutationJournal,
@@ -975,6 +975,9 @@ pub fn diagnose_codex_state(codex_dir: String) -> AppResult<DiagnosticReport> {
     let mut threads_ids: Vec<String> = Vec::new();
     let mut threads_active_ids: Vec<String> = Vec::new();
     let mut threads_archived_ids: Vec<String> = Vec::new();
+    // 孤儿子代理：thread_spawn_edges 中父会话已不在 threads 表的 child。
+    // 父在 threads 表（含 archived=1 的本工具归档）说明父会话仍存在，不算孤儿。
+    let mut orphan_subagent_ids: Vec<String> = Vec::new();
     if paths::state_db_path(&codex).is_file() {
         let conn = state_db::open_ro(&codex)?;
         let mut stmt = conn.prepare("SELECT id, COALESCE(archived,0) FROM threads")?;
@@ -990,6 +993,27 @@ pub fn diagnose_codex_state(codex_dir: String) -> AppResult<DiagnosticReport> {
             }
             threads_ids.push(id);
         }
+        let has_edges: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='thread_spawn_edges')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_edges {
+            let mut stmt = conn.prepare(
+                "WITH RECURSIVE orphan_set(id) AS (
+                    SELECT e.child_thread_id FROM thread_spawn_edges e
+                    WHERE e.parent_thread_id NOT IN (SELECT id FROM threads)
+                    UNION
+                    SELECT e.child_thread_id FROM thread_spawn_edges e
+                    JOIN orphan_set o ON e.parent_thread_id = o.id
+                )
+                SELECT id FROM orphan_set",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            for r in rows.flatten() {
+                orphan_subagent_ids.push(r);
+            }
+        }
     }
     threads_ids.sort();
     threads_ids.dedup();
@@ -997,6 +1021,8 @@ pub fn diagnose_codex_state(codex_dir: String) -> AppResult<DiagnosticReport> {
     threads_active_ids.dedup();
     threads_archived_ids.sort();
     threads_archived_ids.dedup();
+    orphan_subagent_ids.sort();
+    orphan_subagent_ids.dedup();
 
     // 5) 差集
     let rs: BTreeSet<&String> = rollout_ids.iter().collect();
@@ -1029,6 +1055,8 @@ pub fn diagnose_codex_state(codex_dir: String) -> AppResult<DiagnosticReport> {
         missing_in_threads,
         orphan_in_index,
         orphan_in_threads,
+        orphan_subagent_count: orphan_subagent_ids.len() as u32,
+        orphan_subagent_ids,
         current_provider: Some(cur_provider),
         provider_mismatched_families: mismatch,
     })
@@ -1115,6 +1143,8 @@ pub fn prune_orphan_entries(
     codex_dir: String,
     prune_index: bool,
     prune_threads: bool,
+    prune_family: bool,
+    prune_subagents: bool,
     dry_run: bool,
 ) -> AppResult<OrphanPruneReport> {
     let lock = family::FamilyLock::default();
@@ -1122,7 +1152,8 @@ pub fn prune_orphan_entries(
         codex_dir,
         prune_index,
         prune_threads,
-        prune_index || prune_threads,
+        prune_family,
+        prune_subagents,
         dry_run,
         &lock,
     )
@@ -1133,11 +1164,19 @@ pub fn prune_orphan_entries_with_lock(
     prune_index: bool,
     prune_threads: bool,
     prune_family: bool,
+    prune_subagents: bool,
     dry_run: bool,
     lock: &family::FamilyLock,
 ) -> AppResult<OrphanPruneReport> {
     family::with_lock(lock, |_g| {
-        prune_orphan_entries_locked(codex_dir, prune_index, prune_threads, prune_family, dry_run)
+        prune_orphan_entries_locked(
+            codex_dir,
+            prune_index,
+            prune_threads,
+            prune_family,
+            prune_subagents,
+            dry_run,
+        )
     })
 }
 
@@ -1343,6 +1382,7 @@ fn prune_orphan_entries_locked(
     prune_index: bool,
     prune_threads: bool,
     prune_family: bool,
+    prune_subagents: bool,
     dry_run: bool,
 ) -> AppResult<OrphanPruneReport> {
     let codex = PathBuf::from(&codex_dir);
@@ -1374,11 +1414,50 @@ fn prune_orphan_entries_locked(
     } else {
         Vec::new()
     };
-    if !dry_run && prune_threads {
-        crate::codex_projects::preflight_thread_project_state_cleanup(&codex, &orphan_ids)?;
+    // 孤儿子代理：thread_spawn_edges 中父会话已不在 threads 表的 child（含纯边残留）。
+    // 父在 threads 表（含 archived=1 的本工具归档）说明父会话仍存在，不算孤儿。
+    let orphan_subagent_ids = if prune_subagents && state_db_exists {
+        let state = state_db::open_ro(&codex)?;
+        let has_edges: bool = state.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='thread_spawn_edges')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_edges {
+            let mut stmt = state.prepare(
+                "WITH RECURSIVE orphan_set(id) AS (
+                    SELECT e.child_thread_id FROM thread_spawn_edges e
+                    WHERE e.parent_thread_id NOT IN (SELECT id FROM threads)
+                    UNION
+                    SELECT e.child_thread_id FROM thread_spawn_edges e
+                    JOIN orphan_set o ON e.parent_thread_id = o.id
+                )
+                SELECT id FROM orphan_set",
+            )?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    if !dry_run && (prune_threads || prune_subagents) {
+        let mut preflight_ids = orphan_ids.clone();
+        preflight_ids.extend(orphan_subagent_ids.iter().cloned());
+        crate::codex_projects::preflight_thread_project_state_cleanup(&codex, &preflight_ids)?;
         if crate::codex_projects::desktop_state_initialized(&codex)? {
             crate::codex_projects::ensure_desktop_not_running(&codex)?;
         }
+    }
+    // 孤儿子代理清理复用会话删除的完整补偿路径（threads 行 + rollout 文件 +
+    // session_index + 归档账本 + project state + logs + 子代理关系边）。
+    if !dry_run && prune_subagents && !orphan_subagent_ids.is_empty() {
+        crate::sessions::codex_delete::delete_codex_artifacts_batch_with_family_store(
+            &codex,
+            &orphan_subagent_ids,
+            None,
+        )?;
     }
 
     let mut index_removed = 0u32;
@@ -1568,6 +1647,7 @@ fn prune_orphan_entries_locked(
     Ok(OrphanPruneReport {
         index_removed,
         threads_removed,
+        subagents_removed: orphan_subagent_ids.len() as u32,
         family_branches_removed,
         families_removed,
         families_recovered,
@@ -1575,6 +1655,133 @@ fn prune_orphan_entries_locked(
         families_skipped,
         dry_run,
     })
+}
+
+// ========================= 归档来源 backfill =========================
+
+/// D8 存量 backfill：为 ledger 中缺失的归档会话补写来源标记。
+/// 扫描 `archived_sessions/` 下所有 rollout，对每个 id 推断来源（见
+/// `infer_backfill_origin`），ledger 已有记录一律跳过（不覆盖既有标记）。
+/// dry_run=true 只统计不写盘（与 `prune_orphan_entries` 同模式）。
+pub fn backfill_archive_origins(
+    codex_dir: String,
+    dry_run: bool,
+) -> AppResult<ArchiveOriginBackfillReport> {
+    let lock = family::FamilyLock::default();
+    backfill_archive_origins_with_lock(codex_dir, dry_run, &lock)
+}
+
+pub fn backfill_archive_origins_with_lock(
+    codex_dir: String,
+    dry_run: bool,
+    lock: &family::FamilyLock,
+) -> AppResult<ArchiveOriginBackfillReport> {
+    family::with_lock(lock, |_g| {
+        backfill_archive_origins_locked(codex_dir, dry_run)
+    })
+}
+
+fn backfill_archive_origins_locked(
+    codex_dir: String,
+    dry_run: bool,
+) -> AppResult<ArchiveOriginBackfillReport> {
+    let codex = PathBuf::from(&codex_dir);
+    let mut ledger = crate::archive_ledger::load(&codex)?;
+    let store = family::load(&codex)?;
+    let mut report = ArchiveOriginBackfillReport::default();
+    report.dry_run = dry_run;
+
+    let rollouts = family::scan_archived_rollouts(&codex)?;
+    report.scanned = rollouts.len() as u32;
+    for path in &rollouts {
+        let Some(brief) = read_rollout_brief(&codex, path)? else {
+            continue; // 无法读出 id 的 rollout 跳过（与 prune 扫描同一容错策略）
+        };
+        if ledger.entries.contains_key(&brief.id) {
+            report.skipped_existing += 1;
+            continue;
+        }
+        // 子代理会话不参与归档来源登记（归档视图按设计不展示子代理，前端
+        // selectSessionsForView 强制过滤）。静默跳过：不写 ledger，也不计入
+        // 报告任何类别——子代理来源无法也无须推断。
+        if is_subagent_source(brief.source.as_deref()) {
+            continue;
+        }
+        let origin = infer_backfill_origin(&store, &brief.id);
+        match origin {
+            ArchiveOrigin::Fork => report.fork_marked += 1,
+            ArchiveOrigin::ProviderSync => report.provider_sync_marked += 1,
+            _ => report.unknown_marked += 1,
+        }
+        if !dry_run {
+            // D15：孤儿会话 archived_at 从文件 mtime 派生，无法确定时留 None。
+            let archived_at = path
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64);
+            let source_path = path
+                .strip_prefix(&codex)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+            ledger.entries.insert(
+                brief.id.clone(),
+                ArchiveLedgerEntry {
+                    session_id: brief.id.clone(),
+                    origin: origin.clone(),
+                    archived_at,
+                    source_path: Some(source_path),
+                    // backfill 不固化 sha256：存量文件未固化，保持 None（与
+                    // verify_integrity 对未固化分支只查存在性的语义一致）。
+                    sha256: None,
+                },
+            );
+            // 同步 family 分支字段（与 set_archive_origin 命令语义一致）：
+            // 徽标显示读分支字段、来源筛选读 ledger，两处必须一致，否则会出现
+            // 徽标显示"来源未知"却按 ledger 归入其他组的矛盾（fork/manual 会话
+            // 的 backfill 典型场景）。会话不属于任何 family 时 no-op。
+            family::set_archive_origin_for_session(&codex, &brief.id, origin)?;
+        }
+    }
+    if !dry_run && !ledger.entries.is_empty() {
+        crate::archive_ledger::save(&codex, &ledger)?;
+    }
+    Ok(report)
+}
+
+/// 推断单个归档会话的来源（D8 规则，纯函数便于测试）：
+/// - family 分支存在且 note 含 `forked_from:` 前缀 → `Fork`
+///   （fork 写入 note 且不清空，repair.rs:3964-3967；已知近似：被手动归档的
+///    fork 分支也会被启发式标为 Fork——存量数据的合理近似，dry_run 预览可兜底）
+/// - family 分支存在且 archive_origin 有值 → 保留原值（ProviderSync 等）
+/// - family 分支存在且 note 含 `cloned_from:` 前缀 → `ProviderSync`
+///   （provider_sync 克隆写入 note 且不清空；旧版分支没有 archive_origin 字段，
+///    clone 的 note 是唯一可区分信号——与 forked_from 同属存量近似）
+/// - 其余 → `Unknown`（保守不臆测，无法区分 Manual/Official）
+fn infer_backfill_origin(store: &FamilyStore, session_id: &str) -> ArchiveOrigin {
+    for family in store.families.values() {
+        if let Some(branch) = family.chain.iter().find(|b| b.id == session_id) {
+            if branch
+                .note
+                .as_deref()
+                .is_some_and(|note| note.starts_with("forked_from:"))
+            {
+                return ArchiveOrigin::Fork;
+            }
+            if let Some(origin) = &branch.archive_origin {
+                return origin.clone();
+            }
+            if branch
+                .note
+                .as_deref()
+                .is_some_and(|note| note.starts_with("cloned_from:"))
+            {
+                return ArchiveOrigin::ProviderSync;
+            }
+        }
+    }
+    ArchiveOrigin::Unknown
 }
 
 pub fn diagnose_claude_history_orphans(claude_dir: String) -> AppResult<HistoryOrphanReport> {
@@ -3870,6 +4077,25 @@ fn fork_session_at_event_locked(
         let index_path = paths::session_index_path(&codex);
         journal.mutate_file(&index_path, || remove_index_line(&codex, &active_branch.id))?;
 
+        // 归档来源账本：fork 源分支归因于"用户从较早位置创建回溯分支"（D10），
+        // 纳入同一 journal，失败回滚时 ledger 一并还原。
+        let ledger_path = paths::archive_ledger_path(&codex);
+        journal.mutate_file(&ledger_path, || {
+            let sha256 = store
+                .families
+                .get(&family_id)
+                .and_then(|f| f.chain.iter().find(|b| b.id == active_branch.id))
+                .and_then(|b| b.sha256.clone());
+            crate::archive_ledger::record(
+                &codex,
+                &active_branch.id,
+                ArchiveOrigin::Fork,
+                Some(chrono::Utc::now().timestamp()),
+                Some(archived_dest.to_string_lossy().into_owned()),
+                sha256,
+            )
+        })?;
+
         let new_brief = read_rollout_brief(&codex, &new_abs)?.ok_or_else(|| {
             AppError::Other(format!(
                 "新分支 rollout 缺少有效 session_meta.id: {}",
@@ -4423,6 +4649,24 @@ fn clone_session_for_provider_locked_with_hint(
                     mark_thread_archived(&transaction, branch_id, destination)?;
                     let index_path = paths::session_index_path(&codex);
                     journal.mutate_file(&index_path, || remove_index_line(&codex, branch_id))?;
+                    // 归档来源账本：切换 provider 的旧分支归因 ProviderSync（D10），
+                    // 纳入同一 journal，失败回滚时 ledger 一并还原。
+                    let ledger_path = paths::archive_ledger_path(&codex);
+                    journal.mutate_file(&ledger_path, || {
+                        let sha256 = store
+                            .families
+                            .get(&family_id)
+                            .and_then(|f| f.chain.iter().find(|b| b.id == *branch_id))
+                            .and_then(|b| b.sha256.clone());
+                        crate::archive_ledger::record(
+                            &codex,
+                            branch_id,
+                            ArchiveOrigin::ProviderSync,
+                            Some(chrono::Utc::now().timestamp()),
+                            Some(destination.to_string_lossy().into_owned()),
+                            sha256,
+                        )
+                    })?;
                 }
 
                 // 3) 追加新分支为 active（Scatter 不移动旧文件，但 family active 同步切换）。
@@ -4932,6 +5176,24 @@ fn rollback_family_active_locked(
         mark_thread_archived(&transaction, &cur_active.id, &cur_archived_abs)?;
         let index_path = paths::session_index_path(&codex);
         journal.mutate_file(&index_path, || remove_index_line(&codex, &cur_active.id))?;
+        // 归档来源账本：切换当前分支是被归档分支的归因 Manual（D10），
+        // 纳入同一 journal，失败回滚时 ledger 一并还原。
+        let ledger_path = paths::archive_ledger_path(&codex);
+        journal.mutate_file(&ledger_path, || {
+            let sha256 = store
+                .families
+                .get(&family_id)
+                .and_then(|f| f.chain.iter().find(|b| b.id == cur_active.id))
+                .and_then(|b| b.sha256.clone());
+            crate::archive_ledger::record(
+                &codex,
+                &cur_active.id,
+                ArchiveOrigin::Manual,
+                Some(chrono::Utc::now().timestamp()),
+                Some(cur_archived_abs.to_string_lossy().into_owned()),
+                sha256,
+            )
+        })?;
 
         // 目标分支从归档恢复；Scatter 分支本就在 sessions/ 时无需移动。
         if !target_already_active {
@@ -4965,6 +5227,12 @@ fn rollback_family_active_locked(
         let family_path = paths::family_store_path(&codex);
         journal.mutate_file(&family_path, || family::save(&codex, &store))?;
         inject_repair_fault("rollback_after_family_save")?;
+        // 归档来源账本：目标分支已恢复为活跃，不再是归档会话，清理其 ledger 记录
+        //（如 Continuous 切换时留下的 ProviderSync），纳入同一 journal 一并还原。
+        let ledger_path = paths::archive_ledger_path(&codex);
+        journal.mutate_file(&ledger_path, || {
+            crate::archive_ledger::remove(&codex, &target_branch_id)
+        })?;
         Ok(())
     })();
     if let Err(error) = operation {
@@ -5519,6 +5787,31 @@ mod tests {
 
     fn write_rollout(codex: &Path, id: &str, provider: &str) -> AppResult<()> {
         write_rollout_in(codex, "sessions", id, provider)
+    }
+
+    /// 与 write_rollout_in 相同，但 session_meta 带 source 字段（子代理场景）。
+    fn write_rollout_with_source(
+        codex: &Path,
+        root: &str,
+        id: &str,
+        provider: &str,
+        source: &str,
+    ) -> AppResult<()> {
+        let rollout_dir = codex.join(root).join("2026").join("04").join("22");
+        fs::create_dir_all(&rollout_dir)?;
+        let path = rollout_dir.join(format!("rollout-{id}.jsonl"));
+        let line = serde_json::json!({
+            "timestamp": "2026-04-22T00:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": id,
+                "model_provider": provider,
+                "cwd": "F:\\project\\example",
+                "source": source
+            }
+        });
+        fs::write(path, format!("{}\n", serde_json::to_string(&line)?))?;
+        Ok(())
     }
 
     fn write_rollout_with_cwd(codex: &Path, id: &str, cwd: &Path) -> AppResult<()> {
@@ -6745,6 +7038,21 @@ mod tests {
                         archived_branch.archive_origin,
                         Some(ArchiveOrigin::ProviderSync)
                     );
+                    // 归档来源账本：Continuous 切换归档的旧分支应记录 ProviderSync
+                    let ledger_after_clone = crate::archive_ledger::load(&codex)?;
+                    let ledger_entry = ledger_after_clone
+                        .entries
+                        .get(&source_id)
+                        .expect("continuous archived source should be in ledger");
+                    assert_eq!(ledger_entry.origin, ArchiveOrigin::ProviderSync);
+                    assert!(
+                        ledger_entry
+                            .source_path
+                            .as_deref()
+                            .unwrap_or_default()
+                            .contains("archived_sessions"),
+                        "ledger 应指向归档后的路径"
+                    );
 
                     rollback_family_active_locked(
                         codex.to_string_lossy().into_owned(),
@@ -6777,6 +7085,18 @@ mod tests {
                     let restored_index = read_session_index_ids(&codex)?;
                     assert!(restored_index.contains(&source_id));
                     assert!(!restored_index.contains(&active_id));
+                    // 归档来源账本：rollback 后源分支恢复活跃（记录移除），
+                    // 被归档的旧 active 分支记录 Manual
+                    let ledger_after_rollback = crate::archive_ledger::load(&codex)?;
+                    assert!(
+                        !ledger_after_rollback.entries.contains_key(&source_id),
+                        "恢复活跃的分支不应留在账本中"
+                    );
+                    let rollback_entry = ledger_after_rollback
+                        .entries
+                        .get(&active_id)
+                        .expect("rollback 归档的旧 active 应记录 Manual");
+                    assert_eq!(rollback_entry.origin, ArchiveOrigin::Manual);
                     assert_thread_project_cwd(&codex, &source_id, r"F:\project\example")?;
                 }
                 _ => unreachable!(),
@@ -7757,6 +8077,31 @@ mod tests {
                 && matches!(b.status, BranchStatus::Active)
                 && b.note.as_deref() == Some("forked_from:source-session@line:2")
         }));
+        // 归档来源账本：fork 源分支应记录 Fork，且与归档文件校验和一致
+        let ledger = crate::archive_ledger::load(&codex)?;
+        let entry = ledger
+            .entries
+            .get(source_id)
+            .expect("fork 源分支应记录 ArchiveOrigin::Fork");
+        assert_eq!(entry.origin, ArchiveOrigin::Fork);
+        assert!(
+            entry
+                .source_path
+                .as_deref()
+                .unwrap_or_default()
+                .contains("archived_sessions"),
+            "fork 记录应指向归档后的路径"
+        );
+        let source_branch = family
+            .chain
+            .iter()
+            .find(|b| b.id == source_id)
+            .expect("source branch in family");
+        assert_eq!(
+            entry.sha256.as_deref(),
+            source_branch.sha256.as_deref(),
+            "ledger sha256 应与 family store 归档后的校验一致"
+        );
 
         let state = state_db::open_ro(&codex)?;
         let old_archived: i64 = state.query_row(
@@ -8112,7 +8457,14 @@ mod tests {
         )?;
 
         let diag = diagnose_codex_state(codex.to_string_lossy().into_owned())?;
-        let prune = prune_orphan_entries(codex.to_string_lossy().into_owned(), false, true, true)?;
+        let prune = prune_orphan_entries(
+            codex.to_string_lossy().into_owned(),
+            false,
+            true,
+            false,
+            false,
+            true,
+        )?;
         fs::remove_dir_all(&codex).ok();
 
         assert_eq!(diag.archived_rollout_count, 1);
@@ -8154,8 +8506,14 @@ mod tests {
             }),
         )?;
 
-        let report =
-            prune_orphan_entries(codex.to_string_lossy().into_owned(), false, true, false)?;
+        let report = prune_orphan_entries(
+            codex.to_string_lossy().into_owned(),
+            false,
+            true,
+            false,
+            false,
+            false,
+        )?;
 
         assert_eq!(report.threads_removed, 1);
         assert!(thread_project_assignment(&codex, "ghost-thread")?.is_none());
@@ -8177,6 +8535,121 @@ mod tests {
                 .is_object()
         );
 
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn diagnosing_counts_orphan_subagents_when_parent_chain_is_gone() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-orphan-subagent-diag-test");
+        let parent = "orphan-parent";
+        let child = "orphan-child";
+        let grandchild = "orphan-grandchild";
+        let live_parent = "live-parent";
+        let live_child = "live-child";
+        write_rollout(&codex, child, DEFAULT_PROVIDER)?;
+        write_rollout(&codex, grandchild, DEFAULT_PROVIDER)?;
+        write_rollout(&codex, live_child, DEFAULT_PROVIDER)?;
+        let conn = create_minimal_state(&codex)?;
+        for id in [child, grandchild, live_parent, live_child] {
+            conn.execute(
+                "INSERT INTO threads (id, model_provider, source, archived) VALUES (?1, ?2, ?3, 0)",
+                (id, DEFAULT_PROVIDER, DEFAULT_THREAD_SOURCE),
+            )?;
+        }
+        conn.execute(
+            "CREATE TABLE thread_spawn_edges (
+                parent_thread_id TEXT NOT NULL,
+                child_thread_id TEXT NOT NULL PRIMARY KEY,
+                status TEXT NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status) VALUES (?1, ?2, 'open')",
+            (parent, child),
+        )?;
+        conn.execute(
+            "INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status) VALUES (?1, ?2, 'open')",
+            (child, grandchild),
+        )?;
+        conn.execute(
+            "INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status) VALUES (?1, ?2, 'open')",
+            (live_parent, live_child),
+        )?;
+        drop(conn);
+
+        let diag = diagnose_codex_state(codex.to_string_lossy().into_owned())?;
+        fs::remove_dir_all(&codex).ok();
+
+        // child/grandchild 的父链都触不到存活父 → 孤儿；live_child 有存活父 → 不是
+        assert_eq!(diag.orphan_subagent_count, 2);
+        assert_eq!(
+            diag.orphan_subagent_ids,
+            vec![child.to_string(), grandchild.to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pruning_orphan_subagents_removes_threads_rollouts_and_edges() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-prune-subagent-test");
+        let parent = "prune-sub-parent";
+        let child = "prune-sub-child";
+        let grandchild = "prune-sub-grandchild";
+        write_rollout(&codex, child, DEFAULT_PROVIDER)?;
+        write_rollout(&codex, grandchild, DEFAULT_PROVIDER)?;
+        let conn = create_minimal_state(&codex)?;
+        for id in [child, grandchild] {
+            conn.execute(
+                "INSERT INTO threads (id, model_provider, source, archived) VALUES (?1, ?2, ?3, 0)",
+                (id, DEFAULT_PROVIDER, DEFAULT_THREAD_SOURCE),
+            )?;
+        }
+        conn.execute(
+            "CREATE TABLE thread_spawn_edges (
+                parent_thread_id TEXT NOT NULL,
+                child_thread_id TEXT NOT NULL PRIMARY KEY,
+                status TEXT NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status) VALUES (?1, ?2, 'open')",
+            (parent, child),
+        )?;
+        conn.execute(
+            "INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status) VALUES (?1, ?2, 'open')",
+            (child, grandchild),
+        )?;
+        drop(conn);
+
+        let report = prune_orphan_entries(
+            codex.to_string_lossy().into_owned(),
+            false,
+            false,
+            false,
+            true,
+            false,
+        )?;
+        assert_eq!(report.subagents_removed, 2);
+
+        let state = state_db::open_ro(&codex)?;
+        let remaining: Vec<String> = state
+            .prepare("SELECT id FROM threads")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(remaining.is_empty(), "threads 行应全部删除: {remaining:?}");
+        let edges: Vec<String> = state
+            .prepare("SELECT child_thread_id FROM thread_spawn_edges")?
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(edges.is_empty(), "子代理关系边应全部删除: {edges:?}");
+        drop(state);
+        assert!(
+            family::scan_rollouts(&codex)?.is_empty(),
+            "孤儿 rollout 文件应被删除"
+        );
         fs::remove_dir_all(&codex).ok();
         Ok(())
     }
@@ -8215,8 +8688,15 @@ mod tests {
         let index_before = fs::read(&index_path)?;
         let global_before = fs::read(&global_state_path)?;
 
-        let error = prune_orphan_entries(codex.to_string_lossy().into_owned(), true, true, false)
-            .expect_err("broken project state must abort before pruning Core data");
+        let error = prune_orphan_entries(
+            codex.to_string_lossy().into_owned(),
+            true,
+            true,
+            false,
+            false,
+            false,
+        )
+        .expect_err("broken project state must abort before pruning Core data");
 
         assert!(error.to_string().contains("全局状态 JSON 损坏"), "{error}");
         assert_eq!(fs::read(&rollout)?, rollout_before);
@@ -8291,6 +8771,7 @@ mod tests {
             true,
             true,
             false,
+            false,
             &family::FamilyLock::default(),
         )
         .expect_err("late prune failure must compensate every store");
@@ -8306,6 +8787,159 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()?;
         assert_eq!(ids, vec![live_id.to_string(), orphan_id.to_string()]);
         drop(state);
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn backfill_archive_origins_classifies_mixed_legacy_archives() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-backfill-origins-test");
+        fs::create_dir_all(&codex)?;
+
+        // 构造四类存量归档 + 一条已有 ledger 记录 + 一个子代理归档：
+        // - orphan：无 family 分支记录 → 应推断 Unknown
+        // - fork：family 分支 note 含 forked_from: 前缀 → 应推断 Fork
+        // - sync：family 分支 archive_origin=ProviderSync → 应保留原值
+        // - clone：family 分支 note 含 cloned_from: 前缀（旧版 provider_sync
+        //   克隆，archive_origin 字段缺失）→ 应推断 ProviderSync
+        // - known：ledger 已有 Manual 记录 → 应跳过（skipped_existing）
+        // - subagent：source 为 subagent JSON → 静默跳过，不写 ledger
+        let orphan_id = "backfill-orphan";
+        let fork_id = "backfill-fork";
+        let sync_id = "backfill-sync";
+        let clone_id = "backfill-clone";
+        let known_id = "backfill-known";
+        let sub_id = "backfill-subagent";
+        for id in [orphan_id, fork_id, sync_id, clone_id, known_id] {
+            write_rollout_in(&codex, "archived_sessions", id, DEFAULT_PROVIDER)?;
+        }
+        write_rollout_with_source(
+            &codex,
+            "archived_sessions",
+            sub_id,
+            DEFAULT_PROVIDER,
+            "{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"backfill-fork\",\"depth\":1,\"agent_path\":\"/orchestrator\"}}}",
+        )?;
+
+        let family = Family {
+            family_id: "backfill-family".to_string(),
+            root_id: fork_id.to_string(),
+            title: "backfill family".to_string(),
+            chain: vec![
+                FamilyBranch {
+                    id: fork_id.to_string(),
+                    provider: DEFAULT_PROVIDER.to_string(),
+                    created_at: "2026-04-22T00:00:00Z".to_string(),
+                    status: BranchStatus::Archived,
+                    rollout_relpath: format!(
+                        "archived_sessions/2026/04/22/rollout-{fork_id}.jsonl"
+                    ),
+                    sha256: None,
+                    line_count: None,
+                    note: Some("forked_from:some-origin@line:0".to_string()),
+                    archive_origin: None,
+                },
+                FamilyBranch {
+                    id: sync_id.to_string(),
+                    provider: "custom".to_string(),
+                    created_at: "2026-04-22T00:00:00Z".to_string(),
+                    status: BranchStatus::Archived,
+                    rollout_relpath: format!(
+                        "archived_sessions/2026/04/22/rollout-{sync_id}.jsonl"
+                    ),
+                    sha256: None,
+                    line_count: None,
+                    note: None,
+                    archive_origin: Some(ArchiveOrigin::ProviderSync),
+                },
+                FamilyBranch {
+                    id: clone_id.to_string(),
+                    provider: "custom".to_string(),
+                    created_at: "2026-04-22T00:00:00Z".to_string(),
+                    status: BranchStatus::Archived,
+                    rollout_relpath: format!(
+                        "archived_sessions/2026/04/22/rollout-{clone_id}.jsonl"
+                    ),
+                    sha256: None,
+                    line_count: None,
+                    // 旧版 provider_sync 克隆：无 archive_origin 字段，只有 cloned_from note
+                    note: Some("cloned_from:backfill-fork@line:0".to_string()),
+                    archive_origin: None,
+                },
+            ],
+            active_id: fork_id.to_string(),
+            updated_at: "2026-04-22T00:00:00Z".to_string(),
+        };
+        let mut families = BTreeMap::new();
+        families.insert("backfill-family".to_string(), family);
+        let mut index = BTreeMap::new();
+        index.insert(fork_id.to_string(), "backfill-family".to_string());
+        index.insert(sync_id.to_string(), "backfill-family".to_string());
+        index.insert(clone_id.to_string(), "backfill-family".to_string());
+        family::save(
+            &codex,
+            &FamilyStore {
+                version: 1,
+                families,
+                index,
+            },
+        )?;
+        crate::archive_ledger::record(
+            &codex,
+            known_id,
+            ArchiveOrigin::Manual,
+            Some(1_700_000_000),
+            Some(format!(
+                "archived_sessions/2026/04/22/rollout-{known_id}.jsonl"
+            )),
+            None,
+        )?;
+
+        // dry_run：只统计不写盘，孤儿记录不得落入 ledger。
+        let dry = backfill_archive_origins(codex.to_string_lossy().into_owned(), true)?;
+        assert!(dry.dry_run);
+        assert_eq!(dry.scanned, 6);
+        assert_eq!(dry.skipped_existing, 1);
+        assert_eq!(dry.fork_marked, 1);
+        assert_eq!(dry.provider_sync_marked, 2);
+        assert_eq!(dry.unknown_marked, 1);
+        assert_eq!(
+            crate::archive_ledger::origin_for(&codex, orphan_id),
+            None,
+            "dry_run 不得写盘"
+        );
+
+        // apply：写盘后 ledger 内容正确，已有记录不被覆盖。
+        let applied = backfill_archive_origins(codex.to_string_lossy().into_owned(), false)?;
+        assert!(!applied.dry_run);
+        assert_eq!(applied.unknown_marked, 1);
+        assert_eq!(
+            crate::archive_ledger::origin_for(&codex, orphan_id),
+            Some(ArchiveOrigin::Unknown)
+        );
+        assert_eq!(
+            crate::archive_ledger::origin_for(&codex, fork_id),
+            Some(ArchiveOrigin::Fork)
+        );
+        assert_eq!(
+            crate::archive_ledger::origin_for(&codex, sync_id),
+            Some(ArchiveOrigin::ProviderSync)
+        );
+        assert_eq!(
+            crate::archive_ledger::origin_for(&codex, clone_id),
+            Some(ArchiveOrigin::ProviderSync),
+            "旧版 provider_sync 克隆（cloned_from note、无 archive_origin）应推断为 ProviderSync"
+        );
+        assert_eq!(
+            crate::archive_ledger::origin_for(&codex, known_id),
+            Some(ArchiveOrigin::Manual)
+        );
+        assert_eq!(
+            crate::archive_ledger::origin_for(&codex, sub_id),
+            None,
+            "子代理归档不得写入 ledger"
+        );
 
         fs::remove_dir_all(&codex).ok();
         Ok(())
@@ -8347,6 +8981,7 @@ mod tests {
             codex.to_string_lossy().into_owned(),
             true,
             true,
+            false,
             false,
             false,
             &family::FamilyLock::default(),
@@ -8400,6 +9035,7 @@ mod tests {
             true,
             false,
             false,
+            false,
             &family::FamilyLock::default(),
         )
         .expect_err("exhausted project-state CAS retries must compensate Core changes");
@@ -8441,6 +9077,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             &family::FamilyLock::default(),
         )?;
@@ -8485,6 +9122,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             true,
             &lock,
         )?;
@@ -8496,6 +9134,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             &lock,
         )?;
@@ -8537,6 +9176,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             &family::FamilyLock::default(),
         )?;
@@ -8609,6 +9249,7 @@ mod tests {
             false,
             true,
             false,
+            false,
             &family::FamilyLock::default(),
         )?;
 
@@ -8643,6 +9284,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             &family::FamilyLock::default(),
         )?;
@@ -8686,6 +9328,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             true,
             &lock,
         )?;
@@ -8697,6 +9340,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             &lock,
         )?;
@@ -8739,6 +9383,7 @@ mod tests {
             false,
             true,
             false,
+            false,
             &family::FamilyLock::default(),
         )?;
 
@@ -8778,6 +9423,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             true,
             &family::FamilyLock::default(),
         )?;
@@ -8795,6 +9441,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             &family::FamilyLock::default(),
         )?;

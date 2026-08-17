@@ -30,7 +30,12 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import type { FamilyOverlay, SessionConversionOrigin, SessionSummary } from "@/lib/api";
+import type {
+  ArchiveOrigin,
+  FamilyOverlay,
+  SessionConversionOrigin,
+  SessionSummary,
+} from "@/lib/api";
 import {
   absoluteTime,
   highlight,
@@ -39,6 +44,7 @@ import {
   relativeTime,
   shortId,
 } from "@/lib/format";
+import { ArchiveOriginBadge } from "@/components/ArchiveOriginBadge";
 import { isSubagentSession } from "@/lib/sessionSource";
 import { accentBadgeFor, providerLabel } from "@/lib/providerTheme";
 import { sessionDisplayPreview, sessionDisplayTitle } from "@/lib/sessionText";
@@ -61,6 +67,7 @@ type Props = {
   onConvert?: (s: SessionSummary) => void;
   onRename?: (s: SessionSummary) => void;
   onMoveCwd?: (s: SessionSummary) => void;
+  onSetArchiveOrigin?: (s: SessionSummary, origin: ArchiveOrigin) => Promise<void> | void;
   query?: string;
   showProject?: boolean;
   overlay?: FamilyOverlay;
@@ -87,6 +94,7 @@ export const SessionCard = memo(function SessionCard({
   onConvert,
   onRename,
   onMoveCwd,
+  onSetArchiveOrigin,
   query = "",
   showProject = true,
   overlay,
@@ -171,10 +179,11 @@ export const SessionCard = memo(function SessionCard({
                 已归档
               </Badge>
             )}
-            {s.archived && overlay?.archive_origin === "provider_sync" && (
-              <Badge variant="outline" className="h-5 px-1.5 text-[11px] font-normal text-blue-600">
-                同步分支
-              </Badge>
+            {s.archived && (
+              <ArchiveOriginBadge
+                origin={overlay?.archive_origin ?? null}
+                onSetOrigin={onSetArchiveOrigin ? (origin) => onSetArchiveOrigin(s, origin) : undefined}
+              />
             )}
             <ProviderBadge provider={s.provider} />
             {s.conversion_origin && <ConversionOriginBadge origin={s.conversion_origin} />}

@@ -11,7 +11,9 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use url::Url;
 
 use crate::error::{AppError, AppResult};
-use crate::models::{ImportMode, ProjectPathMapping, Settings, SwitchStrategy};
+use crate::models::{
+    ArchiveOrigin, ImportMode, ProjectPathMapping, SetArchiveOriginReport, Settings, SwitchStrategy,
+};
 use crate::{
     backup, bundle, claude_memory, content_search, convert, edit, family, fs_ops, markdown_export,
     repair, rollout, sessions, settings, stats,
@@ -458,6 +460,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             bool_arg(&args, "pruneIndex")?,
             bool_arg(&args, "pruneThreads")?,
             bool_arg(&args, "pruneFamily")?,
+            bool_arg(&args, "pruneSubagents")?,
             bool_arg(&args, "dryRun")?,
             &state.family_lock,
         )),
@@ -529,6 +532,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             arg::<u64>(&args, "jobId")?,
         )),
         "active_provider_sync" => to_result_value(crate::provider_sync::active_provider_sync()),
+        "set_archive_origin" => to_result_value(webui_set_archive_origin(&state, &args)),
         "rollback_family_active" => to_result_value(repair::rollback_family_active_with_lock(
             string_arg(&args, "codexDir")?,
             string_arg(&args, "familyId")?,
@@ -883,6 +887,31 @@ fn opt_string_vec_arg(args: &Value, name: &str) -> AppResult<Option<Vec<String>>
         None | Some(Value::Null) => Ok(None),
         Some(value) => serde_json::from_value(value.clone()).map_err(AppError::Serde),
     }
+}
+
+/// 用户显式指定归档来源：强制覆盖 ledger（绕 D13）并同步 family 分支字段。
+fn webui_set_archive_origin(state: &WebuiState, args: &Value) -> AppResult<SetArchiveOriginReport> {
+    let codex_dir = string_arg(args, "codexDir")?;
+    let session_id = string_arg(args, "sessionId")?;
+    let origin = enum_arg::<ArchiveOrigin>(args, "origin")?;
+    family::with_lock(&state.family_lock, |_g| {
+        crate::archive_ledger::set_archive_origin(
+            Path::new(&codex_dir),
+            &session_id,
+            origin.clone(),
+        )?;
+        let family_synced = family::set_archive_origin_for_session(
+            Path::new(&codex_dir),
+            &session_id,
+            origin.clone(),
+        )?;
+        Ok(SetArchiveOriginReport {
+            session_id,
+            origin,
+            family_synced,
+            error: None,
+        })
+    })
 }
 
 fn bool_arg(args: &Value, name: &str) -> AppResult<bool> {

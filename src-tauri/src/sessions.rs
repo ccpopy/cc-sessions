@@ -12,13 +12,13 @@ use crate::family;
 use crate::history;
 use crate::logs_db;
 use crate::models::{
-    DeleteResult, DeleteTarget, MoveSessionCwdReport, ProjectGroup, SessionSummary,
+    ArchiveOrigin, DeleteResult, DeleteTarget, MoveSessionCwdReport, ProjectGroup, SessionSummary,
 };
 use crate::paths;
 use crate::provenance;
 use crate::state_db;
 
-mod codex_delete;
+pub(crate) mod codex_delete;
 
 pub(crate) use codex_delete::delete_codex_artifacts;
 use codex_delete::delete_codex_artifacts_batch_with_family_store;
@@ -1192,6 +1192,31 @@ fn set_archived_codex_locked(codex_dir: String, id: String, v: bool) -> AppResul
         reconcile_family_active_after_archive_toggle(&mut family_store, &codex, &state, &id)?;
     if family_changed {
         family::save(&codex, &family_store)?;
+    }
+
+    // 5) 归档来源账本：手动归档/取消归档是权威的 Manual 来源（D13）。
+    //    既有代码没有 MutationJournal，因此放在所有文件/数据库写入成功之后，
+    //    ledger 失败不会影响主流程已完成的状态，用户重试即可补齐。
+    if v {
+        let sha256 = family::resolve_family_id_strict(&family_store, &id)?.and_then(|family_id| {
+            family_store
+                .families
+                .get(&family_id)?
+                .chain
+                .iter()
+                .find(|branch| branch.id == id)
+                .and_then(|branch| branch.sha256.clone())
+        });
+        crate::archive_ledger::record(
+            &codex,
+            &id,
+            ArchiveOrigin::Manual,
+            Some(now),
+            Some(target_str),
+            sha256,
+        )?;
+    } else {
+        crate::archive_ledger::remove(&codex, &id)?;
     }
     Ok(())
 }
@@ -4214,6 +4239,27 @@ mod tests {
         assert!(index.contains("other-id"), "其他索引行应保留");
         drop(conn);
 
+        // 归档来源账本：手动归档写入 Manual 记录（无 family 时 sha256 为 None）
+        let ledger = crate::archive_ledger::load(&codex)?;
+        let entry = ledger
+            .entries
+            .get(ARCHIVE_TEST_ID)
+            .expect("手动归档应记录 ArchiveOrigin::Manual");
+        assert_eq!(entry.origin, ArchiveOrigin::Manual);
+        assert!(
+            entry.archived_at.is_some(),
+            "账本记录应带归档时刻（与 threads.archived_at 一致）"
+        );
+        assert!(
+            entry
+                .source_path
+                .as_deref()
+                .unwrap_or_default()
+                .contains("archived_sessions"),
+            "账本记录应带归档后的路径"
+        );
+        assert_eq!(entry.sha256, None, "无 family 的会话归档后没有校验和");
+
         // 取消归档：搬回原日期目录、复位 threads、补回索引
         set_archived_with_lock(
             Some("codex".into()),
@@ -4238,6 +4284,11 @@ mod tests {
         assert!(archived_at.is_none());
         let index = fs::read_to_string(codex.join("session_index.jsonl"))?;
         assert!(index.contains(ARCHIVE_TEST_ID), "取消归档应补回索引行");
+        let ledger = crate::archive_ledger::load(&codex)?;
+        assert!(
+            !ledger.entries.contains_key(ARCHIVE_TEST_ID),
+            "取消归档应移除账本记录"
+        );
 
         fs::remove_dir_all(&codex).ok();
         Ok(())
@@ -4587,6 +4638,18 @@ mod tests {
             Some(expected_integrity.0.as_str())
         );
         assert_eq!(archived_branch.line_count, Some(expected_integrity.1));
+        // 归档来源账本：family 内的手动归档应同时记录 sha256，与 family store 一致
+        let ledger = crate::archive_ledger::load(&codex)?;
+        let entry = ledger
+            .entries
+            .get(active_id)
+            .expect("手动归档应记录 ArchiveOrigin::Manual");
+        assert_eq!(entry.origin, ArchiveOrigin::Manual);
+        assert_eq!(
+            entry.sha256.as_deref(),
+            Some(expected_integrity.0.as_str()),
+            "账本应记录归档后的校验和"
+        );
 
         set_archived_with_lock(
             Some("codex".to_string()),
@@ -4872,6 +4935,38 @@ mod tests {
         assert!(!rollout.exists());
         assert_codex_project_state_membership(&codex, ARCHIVE_TEST_ID, false)?;
         assert_codex_project_state_membership(&codex, other_id, true)?;
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn delete_codex_session_removes_archive_ledger_entry() -> AppResult<()> {
+        let codex = temp_dir("codex-delete-archive-ledger");
+        let rollout = archive_fixture(&codex);
+        // 先模拟一次手动归档，让账本里有 Manual 记录（C5 前提）
+        crate::archive_ledger::record(
+            &codex,
+            ARCHIVE_TEST_ID,
+            ArchiveOrigin::Manual,
+            Some(1770000300),
+            Some(rollout.to_string_lossy().into_owned()),
+            None,
+        )?;
+        assert_eq!(
+            crate::archive_ledger::origin_for(&codex, ARCHIVE_TEST_ID),
+            Some(ArchiveOrigin::Manual)
+        );
+
+        let result = delete_one(&codex, ARCHIVE_TEST_ID)?;
+
+        assert!(result.ok, "{:?}", result.error);
+        assert!(!rollout.exists());
+        // C5：删除会话后账本记录必须同步清除（M3 一致），否则归档视图残留幽灵来源
+        assert_eq!(
+            crate::archive_ledger::origin_for(&codex, ARCHIVE_TEST_ID),
+            None
+        );
 
         fs::remove_dir_all(&codex).ok();
         Ok(())

@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -439,6 +441,10 @@ pub struct DiagnosticReport {
     pub orphan_in_index: Vec<String>,
     /// 在 threads 但 rollout 已没了
     pub orphan_in_threads: Vec<String>,
+    /// 子代理会话的父会话已不存在（thread_spawn_edges 中 parent 不在 threads 表）
+    pub orphan_subagent_count: u32,
+    /// 上述孤儿子代理的 id 列表
+    pub orphan_subagent_ids: Vec<String>,
     /// 当前 `config.toml` 读出的 model_provider
     pub current_provider: Option<String>,
     /// 每个 family 的 active 节点对应 provider 不是 current_provider
@@ -578,10 +584,67 @@ pub enum BranchStatus {
     Deleted,
 }
 
+/// 归档会话的来源（产生原因）。None 表示"未记录/未知"。
+/// 两个语义域：文件已归档的会话（ledger 登记），与 family 分支角色降级（branch.archive_origin）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ArchiveOrigin {
+    /// 用户主动归档（含 fork 源分支、切换当前分支工具归档）——最高价值
+    Manual,
+    /// 官方 Codex App 自身归档
+    Official,
+    /// 回溯 fork 产生的源分支归档
+    Fork,
+    /// 切换模型服务配置（Continuous/Scatter）时旧分支的归档/降级
     ProviderSync,
+    /// 备份恢复
+    Restore,
+    /// bundle 导入
+    Import,
+    /// 无法确定来源（存量 backfill 兜底）
+    Unknown,
+}
+
+impl ArchiveOrigin {
+    /// D13 优先级：数值越大越"用户显式/高价值"，record 覆盖时低优先级不覆盖高优先级。
+    pub(crate) fn priority(&self) -> u8 {
+        match self {
+            ArchiveOrigin::Manual => 5,
+            ArchiveOrigin::Official | ArchiveOrigin::Fork => 4,
+            ArchiveOrigin::ProviderSync => 3,
+            ArchiveOrigin::Restore | ArchiveOrigin::Import => 2,
+            ArchiveOrigin::Unknown => 0,
+        }
+    }
+}
+
+/// archive_ledger.json 的单条记录：session_id → 归档来源信息。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveLedgerEntry {
+    pub session_id: String,
+    pub origin: ArchiveOrigin,
+    /// 归档操作时刻（与官方 threads.archived_at 同语义；孤儿会话从文件 mtime 派生，无法确定时 None）
+    pub archived_at: Option<i64>,
+    /// 归档时的 rollout 路径（相对 codex_dir，或绝对路径字符串保底）
+    pub source_path: Option<String>,
+    /// 归档时固化的 sha256（与 family 分支快照同语义；未固化时 None）
+    pub sha256: Option<String>,
+}
+
+/// CC Sessions 自己维护的归档来源账本，Codex/Claude 原生均不读取。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveLedger {
+    pub version: u32,
+    pub entries: BTreeMap<String, ArchiveLedgerEntry>,
+}
+
+impl Default for ArchiveLedger {
+    fn default() -> Self {
+        ArchiveLedger {
+            version: 1,
+            entries: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -791,12 +854,40 @@ pub struct ProjectConfigRepairReport {
 pub struct OrphanPruneReport {
     pub index_removed: u32,
     pub threads_removed: u32,
+    /// 清理的孤儿子代理会话数（父会话已消失的子代理，含其会话文件与关系记录）
+    pub subagents_removed: u32,
     pub family_branches_removed: u32,
     pub families_removed: u32,
     pub families_recovered: u32,
     pub families_normalized: u32,
     pub families_skipped: Vec<String>,
     pub dry_run: bool,
+}
+
+/// 存量归档来源 backfill 报告（修复工具"补全归档来源标记"）。
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ArchiveOriginBackfillReport {
+    /// 扫描到的归档 rollout 数（read_rollout_brief 能读出 id 的）
+    pub scanned: u32,
+    /// ledger 已有记录、按 D8 规则跳过的会话数
+    pub skipped_existing: u32,
+    /// 按 forked_from note 标为 Fork 的会话数
+    pub fork_marked: u32,
+    /// 保留 family 分支既有 archive_origin（ProviderSync）的会话数
+    pub provider_sync_marked: u32,
+    /// 无法从存量信息确定、兜底标 Unknown 的会话数
+    pub unknown_marked: u32,
+    pub dry_run: bool,
+}
+
+/// 手动切换归档来源报告（前端"来源未知"徽标下拉指定来源）。
+#[derive(Debug, Clone, Serialize)]
+pub struct SetArchiveOriginReport {
+    pub session_id: String,
+    pub origin: ArchiveOrigin,
+    /// 是否同时同步了 family 分支的 archive_origin 字段（会话不在任何 family 时为 false）
+    pub family_synced: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

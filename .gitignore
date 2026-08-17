@@ -26,3 +26,5 @@ vite.config.d.ts
 Thumbs.db
 .idea/
 .vscode/
+/.omo/
+/.vs/

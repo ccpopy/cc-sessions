@@ -35,7 +35,7 @@ fn delete_codex_artifacts_batch(
     delete_codex_artifacts_batch_with_family_store(codex_dir, ids, None)
 }
 
-pub(super) fn delete_codex_artifacts_batch_with_family_store(
+pub(crate) fn delete_codex_artifacts_batch_with_family_store(
     codex_dir: &Path,
     ids: &[String],
     family_store: Option<&FamilyStore>,
@@ -66,6 +66,12 @@ pub(super) fn delete_codex_artifacts_batch_with_family_store(
     }
 
     let state = state_db::open(codex_dir)?;
+    // 是否挂载子代理关系表：存在时按删除单元同步清理关系边，避免残留孤儿边。
+    let spawn_edges_attached: bool = state.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='thread_spawn_edges')",
+        [],
+        |row| row.get(0),
+    )?;
     let transaction =
         rusqlite::Transaction::new_unchecked(&state, rusqlite::TransactionBehavior::Immediate)?;
     let mut preparations = Vec::with_capacity(unique_ids.len());
@@ -74,9 +80,10 @@ pub(super) fn delete_codex_artifacts_batch_with_family_store(
             .query_row(
                 "SELECT rollout_path FROM threads WHERE id = ?",
                 [id],
-                |row| row.get(0),
+                |row| row.get::<_, Option<String>>(0),
             )
-            .optional()?;
+            .optional()?
+            .flatten();
         let mut rollout_files = super::rollout_files_by_id(codex_dir, id)?;
         if let Some(raw_path) = rollout_path.as_deref() {
             let db_path = PathBuf::from(paths::strip_verbatim(
@@ -111,6 +118,13 @@ pub(super) fn delete_codex_artifacts_batch_with_family_store(
         let mut outcomes = Vec::with_capacity(preparations.len());
         for prepared in &preparations {
             let rows = transaction.execute("DELETE FROM threads WHERE id = ?", [&prepared.id])?;
+            if spawn_edges_attached {
+                // 子代理关系记录与主会话同生命周期：删除以本会话为父或子的一切边。
+                transaction.execute(
+                    "DELETE FROM thread_spawn_edges WHERE parent_thread_id = ?1 OR child_thread_id = ?1",
+                    [&prepared.id],
+                )?;
+            }
             let rows_logs = if logs_attached {
                 transaction.execute(
                     "DELETE FROM delete_logs.logs WHERE thread_id = ?",
@@ -128,6 +142,12 @@ pub(super) fn delete_codex_artifacts_batch_with_family_store(
                     super::filter_index_file(&index_path, &prepared.id)
                 })?;
             }
+
+            // C5：删除会话后同步归档来源账本，经 journal 纳入同一补偿（M3 一致）。
+            // 无记录时 remove 是 no-op 且不写盘，不会因此创建账本文件。
+            journal.mutate_file(&paths::archive_ledger_path(codex_dir), || {
+                crate::archive_ledger::remove(codex_dir, &prepared.id)
+            })?;
 
             outcomes.push(CodexDeleteOutcome {
                 result: DeleteResult {

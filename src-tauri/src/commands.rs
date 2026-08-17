@@ -7,6 +7,7 @@
 //! 业务实现仍在各自模块（`*_with_lock` / 同名同步函数），CLI 与 WebUI 继续
 //! 直接调用同步版本；本模块仅在 desktop feature 下编译。
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::error::{AppError, AppResult};
@@ -478,6 +479,7 @@ pub async fn prune_orphan_entries(
     prune_index: bool,
     prune_threads: bool,
     prune_family: bool,
+    prune_subagents: bool,
     dry_run: bool,
     lock: SharedLock<'_>,
 ) -> AppResult<OrphanPruneReport> {
@@ -488,6 +490,7 @@ pub async fn prune_orphan_entries(
             prune_index,
             prune_threads,
             prune_family,
+            prune_subagents,
             dry_run,
             &lock,
         )
@@ -498,6 +501,57 @@ pub async fn prune_orphan_entries(
 #[tauri::command]
 pub async fn diagnose_claude_history_orphans(claude_dir: String) -> AppResult<HistoryOrphanReport> {
     run_blocking(move || crate::repair::diagnose_claude_history_orphans(claude_dir)).await
+}
+
+#[tauri::command]
+pub async fn backfill_archive_origins(
+    codex_dir: String,
+    dry_run: bool,
+    lock: SharedLock<'_>,
+) -> AppResult<ArchiveOriginBackfillReport> {
+    let lock = lock.inner().clone();
+    run_blocking(move || {
+        crate::repair::backfill_archive_origins_with_lock(codex_dir, dry_run, &lock)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn get_archive_ledger(codex_dir: String) -> AppResult<Vec<ArchiveLedgerEntry>> {
+    run_blocking(move || crate::archive_ledger::entries(&PathBuf::from(codex_dir))).await
+}
+
+/// 用户显式指定归档来源（前端"来源未知"徽标下拉）：强制覆盖 ledger 记录（绕 D13），
+/// 并同步 family 分支字段（若该会话属于某 family）。
+#[tauri::command]
+pub async fn set_archive_origin(
+    codex_dir: String,
+    session_id: String,
+    origin: ArchiveOrigin,
+    lock: SharedLock<'_>,
+) -> AppResult<SetArchiveOriginReport> {
+    let lock = lock.inner().clone();
+    run_blocking(move || {
+        crate::family::with_lock(&lock, |_g| {
+            crate::archive_ledger::set_archive_origin(
+                &PathBuf::from(&codex_dir),
+                &session_id,
+                origin.clone(),
+            )?;
+            let family_synced = crate::family::set_archive_origin_for_session(
+                &PathBuf::from(&codex_dir),
+                &session_id,
+                origin.clone(),
+            )?;
+            Ok(SetArchiveOriginReport {
+                session_id,
+                origin,
+                family_synced,
+                error: None,
+            })
+        })
+    })
+    .await
 }
 
 #[tauri::command]

@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { FamilyOverlay, SessionSummary } from "./api";
-import { selectNormalFamilySessions, selectSessionsForView } from "./sessionVisibility.ts";
+import type { ArchiveOrigin, FamilyOverlay, SessionSummary } from "./api";
+import {
+  filterSessionsByOrigin,
+  groupArchivedByOrigin,
+  mergeLedgerIntoOverlay,
+  selectNormalFamilySessions,
+  selectSessionsForView,
+} from "./sessionVisibility.ts";
 
 function session(id: string, updatedAt: number): SessionSummary {
   return {
@@ -204,4 +210,176 @@ test("search scope honors overlay-only subagent classification", () => {
     }).map((item) => item.id),
     ["overlay-subagent"],
   );
+});
+
+test("archived view groups sessions by origin into the three fixed groups", () => {
+  const mine = { ...session("mine-a", 100), archived: true };
+  const fork = { ...session("fork-b", 200), archived: true };
+  const auto = { ...session("auto-c", 300), archived: true };
+  const migrated = { ...session("migrated-d", 400), archived: true };
+  const unknown = { ...session("unknown-e", 500), archived: true };
+  const ledger = new Map<string, ArchiveOrigin>([
+    [mine.id, "manual"],
+    [fork.id, "fork"],
+    [auto.id, "provider_sync"],
+    [migrated.id, "restore"],
+    // unknown-e 无 ledger 记录
+  ]);
+
+  const groups = groupArchivedByOrigin([mine, fork, auto, migrated, unknown], ledger);
+  assert.deepEqual(
+    groups.map((g) => [g.key, g.sessions.map((s) => s.id)]),
+    [
+      ["mine", ["mine-a", "fork-b", "unknown-e"]],
+      ["auto", ["auto-c"]],
+      ["migrated", ["migrated-d"]],
+    ],
+  );
+});
+
+test("groupArchivedByOrigin drops empty groups and keeps input order within a group", () => {
+  const first = { ...session("first", 300), archived: true };
+  const second = { ...session("second", 100), archived: true };
+  const groups = groupArchivedByOrigin(
+    [first, second],
+    new Map<string, ArchiveOrigin>([
+      [first.id, "provider_sync"],
+      [second.id, "import"],
+    ]),
+  );
+  // auto 与 migrated 组内保持传入顺序；mine 为空组被过滤
+  assert.deepEqual(
+    groups.map((g) => [g.key, g.sessions.map((s) => s.id)]),
+    [
+      ["auto", ["first"]],
+      ["migrated", ["second"]],
+    ],
+  );
+});
+
+test("filterSessionsByOrigin with all keeps every session in input order", () => {
+  const mine = { ...session("mine-a", 100), archived: true };
+  const auto = { ...session("auto-c", 300), archived: true };
+  const ledger = new Map<string, ArchiveOrigin>([
+    [mine.id, "manual"],
+    [auto.id, "provider_sync"],
+  ]);
+  assert.deepEqual(
+    filterSessionsByOrigin([mine, auto], ledger, "all").map((s) => s.id),
+    ["mine-a", "auto-c"],
+  );
+});
+
+test("filterSessionsByOrigin keeps only sessions matching the selected group", () => {
+  const mine = { ...session("mine-a", 100), archived: true };
+  const fork = { ...session("fork-b", 200), archived: true };
+  const auto = { ...session("auto-c", 300), archived: true };
+  const migrated = { ...session("migrated-d", 400), archived: true };
+  const unknown = { ...session("unknown-e", 500), archived: true };
+  const ledger = new Map<string, ArchiveOrigin>([
+    [mine.id, "manual"],
+    [fork.id, "fork"],
+    [auto.id, "provider_sync"],
+    [migrated.id, "restore"],
+    // unknown-e 无 ledger 记录
+  ]);
+
+  assert.deepEqual(
+    filterSessionsByOrigin([mine, fork, auto, migrated, unknown], ledger, "mine").map(
+      (s) => s.id,
+    ),
+    ["mine-a", "fork-b", "unknown-e"],
+  );
+  assert.deepEqual(
+    filterSessionsByOrigin([mine, fork, auto, migrated, unknown], ledger, "auto").map(
+      (s) => s.id,
+    ),
+    ["auto-c"],
+  );
+  assert.deepEqual(
+    filterSessionsByOrigin([mine, fork, auto, migrated, unknown], ledger, "migrated").map(
+      (s) => s.id,
+    ),
+    ["migrated-d"],
+  );
+});
+
+test("filterSessionsByOrigin leaves input sessions unchanged", () => {
+  const mine = { ...session("mine-a", 100), archived: true };
+  const auto = { ...session("auto-c", 300), archived: true };
+  const ledger = new Map<string, ArchiveOrigin>([
+    [mine.id, "manual"],
+    [auto.id, "provider_sync"],
+  ]);
+  filterSessionsByOrigin([mine, auto], ledger, "auto");
+  assert.deepEqual([mine.id, auto.id], ["mine-a", "auto-c"]);
+  assert.deepEqual([mine.archived, auto.archived], [true, true]);
+});
+
+test("mergeLedgerIntoOverlay prefers ledger origin when family branch field is missing", () => {
+  // fork/manual 会话：backfill 只写 ledger 未同步 family 分支字段（分支字段为 null）。
+  // 修复前徽标显示"来源未知"，但筛选 mine 时被 ledger 归入 mine 组 → 筛不出来。
+  const forkSession = { ...session("fork-b", 200), archived: true };
+  const overlay = new Map<string, FamilyOverlay>([
+    [
+      forkSession.id,
+      familyOverlay(forkSession.id, "family-1", "custom", false), // archive_origin 为 null
+    ],
+  ]);
+  const ledger = new Map<string, ArchiveOrigin>([[forkSession.id, "fork"]]);
+
+  const merged = mergeLedgerIntoOverlay([...overlay.values()], ledger);
+  assert.equal(merged[0].archive_origin, "fork");
+  // 合并后筛选 mine 组能筛出该会话（与徽标不再矛盾）
+  assert.deepEqual(
+    filterSessionsByOrigin([forkSession], new Map(merged.map((o) => [o.session_id, o.archive_origin as ArchiveOrigin])), "mine").map((s) => s.id),
+    ["fork-b"],
+  );
+  assert.deepEqual(
+    filterSessionsByOrigin([forkSession], new Map(merged.map((o) => [o.session_id, o.archive_origin as ArchiveOrigin])), "auto").map((s) => s.id),
+    [],
+  );
+});
+
+test("mergeLedgerIntoOverlay falls back to family branch field when ledger has no record", () => {
+  const autoSession = { ...session("auto-c", 300), archived: true };
+  const overlay = new Map<string, FamilyOverlay>([
+    [
+      autoSession.id,
+      { ...familyOverlay(autoSession.id, "family-1", "openai", false), archive_origin: "provider_sync" },
+    ],
+  ]);
+
+  const merged = mergeLedgerIntoOverlay([...overlay.values()], new Map());
+  assert.equal(merged[0].archive_origin, "provider_sync");
+});
+
+test("mergeLedgerIntoOverlay keeps unknown sessions filterable as mine", () => {
+  const unknownSession = { ...session("unknown-e", 500), archived: true };
+  const overlay = new Map<string, FamilyOverlay>([
+    [
+      unknownSession.id,
+      familyOverlay(unknownSession.id, "family-1", "openai", false), // archive_origin 为 null
+    ],
+  ]);
+  const ledger = new Map<string, ArchiveOrigin>([[unknownSession.id, "unknown"]]);
+
+  const merged = mergeLedgerIntoOverlay([...overlay.values()], ledger);
+  assert.equal(merged[0].archive_origin, "unknown");
+  // unknown 视为用户主动归档，筛选 mine 能筛出 → 数据源一致
+  assert.deepEqual(
+    filterSessionsByOrigin([unknownSession], new Map(merged.map((o) => [o.session_id, o.archive_origin as ArchiveOrigin])), "mine").map((s) => s.id),
+    ["unknown-e"],
+  );
+});
+
+test("mergeLedgerIntoOverlay does not mutate input overlays", () => {
+  const mine = { ...session("mine-a", 100), archived: true };
+  const overlay = new Map<string, FamilyOverlay>([
+    [mine.id, familyOverlay(mine.id, "family-1", "custom", false)],
+  ]);
+  const ledger = new Map<string, ArchiveOrigin>([[mine.id, "manual"]]);
+
+  mergeLedgerIntoOverlay([...overlay.values()], ledger);
+  assert.equal(overlay.get(mine.id)?.archive_origin, null);
 });

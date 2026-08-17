@@ -31,7 +31,8 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 
-import { api, type BranchSyncState, type Family, type FamilyBranch } from "@/lib/api";
+import { api, type ArchiveOrigin, type BranchSyncState, type Family, type FamilyBranch } from "@/lib/api";
+import { ArchiveOriginBadge } from "@/components/ArchiveOriginBadge";
 
 type SyncTarget = {
   branch: FamilyBranch;
@@ -57,6 +58,9 @@ export function FamilyHistorySheet({
 }: Props) {
   const [family, setFamily] = useState<Family | null>(null);
   const [syncStates, setSyncStates] = useState<Record<string, BranchSyncState>>({});
+  const [ledgerOriginBySession, setLedgerOriginBySession] = useState<ReadonlyMap<string, ArchiveOrigin>>(
+    new Map(),
+  );
   const [loading, setLoading] = useState(false);
   const [rollbackTarget, setRollbackTarget] = useState<FamilyBranch | null>(null);
   const [syncTarget, setSyncTarget] = useState<SyncTarget | null>(null);
@@ -77,8 +81,15 @@ export function FamilyHistorySheet({
     }
     setLoading(true);
     try {
-      const store = await api.getFamilyStore(codexDir);
+      const [store, ledgerEntries] = await Promise.all([
+        api.getFamilyStore(codexDir),
+        api.getArchiveLedger(codexDir),
+      ]);
       if (requestSeq.current !== requestId) return;
+      // 徽标显示与来源筛选共用同一数据源：ledger 优先（与列表 SessionCard 一致）。
+      // 存量 fork/manual 会话只有 ledger 记录、family 分支字段为空（repair.rs
+      // backfill/fork 创建只写 ledger），直接用分支字段会显示"来源未知"。
+      setLedgerOriginBySession(new Map(ledgerEntries.map((e) => [e.session_id, e.origin])));
       const fid = store.index[sessionId];
       if (!fid) {
         setFamily(null);
@@ -302,10 +313,15 @@ export function FamilyHistorySheet({
                                 {inactiveBranchStatusLabel(b.status)}
                               </Badge>
                             )}
-                            {!isActive && b.archive_origin === "provider_sync" && (
-                              <Badge variant="outline" className="h-5 px-1.5 font-normal text-blue-600">
-                                同步分支
-                              </Badge>
+                            {!isActive && (
+                              <ArchiveOriginBadge
+                                origin={ledgerOriginBySession.get(b.id) ?? b.archive_origin ?? null}
+                                onSetOrigin={async (origin) => {
+                                  await api.setArchiveOrigin(codexDir, b.id, origin);
+                                  await load();
+                                  await onChanged?.();
+                                }}
+                              />
                             )}
                             <span className="text-muted-foreground">
                               {safeDate(b.created_at)}
