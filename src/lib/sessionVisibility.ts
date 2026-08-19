@@ -170,6 +170,36 @@ function compareSessionActivityDesc(left: SessionSummary, right: SessionSummary)
   return left.id.localeCompare(right.id);
 }
 
+/** 导出选择器的会话范围：正常会话 / 子代理会话 / 归档会话 / 不过滤。 */
+export type SessionScopeFilter = "main" | "subagent" | "archived" | "all";
+
+/**
+ * 按会话范围过滤（issue #30：导出列表默认混着子代理与归档会话，不好挑）。
+ *
+ * 与会话页的互斥视图不同：subagent 与 archived 在这里是两个独立维度，
+ * 已归档的子代理在两个范围里都能看到。导出是逐条挑 rollout 文件，
+ * 任何会话都不应该只能在"全部"里翻出来。
+ *
+ * 子代理判定不传 overlay：overlay 的 `clone_state === "subagent"` 本身就由
+ * `source` 推导而来（family.rs），这里的 source/agent 字段判定与之等价，
+ * 导出面板因此不必额外拉取 family overlay。
+ */
+export function filterSessionsByScope(
+  sessions: readonly SessionSummary[],
+  scope: SessionScopeFilter,
+): SessionSummary[] {
+  switch (scope) {
+    case "main":
+      return sessions.filter((session) => !isSubagentSession(session) && !session.archived);
+    case "subagent":
+      return sessions.filter((session) => isSubagentSession(session));
+    case "archived":
+      return sessions.filter((session) => session.archived);
+    default:
+      return [...sessions];
+  }
+}
+
 /** 归档视图的分组键：按归档来源聚合，是跨 provider 的统一维度（计划 §F3）。
  *  只有三组：未知/无 ledger 记录的归档视为用户主动归档（官方应用归档、旧版
  *  手动归档都不写来源标识），归入 mine，不再单列 unknown 分组。 */

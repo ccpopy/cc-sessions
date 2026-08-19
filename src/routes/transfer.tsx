@@ -6,6 +6,7 @@ import {
   Download,
   FileArchive,
   FolderOpen,
+  ListFilter,
   Loader2,
   Package,
   Search,
@@ -36,6 +37,13 @@ import {
   RadioGroup,
   RadioGroupItem,
 } from "@/components/ui/radio-group";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 
 import { useSettings } from "@/stores/settings";
 import { useSessions } from "@/hooks/useSessions";
@@ -50,6 +58,10 @@ import {
 } from "@/lib/api";
 import { copyText } from "@/lib/clipboard";
 import { sessionIdentity } from "@/lib/sessionIdentity";
+import {
+  filterSessionsByScope,
+  type SessionScopeFilter,
+} from "@/lib/sessionVisibility";
 import { pickDirectoryPath, pickFilePath, saveFilePath } from "@/lib/dialog";
 import { humanBytes, humanTokens } from "@/lib/format";
 import { providerLabel } from "@/lib/providerTheme";
@@ -128,6 +140,8 @@ function ExportPanel({
   const [exportGroup, setExportGroup] = useState("default");
   const [activeOnly, setActiveOnly] = useState(true);
   const [sessionSearch, setSessionSearch] = useState("");
+  // issue #30：默认只列正常会话，子代理/归档会话按需从下拉里切换
+  const [sessionScope, setSessionScope] = useState<SessionScopeFilter>("main");
   const [visibleSessionLimit, setVisibleSessionLimit] = useState(SESSION_PAGE_SIZE);
   const [selectedSessionKeys, setSelectedSessionKeys] = useState<Set<string>>(new Set());
   const [running, setRunning] = useState(false);
@@ -144,12 +158,13 @@ function ExportPanel({
   useEffect(() => {
     setSelectedSessionKeys(new Set());
     setLastZipSource(null);
+    setSessionScope("main");
     setVisibleSessionLimit(SESSION_PAGE_SIZE);
   }, [provider]);
 
   useEffect(() => {
     setVisibleSessionLimit(SESSION_PAGE_SIZE);
-  }, [sessionSearch]);
+  }, [sessionScope, sessionSearch]);
 
   const toggle = (session: SessionSummary) => {
     const key = sessionIdentity(session);
@@ -161,15 +176,43 @@ function ExportPanel({
     });
   };
 
+  const scopeOptions = useMemo(() => {
+    const scopes: SessionScopeFilter[] =
+      provider === "claude"
+        ? ["main", "subagent", "all"]
+        : ["main", "subagent", "archived", "all"];
+    return scopes.map((scope) => ({
+      value: scope,
+      label:
+        scope === "main"
+          ? "会话"
+          : scope === "subagent"
+            ? provider === "opencode"
+              ? "子会话"
+              : "子代理"
+            : scope === "archived"
+              ? "归档会话"
+              : "全部",
+      count: filterSessionsByScope(sessions, scope).length,
+    }));
+  }, [provider, sessions]);
+  const activeScopeLabel =
+    scopeOptions.find((option) => option.value === sessionScope)?.label ?? "全部";
+
+  const scopedSessions = useMemo(
+    () => filterSessionsByScope(sessions, sessionScope),
+    [sessions, sessionScope],
+  );
+
   const filteredSessions = useMemo(() => {
     const terms = sessionSearch
       .trim()
       .toLowerCase()
       .split(/\s+/)
       .filter(Boolean);
-    if (terms.length === 0) return sessions;
+    if (terms.length === 0) return scopedSessions;
 
-    return sessions.filter((s) => {
+    return scopedSessions.filter((s) => {
       const haystack = [
         s.id,
         s.title,
@@ -185,7 +228,7 @@ function ExportPanel({
         .toLowerCase();
       return terms.every((term) => haystack.includes(term));
     });
-  }, [sessions, sessionSearch]);
+  }, [scopedSessions, sessionSearch]);
   const filteredArchivedCount = useMemo(
     () => filteredSessions.filter((session) => session.archived).length,
     [filteredSessions],
@@ -406,6 +449,7 @@ function ExportPanel({
                 onClick={exportAll}
                 disabled={running}
                 className="gap-1.5"
+                title="导出该服务商的全部会话，不受下方会话列表的筛选与搜索影响"
               >
                 <Upload className="h-3.5 w-3.5" />
                 导出全部
@@ -436,9 +480,11 @@ function ExportPanel({
             <Archive className="h-4 w-4" />
             会话（勾选即可逐条导出）
             <Badge variant="secondary" className="h-5 px-1.5 font-normal">
-              {sessionSearch.trim() ? `${filteredSessions.length}/${sessions.length}` : sessions.length}
+              {filteredSessions.length === sessions.length
+                ? sessions.length
+                : `${filteredSessions.length}/${sessions.length}`}
             </Badge>
-            {filteredArchivedCount > 0 && (
+            {sessionScope !== "archived" && filteredArchivedCount > 0 && (
               <Badge variant="outline" className="h-5 gap-1 px-1.5 font-normal text-muted-foreground">
                 <Archive className="h-3 w-3" />
                 含已归档 {filteredArchivedCount}
@@ -463,17 +509,47 @@ function ExportPanel({
             <EmptyState title="没有会话可导出" />
           ) : (
             <div className="space-y-3">
-              <div className="relative max-w-md">
-                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  value={sessionSearch}
-                  onChange={(e) => setSessionSearch(e.target.value)}
-                  placeholder="搜索 id / 标题 / 首条消息 / 目录"
-                  className="h-9 pl-8 text-xs"
-                />
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="relative min-w-[12rem] flex-1 sm:max-w-md">
+                  <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    value={sessionSearch}
+                    onChange={(e) => setSessionSearch(e.target.value)}
+                    placeholder="搜索 id / 标题 / 首条消息 / 目录"
+                    className="h-9 pl-8 text-xs"
+                  />
+                </div>
+                <Select
+                  value={sessionScope}
+                  onValueChange={(value) => setSessionScope(value as SessionScopeFilter)}
+                >
+                  <SelectTrigger
+                    className="h-9 w-32 shrink-0 gap-1.5 text-xs"
+                    aria-label="按会话范围筛选"
+                  >
+                    <ListFilter className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                    <SelectValue className="flex-1 text-left">{activeScopeLabel}</SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    {scopeOptions.map((option) => (
+                      <SelectItem key={option.value} value={option.value} className="text-xs">
+                        {option.label}{" "}
+                        <span className="ml-1 tabular-nums text-muted-foreground">
+                          {option.count}
+                        </span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </div>
               {filteredSessions.length === 0 ? (
-                <EmptyState title="没有匹配的会话" />
+                <EmptyState
+                  title={
+                    sessionSearch.trim() || sessionScope === "all"
+                      ? "没有匹配的会话"
+                      : `没有${activeScopeLabel}`
+                  }
+                />
               ) : (
                 <div className="rounded-md border">
                   <div className="grid grid-cols-[2rem_8rem_minmax(0,1fr)_9rem_5rem] items-center gap-2 border-b bg-muted/40 px-3 py-2 text-[11px] font-medium text-muted-foreground">

@@ -3,6 +3,7 @@ import test from "node:test";
 import type { ArchiveOrigin, FamilyOverlay, SessionSummary } from "./api";
 import {
   filterSessionsByOrigin,
+  filterSessionsByScope,
   groupArchivedByOrigin,
   mergeLedgerIntoOverlay,
   resolveArchiveOrigins,
@@ -410,4 +411,61 @@ test("resolved archive origins use ledger first and family metadata as a groupin
     ).map((item) => item.id),
     ["family-only"],
   );
+});
+
+test("export scope filter splits main, subagent and archived sessions without an overlay", () => {
+  const main = session("main-a", 500);
+  const subagentBySource = { ...session("sub-source", 400), source: "parent:abc" };
+  const subagentByAgentField = { ...session("sub-agent", 300), agent_role: "reviewer" };
+  const archived = { ...session("archived-a", 200), archived: true };
+  const archivedSubagent = {
+    ...session("archived-sub", 100),
+    archived: true,
+    source: "subagent",
+  };
+  const all = [main, subagentBySource, subagentByAgentField, archived, archivedSubagent];
+
+  assert.deepEqual(
+    filterSessionsByScope(all, "main").map((item) => item.id),
+    ["main-a"],
+  );
+  assert.deepEqual(
+    filterSessionsByScope(all, "subagent").map((item) => item.id),
+    ["sub-source", "sub-agent", "archived-sub"],
+  );
+  assert.deepEqual(
+    filterSessionsByScope(all, "archived").map((item) => item.id),
+    ["archived-a", "archived-sub"],
+  );
+  assert.deepEqual(
+    filterSessionsByScope(all, "all").map((item) => item.id),
+    ["main-a", "sub-source", "sub-agent", "archived-a", "archived-sub"],
+  );
+});
+
+test("export scope filter keeps every session reachable outside the all scope", () => {
+  const all = [
+    session("main-a", 500),
+    { ...session("sub-a", 400), source: "subagent" },
+    { ...session("archived-a", 300), archived: true },
+    { ...session("archived-sub", 200), archived: true, source: "subagent" },
+  ];
+
+  const reachable = new Set(
+    (["main", "subagent", "archived"] as const).flatMap((scope) =>
+      filterSessionsByScope(all, scope).map((item) => item.id),
+    ),
+  );
+
+  assert.deepEqual(
+    all.map((item) => item.id).filter((id) => !reachable.has(id)),
+    [],
+  );
+});
+
+test("export scope filter returns a copy so callers cannot mutate the source list", () => {
+  const all = [session("main-a", 500)];
+  const copy = filterSessionsByScope(all, "all");
+  copy.pop();
+  assert.equal(all.length, 1);
 });
