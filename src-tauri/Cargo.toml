@@ -50,6 +50,7 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
 walkdir = "2"
+same-file = "1"
 sha2 = "0.10"
 hex = "0.4"
 toml = "0.8"

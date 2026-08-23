@@ -1030,6 +1030,30 @@ pub fn move_session_cwd_with_provider_dirs(
     target_cwd: String,
     lock: &family::FamilyLock,
 ) -> AppResult<MoveSessionCwdReport> {
+    move_session_cwd_with_provider_dirs_and_options(
+        provider,
+        codex_dir,
+        claude_dir,
+        opencode_dir,
+        id,
+        rollout_path,
+        target_cwd,
+        false,
+        lock,
+    )
+}
+
+pub fn move_session_cwd_with_provider_dirs_and_options(
+    provider: Option<String>,
+    codex_dir: String,
+    claude_dir: Option<String>,
+    opencode_dir: Option<String>,
+    id: String,
+    rollout_path: Option<String>,
+    target_cwd: String,
+    preserve_claude_path_case: bool,
+    lock: &family::FamilyLock,
+) -> AppResult<MoveSessionCwdReport> {
     let target_cwd = target_cwd.trim().to_string();
     if target_cwd.is_empty() {
         return Err(AppError::Other("工作目录路径不能为空".into()));
@@ -1049,11 +1073,12 @@ pub fn move_session_cwd_with_provider_dirs(
                     .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
             );
             family::with_lock(lock, |_guard| {
-                crate::claude_transfer::move_session_cwd(
+                crate::claude_transfer::move_session_cwd_with_options(
                     &claude,
                     &id,
                     rollout_path.as_deref(),
                     &target_cwd,
+                    preserve_claude_path_case,
                 )
             })
         }

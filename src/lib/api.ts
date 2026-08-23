@@ -960,6 +960,7 @@ export const api = {
     id: string;
     rollout_path?: string;
     target_cwd: string;
+    preserve_claude_path_case?: boolean;
   }) => invokeCommand<MoveSessionCwdReport>("move_session_cwd", {
     provider: p.provider,
     codexDir: p.codex_dir,
@@ -968,6 +969,7 @@ export const api = {
     id: p.id,
     rolloutPath: p.rollout_path,
     targetCwd: p.target_cwd,
+    preserveClaudePathCase: p.preserve_claude_path_case ?? false,
   }),
   deleteSession: (
     provider: SessionProvider,

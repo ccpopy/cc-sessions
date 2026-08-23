@@ -45,13 +45,25 @@ pub fn move_session_cwd(
     rollout_path: Option<&str>,
     target_cwd: &str,
 ) -> AppResult<MoveSessionCwdReport> {
-    let target_cwd = normalize_target_cwd(target_cwd)?;
+    move_session_cwd_with_options(claude_dir, session_id, rollout_path, target_cwd, false)
+}
+
+pub fn move_session_cwd_with_options(
+    claude_dir: &Path,
+    session_id: &str,
+    rollout_path: Option<&str>,
+    target_cwd: &str,
+    preserve_path_case: bool,
+) -> AppResult<MoveSessionCwdReport> {
+    let target_cwd = normalize_target_cwd(target_cwd, preserve_path_case)?;
     let session = claude_sessions::resolve_session_summary(claude_dir, session_id, rollout_path)?;
     let source_transcript = PathBuf::from(&session.rollout_path);
     claude_sessions::validate_main_transcript(claude_dir, &source_transcript, session_id)?;
     let destination_project = claude_sessions::project_dir_for_cwd(claude_dir, &target_cwd);
     let destination_transcript = destination_project.join(format!("{session_id}.jsonl"));
-    if source_transcript == destination_transcript && session.cwd == target_cwd {
+    let transcript_stays_in_place =
+        same_existing_entry(&source_transcript, &destination_transcript)?;
+    if transcript_stays_in_place && session.cwd == target_cwd {
         return Ok(MoveSessionCwdReport {
             old_cwd: session.cwd,
             new_cwd: target_cwd,
@@ -63,11 +75,6 @@ pub fn move_session_cwd(
             target_project_id: None,
             requires_project_open: false,
         });
-    }
-    if source_transcript == destination_transcript {
-        return Err(AppError::Other(
-            "Claude 项目目录编码未变化，但 transcript 内 cwd 不一致；请先检查重复或手工移动过的会话".into(),
-        ));
     }
 
     ensure_plain_directory(&paths::claude_projects_dir(claude_dir), "Claude projects")?;
@@ -131,7 +138,9 @@ pub fn move_session_cwd(
 
     let operation = (|| -> AppResult<(u32, u32)> {
         for artifact in &artifacts {
-            if path_exists(&artifact.destination)? {
+            if path_exists(&artifact.destination)?
+                && !same_existing_entry(&artifact.source, &artifact.destination)?
+            {
                 return Err(AppError::Other(format!(
                     "Claude 目标项目中已存在同名会话资产: {}",
                     artifact.destination.to_string_lossy()
@@ -181,10 +190,15 @@ pub fn move_session_cwd(
             published += 1;
         }
 
+        let verify_path = if transcript_stays_in_place {
+            &source_transcript
+        } else {
+            &destination_transcript
+        };
         let verify = match claude_sessions::resolve_session_summary(
             claude_dir,
             session_id,
-            Some(destination_transcript.to_string_lossy().as_ref()),
+            Some(verify_path.to_string_lossy().as_ref()),
         ) {
             Ok(verify) => verify,
             Err(error) => {
@@ -239,14 +253,18 @@ pub fn move_session_cwd(
         threads_updated: 0,
         rollout_rewritten: true,
         desktop_project_synced: false,
-        artifacts_moved: result.0,
+        artifacts_moved: if transcript_stays_in_place {
+            0
+        } else {
+            result.0
+        },
         history_rows_updated: result.1,
         target_project_id: None,
         requires_project_open: false,
     })
 }
 
-fn normalize_target_cwd(raw: &str) -> AppResult<String> {
+fn normalize_target_cwd(raw: &str, preserve_path_case: bool) -> AppResult<String> {
     let raw = paths::strip_verbatim(raw.trim());
     if raw.is_empty() || raw.chars().any(char::is_control) {
         return Err(AppError::Path("Claude 目标工作目录无效".into()));
@@ -264,7 +282,49 @@ fn normalize_target_cwd(raw: &str) -> AppResult<String> {
             canonical.to_string_lossy()
         )));
     }
-    Ok(paths::strip_verbatim(&canonical.to_string_lossy()))
+    if preserve_path_case {
+        normalize_preserved_target_cwd(&raw)
+    } else {
+        Ok(paths::strip_verbatim(&canonical.to_string_lossy()))
+    }
+}
+
+fn normalize_preserved_target_cwd(raw: &str) -> AppResult<String> {
+    let path = Path::new(raw);
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(AppError::Path(
+            "保留路径大小写时不能包含父目录片段 '..'".into(),
+        ));
+    }
+    let normalized = path.components().collect::<PathBuf>();
+    let mut stored = paths::strip_verbatim(&normalized.to_string_lossy());
+    if looks_like_windows_path(&stored) {
+        stored = stored.replace('/', "\\");
+    }
+    trim_trailing_separators(&mut stored);
+    Ok(stored)
+}
+
+fn looks_like_windows_path(path: &str) -> bool {
+    (path.as_bytes().get(1) == Some(&b':')
+        && path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic))
+        || path.starts_with("\\\\")
+        || path.starts_with("//")
+}
+
+fn trim_trailing_separators(path: &mut String) {
+    let is_unix_root = path == "/";
+    let is_drive_root = path.len() == 3
+        && path.as_bytes().get(1) == Some(&b':')
+        && matches!(path.as_bytes().get(2), Some(b'\\') | Some(b'/'));
+    if !is_unix_root && !is_drive_root {
+        while path.len() > 1 && (path.ends_with('/') || path.ends_with('\\')) {
+            path.pop();
+        }
+    }
 }
 
 fn rewrite_jsonl(
@@ -442,6 +502,13 @@ fn path_exists(path: &Path) -> AppResult<bool> {
     }
 }
 
+fn same_existing_entry(source: &Path, destination: &Path) -> AppResult<bool> {
+    if !path_exists(destination)? {
+        return Ok(false);
+    }
+    same_file::is_same_file(source, destination).map_err(Into::into)
+}
+
 fn remove_path(path: &Path) -> AppResult<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if crate::path_safety::metadata_is_link_or_reparse(&metadata) => {
@@ -554,6 +621,158 @@ mod tests {
             ),
             "F--project-sessions-management-codex-session-manager"
         );
+    }
+
+    #[test]
+    fn move_rewrites_in_place_when_only_the_recorded_cwd_needs_normalizing() -> AppResult<()> {
+        let root = std::env::temp_dir().join(format!(
+            "cc-sessions-claude-normalize-in-place-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let claude = root.join(".claude");
+        let target = root.join("same project");
+        fs::create_dir_all(&target)?;
+        let normalized_target = normalize_target_cwd(target.to_string_lossy().as_ref(), false)?;
+        let stale_cwd = format!("{normalized_target}{}", std::path::MAIN_SEPARATOR);
+        let project = claude_sessions::project_dir_for_cwd(&claude, &normalized_target);
+        fs::create_dir_all(project.join("session-in-place/subagents"))?;
+        let transcript = project.join("session-in-place.jsonl");
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type":"user",
+                    "sessionId":"session-in-place",
+                    "cwd":stale_cwd,
+                    "message":{"role":"user","content":"hello"}
+                })
+            ),
+        )?;
+        let sidecar = project.join("session-in-place/subagents/agent-a.jsonl");
+        fs::write(
+            &sidecar,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type":"assistant",
+                    "sessionId":"session-in-place",
+                    "cwd":stale_cwd,
+                    "message":{"role":"assistant","content":[]}
+                })
+            ),
+        )?;
+        let companion = project.join("session-in-place.claudinal.json");
+        fs::write(
+            &companion,
+            serde_json::json!({"result":{"session_id":"session-in-place"}}).to_string(),
+        )?;
+        fs::write(
+            claude.join("history.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "sessionId":"session-in-place",
+                    "project":stale_cwd,
+                    "display":"hello"
+                })
+            ),
+        )?;
+
+        let report = move_session_cwd(
+            &claude,
+            "session-in-place",
+            Some(transcript.to_string_lossy().as_ref()),
+            target.to_string_lossy().as_ref(),
+        )?;
+
+        assert!(report.rollout_rewritten);
+        assert_eq!(report.artifacts_moved, 0);
+        assert_eq!(report.history_rows_updated, 1);
+        assert_eq!(report.new_cwd, normalized_target);
+        assert!(transcript.is_file());
+        let line = fs::read_to_string(&transcript)?
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let value: Value = serde_json::from_str(&line)?;
+        assert_eq!(value["cwd"], report.new_cwd);
+        let sidecar_line = fs::read_to_string(&sidecar)?
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let sidecar_value: Value = serde_json::from_str(&sidecar_line)?;
+        assert_eq!(sidecar_value["cwd"], report.new_cwd);
+        assert!(companion.is_file());
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn exact_mode_preserves_drive_letter_case_while_default_mode_normalizes_it() -> AppResult<()> {
+        let root = std::env::temp_dir().join(format!(
+            "cc-sessions-claude-exact-case-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let target = root.join("exact project");
+        fs::create_dir_all(&target)?;
+        let normalized = normalize_target_cwd(target.to_string_lossy().as_ref(), false)?;
+        let mut exact = normalized.clone();
+        let drive = exact[..1].to_string();
+        let replacement = if drive == drive.to_ascii_lowercase() {
+            drive.to_ascii_uppercase()
+        } else {
+            drive.to_ascii_lowercase()
+        };
+        exact.replace_range(..1, &replacement);
+
+        assert_ne!(exact, normalized);
+        assert_eq!(normalize_target_cwd(&exact, false)?, normalized);
+        assert_eq!(normalize_target_cwd(&exact, true)?, exact);
+
+        let claude = root.join(".claude");
+        let project = claude_sessions::project_dir_for_cwd(&claude, &normalized);
+        fs::create_dir_all(&project)?;
+        let transcript = project.join("session-exact.jsonl");
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type":"user",
+                    "sessionId":"session-exact",
+                    "cwd":normalized,
+                    "message":{"role":"user","content":"hello"}
+                })
+            ),
+        )?;
+
+        let report = move_session_cwd_with_options(
+            &claude,
+            "session-exact",
+            Some(transcript.to_string_lossy().as_ref()),
+            &exact,
+            true,
+        )?;
+        assert!(report.rollout_rewritten);
+        assert_eq!(report.artifacts_moved, 0);
+        assert_eq!(report.new_cwd, exact);
+        let line = fs::read_to_string(&transcript)?
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let value: Value = serde_json::from_str(&line)?;
+        assert_eq!(value["cwd"], report.new_cwd);
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
     }
 
     #[test]

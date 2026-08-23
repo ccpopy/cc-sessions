@@ -233,16 +233,19 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "title")?,
             &state.family_lock,
         )),
-        "move_session_cwd" => to_result_value(sessions::move_session_cwd_with_provider_dirs(
-            opt_string_arg(&args, "provider")?,
-            string_arg(&args, "codexDir")?,
-            opt_string_arg(&args, "claudeDir")?,
-            opt_string_arg(&args, "opencodeDir")?,
-            string_arg(&args, "id")?,
-            opt_string_arg(&args, "rolloutPath")?,
-            string_arg(&args, "targetCwd")?,
-            &state.family_lock,
-        )),
+        "move_session_cwd" => {
+            to_result_value(sessions::move_session_cwd_with_provider_dirs_and_options(
+                opt_string_arg(&args, "provider")?,
+                string_arg(&args, "codexDir")?,
+                opt_string_arg(&args, "claudeDir")?,
+                opt_string_arg(&args, "opencodeDir")?,
+                string_arg(&args, "id")?,
+                opt_string_arg(&args, "rolloutPath")?,
+                string_arg(&args, "targetCwd")?,
+                opt_bool_arg(&args, "preserveClaudePathCase")?.unwrap_or(false),
+                &state.family_lock,
+            ))
+        }
         "delete_session" => to_result_value(sessions::delete_session_with_provider_dir(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "codexDir")?,
@@ -928,6 +931,13 @@ fn bool_arg(args: &Value, name: &str) -> AppResult<bool> {
     arg(args, name)
 }
 
+fn opt_bool_arg(args: &Value, name: &str) -> AppResult<Option<bool>> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => serde_json::from_value(value.clone()).map_err(AppError::Serde),
+    }
+}
+
 fn usize_arg(args: &Value, name: &str) -> AppResult<usize> {
     arg(args, name)
 }
@@ -1028,6 +1038,24 @@ mod tests {
         assert_eq!(report["dry_run"], true);
 
         fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn optional_bool_arguments_remain_backward_compatible() -> AppResult<()> {
+        assert_eq!(opt_bool_arg(&json!({}), "preserveClaudePathCase")?, None);
+        assert_eq!(
+            opt_bool_arg(
+                &json!({"preserveClaudePathCase": true}),
+                "preserveClaudePathCase"
+            )?,
+            Some(true)
+        );
+        assert!(opt_bool_arg(
+            &json!({"preserveClaudePathCase": "true"}),
+            "preserveClaudePathCase"
+        )
+        .is_err());
         Ok(())
     }
 }

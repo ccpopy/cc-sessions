@@ -1080,11 +1080,12 @@ pub async fn move_session_cwd(
     id: String,
     rollout_path: Option<String>,
     target_cwd: String,
+    preserve_claude_path_case: Option<bool>,
     lock: SharedLock<'_>,
 ) -> AppResult<MoveSessionCwdReport> {
     let lock = lock.inner().clone();
     run_blocking(move || {
-        crate::sessions::move_session_cwd_with_provider_dirs(
+        crate::sessions::move_session_cwd_with_provider_dirs_and_options(
             provider,
             codex_dir,
             claude_dir,
@@ -1092,6 +1093,7 @@ pub async fn move_session_cwd(
             id,
             rollout_path,
             target_cwd,
+            preserve_claude_path_case.unwrap_or(false),
             &lock,
         )
     })

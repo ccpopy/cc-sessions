@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { FolderOpen, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -19,7 +20,7 @@ type Props = {
   onOpenChange: (open: boolean) => void;
   session: SessionSummary | null;
   /** 成功时 resolve；抛错则保持弹窗打开（调用方负责错误提示）。 */
-  onSubmit: (targetCwd: string) => Promise<void>;
+  onSubmit: (targetCwd: string, preserveClaudePathCase: boolean) => Promise<void>;
 };
 
 export function MoveSessionCwdDialog({
@@ -31,10 +32,12 @@ export function MoveSessionCwdDialog({
   const [targetCwd, setTargetCwd] = useState("");
   const [saving, setSaving] = useState(false);
   const [picking, setPicking] = useState(false);
+  const [preserveClaudePathCase, setPreserveClaudePathCase] = useState(false);
 
   useEffect(() => {
     if (open && session) {
       setTargetCwd(session.cwd);
+      setPreserveClaudePathCase(false);
     }
   }, [open, session]);
 
@@ -43,7 +46,7 @@ export function MoveSessionCwdDialog({
     if (!trimmed || saving || picking) return;
     setSaving(true);
     try {
-      await onSubmit(trimmed);
+      await onSubmit(trimmed, session?.provider === "claude" && preserveClaudePathCase);
       onOpenChange(false);
     } catch {
       // 错误已由调用方 toast，弹窗保持打开供修改重试
@@ -113,6 +116,31 @@ export function MoveSessionCwdDialog({
               )}
             </Button>
           </div>
+          {session?.provider === "claude" && (
+            <div className="mt-1 flex items-start gap-2 rounded-md border bg-muted/30 p-3">
+              <Checkbox
+                id="preserve-claude-path-case"
+                checked={preserveClaudePathCase}
+                onCheckedChange={(checked) => setPreserveClaudePathCase(checked === true)}
+                disabled={saving || picking}
+                className="mt-0.5"
+              />
+              <div className="grid gap-1">
+                <Label htmlFor="preserve-claude-path-case" className="cursor-pointer leading-4">
+                  保留输入路径大小写（高级）
+                </Label>
+                <p className="text-xs leading-5 text-muted-foreground">
+                  默认使用系统解析后的标准路径。仅在需要精确匹配 Claude 已有的 Windows
+                  路径变体时开启。
+                </p>
+                {preserveClaudePathCase && (
+                  <p className="text-xs leading-5 text-amber-600 dark:text-amber-400">
+                    这可能继续保留同一目录的多个 Claude 项目变体。
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
         </div>
         <DialogFooter>
           <Button

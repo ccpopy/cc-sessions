@@ -933,7 +933,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         open={!!moveTarget}
         onOpenChange={(v) => !v && setMoveTarget(null)}
         session={moveTarget}
-        onSubmit={async (targetCwd) => {
+        onSubmit={async (targetCwd, preserveClaudePathCase) => {
           if (!settings || !moveTarget) return;
           try {
             const r = await api.moveSessionCwd({
@@ -944,6 +944,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
               id: moveTarget.id,
               rollout_path: moveTarget.rollout_path,
               target_cwd: targetCwd,
+              preserve_claude_path_case: preserveClaudePathCase,
             });
             toast.success(
               `已移动到新项目：${basename(r.new_cwd)}` +
