@@ -315,12 +315,25 @@ fn scan_child_references(
                 continue;
             }
         };
-        let Ok(data) = serde_json::from_slice::<Value>(&raw) else {
+        let Ok(Value::Object(data)) = serde_json::from_slice::<Value>(&raw) else {
             out.complete = false;
             continue;
         };
-        for child in child_ids(&data) {
-            out.referenced.insert(child.to_string());
+        for field in CHILD_ID_FIELDS {
+            let Some(children) = data.get(field) else {
+                continue;
+            };
+            let Some(children) = children.as_array() else {
+                out.complete = false;
+                continue;
+            };
+            for child in children {
+                let Some(child) = child.as_str() else {
+                    out.complete = false;
+                    continue;
+                };
+                out.referenced.insert(child.to_string());
+            }
         }
     }
     Ok(out)
@@ -1894,10 +1907,10 @@ mod tests {
             "composerData:kid",
             json!({"fullConversationHeadersOnly": [{"bubbleId": "b1"}]}),
         )?;
-        // other 也引用着 kid，但它的记录坏了，解析不出这条引用。
+        // other 也引用着 kid，但记录被双重编码成 JSON 字符串，结构上无法读取。
         connection.execute(
             "INSERT INTO cursorDiskKV VALUES ('composerData:other', ?1)",
-            ["{ 坏掉的记录，其实写着 subagentComposerIds: [kid]"],
+            [r#""{\"subagentComposerIds\":[\"kid\"]}""#],
         )?;
         drop(connection);
 
@@ -1917,6 +1930,23 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(parent, 0, "根会话本身还是要删掉");
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_child_reference_fields_make_the_scan_incomplete() -> AppResult<()> {
+        let fixture = fixture("malformed-child-reference-fields")?;
+        let connection = connect(&fixture)?;
+        for value in [
+            json!({"subagentComposerIds": "kid"}),
+            json!({"subComposerIds": [1]}),
+        ] {
+            connection.execute(
+                "UPDATE cursorDiskKV SET value = ?1 WHERE key = 'composerData:s1'",
+                [value.to_string()],
+            )?;
+            assert!(!scan_child_references(&connection, None)?.complete);
+        }
         Ok(())
     }
 
