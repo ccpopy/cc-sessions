@@ -1045,6 +1045,57 @@ mod tests {
     }
 
     #[test]
+    fn webui_markdown_export_includes_the_full_local_timestamp() -> AppResult<()> {
+        let codex = temp_codex_dir("webui-markdown-timestamp");
+        fs::create_dir_all(&codex)?;
+        let rollout = codex.join("rollout.jsonl");
+        let timestamp = "2026-08-27T12:34:56Z";
+        fs::write(
+            &rollout,
+            format!(
+                r#"{{"timestamp":"{timestamp}","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"WebUI 导出"}}]}}}}"#
+            ),
+        )?;
+        let state = test_state(&codex);
+
+        let report = dispatch_invoke(
+            &state,
+            "export_session_markdown",
+            json!({
+                "provider": "codex",
+                "rolloutPath": rollout.to_string_lossy(),
+                "outPath": null,
+                "header": {
+                    "title": "WebUI 导出",
+                    "session_id": "test-session",
+                    "provider": "codex"
+                },
+                "options": {
+                    "include_front_matter": false,
+                    "include_reasoning": false,
+                    "include_tools": false,
+                    "ai_handoff_preamble": false
+                }
+            }),
+        )?;
+        let expected = chrono::DateTime::parse_from_rfc3339(timestamp)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let markdown = report["markdown"].as_str().unwrap_or_default();
+
+        assert_eq!(report["message_count"], 1);
+        assert!(
+            markdown.contains(&format!("## 👤 User · {expected}")),
+            "WebUI 导出缺少完整日期时间: {markdown}"
+        );
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
     fn optional_bool_arguments_remain_backward_compatible() -> AppResult<()> {
         assert_eq!(opt_bool_arg(&json!({}), "preserveClaudePathCase")?, None);
         assert_eq!(

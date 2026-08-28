@@ -415,13 +415,16 @@ fn format_epoch(secs: i64) -> String {
     }
 }
 
-/// ISO8601 时间戳 → 本地 "HH:MM"，解析失败返回空串。
+/// ISO8601 时间戳 → 本地 "YYYY-MM-DD HH:MM:SS"，解析失败返回空串。
 fn format_event_time(ts: &str) -> String {
     if ts.is_empty() {
         return String::new();
     }
     match chrono::DateTime::parse_from_rfc3339(ts) {
-        Ok(dt) => dt.with_timezone(&chrono::Local).format("%H:%M").to_string(),
+        Ok(dt) => dt
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string(),
         Err(_) => String::new(),
     }
 }
@@ -477,6 +480,35 @@ mod tests {
             tokens_used: 0,
             resume_command: String::new(),
         }
+    }
+
+    #[test]
+    fn message_headings_include_the_full_local_timestamp() {
+        let mut event = ev(
+            0,
+            json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "带日期导出"}]
+                }
+            }),
+        );
+        event.timestamp = "2026-08-27T12:34:56Z".into();
+        let expected = chrono::DateTime::parse_from_rfc3339(&event.timestamp)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+
+        let (markdown, count) = render_markdown(&[event], &header(), &default_options());
+
+        assert_eq!(count, 1);
+        assert!(
+            markdown.contains(&format!("## 👤 User · {expected}")),
+            "导出的消息标题缺少完整日期时间: {markdown}"
+        );
     }
 
     #[test]
