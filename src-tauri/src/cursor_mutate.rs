@@ -11,6 +11,7 @@
 //! 会让两份数据以新的方式互相矛盾。
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -138,12 +139,9 @@ pub fn rename_session(dirs: &ProviderDirs, id: &str, title: &str) -> AppResult<u
             // 会话正文里也存了一份名字，两处不同步的话 Cursor 打开会话时会显示旧名。
             let key = format!("composerData:{id}");
             if let Some(raw) = read_kv(&transaction, &key)? {
-                let data = merge_header(
-                    serde_json::from_slice::<Value>(&raw).unwrap_or(Value::Null),
-                    |value| {
-                        value.insert("name".into(), Value::String(title.to_string()));
-                    },
-                );
+                let data = merge_header(parse_mutable_object(&raw, "会话正文")?, |value| {
+                    value.insert("name".into(), Value::String(title.to_string()));
+                });
                 transaction.execute(
                     "UPDATE cursorDiskKV SET value = ?1 WHERE key = ?2",
                     params![data.to_string(), key],
@@ -256,11 +254,40 @@ fn subagent_children(connection: &Connection, id: &str) -> AppResult<Vec<String>
 }
 
 /// 在删除范围之外，还有哪些会话引用着这批子代理。
+///
+/// 只要有一条 `composerData` 读不出来，"没有别人引用它"这个结论就不成立——那条记录
+/// 完全可能正引用着我们准备删的子会话。这种情况下把范围内的子会话全部当成共享保留，
+/// 只删根会话；留下来的子会话之后会在残留诊断里以"无主子会话"出现，由用户自己决定。
 fn shared_children(
     connection: &Connection,
     scope: &BTreeSet<String>,
 ) -> AppResult<BTreeSet<String>> {
-    let mut shared = BTreeSet::new();
+    let scan = scan_child_references(connection, Some(scope))?;
+    if !scan.complete {
+        return Ok(scope.clone());
+    }
+    Ok(scan.referenced)
+}
+
+/// 一次 `composerData` 全扫的结果。
+struct ChildReferences {
+    /// 被别的会话引用的子会话 id。
+    referenced: BTreeSet<String>,
+    /// 是否每条记录都成功解析。为 false 时不能反过来断言"某个 id 没有被引用"。
+    complete: bool,
+}
+
+/// 扫描所有 `composerData`，收集其中登记的子会话 id。
+///
+/// `skip` 里的会话不计入（级联删除时，删除范围内部的引用不算"共享"）。
+fn scan_child_references(
+    connection: &Connection,
+    skip: Option<&BTreeSet<String>>,
+) -> AppResult<ChildReferences> {
+    let mut out = ChildReferences {
+        referenced: BTreeSet::new(),
+        complete: true,
+    };
     let mut statement = connection.prepare(
         "SELECT key, value FROM cursorDiskKV
          WHERE key >= 'composerData:' AND key < 'composerData;'",
@@ -276,22 +303,27 @@ fn shared_children(
         let Some(owner) = key.strip_prefix("composerData:") else {
             continue;
         };
-        if scope.contains(owner) {
+        if skip.is_some_and(|skip| skip.contains(owner)) {
             continue;
         }
         let raw = match value {
             rusqlite::types::Value::Text(text) => text.into_bytes(),
             rusqlite::types::Value::Blob(bytes) => bytes,
-            _ => continue,
-        };
-        let data = serde_json::from_slice::<Value>(&raw).unwrap_or(Value::Null);
-        for child in child_ids(&data) {
-            if scope.contains(child) {
-                shared.insert(child.to_string());
+            // 既不是文本也不是二进制，内容无从判断。
+            _ => {
+                out.complete = false;
+                continue;
             }
+        };
+        let Ok(data) = serde_json::from_slice::<Value>(&raw) else {
+            out.complete = false;
+            continue;
+        };
+        for child in child_ids(&data) {
+            out.referenced.insert(child.to_string());
         }
     }
-    Ok(shared)
+    Ok(out)
 }
 
 /// 回收删除后空出的页。
@@ -338,16 +370,43 @@ fn locate(dirs: &ProviderDirs, id: &str) -> AppResult<Target> {
         }
     }
     // cursor-agent 的会话目录名就是 agentId。
+    //
+    // 这里**不能**把 id 拼进路径：`Path::join` 遇到绝对路径会直接把前面整段丢掉，
+    // 传进来一个绝对路径就能逃出 chats 目录，然后被 delete_session 的 remove_dir_all
+    // 删掉。改成逐个比对目录名，用户输入永远不会变成路径的一段。
+    if !is_plain_path_component(id) {
+        return Err(AppError::NotFound(format!("Cursor 会话不存在: {id}")));
+    }
     let chats = paths::cursor_agent_chats_dir(&dirs.cursor_agent_path());
     if chats.is_dir() {
-        for entry in fs::read_dir(&chats)? {
-            let candidate = entry?.path().join(id);
-            if candidate.is_dir() {
-                return Ok(Target::Agent { dir: candidate });
+        for project in fs::read_dir(&chats)? {
+            let project = project?.path();
+            if !project.is_dir() {
+                continue;
+            }
+            for session in fs::read_dir(&project)? {
+                let session = session?;
+                if session.file_name() == OsStr::new(id) && session.path().is_dir() {
+                    return Ok(Target::Agent {
+                        dir: session.path(),
+                    });
+                }
             }
         }
     }
     Err(AppError::NotFound(format!("Cursor 会话不存在: {id}")))
+}
+
+/// id 必须是单独一段普通目录名，不能带路径分隔符、盘符或 `.` / `..`。
+fn is_plain_path_component(id: &str) -> bool {
+    !id.is_empty()
+        && id != "."
+        && id != ".."
+        && !id.contains('/')
+        && !id.contains('\\')
+        && !id.contains('\0')
+        // Windows 上 "C:foo" 这类带盘符的相对路径同样会改变解析结果。
+        && !id.contains(':')
 }
 
 /// 拒绝在旧版 Cursor 上写入。
@@ -386,12 +445,31 @@ fn header_value(connection: &Connection, id: &str) -> AppResult<Value> {
         )
         .optional()?
         .flatten();
-    Ok(raw
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .unwrap_or(Value::Null))
+    match raw {
+        Some(raw) => parse_mutable_object(raw.as_bytes(), "会话头"),
+        // 列本身是 NULL，没有内容会被覆盖掉。
+        None => Ok(Value::Null),
+    }
+}
+
+/// 解析一段准备"读出来改几个字段再写回去"的 JSON。
+///
+/// 这里绝对不能把解析失败降级成空对象：后面 [`merge_header`] 会把非对象当成新的空
+/// 对象，写回去就等于把原记录整行替换成只剩本次写入的字段。宁可拒绝这次修改，
+/// 也不能让一条读不懂的记录被悄悄清空。
+fn parse_mutable_object(raw: &[u8], what: &str) -> AppResult<Value> {
+    match serde_json::from_slice::<Value>(raw) {
+        Ok(value @ Value::Object(_)) => Ok(value),
+        _ => Err(AppError::Other(format!(
+            "{what}的内容不是合法 JSON 对象，继续写入会覆盖掉原有数据，已放弃本次修改"
+        ))),
+    }
 }
 
 /// 只改动指定字段，其余原样保留——会话头里还有几十个 Cursor 自己用的字段。
+///
+/// 传入非对象只在"原本就没有内容"时才是合法的，调用方必须先用
+/// [`parse_mutable_object`] 把损坏的记录拦下来。
 fn merge_header(header: Value, edit: impl FnOnce(&mut serde_json::Map<String, Value>)) -> Value {
     let mut object = match header {
         Value::Object(object) => object,
@@ -433,7 +511,7 @@ fn rename_agent_session(dir: &Path, title: &str) -> AppResult<()> {
     let text = String::from_utf8(bytes)
         .map_err(|error| AppError::Other(format!("Cursor CLI 会话头不是合法 UTF-8: {error}")))?;
     let header = merge_header(
-        serde_json::from_str::<Value>(&text).unwrap_or(Value::Null),
+        parse_mutable_object(text.as_bytes(), "Cursor CLI 会话头")?,
         |value| {
             value.insert("name".into(), Value::String(title.to_string()));
         },
@@ -506,7 +584,7 @@ pub fn diagnose_residue(dirs: &ProviderDirs) -> AppResult<CursorResidueReport> {
     let headers = read_headers(&connection)?;
     let counts = cursor_sessions::bubble_counts(&connection, headers.keys().map(String::as_str))?;
 
-    let referenced = referenced_subagents(&connection)?;
+    let references = scan_child_references(&connection, None)?;
     let mut empty = Vec::new();
     let mut missing_project = Vec::new();
     let mut orphan_subagents = Vec::new();
@@ -518,7 +596,8 @@ pub fn diagnose_residue(dirs: &ProviderDirs) -> AppResult<CursorResidueReport> {
         }
         if header.is_subagent {
             // 子代理不进列表，只随父会话管理；没有父引用的就再也访问不到了。
-            if !referenced.contains(id) {
+            // 扫描不完整时不能断言"没有父引用"，这一类整体不报，避免误删。
+            if references.complete && !references.referenced.contains(id) {
                 orphan_subagents.push(id.clone());
             }
             continue;
@@ -602,8 +681,12 @@ pub fn diagnose_residue(dirs: &ProviderDirs) -> AppResult<CursorResidueReport> {
         CursorResidueGroup {
             kind: RESIDUE_ORPHAN_SUBAGENTS.into(),
             label: "无主子会话".into(),
-            description: "子会话只跟着父会话管理，但这些的父会话已经不在了，界面上再也访问不到。"
-                .into(),
+            description: if references.complete {
+                "子会话只跟着父会话管理，但这些的父会话已经不在了，界面上再也访问不到。".into()
+            } else {
+                "有会话记录读不出来，无法确认这些子会话是否还被引用，这一类已锁定不可清理。"
+                    .to_string()
+            },
             sessions: orphan_subagents.len() as u32,
             rows: orphan_subagents.len() as u32,
             bytes: 0,
@@ -705,12 +788,18 @@ pub fn prune_residue(
         }
     }
     if kinds.iter().any(|kind| kind == RESIDUE_ORPHAN_SUBAGENTS) {
-        let referenced = referenced_subagents(&connection)?;
+        let references = scan_child_references(&connection, None)?;
+        // 有记录读不出来就没法证明这些子会话真的没人引用了，这一类整体不删。
+        if !references.complete {
+            return Err(AppError::Other(
+                "有会话记录读不出来，无法确认哪些子会话仍被引用，已放弃清理无主子会话".into(),
+            ));
+        }
         for (id, header) in &headers {
             if counts.get(id).copied().unwrap_or(0) == 0 || !header.is_subagent {
                 continue;
             }
-            if !referenced.contains(id) {
+            if !references.referenced.contains(id) {
                 sessions_to_drop.push(id.clone());
             }
         }
@@ -928,26 +1017,6 @@ fn read_headers(connection: &Connection) -> AppResult<BTreeMap<String, HeaderRow
 }
 
 /// 库里所有被某个父会话引用着的子代理 id。
-fn referenced_subagents(connection: &Connection) -> AppResult<BTreeSet<String>> {
-    let mut out = BTreeSet::new();
-    let mut statement = connection.prepare(
-        "SELECT value FROM cursorDiskKV
-         WHERE key >= 'composerData:' AND key < 'composerData;'",
-    )?;
-    let rows = statement.query_map([], |row| row.get::<_, rusqlite::types::Value>(0))?;
-    for row in rows {
-        let raw = match row? {
-            rusqlite::types::Value::Text(text) => text.into_bytes(),
-            rusqlite::types::Value::Blob(bytes) => bytes,
-            _ => continue,
-        };
-        let data = serde_json::from_slice::<Value>(&raw).unwrap_or(Value::Null);
-        for child in child_ids(&data) {
-            out.insert(child.to_string());
-        }
-    }
-    Ok(out)
-}
 
 fn header_cwd(header: &Value) -> String {
     header
@@ -1714,6 +1783,178 @@ mod tests {
         let _probe = CursorRunningProbe::not_running();
         let error = set_archived(&fixture.dirs, "s1", true).unwrap_err();
         assert!(error.to_string().contains("已拒绝写入"));
+        Ok(())
+    }
+
+    /// 会话 id 绝不能被当成路径的一段。
+    ///
+    /// `Path::join` 遇到绝对路径会把前面整段丢掉，早先的实现因此可以用一个绝对路径
+    /// 逃出 chats 目录，再被 `remove_dir_all` 整个删掉。
+    #[test]
+    fn an_agent_id_can_not_escape_the_chats_directory() -> AppResult<()> {
+        let fixture = fixture("agent-escape")?;
+        // chats 目录必须存在，否则查找会提前结束，测不到逃逸路径。
+        let chats = paths::cursor_agent_chats_dir(Path::new(
+            fixture.dirs.cursor_agent_dir.as_deref().unwrap(),
+        ));
+        fs::create_dir_all(chats.join("project"))?;
+
+        let outsider = fixture.root.join("outside");
+        fs::create_dir_all(outsider.join("payload"))?;
+
+        let _probe = CursorRunningProbe::not_running();
+        for id in [
+            outsider.to_string_lossy().into_owned(),
+            "../../outside".to_string(),
+            "..".to_string(),
+            "project/../../outside".to_string(),
+        ] {
+            let error = delete_session(&fixture.dirs, &id).unwrap_err();
+            assert!(
+                matches!(error, AppError::NotFound(_)),
+                "id={id} 应当直接判定为不存在，实际是 {error}"
+            );
+            assert!(outsider.is_dir(), "id={id} 把 chats 之外的目录删掉了");
+        }
+        Ok(())
+    }
+
+    /// 正文解析不了的时候宁可不改，也不能把整条记录覆盖成只剩一个 name。
+    #[test]
+    fn renaming_refuses_to_overwrite_a_record_it_can_not_parse() -> AppResult<()> {
+        let fixture = fixture("rename-corrupt")?;
+        let connection = connect(&fixture)?;
+        connection.execute(
+            "UPDATE cursorDiskKV SET value = ?1 WHERE key = 'composerData:s1'",
+            ["{ 这不是 JSON"],
+        )?;
+        drop(connection);
+
+        let _probe = CursorRunningProbe::not_running();
+        let error = rename_session(&fixture.dirs, "s1", "新名字").unwrap_err();
+        assert!(error.to_string().contains("已放弃本次修改"));
+
+        let connection = connect(&fixture)?;
+        let body: String = connection.query_row(
+            "SELECT value FROM cursorDiskKV WHERE key = 'composerData:s1'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(body, "{ 这不是 JSON", "损坏的正文被覆盖了");
+        // 会话头也要跟着回滚，不能只改了一半。
+        let header: String = connection.query_row(
+            "SELECT value FROM composerHeaders WHERE composerId = 's1'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(header.contains("原名"));
+        Ok(())
+    }
+
+    /// 会话头损坏时同样不能改名——头里还存着项目路径、创建时间等一堆字段。
+    #[test]
+    fn renaming_refuses_when_the_header_json_is_broken() -> AppResult<()> {
+        let fixture = fixture("rename-broken-header")?;
+        let connection = connect(&fixture)?;
+        connection.execute(
+            "UPDATE composerHeaders SET value = '[]' WHERE composerId = 's1'",
+            [],
+        )?;
+        drop(connection);
+
+        let _probe = CursorRunningProbe::not_running();
+        assert!(rename_session(&fixture.dirs, "s1", "新名字").is_err());
+        assert!(set_archived(&fixture.dirs, "s1", true).is_err());
+        Ok(())
+    }
+
+    /// 有父会话记录读不出来时，不能反过来断定某个子会话没人引用。
+    #[test]
+    fn an_unreadable_parent_keeps_shared_subagents_alive() -> AppResult<()> {
+        let fixture = fixture("shared-unreadable-parent")?;
+        let connection = connect(&fixture)?;
+        for id in ["parent", "other", "kid"] {
+            insert_header(&connection, id, 0, i64::from(id == "kid"), json!({}))?;
+            insert_kv(
+                &connection,
+                &format!("bubbleId:{id}:b1"),
+                json!({"type": 1}),
+            )?;
+        }
+        insert_kv(
+            &connection,
+            "composerData:parent",
+            json!({
+                "fullConversationHeadersOnly": [{"bubbleId": "b1"}],
+                "subagentComposerIds": ["kid"],
+            }),
+        )?;
+        insert_kv(
+            &connection,
+            "composerData:kid",
+            json!({"fullConversationHeadersOnly": [{"bubbleId": "b1"}]}),
+        )?;
+        // other 也引用着 kid，但它的记录坏了，解析不出这条引用。
+        connection.execute(
+            "INSERT INTO cursorDiskKV VALUES ('composerData:other', ?1)",
+            ["{ 坏掉的记录，其实写着 subagentComposerIds: [kid]"],
+        )?;
+        drop(connection);
+
+        let _probe = CursorRunningProbe::not_running();
+        delete_session(&fixture.dirs, "parent")?;
+
+        let connection = connect(&fixture)?;
+        let kid: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM composerHeaders WHERE composerId = 'kid'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(kid, 1, "读不出 other 的引用时把共享子会话删掉了");
+        let parent: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM composerHeaders WHERE composerId = 'parent'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(parent, 0, "根会话本身还是要删掉");
+        Ok(())
+    }
+
+    /// 同样的道理：扫描不完整时不能把子会话报成"无主"，更不能清理。
+    #[test]
+    fn an_unreadable_parent_locks_the_orphan_subagent_kind() -> AppResult<()> {
+        let fixture = fixture("orphan-subagent-unreadable")?;
+        let connection = connect(&fixture)?;
+        insert_header(&connection, "lonely", 0, 1, json!({}))?;
+        insert_kv(
+            &connection,
+            "composerData:lonely",
+            json!({"fullConversationHeadersOnly": [{"bubbleId": "b1"}]}),
+        )?;
+        insert_kv(&connection, "bubbleId:lonely:b1", json!({"type": 1}))?;
+        connection.execute(
+            "INSERT INTO cursorDiskKV VALUES ('composerData:broken', ?1)",
+            ["{ 坏掉的记录"],
+        )?;
+        drop(connection);
+
+        let report = diagnose_residue(&fixture.dirs)?;
+        let group = report
+            .groups
+            .iter()
+            .find(|g| g.kind == RESIDUE_ORPHAN_SUBAGENTS)
+            .expect("无主子会话分组");
+        assert_eq!(group.sessions, 0, "扫描不完整时不该报无主子会话");
+        assert!(group.description.contains("锁定"));
+
+        let _probe = CursorRunningProbe::not_running();
+        let error = prune_residue(
+            &fixture.dirs,
+            &[RESIDUE_ORPHAN_SUBAGENTS.to_string()],
+            false,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("已放弃清理无主子会话"));
         Ok(())
     }
 
