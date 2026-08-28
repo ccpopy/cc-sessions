@@ -55,6 +55,8 @@ const config: Config = {
           "claude-fg": "hsl(var(--provider-claude-fg) / <alpha-value>)",
           opencode: "hsl(var(--provider-opencode) / <alpha-value>)",
           "opencode-fg": "hsl(var(--provider-opencode-fg) / <alpha-value>)",
+          cursor: "hsl(var(--provider-cursor) / <alpha-value>)",
+          "cursor-fg": "hsl(var(--provider-cursor-fg) / <alpha-value>)",
         },
         sidebar: {
           DEFAULT: "hsl(var(--sidebar-background))",

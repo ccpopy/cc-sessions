@@ -13,6 +13,11 @@ pub mod codex_rollout_cwd;
 pub mod commands;
 pub mod content_search;
 pub mod convert;
+pub mod cursor_agent_store;
+pub mod cursor_blobs;
+pub mod cursor_mutate;
+pub mod cursor_sessions;
+pub mod cursor_transfer;
 pub mod edit;
 pub mod error;
 pub mod family;
@@ -74,9 +79,11 @@ pub fn run() {
             settings::default_codex_dir,
             settings::default_claude_dir,
             settings::default_opencode_dir,
+            settings::default_cursor_dir,
             settings::validate_codex_dir,
             settings::validate_claude_dir,
             settings::validate_opencode_dir,
+            settings::validate_cursor_dir,
             fs_ops::reveal_cwd,
             fs_ops::open_latest_release_page,
             fs_ops::copy_resume_command,
@@ -92,6 +99,9 @@ pub fn run() {
             commands::move_session_cwd,
             commands::delete_session,
             commands::delete_sessions,
+            commands::compact_cursor_database,
+            commands::diagnose_cursor_residue,
+            commands::prune_cursor_residue,
             commands::preview_session_head,
             commands::preview_session_range,
             commands::preview_session_user_prompts,

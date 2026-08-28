@@ -4,48 +4,44 @@ use std::path::PathBuf;
 use chrono::{Datelike, Duration, TimeZone, Timelike, Utc};
 
 use crate::error::{AppError, AppResult};
-use crate::models::{Kpi, ModelStat, ProjectStat, SessionSummary, StatsSnapshot, TimeseriesPoint};
-use crate::paths;
+use crate::models::{
+    Kpi, ModelStat, ProjectStat, ProviderDirs, SessionSummary, StatsSnapshot, TimeseriesPoint,
+};
 
 fn provider_or_codex(provider: Option<String>) -> String {
     provider.unwrap_or_else(|| "codex".to_string())
 }
 
-fn claude_root(claude_dir: Option<String>) -> PathBuf {
-    PathBuf::from(
-        claude_dir.unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
-    )
-}
-
-fn opencode_root(opencode_dir: Option<String>) -> PathBuf {
-    PathBuf::from(
-        opencode_dir
-            .unwrap_or_else(|| paths::default_opencode_dir().to_string_lossy().into_owned()),
-    )
-}
-
-fn load_sessions(
-    provider: &str,
-    codex_dir: &str,
-    claude_dir: Option<String>,
-    opencode_dir: Option<String>,
-) -> AppResult<Vec<SessionSummary>> {
+fn load_sessions(provider: &str, dirs: &ProviderDirs) -> AppResult<Vec<SessionSummary>> {
     match provider {
-        "codex" => {
-            crate::sessions::list_sessions(Some("codex".into()), codex_dir.to_string(), claude_dir)
+        "codex" => crate::sessions::list_sessions(
+            Some("codex".into()),
+            dirs.codex_dir.clone(),
+            dirs.claude_dir.clone(),
+        ),
+        "claude" => crate::claude_sessions::scan_sessions(&dirs.claude_path()),
+        "opencode" => crate::opencode_sessions::list_sessions(&dirs.opencode_path()),
+        "cursor" => {
+            crate::cursor_sessions::list_sessions(&dirs.cursor_path(), &dirs.cursor_agent_path())
         }
-        "claude" => crate::claude_sessions::scan_sessions(&claude_root(claude_dir)),
-        "opencode" => crate::opencode_sessions::list_sessions(&opencode_root(opencode_dir)),
         "all" => {
             let mut out =
-                crate::sessions::list_sessions(Some("codex".into()), codex_dir.to_string(), None)?;
-            out.extend(crate::claude_sessions::scan_sessions(&claude_root(
-                claude_dir,
-            ))?);
-            // 没装 / 没配 OpenCode 时按"零会话"处理，不让缺少 opencode.db 拖垮整块统计。
-            let opencode = opencode_root(opencode_dir);
+                crate::sessions::list_sessions(Some("codex".into()), dirs.codex_dir.clone(), None)?;
+            out.extend(crate::claude_sessions::scan_sessions(&dirs.claude_path())?);
+            // 没装 / 没配某个 Agent 时按"零会话"处理，不让它拖垮整块统计。
+            let opencode = dirs.opencode_path();
             if crate::opencode_sessions::database_path(&opencode).is_file() {
                 out.extend(crate::opencode_sessions::list_sessions(&opencode)?);
+            }
+            let cursor = dirs.cursor_path();
+            let cursor_agent = dirs.cursor_agent_path();
+            if crate::cursor_sessions::state_db_path(&cursor).is_file()
+                || crate::paths::cursor_agent_chats_dir(&cursor_agent).is_dir()
+            {
+                out.extend(crate::cursor_sessions::list_sessions(
+                    &cursor,
+                    &cursor_agent,
+                )?);
             }
             Ok(out)
         }
@@ -103,17 +99,15 @@ fn filter_family_active_sessions(
 
 fn stat_sessions(
     provider: Option<String>,
-    codex_dir: String,
-    claude_dir: Option<String>,
-    opencode_dir: Option<String>,
+    dirs: ProviderDirs,
     from_ts: Option<i64>,
     to_ts: Option<i64>,
     cwd_filter: Vec<String>,
     include_archived: bool,
 ) -> AppResult<Vec<SessionSummary>> {
     let provider = provider_or_codex(provider);
-    let sessions = load_sessions(&provider, &codex_dir, claude_dir, opencode_dir)?;
-    let sessions = filter_family_active_sessions(sessions, &codex_dir)?;
+    let sessions = load_sessions(&provider, &dirs)?;
+    let sessions = filter_family_active_sessions(sessions, &dirs.codex_dir)?;
     Ok(filter_sessions(
         sessions,
         from_ts,
@@ -125,24 +119,13 @@ fn stat_sessions(
 
 pub fn stats_kpi(
     provider: Option<String>,
-    codex_dir: String,
-    claude_dir: Option<String>,
-    opencode_dir: Option<String>,
+    dirs: ProviderDirs,
     from_ts: Option<i64>,
     to_ts: Option<i64>,
     cwd_filter: Vec<String>,
     include_archived: bool,
 ) -> AppResult<Kpi> {
-    let sessions = stat_sessions(
-        provider,
-        codex_dir,
-        claude_dir,
-        opencode_dir,
-        from_ts,
-        to_ts,
-        cwd_filter,
-        include_archived,
-    )?;
+    let sessions = stat_sessions(provider, dirs, from_ts, to_ts, cwd_filter, include_archived)?;
     Ok(build_kpi(&sessions))
 }
 
@@ -169,25 +152,14 @@ fn build_kpi(sessions: &[SessionSummary]) -> Kpi {
 
 pub fn stats_timeseries(
     provider: Option<String>,
-    codex_dir: String,
-    claude_dir: Option<String>,
-    opencode_dir: Option<String>,
+    dirs: ProviderDirs,
     from_ts: Option<i64>,
     to_ts: Option<i64>,
     bucket: String,
     cwd_filter: Vec<String>,
     include_archived: bool,
 ) -> AppResult<Vec<TimeseriesPoint>> {
-    let sessions = stat_sessions(
-        provider,
-        codex_dir,
-        claude_dir,
-        opencode_dir,
-        from_ts,
-        to_ts,
-        cwd_filter,
-        include_archived,
-    )?;
+    let sessions = stat_sessions(provider, dirs, from_ts, to_ts, cwd_filter, include_archived)?;
     Ok(build_timeseries(&sessions, &bucket))
 }
 
@@ -210,25 +182,14 @@ fn build_timeseries(sessions: &[SessionSummary], bucket: &str) -> Vec<Timeseries
 
 pub fn stats_by_project(
     provider: Option<String>,
-    codex_dir: String,
-    claude_dir: Option<String>,
-    opencode_dir: Option<String>,
+    dirs: ProviderDirs,
     from_ts: Option<i64>,
     to_ts: Option<i64>,
     limit: usize,
     cwd_filter: Vec<String>,
     include_archived: bool,
 ) -> AppResult<Vec<ProjectStat>> {
-    let sessions = stat_sessions(
-        provider,
-        codex_dir,
-        claude_dir,
-        opencode_dir,
-        from_ts,
-        to_ts,
-        cwd_filter,
-        include_archived,
-    )?;
+    let sessions = stat_sessions(provider, dirs, from_ts, to_ts, cwd_filter, include_archived)?;
     Ok(build_by_project(&sessions, limit))
 }
 
@@ -258,24 +219,13 @@ fn build_by_project(sessions: &[SessionSummary], limit: usize) -> Vec<ProjectSta
 
 pub fn stats_by_model(
     provider: Option<String>,
-    codex_dir: String,
-    claude_dir: Option<String>,
-    opencode_dir: Option<String>,
+    dirs: ProviderDirs,
     from_ts: Option<i64>,
     to_ts: Option<i64>,
     cwd_filter: Vec<String>,
     include_archived: bool,
 ) -> AppResult<Vec<ModelStat>> {
-    let sessions = stat_sessions(
-        provider,
-        codex_dir,
-        claude_dir,
-        opencode_dir,
-        from_ts,
-        to_ts,
-        cwd_filter,
-        include_archived,
-    )?;
+    let sessions = stat_sessions(provider, dirs, from_ts, to_ts, cwd_filter, include_archived)?;
     Ok(build_by_model(&sessions))
 }
 
@@ -309,24 +259,13 @@ fn build_by_model(sessions: &[SessionSummary]) -> Vec<ModelStat> {
 
 pub fn stats_heatmap(
     provider: Option<String>,
-    codex_dir: String,
-    claude_dir: Option<String>,
-    opencode_dir: Option<String>,
+    dirs: ProviderDirs,
     from_ts: Option<i64>,
     to_ts: Option<i64>,
     cwd_filter: Vec<String>,
     include_archived: bool,
 ) -> AppResult<Vec<Vec<u32>>> {
-    let sessions = stat_sessions(
-        provider,
-        codex_dir,
-        claude_dir,
-        opencode_dir,
-        from_ts,
-        to_ts,
-        cwd_filter,
-        include_archived,
-    )?;
+    let sessions = stat_sessions(provider, dirs, from_ts, to_ts, cwd_filter, include_archived)?;
     Ok(build_heatmap(&sessions))
 }
 
@@ -346,9 +285,7 @@ fn build_heatmap(sessions: &[SessionSummary]) -> Vec<Vec<u32>> {
 
 pub fn stats_snapshot(
     provider: Option<String>,
-    codex_dir: String,
-    claude_dir: Option<String>,
-    opencode_dir: Option<String>,
+    dirs: ProviderDirs,
     from_ts: Option<i64>,
     to_ts: Option<i64>,
     bucket: String,
@@ -356,16 +293,7 @@ pub fn stats_snapshot(
     cwd_filter: Vec<String>,
     include_archived: bool,
 ) -> AppResult<StatsSnapshot> {
-    let sessions = stat_sessions(
-        provider,
-        codex_dir,
-        claude_dir,
-        opencode_dir,
-        from_ts,
-        to_ts,
-        cwd_filter,
-        include_archived,
-    )?;
+    let sessions = stat_sessions(provider, dirs, from_ts, to_ts, cwd_filter, include_archived)?;
     Ok(StatsSnapshot {
         kpi: build_kpi(&sessions),
         timeseries: build_timeseries(&sessions, &bucket),
@@ -501,35 +429,79 @@ mod tests {
         Ok(())
     }
 
+    fn create_cursor_session(cursor: &Path) -> AppResult<()> {
+        let storage = cursor.join("globalStorage");
+        fs::create_dir_all(&storage)?;
+        let conn = rusqlite::Connection::open(storage.join("state.vscdb"))?;
+        conn.execute_batch(
+            "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, workspaceId TEXT,
+                createdAt INTEGER, lastUpdatedAt INTEGER, isArchived INTEGER,
+                isSubagent INTEGER, recency INTEGER, checkpointAt INTEGER, value TEXT);
+             CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);",
+        )?;
+        conn.execute(
+            "INSERT INTO composerHeaders VALUES ('cur_stats', 'ws', 1770000000000, 1770000900000, 0, 0, 1770000900000, NULL, ?1)",
+            [serde_json::json!({
+                "name": "Cursor title",
+                "workspaceIdentifier": {"uri": {"fsPath": "/work/cursor-project"}}
+            })
+            .to_string()],
+        )?;
+        // 没有气泡的会话会被列表过滤掉，夹具必须给一条真实内容。
+        conn.execute(
+            "INSERT INTO cursorDiskKV VALUES ('composerData:cur_stats', ?1)",
+            [
+                serde_json::json!({"fullConversationHeadersOnly": [{"bubbleId": "b1", "type": 1}]})
+                    .to_string(),
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO cursorDiskKV VALUES ('bubbleId:cur_stats:b1', ?1)",
+            [serde_json::json!({"type": 1, "text": "问题"}).to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// 测试必须显式给出每个目录：`ProviderDirs` 的字段留空会回退到本机真实目录，
+    /// 那样统计断言会被开发机上的真实会话污染。
+    fn stats_dirs(root: &Path) -> ProviderDirs {
+        ProviderDirs {
+            codex_dir: root.join("codex").to_string_lossy().into_owned(),
+            claude_dir: Some(root.join("claude").to_string_lossy().into_owned()),
+            opencode_dir: Some(root.join("opencode").to_string_lossy().into_owned()),
+            cursor_dir: Some(root.join("cursor").to_string_lossy().into_owned()),
+            cursor_agent_dir: Some(root.join("cursor-agent").to_string_lossy().into_owned()),
+        }
+    }
+
     #[test]
     fn aggregates_codex_claude_and_opencode_stats() -> AppResult<()> {
         let root = temp_dir("cc-session-manager-stats-test");
         let codex = root.join("codex");
         let claude = root.join("claude");
         let opencode = root.join("opencode");
+        let cursor = root.join("cursor");
         create_codex_session(&codex)?;
         create_claude_session(&claude)?;
         create_opencode_session(&opencode)?;
+        create_cursor_session(&cursor)?;
+        let dirs = stats_dirs(&root);
 
         let kpi = stats_kpi(
             Some("all".to_string()),
-            codex.to_string_lossy().into_owned(),
-            Some(claude.to_string_lossy().into_owned()),
-            Some(opencode.to_string_lossy().into_owned()),
+            dirs.clone(),
             None,
             None,
             Vec::new(),
             false,
         )?;
-        assert_eq!(kpi.sessions_total, 3);
+        assert_eq!(kpi.sessions_total, 4);
         assert_eq!(kpi.tokens_total, 41);
-        assert_eq!(kpi.active_projects, 3);
+        assert_eq!(kpi.active_projects, 4);
 
         let snapshot = stats_snapshot(
             Some("all".to_string()),
-            codex.to_string_lossy().into_owned(),
-            Some(claude.to_string_lossy().into_owned()),
-            Some(opencode.to_string_lossy().into_owned()),
+            dirs.clone(),
             None,
             None,
             "day".to_string(),
@@ -539,23 +511,27 @@ mod tests {
         )?;
         assert_eq!(snapshot.kpi.sessions_total, kpi.sessions_total);
         assert_eq!(snapshot.kpi.tokens_total, kpi.tokens_total);
-        assert_eq!(snapshot.by_project.len(), 3);
-        assert_eq!(snapshot.by_model.len(), 3);
+        assert_eq!(snapshot.by_project.len(), 4);
+        assert_eq!(snapshot.by_model.len(), 4);
+        // Cursor 的模型名要展开会话正文才拿得到，列表里一律留空，
+        // 因此它在模型维度上聚成一个"未知模型"分组。
+        assert!(snapshot
+            .by_model
+            .iter()
+            .any(|m| m.provider.as_deref() == Some("cursor") && m.model.is_empty()));
         assert_eq!(
             snapshot
                 .timeseries
                 .iter()
                 .map(|point| point.sessions)
                 .sum::<u32>(),
-            3
+            4
         );
-        assert_eq!(snapshot.heatmap.iter().flatten().sum::<u32>(), 3);
+        assert_eq!(snapshot.heatmap.iter().flatten().sum::<u32>(), 4);
 
         let projects = stats_by_project(
             Some("all".to_string()),
-            codex.to_string_lossy().into_owned(),
-            Some(claude.to_string_lossy().into_owned()),
-            Some(opencode.to_string_lossy().into_owned()),
+            dirs.clone(),
             None,
             None,
             10,
@@ -571,12 +547,13 @@ mod tests {
         assert!(projects
             .iter()
             .any(|p| p.provider.as_deref() == Some("opencode")));
+        assert!(projects
+            .iter()
+            .any(|p| p.provider.as_deref() == Some("cursor")));
 
         let models = stats_by_model(
             Some("all".to_string()),
-            codex.to_string_lossy().into_owned(),
-            Some(claude.to_string_lossy().into_owned()),
-            Some(opencode.to_string_lossy().into_owned()),
+            dirs.clone(),
             None,
             None,
             Vec::new(),
@@ -595,9 +572,7 @@ mod tests {
         // 只看 OpenCode 时不应混入其他 Agent 的会话。
         let opencode_only = stats_kpi(
             Some("opencode".to_string()),
-            codex.to_string_lossy().into_owned(),
-            Some(claude.to_string_lossy().into_owned()),
-            Some(opencode.to_string_lossy().into_owned()),
+            dirs.clone(),
             None,
             None,
             Vec::new(),
@@ -618,11 +593,10 @@ mod tests {
         create_codex_session(&codex)?;
         create_claude_session(&claude)?;
 
+        // Cursor 与 OpenCode 都不存在，统计仍应正常产出。
         let kpi = stats_kpi(
             Some("all".to_string()),
-            codex.to_string_lossy().into_owned(),
-            Some(claude.to_string_lossy().into_owned()),
-            Some(root.join("opencode").to_string_lossy().into_owned()),
+            stats_dirs(&root),
             None,
             None,
             Vec::new(),
@@ -708,9 +682,7 @@ mod tests {
         for include_archived in [false, true] {
             let kpi = stats_kpi(
                 Some("codex".to_string()),
-                codex.to_string_lossy().into_owned(),
-                None,
-                None,
+                ProviderDirs::new(codex.to_string_lossy().into_owned()),
                 None,
                 None,
                 Vec::new(),

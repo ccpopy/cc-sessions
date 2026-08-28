@@ -8,6 +8,7 @@ import {
   Check,
   ChevronDown,
   MessageSquare,
+  MousePointer2,
   NotebookText,
   Package,
   Settings,
@@ -93,6 +94,17 @@ const providers: ProviderDefinition[] = [
       { to: "/opencode/sessions", icon: MessageSquare, label: "会话" },
       { to: "/opencode/backups", icon: Archive, label: "备份" },
       { to: "/opencode/transfer", icon: Package, label: "导出 / 导入" },
+    ],
+  },
+  {
+    id: "cursor",
+    label: "Cursor",
+    icon: MousePointer2,
+    items: [
+      { to: "/cursor/sessions", icon: MessageSquare, label: "会话" },
+      { to: "/cursor/repair", icon: Wrench, label: "清理" },
+      { to: "/cursor/backups", icon: Archive, label: "备份" },
+      { to: "/cursor/transfer", icon: Package, label: "导出 / 导入" },
     ],
   },
 ];
@@ -297,7 +309,9 @@ function DirCard({ label, path, accent }: { label: string; path: string; accent:
 
 function providerFromPath(pathname: string): SessionProvider | null {
   const segment = pathname.split("/").filter(Boolean)[0];
-  if (segment === "codex" || segment === "claude" || segment === "opencode") return segment;
+  if (segment === "codex" || segment === "claude" || segment === "opencode" || segment === "cursor") {
+    return segment;
+  }
   return null;
 }
 
@@ -308,5 +322,6 @@ function providerDirectory(
   if (!settings) return "";
   if (provider === "claude") return settings.claude_dir;
   if (provider === "opencode") return settings.opencode_dir;
+  if (provider === "cursor") return settings.cursor_dir;
   return settings.codex_dir;
 }

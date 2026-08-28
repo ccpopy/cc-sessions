@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::error::{AppError, AppResult};
-use crate::models::ConvertReport;
+use crate::models::{ConvertReport, ProviderDirs};
 use crate::{
     atomic_file, family, fs_ops, mutation_journal, paths, provenance, repair, sessions, state_db,
 };
@@ -27,6 +27,8 @@ const TOOL_RESULT_TAG: &str = "tool_result";
 const NOTE_MAX_LEN: usize = 2_000;
 const TOOL_RESULT_MAX_LEN: usize = 4_000;
 const NATIVE_TOOL_RESULT_MAX_LEN: usize = 30_000;
+pub(crate) mod cursor;
+
 const LEGACY_IMPORTED_MARKER: &str = "<EXTERNAL SESSION IMPORTED>";
 /// Codex 要求 `SessionMeta.cli_version` 为字符串。没有样本时写入占位版本。
 const FALLBACK_CODEX_CLI_VERSION: &str = "0.0.0";
@@ -151,6 +153,32 @@ pub fn convert_session_with_lock(
     conversion_mode: Option<String>,
     lock: &family::FamilyLock,
 ) -> AppResult<ConvertReport> {
+    convert_session_with_target(
+        ProviderDirs {
+            codex_dir,
+            claude_dir: Some(claude_dir),
+            ..ProviderDirs::default()
+        },
+        source_provider,
+        None,
+        rollout_path,
+        conversion_mode,
+        lock,
+    )
+}
+
+/// Claude 与 Codex 各自只有一个可能的目标，`target_provider` 留空即可；
+/// Cursor 两个方向都能去，必须显式指定。
+pub fn convert_session_with_target(
+    dirs: ProviderDirs,
+    source_provider: String,
+    target_provider: Option<String>,
+    rollout_path: String,
+    conversion_mode: Option<String>,
+    lock: &family::FamilyLock,
+) -> AppResult<ConvertReport> {
+    let codex_dir = dirs.codex_dir.clone();
+    let claude_dir = dirs.claude_path().to_string_lossy().into_owned();
     family::with_lock(lock, |_g| match source_provider.as_str() {
         "claude" => convert_claude_to_codex(
             &codex_dir,
@@ -163,6 +191,35 @@ pub fn convert_session_with_lock(
             &rollout_path,
             ClaudeImportMode::parse(conversion_mode.as_deref())?,
         ),
+        "cursor" => {
+            let parsed = cursor::parse(
+                &dirs.cursor_path(),
+                &dirs.cursor_agent_path(),
+                &rollout_path,
+            )?;
+            match target_provider.as_deref() {
+                Some("claude") => write_claude_session(
+                    &codex_dir,
+                    &claude_dir,
+                    "cursor",
+                    &parsed.source_id.clone(),
+                    &cursor::as_codex(&parsed),
+                    ClaudeImportMode::parse(conversion_mode.as_deref())?,
+                    Vec::new(),
+                ),
+                Some("codex") => write_codex_session(
+                    &codex_dir,
+                    "cursor",
+                    &parsed.source_id.clone(),
+                    &cursor::as_claude(&parsed),
+                    CodexImportMode::parse(conversion_mode.as_deref())?,
+                ),
+                Some(other) => Err(AppError::Other(format!("Cursor 会话不支持转换到 {other}"))),
+                None => Err(AppError::Other(
+                    "Cursor 会话可以转到 Claude 或 Codex，请指定目标".into(),
+                )),
+            }
+        }
         other => Err(AppError::Other(format!(
             "不支持的转换来源 provider: {other}"
         ))),
@@ -178,9 +235,29 @@ fn convert_claude_to_codex(
     source_path: &str,
     mode: CodexImportMode,
 ) -> AppResult<ConvertReport> {
-    let codex = PathBuf::from(codex_dir);
     let source = PathBuf::from(source_path);
     let parsed = parse_claude_session(&source)?;
+    let source_id = parsed.source_id.clone().unwrap_or_else(|| {
+        source
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
+    write_codex_session(codex_dir, "claude", &source_id, &parsed, mode)
+}
+
+/// 把已经解析成 Claude 事件流的会话写成一个新的 Codex 会话。
+///
+/// rollout、threads、session_index 与 Desktop 项目归属必须一起提交，所以这段可补偿
+/// 事务由 Claude 与 Cursor 两个来源共用，绝不复制第二份。
+fn write_codex_session(
+    codex_dir: &str,
+    source_provider: &str,
+    source_id: &str,
+    parsed: &ParsedClaudeSession,
+    mode: CodexImportMode,
+) -> AppResult<ConvertReport> {
+    let codex = PathBuf::from(codex_dir);
     let Some(source_cwd) = parsed.cwd.as_deref() else {
         return Err(AppError::Other(
             "源会话缺少 cwd，无法确定 Codex 项目目录".into(),
@@ -199,14 +276,8 @@ fn convert_claude_to_codex(
     repair::validate_rollout_filename(&new_abs)?;
     let provider = repair::effective_current_provider(&codex)?;
     let identity = detect_codex_identity(&codex);
-    let built = build_codex_lines(&new_id, &cwd, &provider, &parsed, &identity, &now, mode);
+    let built = build_codex_lines(&new_id, &cwd, &provider, parsed, &identity, &now, mode);
     let imported_messages = parsed.messages.len() as u32;
-    let source_id = parsed.source_id.clone().unwrap_or_else(|| {
-        source
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    });
     let title = conversion_title(parsed.title.as_deref(), &parsed.messages);
     let desktop_cwd = desktop_project_cwd(&codex, &cwd);
 
@@ -305,16 +376,16 @@ fn convert_claude_to_codex(
         &codex,
         "codex",
         &new_id,
-        "claude",
-        &source_id,
+        source_provider,
+        source_id,
         Some(mode.as_str()),
     ) {
         warnings.push(format!("记录转换来源失败（不影响会话使用）: {error}"));
     }
 
     Ok(ConvertReport {
-        source_id,
-        source_provider: "claude".into(),
+        source_id: source_id.to_string(),
+        source_provider: source_provider.to_string(),
         target_provider: "codex".into(),
         conversion_mode: Some(mode.as_str().into()),
         new_id: new_id.clone(),
@@ -1352,12 +1423,45 @@ fn convert_codex_to_claude(
     mode: ClaudeImportMode,
 ) -> AppResult<ConvertReport> {
     let codex = PathBuf::from(codex_dir);
-    let claude = PathBuf::from(claude_dir);
     let source = PathBuf::from(rollout_path);
     let mut parsed = parse_codex_rollout(&source)?;
+    let source_id = parsed.source_id.clone().unwrap_or_else(|| {
+        source
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
+    let mut warnings = Vec::new();
+    // Codex App 可能已经给会话起了短标题，比首条消息更适合作为新会话的名字。
+    if !codex.as_os_str().is_empty() && !source_id.is_empty() {
+        match sessions::codex_display_title(&codex, &source_id) {
+            Ok(title) => parsed.title = title,
+            Err(error) => warnings.push(format!("读取 Codex 标题失败，已保留内容转换: {error}")),
+        }
+    }
+    write_claude_session(
+        codex_dir, claude_dir, "codex", &source_id, &parsed, mode, warnings,
+    )
+}
+
+/// 把已经解析成 Codex 事件流的会话写成一个新的 Claude 会话。
+///
+/// Codex 与 Cursor 两个来源共用这段写入，避免 parentUuid 链、custom-title 与来源登记
+/// 出现两份实现。
+fn write_claude_session(
+    codex_dir: &str,
+    claude_dir: &str,
+    source_provider: &str,
+    source_id: &str,
+    parsed: &ParsedCodexRollout,
+    mode: ClaudeImportMode,
+    mut warnings: Vec<String>,
+) -> AppResult<ConvertReport> {
+    let codex = PathBuf::from(codex_dir);
+    let claude = PathBuf::from(claude_dir);
     let Some(cwd) = parsed.cwd.clone() else {
         return Err(AppError::Other(
-            "源 rollout 缺少 cwd（session_meta/turn_context 均未提供）".into(),
+            "源会话缺少 cwd，无法确定 Claude 项目目录".into(),
         ));
     };
     if parsed.messages.iter().all(|m| m.role != Role::User) {
@@ -1366,27 +1470,13 @@ fn convert_codex_to_claude(
         ));
     }
 
-    let source_id = parsed.source_id.clone().unwrap_or_else(|| {
-        source
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    });
-    let mut warnings = Vec::new();
-    if !codex.as_os_str().is_empty() && !source_id.is_empty() {
-        match sessions::codex_display_title(&codex, &source_id) {
-            Ok(title) => parsed.title = title,
-            Err(error) => warnings.push(format!("读取 Codex 标题失败，已保留内容转换: {error}")),
-        }
-    }
-
     let projects = paths::claude_projects_dir(&claude);
     let project_dir = projects.join(encode_claude_project_dir(&cwd));
     fs::create_dir_all(&project_dir)?;
     let new_id = repair::new_session_id();
     let new_abs = project_dir.join(format!("{new_id}.jsonl"));
     let identity = detect_claude_identity(&projects);
-    let mut built = build_claude_lines(&new_id, &cwd, &parsed, &identity, mode);
+    let mut built = build_claude_lines(&new_id, &cwd, parsed, &identity, mode);
     let imported_messages = built.lines.len() as u32;
     if let Some(title) = parsed
         .title
@@ -1427,8 +1517,8 @@ fn convert_codex_to_claude(
             &codex,
             "claude",
             &new_id,
-            "codex",
-            &source_id,
+            source_provider,
+            source_id,
             Some(mode.as_str()),
         ) {
             warnings.push(format!("记录转换来源失败（不影响会话使用）: {error}"));
@@ -1436,8 +1526,8 @@ fn convert_codex_to_claude(
     }
 
     Ok(ConvertReport {
-        source_id,
-        source_provider: "codex".into(),
+        source_id: source_id.to_string(),
+        source_provider: source_provider.to_string(),
         target_provider: "claude".into(),
         conversion_mode: Some(mode.as_str().into()),
         new_id: new_id.clone(),

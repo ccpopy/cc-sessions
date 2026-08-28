@@ -45,6 +45,8 @@
     --provider-claude-fg: 14 50% 47%;
     --provider-opencode: 217 91% 60%;
     --provider-opencode-fg: 221 83% 53%;
+    --provider-cursor: 265 70% 55%;
+    --provider-cursor-fg: 264 72% 47%;
   }
 
   .dark {
@@ -86,6 +88,8 @@
     --provider-claude-fg: 16 81% 74%;
     --provider-opencode: 217 91% 64%;
     --provider-opencode-fg: 212 96% 78%;
+    --provider-cursor: 265 82% 70%;
+    --provider-cursor-fg: 262 88% 80%;
   }
 }
 

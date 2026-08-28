@@ -74,8 +74,16 @@ export default function TransferRoute({ provider = "codex" }: { provider?: Sessi
   const codexDir = settings?.codex_dir ?? "";
   const claudeDir = settings?.claude_dir ?? "";
   const opencodeDir = settings?.opencode_dir ?? "";
+  const cursorDir = settings?.cursor_dir ?? "";
   const providerName = providerLabel(provider);
-  const providerDir = provider === "codex" ? codexDir : provider === "claude" ? claudeDir : opencodeDir;
+  const providerDir =
+    provider === "codex"
+      ? codexDir
+      : provider === "claude"
+        ? claudeDir
+        : provider === "cursor"
+          ? cursorDir
+          : opencodeDir;
 
   return (
     <>
@@ -103,6 +111,7 @@ export default function TransferRoute({ provider = "codex" }: { provider?: Sessi
                   codexDir={codexDir}
                   claudeDir={claudeDir}
                   opencodeDir={opencodeDir}
+                  cursorDir={cursorDir}
                 />
               </TabsContent>
               <TabsContent value="import">
@@ -111,6 +120,7 @@ export default function TransferRoute({ provider = "codex" }: { provider?: Sessi
                   codexDir={codexDir}
                   claudeDir={claudeDir}
                   opencodeDir={opencodeDir}
+                  cursorDir={cursorDir}
                 />
               </TabsContent>
             </Tabs>
@@ -128,11 +138,13 @@ function ExportPanel({
   codexDir,
   claudeDir,
   opencodeDir,
+  cursorDir,
 }: {
   provider: SessionProvider;
   codexDir: string;
   claudeDir: string;
   opencodeDir: string;
+  cursorDir: string;
 }) {
   const { sessions, loading: loadingSessions } = useSessions(provider, "");
   const [outDir, setOutDir] = useState("");
@@ -276,6 +288,7 @@ function ExportPanel({
       codex_dir: codexDir,
       claude_dir: claudeDir,
       opencode_dir: opencodeDir,
+      cursor_dir: cursorDir,
       out_dir: outDir,
       ids: selected.map((session) => session.id),
       targets: selected.map((session) => ({
@@ -313,6 +326,7 @@ function ExportPanel({
         codex_dir: codexDir,
         claude_dir: claudeDir,
         opencode_dir: opencodeDir,
+        cursor_dir: cursorDir,
         out_dir: outDir,
         machine_label: machineLabel || undefined,
         export_group: exportGroup || undefined,
@@ -674,11 +688,13 @@ function ImportPanel({
   codexDir,
   claudeDir,
   opencodeDir,
+  cursorDir,
 }: {
   provider: SessionProvider;
   codexDir: string;
   claudeDir: string;
   opencodeDir: string;
+  cursorDir: string;
 }) {
   const [srcDir, setSrcDir] = useState("");
   const [items, setItems] = useState<BundleListItem[]>([]);
@@ -846,6 +862,7 @@ function ImportPanel({
         codex_dir: codexDir,
         claude_dir: claudeDir,
         opencode_dir: opencodeDir,
+        cursor_dir: cursorDir,
         mode,
         make_visible: providerAtStart === "codex" ? makeVisible : false,
         strict,

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use cc_session_manager_lib::error::AppError;
 use cc_session_manager_lib::models::{
     BackupSummary, BundleExportTarget, BundleListItem, ConvertReport, ImportMode, ProjectGroup,
-    SessionSummary, Settings, SwitchStrategy,
+    ProviderDirs, SessionSummary, Settings, SwitchStrategy,
 };
 use cc_session_manager_lib::{
     backup, bundle, convert, family, fs_ops, paths, repair, rollout, sessions, settings, stats,
@@ -64,7 +64,21 @@ struct CliContext {
     claude_dir_explicit: bool,
     opencode_dir: String,
     opencode_dir_explicit: bool,
+    cursor_dir: String,
+    cursor_dir_explicit: bool,
     family_lock: family::FamilyLock,
+}
+
+impl CliContext {
+    fn dirs(&self) -> ProviderDirs {
+        ProviderDirs {
+            codex_dir: self.codex_dir.clone(),
+            claude_dir: Some(self.claude_dir.clone()),
+            opencode_dir: Some(self.opencode_dir.clone()),
+            cursor_dir: Some(self.cursor_dir.clone()),
+            cursor_agent_dir: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +132,10 @@ fn run_cli() -> CliResult<()> {
     let opencode_dir_explicit = opencode_dir_arg.is_some();
     let opencode_dir = opencode_dir_arg
         .unwrap_or_else(|| paths::default_opencode_dir().to_string_lossy().into_owned());
+    let cursor_dir_arg = take_value(&mut args, "--cursor-dir")?;
+    let cursor_dir_explicit = cursor_dir_arg.is_some();
+    let cursor_dir = cursor_dir_arg
+        .unwrap_or_else(|| paths::default_cursor_dir().to_string_lossy().into_owned());
 
     if help {
         print_help();
@@ -133,6 +151,8 @@ fn run_cli() -> CliResult<()> {
         claude_dir_explicit,
         opencode_dir,
         opencode_dir_explicit,
+        cursor_dir,
+        cursor_dir_explicit,
         family_lock: family::FamilyLock::default(),
     };
 
@@ -142,6 +162,7 @@ fn run_cli() -> CliResult<()> {
             ctx.codex_dir.clone(),
             ctx.claude_dir.clone(),
             ctx.opencode_dir.clone(),
+            ctx.cursor_dir.clone(),
         )
         .map_err(CliError::message);
     };
@@ -154,6 +175,7 @@ fn run_cli() -> CliResult<()> {
                 ctx.codex_dir.clone(),
                 ctx.claude_dir.clone(),
                 ctx.opencode_dir.clone(),
+                ctx.cursor_dir.clone(),
             )
             .map_err(CliError::message)
         }
@@ -189,10 +211,11 @@ fn print_help() {
 
 全局选项:
   --json                    输出 JSON
-  --provider <codex|claude|opencode|all>  会话、统计与 webui 使用的 provider
+  --provider <codex|claude|opencode|cursor|all>  会话、统计与 webui 使用的 provider
   --codex-dir <路径>         默认读取 ~/.codex
   --claude-dir <路径>        默认读取 ~/.claude
   --opencode-dir <路径>      默认读取 ~/.local/share/opencode
+  --cursor-dir <路径>        Cursor 用户数据目录，默认 <配置目录>/Cursor/User
   -h, --help                显示帮助
 
 常用命令:
@@ -203,11 +226,11 @@ fn print_help() {
   webui [--host 127.0.0.1] [--port 17888]
   meta <rollout路径>
   resume-command <session-id>
-  convert <会话JSONL路径> [--mode simple|native]  # --provider 表示来源
+  convert <会话路径或定位符> [--mode simple|native] [--to claude|codex]  # --provider 表示来源
   stats <kpi|projects|models|timeseries|heatmap>
   backup <create|list|open|verify|delete|restore|restore-all>
   bundle <export|export-all|list|verify|import|pack|unpack>
-  repair <provider-info|project-configs|diagnose|index|threads|prune|claude-history|claude-gui|clone|batch-clone|fork>
+  repair <provider-info|project-configs|diagnose|index|threads|prune|claude-history|claude-gui|cursor-residue|clone|batch-clone|fork>
   family <store|verify|overlay|rollback|delete-branch|sync-states|sync-into-active|sync-active-into>
   settings <defaults|read|validate>
   menu
@@ -266,29 +289,17 @@ fn cmd_search(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
 
     let provider = session_provider(ctx)?;
     let mut hits = if provider == "all" {
-        let mut providers = vec!["codex", "claude"];
-        if Path::new(&ctx.opencode_dir).join("opencode.db").is_file() {
-            providers.push("opencode");
-        }
         let mut all_hits = Vec::new();
-        for current in providers {
-            all_hits.extend(sessions::search_sessions_with_opencode(
+        for current in installed_providers(ctx) {
+            all_hits.extend(sessions::search_sessions_with_dirs(
                 Some(current.to_string()),
-                ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
-                Some(ctx.opencode_dir.clone()),
+                ctx.dirs(),
                 query.clone(),
             )?);
         }
         all_hits
     } else {
-        sessions::search_sessions_with_opencode(
-            Some(provider),
-            ctx.codex_dir.clone(),
-            Some(ctx.claude_dir.clone()),
-            Some(ctx.opencode_dir.clone()),
-            query,
-        )?
+        sessions::search_sessions_with_dirs(Some(provider), ctx.dirs(), query)?
     };
     if !include_archived {
         hits.retain(|session| !session.archived);
@@ -339,7 +350,7 @@ fn cmd_webui(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
     webui::validate_host(&host)?;
     let default_provider = match ctx.provider.as_deref() {
         None => None,
-        Some("codex" | "claude" | "opencode") => ctx.provider.clone(),
+        Some("codex" | "claude" | "opencode" | "cursor") => ctx.provider.clone(),
         Some("all") => {
             return Err(CliError::message(
                 "webui 不支持 --provider all；请使用 codex、claude 或 opencode",
@@ -361,6 +372,8 @@ fn cmd_webui(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
         claude_dir_explicit: ctx.claude_dir_explicit,
         opencode_dir: ctx.opencode_dir.clone(),
         opencode_dir_explicit: ctx.opencode_dir_explicit,
+        cursor_dir: ctx.cursor_dir.clone(),
+        cursor_dir_explicit: ctx.cursor_dir_explicit,
     })?;
     Ok(())
 }
@@ -540,16 +553,28 @@ fn cmd_resume_command(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> 
 
 fn cmd_convert(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
     let conversion_mode = parse_conversion_mode(take_value(&mut args, "--mode")?)?;
+    let target_provider = take_value(&mut args, "--to")?;
     let rollout_path = conversion_path_arg(&mut args)?;
     ensure_no_args(&args)?;
     let source_provider = concrete_provider(ctx)?;
     if source_provider == "opencode" {
         return Err(CliError::message("OpenCode 会话暂不支持转换"));
     }
-    let report = convert::convert_session_with_lock(
-        ctx.codex_dir.clone(),
-        ctx.claude_dir.clone(),
+    if let Some(target) = target_provider.as_deref() {
+        if !matches!(target, "claude" | "codex") {
+            return Err(CliError::message(format!(
+                "--to 只支持 claude 或 codex，收到: {target}"
+            )));
+        }
+    } else if source_provider == "cursor" {
+        return Err(CliError::message(
+            "Cursor 会话可以转到 Claude 或 Codex，请用 --to 指定目标",
+        ));
+    }
+    let report = convert::convert_session_with_target(
+        ctx.dirs(),
         source_provider,
+        target_provider,
         rollout_path,
         conversion_mode,
         &ctx.family_lock,
@@ -572,9 +597,7 @@ fn cmd_stats(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             ensure_no_args(&args)?;
             let data = stats::stats_kpi(
                 Some(provider),
-                ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
-                Some(ctx.opencode_dir.clone()),
+                ctx.dirs(),
                 from_ts,
                 to_ts,
                 cwd_filter,
@@ -592,9 +615,7 @@ fn cmd_stats(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             ensure_no_args(&args)?;
             let data = stats::stats_by_project(
                 Some(provider),
-                ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
-                Some(ctx.opencode_dir.clone()),
+                ctx.dirs(),
                 from_ts,
                 to_ts,
                 limit,
@@ -618,9 +639,7 @@ fn cmd_stats(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             ensure_no_args(&args)?;
             let data = stats::stats_by_model(
                 Some(provider),
-                ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
-                Some(ctx.opencode_dir.clone()),
+                ctx.dirs(),
                 from_ts,
                 to_ts,
                 cwd_filter,
@@ -645,9 +664,7 @@ fn cmd_stats(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             ensure_no_args(&args)?;
             let data = stats::stats_timeseries(
                 Some(provider),
-                ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
-                Some(ctx.opencode_dir.clone()),
+                ctx.dirs(),
                 from_ts,
                 to_ts,
                 bucket,
@@ -665,9 +682,7 @@ fn cmd_stats(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             ensure_no_args(&args)?;
             let data = stats::stats_heatmap(
                 Some(provider),
-                ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
-                Some(ctx.opencode_dir.clone()),
+                ctx.dirs(),
                 from_ts,
                 to_ts,
                 cwd_filter,
@@ -700,11 +715,9 @@ fn cmd_backup(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             let name = take_value(&mut args, "--name")?;
             let note = take_value(&mut args, "--note")?;
             ensure_no_args(&args)?;
-            let summary = backup::create_backup_with_opencode(
+            let summary = backup::create_backup_with_dirs(
                 Some(concrete_provider(ctx)?),
-                ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
-                Some(ctx.opencode_dir.clone()),
+                ctx.dirs(),
                 backup_dir,
                 ids,
                 None,
@@ -773,9 +786,7 @@ fn cmd_backup(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
                 Some(concrete_provider(ctx)?),
                 backup_root,
                 backup_path,
-                ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
-                Some(ctx.opencode_dir.clone()),
+                ctx.dirs(),
                 id,
                 None,
                 overwrite,
@@ -800,9 +811,7 @@ fn cmd_backup(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
                 Some(concrete_provider(ctx)?),
                 backup_root,
                 backup_path,
-                ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
-                Some(ctx.opencode_dir.clone()),
+                ctx.dirs(),
                 overwrite,
                 &ctx.family_lock,
             )?;
@@ -855,11 +864,9 @@ fn cmd_bundle(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
                         .collect(),
                 )
             };
-            let reports = bundle::export_session_bundles_with_opencode(
+            let reports = bundle::export_session_bundles_with_dirs(
                 Some(concrete_provider(ctx)?),
-                ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
-                Some(ctx.opencode_dir.clone()),
+                ctx.dirs(),
                 out_dir,
                 ids,
                 targets,
@@ -877,11 +884,9 @@ fn cmd_bundle(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             let export_group = take_value(&mut args, "--export-group")?;
             let active_only = take_flag(&mut args, "--active-only");
             ensure_no_args(&args)?;
-            let reports = bundle::export_all_bundles_with_opencode(
+            let reports = bundle::export_all_bundles_with_dirs(
                 Some(concrete_provider(ctx)?),
-                ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
-                Some(ctx.opencode_dir.clone()),
+                ctx.dirs(),
                 out_dir,
                 machine_label,
                 export_group,
@@ -910,9 +915,7 @@ fn cmd_bundle(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             let reports = bundle::import_session_bundles_with_lock(
                 Some(concrete_provider(ctx)?),
                 src_dir,
-                ctx.codex_dir.clone(),
-                Some(ctx.claude_dir.clone()),
-                Some(ctx.opencode_dir.clone()),
+                ctx.dirs(),
                 mode,
                 make_visible,
                 strict,
@@ -1109,6 +1112,54 @@ fn cmd_repair(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
                 );
                 for family_id in &report.families_skipped {
                     println!("family_skipped\t{family_id}");
+                }
+            })
+        }
+        "cursor-residue" => {
+            let prune = take_flag(&mut args, "--prune");
+            let kinds = take_value(&mut args, "--kinds")?;
+            let dry_run = take_flag(&mut args, "--dry-run");
+            ensure_no_args(&args)?;
+            if !prune {
+                let report = cc_session_manager_lib::cursor_mutate::diagnose_residue(&ctx.dirs())?;
+                return output(ctx, &report, |report| {
+                    println!("database\t{}", report.database_path);
+                    println!(
+                        "headers\t{}\tvisible\t{}",
+                        report.header_rows, report.visible_sessions
+                    );
+                    for group in &report.groups {
+                        println!(
+                            "{}\t会话 {}\t行 {}\t字节 {}\t破坏性 {}\t{}",
+                            group.kind,
+                            group.sessions,
+                            group.rows,
+                            group.bytes,
+                            group.destructive,
+                            group.label
+                        );
+                    }
+                });
+            }
+            let kinds = kinds
+                .map(|value| {
+                    value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|kind| !kind.is_empty())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let report =
+                cc_session_manager_lib::cursor_mutate::prune_residue(&ctx.dirs(), &kinds, dry_run)?;
+            output(ctx, &report, |report| {
+                println!("dry_run\t{}", report.dry_run);
+                println!("removed_headers\t{}", report.removed_header_rows);
+                println!("removed_rows\t{}", report.removed_kv_rows);
+                println!("freed_bytes\t{}", report.freed_bytes);
+                if report.blob_scan_errors > 0 {
+                    println!("blob_scan_errors\t{}", report.blob_scan_errors);
                 }
             })
         }
@@ -1445,6 +1496,7 @@ fn cmd_settings(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
                 println!("codex_dir\t{}", settings.codex_dir);
                 println!("claude_dir\t{}", settings.claude_dir);
                 println!("opencode_dir\t{}", settings.opencode_dir);
+                println!("cursor_dir\t{}", settings.cursor_dir);
                 println!("backup_dir\t{}", settings.backup_dir);
                 println!("refresh_interval_ms\t{}", settings.refresh_interval_ms);
             })
@@ -1457,6 +1509,7 @@ fn cmd_settings(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
                 println!("codex_dir\t{}", settings.codex_dir);
                 println!("claude_dir\t{}", settings.claude_dir);
                 println!("opencode_dir\t{}", settings.opencode_dir);
+                println!("cursor_dir\t{}", settings.cursor_dir);
                 println!("backup_dir\t{}", settings.backup_dir);
                 println!("refresh_interval_ms\t{}", settings.refresh_interval_ms);
             })
@@ -1466,10 +1519,12 @@ fn cmd_settings(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             let codex = settings::validate_codex_dir(ctx.codex_dir.clone())?;
             let claude = settings::validate_claude_dir(ctx.claude_dir.clone())?;
             let opencode = settings::validate_opencode_dir(ctx.opencode_dir.clone())?;
+            let cursor = settings::validate_cursor_dir(ctx.cursor_dir.clone())?;
             let report = HashMap::from([
                 ("codex", serde_json::to_value(codex)?),
                 ("claude", serde_json::to_value(claude)?),
                 ("opencode", serde_json::to_value(opencode)?),
+                ("cursor", serde_json::to_value(cursor)?),
             ]);
             output(ctx, &report, |report| {
                 for (name, value) in report {
@@ -1481,26 +1536,33 @@ fn cmd_settings(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
     }
 }
 
+/// `all` 只聚合本机确实装了的 Agent，缺一个不该让整条命令失败。
+fn installed_providers(ctx: &CliContext) -> Vec<&'static str> {
+    let mut providers = vec!["codex", "claude"];
+    if Path::new(&ctx.opencode_dir).join("opencode.db").is_file() {
+        providers.push("opencode");
+    }
+    let cursor_dir = PathBuf::from(&ctx.cursor_dir);
+    if cc_session_manager_lib::cursor_sessions::state_db_path(&cursor_dir).is_file()
+        || paths::cursor_agent_chats_dir(&paths::default_cursor_agent_dir()).is_dir()
+    {
+        providers.push("cursor");
+    }
+    providers
+}
+
 fn load_sessions(ctx: &CliContext, provider: String) -> CliResult<Vec<SessionSummary>> {
     match provider.as_str() {
-        "codex" | "claude" | "opencode" => Ok(sessions::list_sessions_with_opencode(
+        "codex" | "claude" | "opencode" | "cursor" => Ok(sessions::list_sessions_with_dirs(
             Some(provider),
-            ctx.codex_dir.clone(),
-            Some(ctx.claude_dir.clone()),
-            Some(ctx.opencode_dir.clone()),
+            ctx.dirs(),
         )?),
         "all" => {
-            let mut providers = vec!["codex", "claude"];
-            if Path::new(&ctx.opencode_dir).join("opencode.db").is_file() {
-                providers.push("opencode");
-            }
             let mut list = Vec::new();
-            for current in providers {
-                list.extend(sessions::list_sessions_with_opencode(
+            for current in installed_providers(ctx) {
+                list.extend(sessions::list_sessions_with_dirs(
                     Some(current.to_string()),
-                    ctx.codex_dir.clone(),
-                    Some(ctx.claude_dir.clone()),
-                    Some(ctx.opencode_dir.clone()),
+                    ctx.dirs(),
                 )?);
             }
             list.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
@@ -1559,7 +1621,7 @@ fn group_projects(list: Vec<SessionSummary>, include_archived: bool) -> Vec<Proj
 fn session_provider(ctx: &CliContext) -> CliResult<String> {
     let provider = ctx.provider.clone().unwrap_or_else(|| "codex".to_string());
     match provider.as_str() {
-        "codex" | "claude" | "opencode" | "all" => Ok(provider),
+        "codex" | "claude" | "opencode" | "cursor" | "all" => Ok(provider),
         other => Err(CliError::message(format!("不支持的 provider: {other}"))),
     }
 }
@@ -1900,6 +1962,8 @@ mod tests {
             claude_dir_explicit: false,
             opencode_dir: "opencode".into(),
             opencode_dir_explicit: false,
+            cursor_dir: "cursor".into(),
+            cursor_dir_explicit: false,
             family_lock: family::FamilyLock::default(),
         }
     }

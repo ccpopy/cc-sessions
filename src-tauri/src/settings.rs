@@ -194,6 +194,11 @@ pub fn default_opencode_dir() -> String {
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
+pub fn default_cursor_dir() -> String {
+    paths::default_cursor_dir().to_string_lossy().into_owned()
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn validate_codex_dir(path: String) -> AppResult<DirValidation> {
     let p = PathBuf::from(&path);
     let (exists, has_state, has_sessions) = paths::validate_codex_dir(&p);
@@ -236,6 +241,21 @@ pub fn validate_opencode_dir(path: String) -> AppResult<DirValidation> {
         valid: data_dir.is_dir() && database.is_file(),
         has_state_db: database.is_file(),
         has_sessions: database.is_file(),
+        threads_count: count,
+    })
+}
+
+/// Cursor 的会话分散在 IDE 数据库与 cursor-agent 目录两处，任一处有会话即视为可用。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn validate_cursor_dir(path: String) -> AppResult<DirValidation> {
+    let cursor_dir = PathBuf::from(&path);
+    let agent_dir = paths::default_cursor_agent_dir();
+    let database = crate::cursor_sessions::state_db_path(&cursor_dir);
+    let count = crate::cursor_sessions::validate_data_dir(&cursor_dir, &agent_dir)?;
+    Ok(DirValidation {
+        valid: count > 0 || database.is_file(),
+        has_state_db: database.is_file(),
+        has_sessions: count > 0,
         threads_count: count,
     })
 }

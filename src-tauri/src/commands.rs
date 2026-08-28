@@ -31,19 +31,60 @@ where
 pub fn start_content_search(
     provider: String,
     codex_dir: String,
-    claude_dir: String,
-    opencode_dir: String,
+    claude_dir: Option<String>,
+    opencode_dir: Option<String>,
+    cursor_dir: Option<String>,
     query: String,
     rollout_paths: Vec<String>,
 ) -> AppResult<ContentSearchStart> {
     crate::content_search::start_content_search(
         provider,
-        codex_dir,
-        claude_dir,
-        opencode_dir,
+        provider_dirs(codex_dir, claude_dir, opencode_dir, cursor_dir),
         query,
         rollout_paths,
     )
+}
+
+/// 回收 Cursor 数据库中删除留下的空页。库可能有数 GB，单独成命令并放在设置里。
+#[tauri::command]
+pub async fn compact_cursor_database(
+    codex_dir: String,
+    cursor_dir: Option<String>,
+) -> AppResult<crate::cursor_mutate::CursorCompactReport> {
+    run_blocking(move || {
+        crate::cursor_mutate::compact_database(&provider_dirs(codex_dir, None, None, cursor_dir))
+    })
+    .await
+}
+
+/// 扫描 Cursor 数据库里的空会话、孤儿记录与项目目录已消失的会话。
+#[tauri::command]
+pub async fn diagnose_cursor_residue(
+    codex_dir: String,
+    cursor_dir: Option<String>,
+) -> AppResult<CursorResidueReport> {
+    run_blocking(move || {
+        crate::cursor_mutate::diagnose_residue(&provider_dirs(codex_dir, None, None, cursor_dir))
+    })
+    .await
+}
+
+/// 按选定类别清理残留。`kinds` 必须显式给出，删除有内容的会话不会被默认包含。
+#[tauri::command]
+pub async fn prune_cursor_residue(
+    codex_dir: String,
+    cursor_dir: Option<String>,
+    kinds: Vec<String>,
+    dry_run: bool,
+) -> AppResult<CursorPruneReport> {
+    run_blocking(move || {
+        crate::cursor_mutate::prune_residue(
+            &provider_dirs(codex_dir, None, None, cursor_dir),
+            &kinds,
+            dry_run,
+        )
+    })
+    .await
 }
 
 #[tauri::command]
@@ -120,6 +161,7 @@ pub async fn restore_session(
     codex_dir: String,
     claude_dir: Option<String>,
     opencode_dir: Option<String>,
+    cursor_dir: Option<String>,
     id: String,
     backup_rollout_relpath: Option<String>,
     overwrite: bool,
@@ -131,9 +173,7 @@ pub async fn restore_session(
             provider,
             backup_dir,
             backup_path,
-            codex_dir,
-            claude_dir,
-            opencode_dir,
+            provider_dirs(codex_dir, claude_dir, opencode_dir, cursor_dir),
             id,
             backup_rollout_relpath,
             overwrite,
@@ -151,6 +191,7 @@ pub async fn restore_all(
     codex_dir: String,
     claude_dir: Option<String>,
     opencode_dir: Option<String>,
+    cursor_dir: Option<String>,
     overwrite: bool,
     lock: SharedLock<'_>,
 ) -> AppResult<Vec<RestoreResult>> {
@@ -160,9 +201,7 @@ pub async fn restore_all(
             provider,
             backup_dir,
             backup_path,
-            codex_dir,
-            claude_dir,
-            opencode_dir,
+            provider_dirs(codex_dir, claude_dir, opencode_dir, cursor_dir),
             overwrite,
             &lock,
         )
@@ -176,6 +215,7 @@ pub async fn export_session_bundles(
     codex_dir: String,
     claude_dir: Option<String>,
     opencode_dir: Option<String>,
+    cursor_dir: Option<String>,
     out_dir: String,
     ids: Vec<String>,
     targets: Option<Vec<BundleExportTarget>>,
@@ -183,11 +223,9 @@ pub async fn export_session_bundles(
     export_group: Option<String>,
 ) -> AppResult<Vec<ExportReport>> {
     run_blocking(move || {
-        crate::bundle::export_session_bundles_with_opencode(
+        crate::bundle::export_session_bundles_with_dirs(
             provider,
-            codex_dir,
-            claude_dir,
-            opencode_dir,
+            provider_dirs(codex_dir, claude_dir, opencode_dir, cursor_dir),
             out_dir,
             ids,
             targets,
@@ -204,17 +242,16 @@ pub async fn export_all_bundles(
     codex_dir: String,
     claude_dir: Option<String>,
     opencode_dir: Option<String>,
+    cursor_dir: Option<String>,
     out_dir: String,
     machine_label: Option<String>,
     export_group: Option<String>,
     active_only: bool,
 ) -> AppResult<Vec<ExportReport>> {
     run_blocking(move || {
-        crate::bundle::export_all_bundles_with_opencode(
+        crate::bundle::export_all_bundles_with_dirs(
             provider,
-            codex_dir,
-            claude_dir,
-            opencode_dir,
+            provider_dirs(codex_dir, claude_dir, opencode_dir, cursor_dir),
             out_dir,
             machine_label,
             export_group,
@@ -247,6 +284,7 @@ pub async fn import_session_bundles(
     codex_dir: String,
     claude_dir: Option<String>,
     opencode_dir: Option<String>,
+    cursor_dir: Option<String>,
     mode: ImportMode,
     make_visible: bool,
     strict: bool,
@@ -258,9 +296,7 @@ pub async fn import_session_bundles(
         crate::bundle::import_session_bundles_with_lock(
             provider,
             src_dir,
-            codex_dir,
-            claude_dir,
-            opencode_dir,
+            provider_dirs(codex_dir, claude_dir, opencode_dir, cursor_dir),
             mode,
             make_visible,
             strict,
@@ -633,18 +669,21 @@ pub async fn duplicate_session(
 #[tauri::command]
 pub async fn convert_session_provider(
     codex_dir: String,
-    claude_dir: String,
+    claude_dir: Option<String>,
+    opencode_dir: Option<String>,
+    cursor_dir: Option<String>,
     source_provider: String,
+    target_provider: Option<String>,
     rollout_path: String,
     conversion_mode: Option<String>,
     lock: SharedLock<'_>,
 ) -> AppResult<ConvertReport> {
     let lock = lock.inner().clone();
     run_blocking(move || {
-        crate::convert::convert_session_with_lock(
-            codex_dir,
-            claude_dir,
+        crate::convert::convert_session_with_target(
+            provider_dirs(codex_dir, claude_dir, opencode_dir, cursor_dir),
             source_provider,
+            target_provider,
             rollout_path,
             conversion_mode,
             &lock,
@@ -920,15 +959,38 @@ pub async fn delete_claude_memory_file(
     .await
 }
 
+/// 把前端传来的扁平目录参数收成一个 `ProviderDirs`。
+///
+/// 命令签名保持扁平是为了让 Tauri 与 Web UI 两条通道的入参形状完全一致；
+/// 收口只发生在这一层之后。
+fn provider_dirs(
+    codex_dir: String,
+    claude_dir: Option<String>,
+    opencode_dir: Option<String>,
+    cursor_dir: Option<String>,
+) -> ProviderDirs {
+    ProviderDirs {
+        codex_dir,
+        claude_dir,
+        opencode_dir,
+        cursor_dir,
+        cursor_agent_dir: None,
+    }
+}
+
 #[tauri::command]
 pub async fn list_sessions(
     provider: Option<String>,
     codex_dir: String,
     claude_dir: Option<String>,
     opencode_dir: Option<String>,
+    cursor_dir: Option<String>,
 ) -> AppResult<Vec<SessionSummary>> {
     run_blocking(move || {
-        crate::sessions::list_sessions_with_opencode(provider, codex_dir, claude_dir, opencode_dir)
+        crate::sessions::list_sessions_with_dirs(
+            provider,
+            provider_dirs(codex_dir, claude_dir, opencode_dir, cursor_dir),
+        )
     })
     .await
 }
@@ -939,13 +1001,12 @@ pub async fn group_sessions_by_project(
     codex_dir: String,
     claude_dir: Option<String>,
     opencode_dir: Option<String>,
+    cursor_dir: Option<String>,
 ) -> AppResult<Vec<ProjectGroup>> {
     run_blocking(move || {
-        crate::sessions::group_sessions_by_project_with_opencode(
+        crate::sessions::group_sessions_by_project_with_dirs(
             provider,
-            codex_dir,
-            claude_dir,
-            opencode_dir,
+            provider_dirs(codex_dir, claude_dir, opencode_dir, cursor_dir),
         )
     })
     .await
@@ -957,14 +1018,13 @@ pub async fn search_sessions(
     codex_dir: String,
     claude_dir: Option<String>,
     opencode_dir: Option<String>,
+    cursor_dir: Option<String>,
     query: String,
 ) -> AppResult<Vec<SessionSummary>> {
     run_blocking(move || {
-        crate::sessions::search_sessions_with_opencode(
+        crate::sessions::search_sessions_with_dirs(
             provider,
-            codex_dir,
-            claude_dir,
-            opencode_dir,
+            provider_dirs(codex_dir, claude_dir, opencode_dir, cursor_dir),
             query,
         )
     })
@@ -975,17 +1035,18 @@ pub async fn search_sessions(
 pub async fn set_archived(
     provider: Option<String>,
     codex_dir: String,
+    claude_dir: Option<String>,
     opencode_dir: Option<String>,
+    cursor_dir: Option<String>,
     id: String,
     v: bool,
     lock: SharedLock<'_>,
 ) -> AppResult<()> {
     let lock = lock.inner().clone();
     run_blocking(move || {
-        crate::sessions::set_archived_with_provider_dir(
+        crate::sessions::set_archived_with_dirs(
             provider,
-            codex_dir,
-            opencode_dir,
+            provider_dirs(codex_dir, claude_dir, opencode_dir, cursor_dir),
             id,
             v,
             &lock,
@@ -1000,17 +1061,16 @@ pub async fn delete_session(
     codex_dir: String,
     claude_dir: Option<String>,
     opencode_dir: Option<String>,
+    cursor_dir: Option<String>,
     id: String,
     target: Option<DeleteTarget>,
     lock: SharedLock<'_>,
 ) -> AppResult<DeleteResult> {
     let lock = lock.inner().clone();
     run_blocking(move || {
-        crate::sessions::delete_session_with_provider_dir(
+        crate::sessions::delete_session_with_dirs(
             provider,
-            codex_dir,
-            claude_dir,
-            opencode_dir,
+            provider_dirs(codex_dir, claude_dir, opencode_dir, cursor_dir),
             id,
             target,
             &lock,
@@ -1025,17 +1085,16 @@ pub async fn delete_sessions(
     codex_dir: String,
     claude_dir: Option<String>,
     opencode_dir: Option<String>,
+    cursor_dir: Option<String>,
     ids: Vec<String>,
     targets: Option<Vec<DeleteTarget>>,
     lock: SharedLock<'_>,
 ) -> AppResult<Vec<DeleteResult>> {
     let lock = lock.inner().clone();
     run_blocking(move || {
-        crate::sessions::delete_sessions_with_provider_dir(
+        crate::sessions::delete_sessions_with_dirs(
             provider,
-            codex_dir,
-            claude_dir,
-            opencode_dir,
+            provider_dirs(codex_dir, claude_dir, opencode_dir, cursor_dir),
             ids,
             targets,
             &lock,
@@ -1050,6 +1109,7 @@ pub async fn rename_session(
     codex_dir: String,
     claude_dir: Option<String>,
     opencode_dir: Option<String>,
+    cursor_dir: Option<String>,
     id: String,
     rollout_path: Option<String>,
     title: String,
@@ -1057,11 +1117,9 @@ pub async fn rename_session(
 ) -> AppResult<u32> {
     let lock = lock.inner().clone();
     run_blocking(move || {
-        crate::sessions::rename_session_with_provider_dirs(
+        crate::sessions::rename_session_with_dirs(
             provider,
-            codex_dir,
-            claude_dir,
-            opencode_dir,
+            provider_dirs(codex_dir, claude_dir, opencode_dir, cursor_dir),
             id,
             rollout_path,
             title,
@@ -1106,6 +1164,7 @@ pub async fn stats_snapshot(
     codex_dir: String,
     claude_dir: Option<String>,
     opencode_dir: Option<String>,
+    cursor_dir: Option<String>,
     from_ts: Option<i64>,
     to_ts: Option<i64>,
     bucket: String,
@@ -1116,9 +1175,7 @@ pub async fn stats_snapshot(
     run_blocking(move || {
         crate::stats::stats_snapshot(
             provider,
-            codex_dir,
-            claude_dir,
-            opencode_dir,
+            provider_dirs(codex_dir, claude_dir, opencode_dir, cursor_dir),
             from_ts,
             to_ts,
             bucket,

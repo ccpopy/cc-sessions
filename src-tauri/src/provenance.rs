@@ -84,8 +84,9 @@ pub fn record_conversion(
     conversion_mode: Option<&str>,
 ) -> AppResult<()> {
     if codex_dir.as_os_str().is_empty()
+        // 目标只可能是 codex 或 claude；来源还可以是 Cursor（只出不进）。
         || !matches!(target_provider, "codex" | "claude")
-        || !matches!(source_provider, "codex" | "claude")
+        || !matches!(source_provider, "codex" | "claude" | "cursor")
         || target_id.trim().is_empty()
         || source_id.trim().is_empty()
     {

@@ -12,7 +12,8 @@ use crate::family;
 use crate::history;
 use crate::logs_db;
 use crate::models::{
-    ArchiveOrigin, DeleteResult, DeleteTarget, MoveSessionCwdReport, ProjectGroup, SessionSummary,
+    ArchiveOrigin, DeleteResult, DeleteTarget, MoveSessionCwdReport, ProjectGroup, ProviderDirs,
+    SessionSummary,
 };
 use crate::paths;
 use crate::provenance;
@@ -280,7 +281,14 @@ pub fn list_sessions(
     codex_dir: String,
     claude_dir: Option<String>,
 ) -> AppResult<Vec<SessionSummary>> {
-    list_sessions_with_opencode(provider, codex_dir, claude_dir, None)
+    list_sessions_with_dirs(
+        provider,
+        ProviderDirs {
+            codex_dir,
+            claude_dir,
+            ..ProviderDirs::default()
+        },
+    )
 }
 
 pub fn list_sessions_with_opencode(
@@ -289,7 +297,22 @@ pub fn list_sessions_with_opencode(
     claude_dir: Option<String>,
     opencode_dir: Option<String>,
 ) -> AppResult<Vec<SessionSummary>> {
-    list_sessions_impl(provider, codex_dir, claude_dir, opencode_dir, None)
+    list_sessions_with_dirs(
+        provider,
+        ProviderDirs {
+            codex_dir,
+            claude_dir,
+            opencode_dir,
+            ..ProviderDirs::default()
+        },
+    )
+}
+
+pub fn list_sessions_with_dirs(
+    provider: Option<String>,
+    dirs: ProviderDirs,
+) -> AppResult<Vec<SessionSummary>> {
+    list_sessions_impl(provider, dirs, None)
 }
 
 pub fn list_sessions_cancellable(
@@ -298,28 +321,32 @@ pub fn list_sessions_cancellable(
     claude_dir: Option<String>,
     cancel: &AtomicBool,
 ) -> AppResult<Vec<SessionSummary>> {
-    list_sessions_impl(provider, codex_dir, claude_dir, None, Some(cancel))
+    list_sessions_impl(
+        provider,
+        ProviderDirs {
+            codex_dir,
+            claude_dir,
+            ..ProviderDirs::default()
+        },
+        Some(cancel),
+    )
 }
 
-pub fn list_sessions_cancellable_with_opencode(
+pub fn list_sessions_cancellable_with_dirs(
     provider: Option<String>,
-    codex_dir: String,
-    claude_dir: Option<String>,
-    opencode_dir: Option<String>,
+    dirs: ProviderDirs,
     cancel: &AtomicBool,
 ) -> AppResult<Vec<SessionSummary>> {
-    list_sessions_impl(provider, codex_dir, claude_dir, opencode_dir, Some(cancel))
+    list_sessions_impl(provider, dirs, Some(cancel))
 }
 
 fn list_sessions_impl(
     provider: Option<String>,
-    codex_dir: String,
-    claude_dir: Option<String>,
-    opencode_dir: Option<String>,
+    dirs: ProviderDirs,
     cancel: Option<&AtomicBool>,
 ) -> AppResult<Vec<SessionSummary>> {
     ensure_not_cancelled(cancel)?;
-    let codex = PathBuf::from(&codex_dir);
+    let codex = dirs.codex_path();
     match provider_or_codex(provider).as_str() {
         "codex" => {
             let mut list = query_summaries(&codex, "", &[], cancel)?;
@@ -336,10 +363,7 @@ fn list_sessions_impl(
             Ok(list)
         }
         "claude" => {
-            let p = PathBuf::from(
-                claude_dir
-                    .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
-            );
+            let p = dirs.claude_path();
             let mut list = match cancel {
                 Some(cancel) => crate::claude_sessions::scan_sessions_cancellable(&p, cancel)?,
                 None => crate::claude_sessions::scan_sessions(&p)?,
@@ -349,11 +373,16 @@ fn list_sessions_impl(
             Ok(list)
         }
         "opencode" => {
-            let data_dir =
-                PathBuf::from(opencode_dir.unwrap_or_else(|| {
-                    paths::default_opencode_dir().to_string_lossy().into_owned()
-                }));
-            let mut list = crate::opencode_sessions::list_sessions(&data_dir)?;
+            let mut list = crate::opencode_sessions::list_sessions(&dirs.opencode_path())?;
+            provenance::annotate_sessions(&codex, &mut list);
+            Ok(list)
+        }
+        "cursor" => {
+            let mut list = crate::cursor_sessions::list_sessions(
+                &dirs.cursor_path(),
+                &dirs.cursor_agent_path(),
+            )?;
+            ensure_not_cancelled(cancel)?;
             provenance::annotate_sessions(&codex, &mut list);
             Ok(list)
         }
@@ -434,16 +463,21 @@ pub fn group_sessions_by_project(
     codex_dir: String,
     claude_dir: Option<String>,
 ) -> AppResult<Vec<ProjectGroup>> {
-    group_sessions_by_project_with_opencode(provider, codex_dir, claude_dir, None)
+    group_sessions_by_project_with_dirs(
+        provider,
+        ProviderDirs {
+            codex_dir,
+            claude_dir,
+            ..ProviderDirs::default()
+        },
+    )
 }
 
-pub fn group_sessions_by_project_with_opencode(
+pub fn group_sessions_by_project_with_dirs(
     provider: Option<String>,
-    codex_dir: String,
-    claude_dir: Option<String>,
-    opencode_dir: Option<String>,
+    dirs: ProviderDirs,
 ) -> AppResult<Vec<ProjectGroup>> {
-    let list = list_sessions_with_opencode(provider, codex_dir, claude_dir, opencode_dir)?;
+    let list = list_sessions_with_dirs(provider, dirs)?;
     let mut groups: HashMap<String, ProjectGroup> = HashMap::new();
     for s in list {
         let key = s.cwd.clone();
@@ -472,21 +506,27 @@ pub fn search_sessions(
     claude_dir: Option<String>,
     query: String,
 ) -> AppResult<Vec<SessionSummary>> {
-    search_sessions_with_opencode(provider, codex_dir, claude_dir, None, query)
+    search_sessions_with_dirs(
+        provider,
+        ProviderDirs {
+            codex_dir,
+            claude_dir,
+            ..ProviderDirs::default()
+        },
+        query,
+    )
 }
 
-pub fn search_sessions_with_opencode(
+pub fn search_sessions_with_dirs(
     provider: Option<String>,
-    codex_dir: String,
-    claude_dir: Option<String>,
-    opencode_dir: Option<String>,
+    dirs: ProviderDirs,
     query: String,
 ) -> AppResult<Vec<SessionSummary>> {
     let q = query.trim();
     if q.is_empty() {
-        return list_sessions_with_opencode(provider, codex_dir, claude_dir, opencode_dir);
+        return list_sessions_with_dirs(provider, dirs);
     }
-    let all = list_sessions_with_opencode(provider, codex_dir, claude_dir, opencode_dir)?;
+    let all = list_sessions_with_dirs(provider, dirs)?;
     let low = q.to_lowercase();
 
     // 前缀/过滤：id: cwd: model: archived:
@@ -570,26 +610,22 @@ pub fn set_archived_with_lock(
     v: bool,
     lock: &family::FamilyLock,
 ) -> AppResult<()> {
-    set_archived_with_provider_dir(provider, codex_dir, None, id, v, lock)
+    set_archived_with_dirs(provider, ProviderDirs::new(codex_dir), id, v, lock)
 }
 
-pub fn set_archived_with_provider_dir(
+pub fn set_archived_with_dirs(
     provider: Option<String>,
-    codex_dir: String,
-    opencode_dir: Option<String>,
+    dirs: ProviderDirs,
     id: String,
     v: bool,
     lock: &family::FamilyLock,
 ) -> AppResult<()> {
     match provider_or_codex(provider).as_str() {
-        "codex" => family::with_lock(lock, |_guard| set_archived_codex_locked(codex_dir, id, v)),
-        "opencode" => {
-            let data_dir =
-                PathBuf::from(opencode_dir.unwrap_or_else(|| {
-                    paths::default_opencode_dir().to_string_lossy().into_owned()
-                }));
-            crate::opencode_sessions::set_archived(&data_dir, &id, v)
-        }
+        "codex" => family::with_lock(lock, |_guard| {
+            set_archived_codex_locked(dirs.codex_dir, id, v)
+        }),
+        "opencode" => crate::opencode_sessions::set_archived(&dirs.opencode_path(), &id, v),
+        "cursor" => crate::cursor_mutate::set_archived(&dirs, &id, v),
         "claude" => Err(AppError::Other("Claude 会话不支持归档".into())),
         other => Err(AppError::Other(format!("不支持的 provider: {other}"))),
     }
@@ -606,22 +642,9 @@ pub fn rename_session_with_lock(
     title: String,
     lock: &family::FamilyLock,
 ) -> AppResult<u32> {
-    rename_session_with_provider_dir(provider, codex_dir, None, id, title, lock)
-}
-
-pub fn rename_session_with_provider_dir(
-    provider: Option<String>,
-    codex_dir: String,
-    opencode_dir: Option<String>,
-    id: String,
-    title: String,
-    lock: &family::FamilyLock,
-) -> AppResult<u32> {
-    rename_session_with_provider_dirs(
+    rename_session_with_dirs(
         provider,
-        codex_dir,
-        None,
-        opencode_dir,
+        ProviderDirs::new(codex_dir),
         id,
         None,
         title,
@@ -629,31 +652,28 @@ pub fn rename_session_with_provider_dir(
     )
 }
 
-pub fn rename_session_with_provider_dirs(
+pub fn rename_session_with_dirs(
     provider: Option<String>,
-    codex_dir: String,
-    claude_dir: Option<String>,
-    opencode_dir: Option<String>,
+    dirs: ProviderDirs,
     id: String,
     rollout_path: Option<String>,
     title: String,
     lock: &family::FamilyLock,
 ) -> AppResult<u32> {
     let provider = provider_or_codex(provider);
+    let codex_dir = dirs.codex_dir.clone();
     if provider == "opencode" {
-        let data_dir = PathBuf::from(
-            opencode_dir
-                .unwrap_or_else(|| paths::default_opencode_dir().to_string_lossy().into_owned()),
-        );
         return family::with_lock(lock, |_guard| {
-            crate::opencode_sessions::rename_session(&data_dir, &id, &title)
+            crate::opencode_sessions::rename_session(&dirs.opencode_path(), &id, &title)
+        });
+    }
+    if provider == "cursor" {
+        return family::with_lock(lock, |_guard| {
+            crate::cursor_mutate::rename_session(&dirs, &id, &title)
         });
     }
     if provider == "claude" {
-        let claude = PathBuf::from(
-            claude_dir
-                .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
-        );
+        let claude = dirs.claude_path();
         return family::with_lock(lock, |_guard| {
             crate::claude_transfer::rename_session(&claude, &id, rollout_path.as_deref(), &title)
         });
@@ -1477,14 +1497,22 @@ pub fn delete_session_with_lock(
     target: Option<DeleteTarget>,
     lock: &family::FamilyLock,
 ) -> AppResult<DeleteResult> {
-    delete_session_with_provider_dir(provider, codex_dir, claude_dir, None, id, target, lock)
+    delete_session_with_dirs(
+        provider,
+        ProviderDirs {
+            codex_dir,
+            claude_dir,
+            ..ProviderDirs::default()
+        },
+        id,
+        target,
+        lock,
+    )
 }
 
-pub fn delete_session_with_provider_dir(
+pub fn delete_session_with_dirs(
     provider: Option<String>,
-    codex_dir: String,
-    claude_dir: Option<String>,
-    opencode_dir: Option<String>,
+    dirs: ProviderDirs,
     id: String,
     target: Option<DeleteTarget>,
     lock: &family::FamilyLock,
@@ -1504,24 +1532,15 @@ pub fn delete_session_with_provider_dir(
     };
     match provider_or_codex(provider).as_str() {
         "codex" => family::with_lock(lock, |_guard| {
-            delete_codex_targets_locked(Path::new(&codex_dir), vec![target])?
+            delete_codex_targets_locked(&dirs.codex_path(), vec![target])?
                 .pop()
                 .ok_or_else(|| AppError::Other("Codex 删除未返回结果".to_string()))
         }),
-        "claude" => {
-            let dir = claude_dir
-                .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned());
-            delete_claude_targets(Path::new(&dir), vec![target])?
-                .pop()
-                .ok_or_else(|| AppError::Other("Claude 删除未返回结果".to_string()))
-        }
-        "opencode" => {
-            let dir =
-                PathBuf::from(opencode_dir.unwrap_or_else(|| {
-                    paths::default_opencode_dir().to_string_lossy().into_owned()
-                }));
-            crate::opencode_sessions::delete_session(&dir, &target.id)
-        }
+        "claude" => delete_claude_targets(&dirs.claude_path(), vec![target])?
+            .pop()
+            .ok_or_else(|| AppError::Other("Claude 删除未返回结果".to_string())),
+        "opencode" => crate::opencode_sessions::delete_session(&dirs.opencode_path(), &target.id),
+        "cursor" => crate::cursor_mutate::delete_session(&dirs, &target.id),
         other => Err(AppError::Other(format!("不支持的 provider: {other}"))),
     }
 }
@@ -1534,14 +1553,22 @@ pub fn delete_sessions_with_lock(
     targets: Option<Vec<DeleteTarget>>,
     lock: &family::FamilyLock,
 ) -> AppResult<Vec<DeleteResult>> {
-    delete_sessions_with_provider_dir(provider, codex_dir, claude_dir, None, ids, targets, lock)
+    delete_sessions_with_dirs(
+        provider,
+        ProviderDirs {
+            codex_dir,
+            claude_dir,
+            ..ProviderDirs::default()
+        },
+        ids,
+        targets,
+        lock,
+    )
 }
 
-pub fn delete_sessions_with_provider_dir(
+pub fn delete_sessions_with_dirs(
     provider: Option<String>,
-    codex_dir: String,
-    claude_dir: Option<String>,
-    opencode_dir: Option<String>,
+    dirs: ProviderDirs,
     ids: Vec<String>,
     targets: Option<Vec<DeleteTarget>>,
     lock: &family::FamilyLock,
@@ -1571,24 +1598,25 @@ pub fn delete_sessions_with_provider_dir(
     };
     match provider_or_codex(provider).as_str() {
         "codex" => family::with_lock(lock, |_guard| {
-            delete_codex_targets_locked(Path::new(&codex_dir), targets)
+            delete_codex_targets_locked(&dirs.codex_path(), targets)
         }),
-        "claude" => {
-            let dir = PathBuf::from(
-                claude_dir
-                    .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
-            );
-            delete_claude_targets(&dir, targets)
-        }
+        "claude" => delete_claude_targets(&dirs.claude_path(), targets),
         "opencode" => {
-            let dir =
-                PathBuf::from(opencode_dir.unwrap_or_else(|| {
-                    paths::default_opencode_dir().to_string_lossy().into_owned()
-                }));
+            let dir = dirs.opencode_path();
             Ok(targets
                 .into_iter()
                 .map(|target| {
                     crate::opencode_sessions::delete_session(&dir, &target.id)
+                        .unwrap_or_else(|error| failed_delete_result(&target, error.to_string()))
+                })
+                .collect())
+        }
+        "cursor" => {
+            // 逐个删：Cursor 在跑时守卫会让第一个就失败，逐条上报比整批中断清楚。
+            Ok(targets
+                .into_iter()
+                .map(|target| {
+                    crate::cursor_mutate::delete_session(&dirs, &target.id)
                         .unwrap_or_else(|error| failed_delete_result(&target, error.to_string()))
                 })
                 .collect())

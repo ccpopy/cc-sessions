@@ -54,6 +54,7 @@ const providerOptions: { value: StatsProvider; label: string }[] = [
   { value: "codex", label: "Codex" },
   { value: "claude", label: "Claude" },
   { value: "opencode", label: "OpenCode" },
+  { value: "cursor", label: "Cursor" },
 ];
 
 const rangeOptions: { value: Range; label: string }[] = [
@@ -118,7 +119,9 @@ export function StatsDashboard() {
         ? settings.claude_dir
         : provider === "opencode"
           ? settings.opencode_dir
-          : settings.codex_dir;
+          : provider === "cursor"
+            ? settings.cursor_dir
+            : settings.codex_dir;
     if (!requiredDir) {
       setLoading(false);
       setError(
@@ -126,7 +129,9 @@ export function StatsDashboard() {
           ? "尚未配置 Claude 目录"
           : provider === "opencode"
             ? "尚未配置 OpenCode 数据目录"
-            : "尚未配置 Codex 目录",
+            : provider === "cursor"
+              ? "尚未配置 Cursor 用户数据目录"
+              : "尚未配置 Codex 目录",
       );
       return;
     }
@@ -137,6 +142,7 @@ export function StatsDashboard() {
       codex_dir: settings.codex_dir,
       claude_dir: settings.claude_dir,
       opencode_dir: settings.opencode_dir,
+      cursor_dir: settings.cursor_dir,
       from_ts: from,
       to_ts: to,
       cwd_filter: [] as string[],
@@ -170,6 +176,7 @@ export function StatsDashboard() {
     settings?.codex_dir,
     settings?.claude_dir,
     settings?.opencode_dir,
+    settings?.cursor_dir,
     provider,
     range,
     bucket,
@@ -831,7 +838,9 @@ function ProviderDot({ provider }: { provider: ProjectStat["provider"] }) {
       ? "hsl(var(--provider-claude))"
       : provider === "opencode"
         ? "hsl(var(--provider-opencode))"
-        : "hsl(var(--provider-codex))";
+        : provider === "cursor"
+          ? "hsl(var(--provider-cursor))"
+          : "hsl(var(--provider-codex))";
   return <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: color }} />;
 }
 

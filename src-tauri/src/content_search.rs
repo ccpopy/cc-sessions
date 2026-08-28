@@ -17,7 +17,7 @@ use serde_json::Value;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    ContentSearchMatch, ContentSearchResult, ContentSearchStart, ContentSearchStatus,
+    ContentSearchMatch, ContentSearchResult, ContentSearchStart, ContentSearchStatus, ProviderDirs,
     SessionSummary,
 };
 use crate::{rollout, sessions};
@@ -43,9 +43,7 @@ struct SearchManager {
 
 struct SearchRequest {
     provider: String,
-    codex_dir: String,
-    claude_dir: String,
-    opencode_dir: String,
+    dirs: ProviderDirs,
     query: String,
     rollout_paths: Vec<String>,
 }
@@ -159,17 +157,13 @@ fn manager() -> &'static SearchManager {
 
 pub fn start_content_search(
     provider: String,
-    codex_dir: String,
-    claude_dir: String,
-    opencode_dir: String,
+    dirs: ProviderDirs,
     query: String,
     rollout_paths: Vec<String>,
 ) -> AppResult<ContentSearchStart> {
     manager().start(SearchRequest {
         provider,
-        codex_dir,
-        claude_dir,
-        opencode_dir,
+        dirs,
         query: query.trim().to_string(),
         rollout_paths,
     })
@@ -188,7 +182,10 @@ pub fn cancel_content_search(job_id: u64) -> AppResult<()> {
 }
 
 fn validate_request(request: &SearchRequest) -> AppResult<()> {
-    if !matches!(request.provider.as_str(), "codex" | "claude" | "opencode") {
+    if !matches!(
+        request.provider.as_str(),
+        "codex" | "claude" | "opencode" | "cursor"
+    ) {
         return Err(AppError::Other(format!(
             "不支持的 provider: {}",
             request.provider
@@ -204,14 +201,9 @@ fn validate_request(request: &SearchRequest) -> AppResult<()> {
             "全文搜索关键词不能超过 {MAX_QUERY_CHARS} 个字符"
         )));
     }
-    if request.provider == "codex" && request.codex_dir.trim().is_empty() {
+    // 目录为空时后端会退回默认值，只有 Codex 没有可用默认目录，必须显式给出。
+    if request.provider == "codex" && request.dirs.codex_dir.trim().is_empty() {
         return Err(AppError::Other("Codex 目录不能为空".to_string()));
-    }
-    if request.provider == "claude" && request.claude_dir.trim().is_empty() {
-        return Err(AppError::Other("Claude 目录不能为空".to_string()));
-    }
-    if request.provider == "opencode" && request.opencode_dir.trim().is_empty() {
-        return Err(AppError::Other("OpenCode 目录不能为空".to_string()));
     }
     if request.query.chars().any(char::is_control) {
         return Err(AppError::Other(
@@ -247,11 +239,9 @@ fn execute_search(job: &SearchJob, request: &SearchRequest) -> AppResult<()> {
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
-    let sessions = sessions::list_sessions_cancellable_with_opencode(
+    let sessions = sessions::list_sessions_cancellable_with_dirs(
         Some(request.provider.clone()),
-        request.codex_dir.clone(),
-        Some(request.claude_dir.clone()),
-        Some(request.opencode_dir.clone()),
+        request.dirs.clone(),
         &job.cancel,
     )?
     .into_iter()
@@ -262,7 +252,12 @@ fn execute_search(job: &SearchJob, request: &SearchRequest) -> AppResult<()> {
         return Ok(());
     }
 
-    let total_bytes = sessions.iter().map(|session| session.rollout_bytes).sum();
+    // Cursor 的 Composer 会话拿不到便宜的体积估计（`rollout_bytes` 为 0），
+    // 每个会话至少记 1，进度条就退化成"扫到第几个会话"而不是原地不动。
+    let total_bytes = sessions
+        .iter()
+        .map(|session| session.rollout_bytes.max(1))
+        .sum();
     {
         let mut status = job.status.lock().unwrap_or_else(|error| error.into_inner());
         status.total_files = sessions.len();
@@ -278,11 +273,14 @@ fn execute_search(job: &SearchJob, request: &SearchRequest) -> AppResult<()> {
         if outcome.cancelled {
             return Ok(());
         }
-        completed_bytes = completed_bytes.saturating_add(if outcome.missing {
-            session.rollout_bytes
-        } else {
-            outcome.bytes_read
-        });
+        completed_bytes = completed_bytes.saturating_add(
+            if outcome.missing {
+                session.rollout_bytes
+            } else {
+                outcome.bytes_read
+            }
+            .max(1),
+        );
 
         let mut status = job.status.lock().unwrap_or_else(|error| error.into_inner());
         status.scanned_files += 1;
@@ -315,8 +313,19 @@ fn scan_session(
     query: &str,
     completed_bytes: u64,
 ) -> AppResult<FileScanOutcome> {
-    if session.provider == "opencode" {
-        return scan_opencode_session(job, session, query, completed_bytes);
+    // 这两个 provider 的会话不是可逐行扫描的文件，先还原成事件序列再匹配。
+    match session.provider.as_str() {
+        "opencode" => {
+            let events =
+                crate::opencode_sessions::load_preview_events_from_locator(&session.rollout_path)?;
+            return scan_event_sequence(job, session, query, completed_bytes, events);
+        }
+        "cursor" => {
+            let events =
+                crate::cursor_sessions::load_preview_events_from_locator(&session.rollout_path)?;
+            return scan_event_sequence(job, session, query, completed_bytes, events);
+        }
+        _ => {}
     }
     let file = match File::open(&session.rollout_path) {
         Ok(file) => file,
@@ -410,13 +419,14 @@ fn scan_session(
     })
 }
 
-fn scan_opencode_session(
+/// 在已经展开好的事件序列上做匹配，供没有行式存储的 provider 复用。
+fn scan_event_sequence(
     job: &SearchJob,
     session: &SessionSummary,
     query: &str,
     completed_bytes: u64,
+    events: Vec<crate::models::PreviewEvent>,
 ) -> AppResult<FileScanOutcome> {
-    let events = crate::opencode_sessions::load_preview_events_from_locator(&session.rollout_path)?;
     let total_events = events.len().max(1);
     let mut matches = Vec::new();
 
@@ -472,7 +482,8 @@ fn scan_opencode_session(
 fn classify_event(provider: &str, index: usize, raw: Value) -> Option<crate::models::PreviewEvent> {
     match provider {
         "codex" => Some(rollout::classify_preview(index, raw)),
-        "claude" => crate::claude_sessions::classify_preview(index, raw),
+        // Cursor 与 OpenCode 都会先合成 Claude 形状的记录再分类。
+        "claude" | "cursor" => crate::claude_sessions::classify_preview(index, raw),
         _ => None,
     }
 }
@@ -808,9 +819,13 @@ mod tests {
         job.cancel.store(true, Ordering::Release);
         let request = SearchRequest {
             provider: "claude".to_string(),
-            codex_dir: root.join("codex").to_string_lossy().into_owned(),
-            claude_dir: claude_dir.to_string_lossy().into_owned(),
-            opencode_dir: root.join("opencode").to_string_lossy().into_owned(),
+            dirs: ProviderDirs {
+                codex_dir: root.join("codex").to_string_lossy().into_owned(),
+                claude_dir: Some(claude_dir.to_string_lossy().into_owned()),
+                opencode_dir: Some(root.join("opencode").to_string_lossy().into_owned()),
+                cursor_dir: Some(root.join("cursor").to_string_lossy().into_owned()),
+                cursor_agent_dir: Some(root.join("cursor-agent").to_string_lossy().into_owned()),
+            },
             query: "needle".to_string(),
             rollout_paths: Vec::new(),
         };

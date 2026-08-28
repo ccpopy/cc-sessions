@@ -30,6 +30,7 @@ type Props = {
   codexDir: string;
   claudeDir: string;
   opencodeDir: string;
+  cursorDir: string;
   showSubagentSessions: boolean;
   showArchivedSessions: boolean;
   rolloutPaths: readonly string[];
@@ -47,6 +48,7 @@ export function ContentSearchDialog({
   codexDir,
   claudeDir,
   opencodeDir,
+  cursorDir,
   showSubagentSessions,
   showArchivedSessions,
   rolloutPaths,
@@ -70,6 +72,7 @@ export function ContentSearchDialog({
     codexDir,
     claudeDir,
     opencodeDir,
+    cursorDir,
     showSubagentSessions,
     showArchivedSessions,
     rolloutPaths,
@@ -224,6 +227,7 @@ export function ContentSearchDialog({
         codexDir,
         claudeDir,
         opencodeDir,
+        cursorDir,
         query: normalized,
         rolloutPaths,
       });

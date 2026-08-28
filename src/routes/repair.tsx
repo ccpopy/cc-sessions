@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { DESKTOP_DELETE_RESTART_NOTICE } from "@/lib/desktopRestart";
+import { humanBytes } from "@/lib/format";
 
 import { TopBar } from "@/components/TopBar";
 import { EmptyState } from "@/components/EmptyState";
@@ -61,6 +62,7 @@ import {
 import { useSettings } from "@/stores/settings";
 import {
   api,
+  type CursorResidueReport,
   type ArchiveOriginBackfillReport,
   type DiagnosticReport,
   type FamilyIntegrityReport,
@@ -76,7 +78,9 @@ import {
 import { copyText } from "@/lib/clipboard";
 
 export default function RepairRoute({ provider = "codex" }: { provider?: SessionProvider }) {
-  return provider === "claude" ? <ClaudeRepairRoute /> : <CodexRepairRoute />;
+  if (provider === "claude") return <ClaudeRepairRoute />;
+  if (provider === "cursor") return <CursorRepairRoute />;
+  return <CodexRepairRoute />;
 }
 
 function CodexRepairRoute() {
@@ -1581,6 +1585,324 @@ function ClaudeRepairRoute() {
       </AlertDialog>
     </>
   );
+}
+
+// Cursor 的清理页：Cursor 自己不提供任何维护入口，空会话、孤儿记录会一直留在
+// 那个几 GB 的库里。诊断要整段扫气泡表（实测 9 秒），所以不自动跑，由用户点。
+function CursorRepairRoute() {
+  const settings = useSettings((s) => s.settings);
+  const codexDir = settings?.codex_dir ?? "";
+  const cursorDir = settings?.cursor_dir ?? "";
+  const [report, setReport] = useState<CursorResidueReport | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [compacting, setCompacting] = useState(false);
+  const [selected, setSelected] = useState<Record<string, boolean>>({});
+  /** null = 关闭；"prune" = 只清理；"prune_compact" = 清理后接着压缩。 */
+  const [confirmPrune, setConfirmPrune] = useState<null | "prune" | "prune_compact">(null);
+
+  const diagnose = useCallback(async () => {
+    if (!codexDir) return;
+    setLoading(true);
+    try {
+      const next = await api.diagnoseCursorResidue(codexDir, cursorDir);
+      setReport(next);
+      // 默认只勾非破坏性的那几类，删除有内容的会话必须用户自己点。
+      setSelected(
+        Object.fromEntries(
+          next.groups.map((group) => [group.kind, !group.destructive && hasWork(group)]),
+        ),
+      );
+    } catch (e) {
+      toast.error(`Cursor 残留诊断失败：${String((e as Error)?.message ?? e)}`);
+    } finally {
+      setLoading(false);
+    }
+  }, [codexDir, cursorDir]);
+
+  const busy = running || compacting || loading;
+  const chosen = (report?.groups ?? []).filter((group) => selected[group.kind] && hasWork(group));
+  const chosenDestructive = chosen.some((group) => group.destructive);
+  const chosenSessions = chosen.reduce((sum, group) => sum + group.sessions, 0);
+  const chosenBytes = chosen.reduce((sum, group) => sum + group.bytes, 0);
+
+  // 删除只把页面标成空闲，文件不会变小；VACUUM 才会真正把磁盘还回去。
+  const compact = async () => {
+    setCompacting(true);
+    try {
+      const report = await api.compactCursorDatabase(codexDir, cursorDir);
+      toast.success(
+        report.bytes_reclaimed > 0
+          ? `已回收 ${humanBytes(report.bytes_reclaimed)}（${humanBytes(report.bytes_before)} → ${humanBytes(report.bytes_after)}）`
+          : "数据库已经是紧凑的，没有可回收的空间",
+      );
+      await diagnose();
+    } catch (e) {
+      toast.error(String((e as Error)?.message ?? e));
+    } finally {
+      setCompacting(false);
+    }
+  };
+
+  const prune = async (dryRun: boolean, thenCompact = false) => {
+    setRunning(true);
+    try {
+      const result = await api.pruneCursorResidue({
+        codex_dir: codexDir,
+        cursor_dir: cursorDir,
+        kinds: chosen.map((group) => group.kind),
+        dry_run: dryRun,
+      });
+      const summary = `${result.removed_header_rows} 个会话、${result.removed_kv_rows} 行记录，约 ${humanBytes(result.freed_bytes)}`;
+      if (result.blob_scan_errors > 0) {
+        toast.warning(`「无引用的内容块」已跳过`, {
+          description: `有 ${result.blob_scan_errors} 行读不出来，无法确认剩下的内容块是否还被引用，为避免误删这一类整体没动。`,
+        });
+      }
+      if (dryRun) {
+        toast.success(`预览：将清理 ${summary}`);
+        return;
+      }
+      if (thenCompact) {
+        toast.success(`已清理 ${summary}，正在压缩数据库…`);
+      } else {
+        toast.success(`已清理 ${summary}`, {
+          description: "磁盘占用需要点下方「压缩数据库」才会真正回落。",
+        });
+      }
+      // 压缩自己会重新诊断，不必重复跑一次几秒的扫描。
+      if (thenCompact) {
+        await compact();
+      } else {
+        await diagnose();
+      }
+    } catch (e) {
+      toast.error(String((e as Error)?.message ?? e));
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  return (
+    <>
+      <TopBar title="Cursor 清理" />
+      <ScrollArea className="flex-1">
+        <div className="mx-auto min-w-0 max-w-5xl space-y-4 p-4">
+          <Card className="min-w-0 overflow-hidden">
+            <CardHeader className="pb-3">
+              <CardTitle className="flex min-w-0 flex-wrap items-center gap-2 text-base">
+                <Database className="h-4 w-4 shrink-0" />
+                Cursor 数据库残留
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="min-w-0 space-y-3">
+              <div className="text-xs text-muted-foreground">
+                Cursor 删除会话时留下的检查点、代码差异、文件快照都还在库里，从不回收。
+                这里可以把它们真正清掉。诊断要做一次全库可达性扫描，6 GB 的库上约半分钟。
+              </div>
+              {report && (
+                <div className="grid min-w-0 gap-2 sm:grid-cols-3">
+                  <Stat label="会话头总数" value={report.header_rows} />
+                  <Stat label="列表可见会话" value={report.visible_sessions} />
+                  <Stat label="数据库大小" value={humanBytes(report.database_bytes)} />
+                </div>
+              )}
+              <div className="flex flex-wrap items-center gap-2">
+                <Button size="sm" onClick={() => void diagnose()} disabled={busy}>
+                  {loading ? (
+                    <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Wrench className="mr-1.5 h-3.5 w-3.5" />
+                  )}
+                  {report ? "重新诊断" : "开始诊断"}
+                </Button>
+                {report && (
+                  <span className="text-xs text-muted-foreground [overflow-wrap:anywhere]">
+                    <code>{report.database_path}</code>
+                  </span>
+                )}
+              </div>
+            </CardContent>
+          </Card>
+
+          {!report && !loading && (
+            <EmptyState
+              title="尚未诊断"
+              description="点击「开始诊断」扫描 Cursor 数据库中的残留数据"
+            />
+          )}
+
+          {report?.groups.map((group) => (
+            <Card key={group.kind} className="min-w-0 overflow-hidden">
+              <CardHeader className="pb-3">
+                <CardTitle className="flex min-w-0 flex-wrap items-center gap-2 text-base">
+                  {group.destructive ? (
+                    <ShieldAlert className="h-4 w-4 shrink-0 text-amber-600" />
+                  ) : (
+                    <Eraser className="h-4 w-4 shrink-0" />
+                  )}
+                  {group.label}
+                  <Badge variant={hasWork(group) ? "outline" : "secondary"} className="text-[10px]">
+                    {group.sessions > 0 ? `${group.sessions} 个会话` : `${group.rows} 行记录`}
+                  </Badge>
+                  {group.destructive && (
+                    <Badge variant="outline" className="border-amber-500/40 text-[10px] text-amber-600">
+                      会丢失对话
+                    </Badge>
+                  )}
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="min-w-0 space-y-3">
+                <div className="text-xs text-muted-foreground">{group.description}</div>
+                <div className="grid min-w-0 gap-2 sm:grid-cols-3">
+                  <Stat label="会话数" value={group.sessions} warn={group.sessions > 0} />
+                  <Stat label="记录行数" value={group.rows} warn={group.rows > 0} />
+                  <Stat
+                    label="占用"
+                    value={group.bytes > 0 ? humanBytes(group.bytes) : "—"}
+                    hint={group.bytes > 0 ? undefined : "这一类只删会话头，占用会在清理时统计"}
+                  />
+                </div>
+                {group.samples.length > 0 && (
+                  <div className="min-w-0 space-y-1 rounded-md bg-muted/30 p-3 text-xs">
+                    <div className="text-muted-foreground">样例：</div>
+                    {group.samples.map((sample) => (
+                      <div key={sample.id} className="min-w-0 [overflow-wrap:anywhere]">
+                        <code className="text-[11px]">{sample.id.slice(0, 8)}</code>{" "}
+                        <span className="text-foreground">{sample.title}</span>
+                        {sample.bubbles > 0 && (
+                          <span className="text-muted-foreground"> · {sample.bubbles} 条消息</span>
+                        )}
+                        {sample.cwd && <span className="text-muted-foreground"> · {sample.cwd}</span>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <div className="flex items-center gap-2 rounded-md border bg-muted/20 px-2.5 py-1">
+                  <Switch
+                    id={`cursor-residue-${group.kind}`}
+                    checked={!!selected[group.kind]}
+                    disabled={busy || !hasWork(group)}
+                    onCheckedChange={(v) =>
+                      setSelected((prev) => ({ ...prev, [group.kind]: v }))
+                    }
+                  />
+                  <Label htmlFor={`cursor-residue-${group.kind}`} className="text-xs">
+                    纳入清理
+                  </Label>
+                </div>
+              </CardContent>
+            </Card>
+          ))}
+
+          {report && (
+            <Card className="min-w-0 overflow-hidden">
+              <CardContent className="min-w-0 space-y-3 pt-6">
+                <div className="text-xs text-muted-foreground">
+                  清理和压缩都需要先完全退出 Cursor，否则会被拒绝。清理只把库内页面标成空闲，
+                  文件不会变小；<b>压缩数据库</b>才会把磁盘还回去，几 GB 的库可能要几分钟。
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => void prune(true)}
+                    disabled={busy || chosen.length === 0}
+                  >
+                    效果预览
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="destructive"
+                    onClick={() => setConfirmPrune("prune")}
+                    disabled={busy || chosen.length === 0}
+                    className="gap-1.5"
+                  >
+                    {running ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Trash2 className="h-3.5 w-3.5" />
+                    )}
+                    清理已选（约 {humanBytes(chosenBytes)}）
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="destructive"
+                    onClick={() => setConfirmPrune("prune_compact")}
+                    disabled={busy || chosen.length === 0}
+                    className="gap-1.5"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                    清理并压缩数据库
+                  </Button>
+                  <Separator orientation="vertical" className="h-6" />
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => void compact()}
+                    disabled={busy}
+                    className="gap-1.5"
+                  >
+                    {compacting ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Database className="h-3.5 w-3.5" />
+                    )}
+                    {compacting ? "压缩中…" : "压缩数据库"}
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+          )}
+        </div>
+      </ScrollArea>
+
+      <AlertDialog
+        open={confirmPrune !== null}
+        onOpenChange={(open) => !open && setConfirmPrune(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {confirmPrune === "prune_compact" ? "清理并压缩数据库" : "清理 Cursor 残留"}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              即将清理 <b>{chosen.map((group) => group.label).join("、")}</b>，
+              涉及 {chosenSessions} 个会话、{chosen.reduce((sum, group) => sum + group.rows, 0)} 行记录，
+              约 <b>{humanBytes(chosenBytes)}</b>。此操作不可撤销。
+              {chosenDestructive && (
+                <>
+                  {" "}
+                  其中<b>「项目目录已不存在」包含完整对话内容</b>，删除后这些对话将永久丢失。
+                </>
+              )}
+              {confirmPrune === "prune_compact" && (
+                <> 清理完成后会立刻压缩数据库，期间请不要打开 Cursor。</>
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              onClick={() => {
+                const thenCompact = confirmPrune === "prune_compact";
+                setConfirmPrune(null);
+                void prune(false, thenCompact);
+              }}
+            >
+              确认清理
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  );
+}
+
+/// 有些残留按会话计（空会话、孤儿记录），有些只按行计（内容块没有会话归属）。
+function hasWork(group: { sessions: number; rows: number }) {
+  return group.sessions > 0 || group.rows > 0;
 }
 
 function Stat({

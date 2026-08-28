@@ -33,7 +33,7 @@ use crate::error::{AppError, AppResult};
 use crate::family;
 use crate::models::{
     ArchiveOrigin, BundleExportTarget, BundleListItem, BundleManifest, ExportReport, ImportMode,
-    ImportReport, ManifestArtifact, ProjectPathMapping, SessionSummary,
+    ImportReport, ManifestArtifact, ProjectPathMapping, ProviderDirs, SessionSummary,
 };
 use crate::paths;
 use crate::state_db;
@@ -42,6 +42,7 @@ const BUNDLE_VERSION: u32 = 2;
 const PROVIDER_CODEX: &str = "codex";
 const PROVIDER_CLAUDE: &str = "claude";
 const PROVIDER_OPENCODE: &str = "opencode";
+const PROVIDER_CURSOR: &str = "cursor";
 const DEFAULT_SANDBOX_POLICY: &str = "read-only";
 const DEFAULT_APPROVAL_MODE: &str = "on-request";
 const DEFAULT_MEMORY_MODE: &str = "enabled";
@@ -578,6 +579,35 @@ pub fn export_session_bundles_with_opencode(
     machine_label: Option<String>,
     export_group: Option<String>,
 ) -> AppResult<Vec<ExportReport>> {
+    export_session_bundles_with_dirs(
+        provider,
+        ProviderDirs {
+            codex_dir,
+            claude_dir,
+            opencode_dir,
+            ..ProviderDirs::default()
+        },
+        out_dir,
+        ids,
+        targets,
+        machine_label,
+        export_group,
+    )
+}
+
+pub fn export_session_bundles_with_dirs(
+    provider: Option<String>,
+    dirs: ProviderDirs,
+    out_dir: String,
+    ids: Vec<String>,
+    targets: Option<Vec<BundleExportTarget>>,
+    machine_label: Option<String>,
+    export_group: Option<String>,
+) -> AppResult<Vec<ExportReport>> {
+    let codex_dir = dirs.codex_dir.clone();
+    let claude_dir = Some(dirs.claude_path().to_string_lossy().into_owned());
+    let opencode_dir = Some(dirs.opencode_path().to_string_lossy().into_owned());
+    let cursor_dir = Some(dirs.cursor_path().to_string_lossy().into_owned());
     let targets = normalize_bundle_export_targets(&ids, targets)?;
     let provider_name = provider.as_deref().unwrap_or(PROVIDER_CODEX);
     if provider_name == PROVIDER_CLAUDE {
@@ -600,6 +630,19 @@ pub fn export_session_bundles_with_opencode(
         );
         return export_opencode_session_bundles(
             &data_dir,
+            &PathBuf::from(out_dir),
+            &targets,
+            machine_label.as_deref(),
+            export_group.as_deref(),
+        );
+    }
+    if provider_name == PROVIDER_CURSOR {
+        let cursor = PathBuf::from(
+            cursor_dir
+                .unwrap_or_else(|| paths::default_cursor_dir().to_string_lossy().into_owned()),
+        );
+        return export_cursor_session_bundles(
+            &cursor,
             &PathBuf::from(out_dir),
             &targets,
             machine_label.as_deref(),
@@ -1289,6 +1332,33 @@ pub fn export_all_bundles_with_opencode(
     export_group: Option<String>,
     active_only: bool,
 ) -> AppResult<Vec<ExportReport>> {
+    export_all_bundles_with_dirs(
+        provider,
+        ProviderDirs {
+            codex_dir,
+            claude_dir,
+            opencode_dir,
+            ..ProviderDirs::default()
+        },
+        out_dir,
+        machine_label,
+        export_group,
+        active_only,
+    )
+}
+
+pub fn export_all_bundles_with_dirs(
+    provider: Option<String>,
+    dirs: ProviderDirs,
+    out_dir: String,
+    machine_label: Option<String>,
+    export_group: Option<String>,
+    active_only: bool,
+) -> AppResult<Vec<ExportReport>> {
+    let codex_dir = dirs.codex_dir.clone();
+    let claude_dir = Some(dirs.claude_path().to_string_lossy().into_owned());
+    let opencode_dir = Some(dirs.opencode_path().to_string_lossy().into_owned());
+    let cursor_dir = Some(dirs.cursor_path().to_string_lossy().into_owned());
     let provider_name = provider.as_deref().unwrap_or(PROVIDER_CODEX);
     if provider_name == PROVIDER_CLAUDE {
         let claude = PathBuf::from(
@@ -1327,6 +1397,30 @@ pub fn export_all_bundles_with_opencode(
             .collect::<Vec<_>>();
         return export_opencode_session_bundles(
             &data_dir,
+            &PathBuf::from(out_dir),
+            &targets,
+            machine_label.as_deref(),
+            export_group.as_deref(),
+        );
+    }
+    if provider_name == PROVIDER_CURSOR {
+        let cursor = PathBuf::from(
+            cursor_dir
+                .unwrap_or_else(|| paths::default_cursor_dir().to_string_lossy().into_owned()),
+        );
+        let targets =
+            crate::cursor_sessions::list_sessions(&cursor, &paths::default_cursor_agent_dir())?
+                .into_iter()
+                // cursor-agent 会话不落在 state.vscdb 里，导出格式另说，本期不导。
+                .filter(|session| session.resume_command.is_empty())
+                .filter(|session| !active_only || !session.archived)
+                .map(|session| BundleExportTarget {
+                    id: session.id,
+                    rollout_path: Some(session.rollout_path),
+                })
+                .collect::<Vec<_>>();
+        return export_cursor_session_bundles(
+            &cursor,
             &PathBuf::from(out_dir),
             &targets,
             machine_label.as_deref(),
@@ -1459,7 +1553,8 @@ pub fn verify_bundles(src_dir: String, provider: Option<String>) -> AppResult<Ve
                 validate_claude_bundle_rollout_relpath(source_rel, &it.manifest.session_id)?;
                 rel
             }
-            PROVIDER_OPENCODE => validate_opencode_bundle_rollout_relpath(
+            PROVIDER_OPENCODE | PROVIDER_CURSOR => validate_snapshot_bundle_relpath(
+                provider,
                 &it.manifest.rollout_relpath,
                 &it.manifest.session_id,
             )?,
@@ -1530,6 +1625,35 @@ pub fn import_session_bundles_with_opencode(
     strict: bool,
     project_mappings: Vec<ProjectPathMapping>,
 ) -> AppResult<Vec<ImportReport>> {
+    import_session_bundles_with_dirs(
+        provider,
+        src_dir,
+        ProviderDirs {
+            codex_dir,
+            claude_dir,
+            opencode_dir,
+            ..ProviderDirs::default()
+        },
+        mode,
+        make_visible,
+        strict,
+        project_mappings,
+    )
+}
+
+pub fn import_session_bundles_with_dirs(
+    provider: Option<String>,
+    src_dir: String,
+    dirs: ProviderDirs,
+    mode: ImportMode,
+    make_visible: bool,
+    strict: bool,
+    project_mappings: Vec<ProjectPathMapping>,
+) -> AppResult<Vec<ImportReport>> {
+    let codex_dir = dirs.codex_dir.clone();
+    let claude_dir = Some(dirs.claude_path().to_string_lossy().into_owned());
+    let opencode_dir = Some(dirs.opencode_path().to_string_lossy().into_owned());
+    let cursor = dirs.cursor_path();
     let codex = PathBuf::from(&codex_dir);
     let claude = PathBuf::from(
         claude_dir.unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
@@ -1553,6 +1677,7 @@ pub fn import_session_bundles_with_opencode(
                 PROVIDER_OPENCODE => {
                     import_one_opencode(&opencode, &it, &mode, strict, &project_mappings)
                 }
+                PROVIDER_CURSOR => import_one_cursor(&cursor, &it, &mode, strict),
                 _ => import_one(&codex, &it, &mode, make_visible, strict, &project_mappings),
             })
             .unwrap_or_else(|e| ImportReport {
@@ -1576,9 +1701,7 @@ pub fn import_session_bundles_with_opencode(
 pub fn import_session_bundles_with_lock(
     provider: Option<String>,
     src_dir: String,
-    codex_dir: String,
-    claude_dir: Option<String>,
-    opencode_dir: Option<String>,
+    dirs: ProviderDirs,
     mode: ImportMode,
     make_visible: bool,
     strict: bool,
@@ -1586,12 +1709,10 @@ pub fn import_session_bundles_with_lock(
     lock: &crate::family::FamilyLock,
 ) -> AppResult<Vec<ImportReport>> {
     crate::family::with_lock(lock, |_guard| {
-        import_session_bundles_with_opencode(
+        import_session_bundles_with_dirs(
             provider,
             src_dir,
-            codex_dir,
-            claude_dir,
-            opencode_dir,
+            dirs,
             mode,
             make_visible,
             strict,
@@ -1835,12 +1956,21 @@ fn validate_claude_bundle_rollout_relpath(raw: &str, session_id: &str) -> AppRes
 }
 
 fn validate_opencode_bundle_rollout_relpath(raw: &str, session_id: &str) -> AppResult<PathBuf> {
+    validate_snapshot_bundle_relpath(PROVIDER_OPENCODE, raw, session_id)
+}
+
+/// 以会话快照 JSON 形式打包的 provider 共用同一套路径约束。
+fn validate_snapshot_bundle_relpath(
+    provider: &str,
+    raw: &str,
+    session_id: &str,
+) -> AppResult<PathBuf> {
     let relative = paths::checked_relative_path(raw)?;
     let expected =
         PathBuf::from("sessions").join(format!("{}.json", paths::sanitize_slug(session_id)));
     if relative != expected {
         return Err(AppError::Path(format!(
-            "OpenCode bundle 快照路径与会话 ID 不匹配: id={session_id} path={raw}"
+            "{provider} bundle 快照路径与会话 ID 不匹配: id={session_id} path={raw}"
         )));
     }
     Ok(relative)
@@ -2143,6 +2273,172 @@ fn import_one_opencode(
     report.rollout_written = outcome.written;
     report.threads_upserted = outcome.written;
     report.skipped_reason = outcome.skipped_reason;
+    report.ok = true;
+    Ok(report)
+}
+
+/// Cursor 会话包：与 OpenCode 一样，一个会话一份自包含的 JSON 快照。
+fn export_cursor_session_bundles(
+    cursor_dir: &Path,
+    out: &Path,
+    targets: &[BundleExportTarget],
+    machine_label: Option<&str>,
+    export_group: Option<&str>,
+) -> AppResult<Vec<ExportReport>> {
+    let machine = machine_label
+        .map(paths::sanitize_slug)
+        .unwrap_or_else(paths::machine_label);
+    let group = paths::sanitize_slug(export_group.unwrap_or("default"));
+    let sessions =
+        crate::cursor_sessions::list_sessions(cursor_dir, &paths::default_cursor_agent_dir())?
+            .into_iter()
+            .map(|session| (session.id.clone(), session))
+            .collect::<HashMap<_, _>>();
+    let (batch_root, final_batch_root) = create_export_batch(out, &machine, &group)?;
+    let mut reports = Vec::with_capacity(targets.len());
+    for target in targets {
+        let result = (|| -> AppResult<ExportReport> {
+            let session = sessions
+                .get(&target.id)
+                .ok_or_else(|| AppError::NotFound(format!("Cursor 会话不存在: {}", target.id)))?;
+            if !session.resume_command.is_empty() {
+                return Err(AppError::Other(format!(
+                    "cursor-agent 会话暂不支持导出会话包: {}",
+                    target.id
+                )));
+            }
+            let snapshot = crate::cursor_transfer::export_snapshot(cursor_dir, &target.id)?;
+            let bundle_dir = batch_root.join(paths::sanitize_slug(&target.id));
+            crate::path_safety::validate_descendant(
+                &batch_root,
+                &bundle_dir,
+                crate::path_safety::EntryKind::Directory,
+                true,
+                "Cursor Bundle 导出目录",
+            )?;
+            let relative = PathBuf::from("sessions")
+                .join(format!("{}.json", paths::sanitize_slug(&target.id)));
+            let destination = bundle_dir.join(PROVIDER_CURSOR).join(&relative);
+            crate::cursor_transfer::write_snapshot(&destination, &snapshot)?;
+            let sha = sha256_file(&destination)?;
+            let manifest = BundleManifest {
+                version: BUNDLE_VERSION,
+                provider: Some(PROVIDER_CURSOR.to_string()),
+                session_id: target.id.clone(),
+                rollout_relpath: relative.to_string_lossy().replace('\\', "/"),
+                source_relpath: None,
+                sidecar_relpath: None,
+                companions_relpath: None,
+                tasks_relpath: None,
+                exported_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: session.updated_at,
+                thread_name: session.title.clone(),
+                session_cwd: session.cwd.clone(),
+                session_source: Some(PROVIDER_CURSOR.to_string()),
+                session_originator: Some("Cursor".to_string()),
+                model_provider: session.model.clone(),
+                export_machine: machine.clone(),
+                export_group: group.clone(),
+                sha256_rollout: sha,
+                rollout_line_count: snapshot.bubbles.len() as u64,
+                has_history: false,
+                artifacts: Vec::new(),
+            };
+            fs::write(
+                bundle_dir.join("manifest.json"),
+                serde_json::to_vec_pretty(&manifest)?,
+            )?;
+            Ok(ExportReport {
+                session_id: target.id.clone(),
+                ok: true,
+                bundle_path: Some(bundle_dir.to_string_lossy().into_owned()),
+                error: None,
+                skipped_reason: None,
+            })
+        })();
+        reports.push(result.unwrap_or_else(|error| ExportReport {
+            session_id: target.id.clone(),
+            ok: false,
+            bundle_path: None,
+            error: Some(error.to_string()),
+            skipped_reason: None,
+        }));
+    }
+    if reports.iter().any(|report| report.ok) {
+        if let Err(error) = publish_export_batch(&batch_root, &final_batch_root, &mut reports) {
+            return Err(match remove_path_recursive(&batch_root) {
+                Ok(()) => error,
+                Err(cleanup_error) => {
+                    AppError::Other(format!("{error}；清理临时导出目录失败: {cleanup_error}"))
+                }
+            });
+        }
+    } else {
+        remove_path_recursive(&batch_root)?;
+    }
+    Ok(reports)
+}
+
+fn import_one_cursor(
+    cursor_dir: &Path,
+    item: &BundleListItem,
+    mode: &ImportMode,
+    strict: bool,
+) -> AppResult<ImportReport> {
+    let mut report = ImportReport {
+        session_id: item.manifest.session_id.clone(),
+        ok: false,
+        rollout_written: false,
+        history_appended: 0,
+        threads_upserted: false,
+        index_appended: false,
+        skipped_reason: None,
+        error: None,
+        verified: false,
+        sha_mismatch: false,
+    };
+    let bundle_root = validate_bundle_item_root(item)?;
+    let relative = validate_snapshot_bundle_relpath(
+        PROVIDER_CURSOR,
+        &item.manifest.rollout_relpath,
+        &item.manifest.session_id,
+    )?;
+    let source = bundle_root.join(PROVIDER_CURSOR).join(relative);
+    if !crate::path_safety::validate_descendant(
+        &bundle_root,
+        &source,
+        crate::path_safety::EntryKind::File,
+        true,
+        "Cursor bundle 快照",
+    )? {
+        report.error = Some(format!(
+            "Cursor bundle 快照缺失: {}",
+            source.to_string_lossy()
+        ));
+        return Ok(report);
+    }
+    let actual = sha256_file(&source)?;
+    if actual != item.manifest.sha256_rollout {
+        report.sha_mismatch = true;
+        if strict {
+            report.error = Some("sha256 不一致，strict 模式跳过".into());
+            return Ok(report);
+        }
+    } else {
+        report.verified = true;
+    }
+    let snapshot = crate::cursor_transfer::read_snapshot(&source, &item.manifest.session_id)?;
+    // Cursor 的会话归属记在会话头里，跨机器改项目路径本期不做，因此不套用项目映射。
+    let overwrite = matches!(mode, ImportMode::Overwrite);
+    let written = crate::cursor_transfer::import_snapshot(cursor_dir, &snapshot, overwrite)?;
+    if !written {
+        report.skipped_reason = Some(match mode {
+            ImportMode::Skip => "目标库已存在同 ID 会话，按跳过处理".into(),
+            _ => "目标库已存在同 ID 会话，未覆盖".into(),
+        });
+    }
+    report.rollout_written = written;
+    report.threads_upserted = written;
     report.ok = true;
     Ok(report)
 }
@@ -3796,9 +4092,7 @@ mod tests {
             let result = import_session_bundles_with_lock(
                 None,
                 "missing-bundles".into(),
-                "missing-codex".into(),
-                None,
-                None,
+                ProviderDirs::new("missing-codex".into()),
                 ImportMode::Skip,
                 false,
                 false,

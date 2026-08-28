@@ -26,6 +26,7 @@ export default function App() {
   const initTheme = useTheme((s) => s.init);
   const toggleTheme = useTheme((s) => s.toggle);
   const defaultProvider = webuiDefaultProvider();
+  // OpenCode 没有修复页，落回 Codex；其余 provider 都有自己的。
   const defaultRepairProvider = defaultProvider === "opencode" ? "codex" : defaultProvider;
   const defaultSessionsPath = `/${defaultProvider}/sessions`;
   const defaultRepairPath = `/${defaultRepairProvider}/repair`;
@@ -77,6 +78,11 @@ export default function App() {
             <Route path="/opencode/backups" element={<BackupsRoute key="opencode-backups" provider="opencode" />} />
             <Route path="/opencode/backups/:name" element={<BackupDetailRoute key="opencode-backup-detail" provider="opencode" />} />
             <Route path="/opencode/transfer" element={<TransferRoute key="opencode-transfer" provider="opencode" />} />
+            <Route path="/cursor/sessions" element={<SessionsRoute key="cursor-sessions" provider="cursor" />} />
+            <Route path="/cursor/repair" element={<RepairRoute key="cursor-repair" provider="cursor" />} />
+            <Route path="/cursor/backups" element={<BackupsRoute key="cursor-backups" provider="cursor" />} />
+            <Route path="/cursor/backups/:name" element={<BackupDetailRoute key="cursor-backup-detail" provider="cursor" />} />
+            <Route path="/cursor/transfer" element={<TransferRoute key="cursor-transfer" provider="cursor" />} />
             <Route path="/sessions" element={<Navigate to={defaultSessionsPath} replace />} />
             <Route path="/repair" element={<Navigate to={defaultRepairPath} replace />} />
             <Route path="/backups" element={<Navigate to={defaultBackupsPath} replace />} />

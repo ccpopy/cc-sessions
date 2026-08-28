@@ -10,7 +10,7 @@ use crate::error::{AppError, AppResult};
 use crate::logs_db;
 use crate::models::{
     ArchiveOrigin, BackupDetail, BackupSummary, BundleExportTarget, Manifest, ManifestArtifact,
-    ManifestSession, RestoreResult, VerifyItem, VerifyReport,
+    ManifestSession, ProviderDirs, RestoreResult, VerifyItem, VerifyReport,
 };
 use crate::path_safety::{self, EntryKind};
 use crate::paths;
@@ -22,6 +22,7 @@ use restore_snapshot::{inject_restore_file_fault, restore_failure_message, Resto
 const PROVIDER_CODEX: &str = "codex";
 const PROVIDER_CLAUDE: &str = "claude";
 const PROVIDER_OPENCODE: &str = "opencode";
+const PROVIDER_CURSOR: &str = "cursor";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RolloutPresence {
@@ -242,21 +243,60 @@ pub fn create_backup_with_opencode(
     name: Option<String>,
     note: Option<String>,
 ) -> AppResult<BackupSummary> {
+    create_backup_with_dirs(
+        provider,
+        ProviderDirs {
+            codex_dir,
+            claude_dir,
+            opencode_dir,
+            ..ProviderDirs::default()
+        },
+        backup_dir,
+        ids,
+        targets,
+        name,
+        note,
+    )
+}
+
+pub fn create_backup_with_dirs(
+    provider: Option<String>,
+    dirs: ProviderDirs,
+    backup_dir: String,
+    ids: Vec<String>,
+    targets: Option<Vec<BundleExportTarget>>,
+    name: Option<String>,
+    note: Option<String>,
+) -> AppResult<BackupSummary> {
+    let codex_dir = dirs.codex_dir.clone();
     let targets = normalize_backup_targets(&ids, targets)?;
     let provider_name = provider.as_deref().unwrap_or(PROVIDER_CODEX);
     if provider_name == PROVIDER_CLAUDE {
-        let claude = PathBuf::from(
-            claude_dir
-                .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
+        return create_claude_backup(
+            dirs.claude_path(),
+            PathBuf::from(backup_dir),
+            targets,
+            name,
+            note,
         );
-        return create_claude_backup(claude, PathBuf::from(backup_dir), targets, name, note);
     }
     if provider_name == PROVIDER_OPENCODE {
-        let data_dir = PathBuf::from(
-            opencode_dir
-                .unwrap_or_else(|| paths::default_opencode_dir().to_string_lossy().into_owned()),
+        return create_opencode_backup(
+            dirs.opencode_path(),
+            PathBuf::from(backup_dir),
+            targets,
+            name,
+            note,
         );
-        return create_opencode_backup(data_dir, PathBuf::from(backup_dir), targets, name, note);
+    }
+    if provider_name == PROVIDER_CURSOR {
+        return create_cursor_backup(
+            dirs.cursor_path(),
+            PathBuf::from(backup_dir),
+            targets,
+            name,
+            note,
+        );
     }
 
     let codex = PathBuf::from(&codex_dir);
@@ -753,6 +793,113 @@ fn create_opencode_backup(
     summarize_backup(&final_path)
 }
 
+/// Cursor 备份：每个会话一份自包含的 JSON 快照。
+///
+/// 不能拷 `state.vscdb`——那个文件里还有登录态和全部工作区状态，而且实测有 8 GB。
+fn create_cursor_backup(
+    cursor_dir: PathBuf,
+    backup_root: PathBuf,
+    targets: Vec<BundleExportTarget>,
+    name: Option<String>,
+    note: Option<String>,
+) -> AppResult<BackupSummary> {
+    fs::create_dir_all(&backup_root)?;
+    let final_name = name
+        .map(|n| n.trim().to_string())
+        .unwrap_or_else(|| format!("backup-{}", chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S")));
+    validate_backup_name(&final_name)?;
+    let tmp = backup_root.join(format!(".{}.partial", final_name));
+    let final_path = backup_root.join(&final_name);
+    path_safety::validate_descendant(
+        &backup_root,
+        &tmp,
+        EntryKind::Directory,
+        true,
+        "备份临时目录",
+    )?;
+    path_safety::validate_descendant(
+        &backup_root,
+        &final_path,
+        EntryKind::Directory,
+        true,
+        "备份目标目录",
+    )?;
+    if final_path.exists() {
+        return Err(AppError::Other(format!("备份目录已存在: {final_name}")));
+    }
+    if tmp.exists() {
+        return Err(AppError::Other(format!(
+            "存在未完成的临时备份目录，请先检查或移除: {}",
+            tmp.to_string_lossy()
+        )));
+    }
+
+    let sessions = crate::cursor_sessions::list_sessions(
+        &cursor_dir,
+        &crate::paths::default_cursor_agent_dir(),
+    )?
+    .into_iter()
+    .map(|session| (session.id.clone(), session))
+    .collect::<HashMap<_, _>>();
+    let mut manifest = Manifest {
+        version: 5,
+        provider: Some(PROVIDER_CURSOR.to_string()),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+        codex_dir: String::new(),
+        claude_dir: None,
+        opencode_dir: None,
+        note,
+        artifacts: Vec::new(),
+        sessions: Vec::new(),
+    };
+    for target in targets {
+        let summary = sessions
+            .get(&target.id)
+            .ok_or_else(|| AppError::NotFound(format!("Cursor 会话不存在: {}", target.id)))?;
+        if !summary.resume_command.is_empty() {
+            return Err(AppError::Other(format!(
+                "cursor-agent 会话暂不支持备份: {}",
+                target.id
+            )));
+        }
+        let snapshot = crate::cursor_transfer::export_snapshot(&cursor_dir, &target.id)?;
+        let relative = snapshot_relpath(PROVIDER_CURSOR, &target.id);
+        let destination = tmp.join(&relative);
+        crate::cursor_transfer::write_snapshot(&destination, &snapshot)?;
+        let sha = sha256_file(&destination)?;
+        let bytes = fs::metadata(&destination)?.len();
+        manifest.sessions.push(ManifestSession {
+            provider: Some(PROVIDER_CURSOR.to_string()),
+            id: target.id,
+            rollout_relpath: relative.to_string_lossy().replace('\\', "/"),
+            source_relpath: None,
+            sidecar_relpath: None,
+            sidecar_files: Vec::new(),
+            companions_relpath: None,
+            companion_files: Vec::new(),
+            tasks_relpath: None,
+            task_files: Vec::new(),
+            title: summary.title.clone(),
+            cwd: summary.cwd.clone(),
+            created_at: summary.created_at,
+            updated_at: summary.updated_at,
+            tokens_used: summary.tokens_used,
+            model: summary.model.clone(),
+            bytes_rollout: bytes,
+            logs_count: 0,
+            history_rows: 0,
+            sha256_rollout: sha,
+        });
+    }
+    fs::write(
+        tmp.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
+    fs::rename(&tmp, &final_path)?;
+    summarize_backup(&final_path)
+}
+
 fn normalize_backup_targets(
     ids: &[String],
     targets: Option<Vec<BundleExportTarget>>,
@@ -1040,16 +1187,29 @@ fn validate_claude_source_relpath(raw: &str, id: &str) -> AppResult<PathBuf> {
 }
 
 fn validate_opencode_snapshot_relpath(raw: &str, id: &str) -> AppResult<PathBuf> {
+    validate_snapshot_relpath(PROVIDER_OPENCODE, raw, id)
+}
+
+fn validate_cursor_snapshot_relpath(raw: &str, id: &str) -> AppResult<PathBuf> {
+    validate_snapshot_relpath(PROVIDER_CURSOR, raw, id)
+}
+
+/// 以会话快照 JSON 形式落盘的 provider 共用同一套路径约束。
+fn validate_snapshot_relpath(provider: &str, raw: &str, id: &str) -> AppResult<PathBuf> {
     let relative = paths::checked_relative_path(raw)?;
-    let expected = PathBuf::from(PROVIDER_OPENCODE)
-        .join("sessions")
-        .join(format!("{}.json", paths::sanitize_slug(id)));
+    let expected = snapshot_relpath(provider, id);
     if relative != expected {
         return Err(AppError::Path(format!(
-            "OpenCode 备份快照路径与会话 ID 不匹配: id={id} path={raw}"
+            "{provider} 备份快照路径与会话 ID 不匹配: id={id} path={raw}"
         )));
     }
     Ok(relative)
+}
+
+fn snapshot_relpath(provider: &str, id: &str) -> PathBuf {
+    PathBuf::from(provider)
+        .join("sessions")
+        .join(format!("{}.json", paths::sanitize_slug(id)))
 }
 
 fn validate_manifest_paths(manifest: &Manifest) -> AppResult<()> {
@@ -1083,7 +1243,7 @@ fn validate_manifest_paths(manifest: &Manifest) -> AppResult<()> {
         });
         let expected = match provider {
             PROVIDER_CLAUDE => ["history.jsonl"].into_iter().collect::<HashSet<_>>(),
-            PROVIDER_OPENCODE => HashSet::new(),
+            PROVIDER_OPENCODE | PROVIDER_CURSOR => HashSet::new(),
             _ => ["history.jsonl", "logs.ndjson", "threads.json"]
                 .into_iter()
                 .collect::<HashSet<_>>(),
@@ -1204,15 +1364,16 @@ fn validate_manifest_paths(manifest: &Manifest) -> AppResult<()> {
                     }
                 }
             }
-            PROVIDER_OPENCODE => {
-                validate_opencode_snapshot_relpath(&session.rollout_relpath, &session.id)?;
+            // 这两个 provider 都以单份 JSON 快照落盘，不该带任何文件型附属资产。
+            PROVIDER_OPENCODE | PROVIDER_CURSOR => {
+                validate_snapshot_relpath(provider, &session.rollout_relpath, &session.id)?;
                 if session.source_relpath.is_some()
                     || session.sidecar_relpath.is_some()
                     || session.companions_relpath.is_some()
                     || session.tasks_relpath.is_some()
                 {
                     return Err(AppError::Path(format!(
-                        "OpenCode 备份不应声明文件型附属资产: {}",
+                        "{provider} 备份不应声明文件型附属资产: {}",
                         session.id
                     )));
                 }
@@ -1228,6 +1389,9 @@ fn validate_manifest_paths(manifest: &Manifest) -> AppResult<()> {
 fn verify_rollout_identity(source: &Path, expected_id: &str, provider: &str) -> AppResult<()> {
     if provider == PROVIDER_OPENCODE {
         return crate::opencode_transfer::verify_snapshot_file(source, expected_id);
+    }
+    if provider == PROVIDER_CURSOR {
+        return crate::cursor_transfer::verify_snapshot_file(source, expected_id);
     }
     if provider == PROVIDER_CODEX {
         let brief = crate::repair::read_rollout_brief(source.parent().unwrap_or(source), source)?
@@ -1655,15 +1819,36 @@ pub fn restore_session_with_opencode(
     backup_rollout_relpath: Option<String>,
     overwrite: bool,
 ) -> AppResult<RestoreResult> {
+    restore_session_with_dirs(
+        provider,
+        backup_dir,
+        backup_path,
+        ProviderDirs {
+            codex_dir,
+            claude_dir,
+            opencode_dir,
+            ..ProviderDirs::default()
+        },
+        id,
+        backup_rollout_relpath,
+        overwrite,
+    )
+}
+
+pub fn restore_session_with_dirs(
+    provider: Option<String>,
+    backup_dir: String,
+    backup_path: String,
+    dirs: ProviderDirs,
+    id: String,
+    backup_rollout_relpath: Option<String>,
+    overwrite: bool,
+) -> AppResult<RestoreResult> {
     let backup = validated_backup_path(Path::new(&backup_dir), Path::new(&backup_path))?;
-    let codex = PathBuf::from(&codex_dir);
-    let claude = PathBuf::from(
-        claude_dir.unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
-    );
-    let opencode = PathBuf::from(
-        opencode_dir
-            .unwrap_or_else(|| paths::default_opencode_dir().to_string_lossy().into_owned()),
-    );
+    let codex = dirs.codex_path();
+    let claude = dirs.claude_path();
+    let opencode = dirs.opencode_path();
+    let cursor = dirs.cursor_path();
     let manifest = load_backup_manifest(&backup)?;
     validate_backup_payload(&backup, &manifest, RolloutPresence::Required)?;
     let matches = manifest
@@ -1710,6 +1895,7 @@ pub fn restore_session_with_opencode(
     match provider {
         PROVIDER_CLAUDE => restore_one_claude(&backup, &claude, target, overwrite),
         PROVIDER_OPENCODE => restore_one_opencode(&backup, &opencode, target, overwrite),
+        PROVIDER_CURSOR => restore_one_cursor(&backup, &cursor, target, overwrite),
         _ => restore_one(&backup, &codex, target, overwrite),
     }
 }
@@ -1719,22 +1905,18 @@ pub fn restore_session_with_lock(
     provider: Option<String>,
     backup_dir: String,
     backup_path: String,
-    codex_dir: String,
-    claude_dir: Option<String>,
-    opencode_dir: Option<String>,
+    dirs: ProviderDirs,
     id: String,
     backup_rollout_relpath: Option<String>,
     overwrite: bool,
     lock: &crate::family::FamilyLock,
 ) -> AppResult<RestoreResult> {
     crate::family::with_lock(lock, |_guard| {
-        restore_session_with_opencode(
+        restore_session_with_dirs(
             provider,
             backup_dir,
             backup_path,
-            codex_dir,
-            claude_dir,
-            opencode_dir,
+            dirs,
             id,
             backup_rollout_relpath,
             overwrite,
@@ -1770,15 +1952,32 @@ pub fn restore_all_with_opencode(
     opencode_dir: Option<String>,
     overwrite: bool,
 ) -> AppResult<Vec<RestoreResult>> {
+    restore_all_with_dirs(
+        provider,
+        backup_dir,
+        backup_path,
+        ProviderDirs {
+            codex_dir,
+            claude_dir,
+            opencode_dir,
+            ..ProviderDirs::default()
+        },
+        overwrite,
+    )
+}
+
+pub fn restore_all_with_dirs(
+    provider: Option<String>,
+    backup_dir: String,
+    backup_path: String,
+    dirs: ProviderDirs,
+    overwrite: bool,
+) -> AppResult<Vec<RestoreResult>> {
     let backup = validated_backup_path(Path::new(&backup_dir), Path::new(&backup_path))?;
-    let codex = PathBuf::from(&codex_dir);
-    let claude = PathBuf::from(
-        claude_dir.unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
-    );
-    let opencode = PathBuf::from(
-        opencode_dir
-            .unwrap_or_else(|| paths::default_opencode_dir().to_string_lossy().into_owned()),
-    );
+    let codex = dirs.codex_path();
+    let claude = dirs.claude_path();
+    let opencode = dirs.opencode_path();
+    let cursor = dirs.cursor_path();
     let manifest = load_backup_manifest(&backup)?;
     validate_backup_payload(&backup, &manifest, RolloutPresence::Required)?;
     if let Some(requested) = provider.as_deref() {
@@ -1801,6 +2000,7 @@ pub fn restore_all_with_opencode(
             (match session_provider {
                 PROVIDER_CLAUDE => restore_one_claude(&backup, &claude, s, overwrite),
                 PROVIDER_OPENCODE => restore_one_opencode(&backup, &opencode, s, overwrite),
+                PROVIDER_CURSOR => restore_one_cursor(&backup, &cursor, s, overwrite),
                 _ => restore_one(&backup, &codex, s, overwrite),
             })
             .unwrap_or_else(|e| RestoreResult {
@@ -1823,22 +2023,12 @@ pub fn restore_all_with_lock(
     provider: Option<String>,
     backup_dir: String,
     backup_path: String,
-    codex_dir: String,
-    claude_dir: Option<String>,
-    opencode_dir: Option<String>,
+    dirs: ProviderDirs,
     overwrite: bool,
     lock: &crate::family::FamilyLock,
 ) -> AppResult<Vec<RestoreResult>> {
     crate::family::with_lock(lock, |_guard| {
-        restore_all_with_opencode(
-            provider,
-            backup_dir,
-            backup_path,
-            codex_dir,
-            claude_dir,
-            opencode_dir,
-            overwrite,
-        )
+        restore_all_with_dirs(provider, backup_dir, backup_path, dirs, overwrite)
     })
 }
 
@@ -2023,6 +2213,37 @@ fn restore_one_opencode(
     if !outcome.written {
         result.conflict = true;
         result.error = outcome.skipped_reason;
+        return Ok(result);
+    }
+    result.rollout_copied = true;
+    result.threads_inserted = true;
+    result.ok = true;
+    Ok(result)
+}
+
+fn restore_one_cursor(
+    backup: &Path,
+    cursor_dir: &Path,
+    target: &ManifestSession,
+    overwrite: bool,
+) -> AppResult<RestoreResult> {
+    let mut result = RestoreResult {
+        id: target.id.clone(),
+        ok: false,
+        threads_inserted: false,
+        logs_inserted: 0,
+        history_appended: 0,
+        rollout_copied: false,
+        conflict: false,
+        error: None,
+    };
+    let relative = validate_cursor_snapshot_relpath(&target.rollout_relpath, &target.id)?;
+    let source = backup.join(relative);
+    verify_restore_source(backup, &source, target, PROVIDER_CURSOR)?;
+    let snapshot = crate::cursor_transfer::read_snapshot(&source, &target.id)?;
+    if !crate::cursor_transfer::import_snapshot(cursor_dir, &snapshot, overwrite)? {
+        result.conflict = true;
+        result.error = Some("目标库中已存在同 ID 会话".into());
         return Ok(result);
     }
     result.rollout_copied = true;
@@ -2619,9 +2840,7 @@ mod tests {
                 None,
                 "missing-backup-root".into(),
                 "missing-backup".into(),
-                "missing-codex".into(),
-                None,
-                None,
+                ProviderDirs::new("missing-codex".into()),
                 "missing-session".into(),
                 None,
                 false,
@@ -2633,9 +2852,7 @@ mod tests {
                 None,
                 "missing-backup-root".into(),
                 "missing-backup".into(),
-                "missing-codex".into(),
-                None,
-                None,
+                ProviderDirs::new("missing-codex".into()),
                 false,
                 &lock,
             )
