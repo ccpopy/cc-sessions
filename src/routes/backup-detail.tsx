@@ -323,6 +323,7 @@ export default function BackupDetailRoute({ provider = "codex" }: { provider?: S
             codex_dir: settings.codex_dir,
             claude_dir: settings.claude_dir,
             opencode_dir: settings.opencode_dir,
+            cursor_dir: settings.cursor_dir,
             id: restoreTarget.id,
             backup_rollout_relpath: restoreTarget.rollout_relpath,
             overwrite: overwrite === "overwrite",

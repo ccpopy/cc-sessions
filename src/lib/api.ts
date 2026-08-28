@@ -42,17 +42,22 @@ function resumeCommandText(provider: SessionProvider, sessionId: string, cwd?: s
     }
     case "opencode":
       return `opencode --session ${sessionId}`;
+    // Cursor 的 IDE 会话只能在 Cursor 里打开；cursor-agent 会话可以续聊，
+    // 但从 (provider, id) 分辨不出是哪一种，命令由后端逐会话给在 resume_command 上。
+    case "cursor":
+      return "";
   }
 }
 
 export type CoreSessionProvider = "codex" | "claude";
-export type SessionProvider = CoreSessionProvider | "opencode";
+export type SessionProvider = CoreSessionProvider | "opencode" | "cursor";
 export type StatsProvider = "all" | SessionProvider;
 
 export type Settings = {
   codex_dir: string;
   claude_dir: string;
   opencode_dir: string;
+  cursor_dir: string;
   backup_dir: string;
   open_command: string;
   refresh_interval_ms: number;
@@ -66,6 +71,50 @@ export type DirValidation = {
   has_state_db: boolean;
   has_sessions: boolean;
   threads_count: number;
+};
+
+export type CursorResidueSample = {
+  id: string;
+  title: string;
+  cwd: string;
+  bubbles: number;
+};
+
+export type CursorResidueGroup = {
+  kind: "empty_sessions" | "orphan_records" | "missing_project" | string;
+  label: string;
+  description: string;
+  sessions: number;
+  rows: number;
+  bytes: number;
+  /** 为 true 表示删除会丢失真实对话，界面上必须额外确认。 */
+  destructive: boolean;
+  samples: CursorResidueSample[];
+};
+
+export type CursorResidueReport = {
+  database_path: string;
+  database_bytes: number;
+  header_rows: number;
+  visible_sessions: number;
+  groups: CursorResidueGroup[];
+};
+
+export type CursorPruneReport = {
+  database_path: string;
+  dry_run: boolean;
+  removed_header_rows: number;
+  removed_kv_rows: number;
+  freed_bytes: number;
+  kinds: string[];
+  /** 内容块可达性扫描读不出来的行数；不为 0 时那一类被整体跳过。 */
+  blob_scan_errors: number;
+};
+
+export type CursorCompactReport = {
+  bytes_before: number;
+  bytes_after: number;
+  bytes_reclaimed: number;
 };
 
 export type AppUpdateInfo = {
@@ -909,21 +958,24 @@ export const api = {
   defaultCodexDir: () => invokeCommand<string>("default_codex_dir"),
   defaultClaudeDir: () => invokeCommand<string>("default_claude_dir"),
   defaultOpenCodeDir: () => invokeCommand<string>("default_opencode_dir"),
+  defaultCursorDir: () => invokeCommand<string>("default_cursor_dir"),
   validateCodexDir: (path: string) => invokeCommand<DirValidation>("validate_codex_dir", { path }),
   validateClaudeDir: (path: string) => invokeCommand<DirValidation>("validate_claude_dir", { path }),
   validateOpenCodeDir: (path: string) => invokeCommand<DirValidation>("validate_opencode_dir", { path }),
+  validateCursorDir: (path: string) => invokeCommand<DirValidation>("validate_cursor_dir", { path }),
 
-  listSessions: (provider: SessionProvider, codexDir: string, claudeDir?: string, opencodeDir?: string) =>
-    invokeCommand<SessionSummary[]>("list_sessions", { provider, codexDir, claudeDir, opencodeDir }),
-  groupByProject: (provider: SessionProvider, codexDir: string, claudeDir?: string, opencodeDir?: string) =>
-    invokeCommand<ProjectGroup[]>("group_sessions_by_project", { provider, codexDir, claudeDir, opencodeDir }),
-  searchSessions: (provider: SessionProvider, codexDir: string, claudeDir: string | undefined, opencodeDir: string | undefined, query: string) =>
-    invokeCommand<SessionSummary[]>("search_sessions", { provider, codexDir, claudeDir, opencodeDir, query }),
+  listSessions: (provider: SessionProvider, codexDir: string, claudeDir?: string, opencodeDir?: string, cursorDir?: string) =>
+    invokeCommand<SessionSummary[]>("list_sessions", { provider, codexDir, claudeDir, opencodeDir, cursorDir }),
+  groupByProject: (provider: SessionProvider, codexDir: string, claudeDir?: string, opencodeDir?: string, cursorDir?: string) =>
+    invokeCommand<ProjectGroup[]>("group_sessions_by_project", { provider, codexDir, claudeDir, opencodeDir, cursorDir }),
+  searchSessions: (provider: SessionProvider, codexDir: string, claudeDir: string | undefined, opencodeDir: string | undefined, cursorDir: string | undefined, query: string) =>
+    invokeCommand<SessionSummary[]>("search_sessions", { provider, codexDir, claudeDir, opencodeDir, cursorDir, query }),
   startContentSearch: (p: {
     provider: SessionProvider;
     codexDir: string;
     claudeDir: string;
     opencodeDir: string;
+    cursorDir: string;
     query: string;
     rolloutPaths: readonly string[];
   }) => invokeCommand<{ job_id: number }>("start_content_search", p),
@@ -933,13 +985,32 @@ export const api = {
     invokeCommand<{ job_id: number } | null>("active_content_search"),
   cancelContentSearch: (jobId: number) =>
     invokeCommand<void>("cancel_content_search", { jobId }),
-  setArchived: (provider: SessionProvider, codexDir: string, id: string, v: boolean, opencodeDir?: string) =>
-    invokeCommand<void>("set_archived", { provider, codexDir, id, v, opencodeDir }),
+  setArchived: (provider: SessionProvider, codexDir: string, id: string, v: boolean, opencodeDir?: string, cursorDir?: string) =>
+    invokeCommand<void>("set_archived", { provider, codexDir, id, v, opencodeDir, cursorDir }),
+  /** 扫描 Cursor 数据库里的空会话、孤儿记录与项目目录已消失的会话。 */
+  diagnoseCursorResidue: (codexDir: string, cursorDir?: string) =>
+    invokeCommand<CursorResidueReport>("diagnose_cursor_residue", { codexDir, cursorDir }),
+  pruneCursorResidue: (p: {
+    codex_dir: string;
+    cursor_dir?: string;
+    kinds: string[];
+    dry_run: boolean;
+  }) =>
+    invokeCommand<CursorPruneReport>("prune_cursor_residue", {
+      codexDir: p.codex_dir,
+      cursorDir: p.cursor_dir,
+      kinds: p.kinds,
+      dryRun: p.dry_run,
+    }),
+  /** 回收 Cursor 数据库中删除留下的空页；库可能有数 GB，耗时较长。 */
+  compactCursorDatabase: (codexDir: string, cursorDir?: string) =>
+    invokeCommand<CursorCompactReport>("compact_cursor_database", { codexDir, cursorDir }),
   renameSession: (p: {
     provider: SessionProvider;
     codex_dir: string;
     claude_dir?: string;
     opencode_dir?: string;
+    cursor_dir?: string;
     id: string;
     rollout_path?: string;
     title: string;
@@ -948,6 +1019,7 @@ export const api = {
     codexDir: p.codex_dir,
     claudeDir: p.claude_dir,
     opencodeDir: p.opencode_dir,
+    cursorDir: p.cursor_dir,
     id: p.id,
     rolloutPath: p.rollout_path,
     title: p.title,
@@ -978,7 +1050,8 @@ export const api = {
     claudeDir?: string,
     target?: DeleteTarget,
     opencodeDir?: string,
-  ) => invokeCommand<DeleteResult>("delete_session", { provider, codexDir, claudeDir, opencodeDir, id, target }),
+    cursorDir?: string,
+  ) => invokeCommand<DeleteResult>("delete_session", { provider, codexDir, claudeDir, opencodeDir, cursorDir, id, target }),
   deleteSessions: (
     provider: SessionProvider,
     codexDir: string,
@@ -986,12 +1059,14 @@ export const api = {
     claudeDir?: string,
     targets?: DeleteTarget[],
     opencodeDir?: string,
+    cursorDir?: string,
   ) =>
     invokeCommand<DeleteResult[]>("delete_sessions", {
       provider,
       codexDir,
       claudeDir,
       opencodeDir,
+      cursorDir,
       ids,
       targets,
     }),
@@ -1077,6 +1152,7 @@ export const api = {
     codex_dir: string;
     claude_dir?: string;
     opencode_dir?: string;
+    cursor_dir?: string;
     backup_dir: string;
     ids: string[];
     targets?: BundleExportTarget[];
@@ -1088,6 +1164,7 @@ export const api = {
       codexDir: p.codex_dir,
       claudeDir: p.claude_dir,
       opencodeDir: p.opencode_dir,
+      cursorDir: p.cursor_dir,
       backupDir: p.backup_dir,
       ids: p.ids,
       targets: p.targets,
@@ -1105,6 +1182,7 @@ export const api = {
     codex_dir: string;
     claude_dir?: string;
     opencode_dir?: string;
+    cursor_dir?: string;
     id: string;
     backup_rollout_relpath?: string;
     overwrite: boolean;
@@ -1116,6 +1194,7 @@ export const api = {
       codexDir: p.codex_dir,
       claudeDir: p.claude_dir,
       opencodeDir: p.opencode_dir,
+      cursorDir: p.cursor_dir,
       id: p.id,
       backupRolloutRelpath: p.backup_rollout_relpath,
       overwrite: p.overwrite,
@@ -1127,6 +1206,7 @@ export const api = {
     codex_dir: string;
     claude_dir?: string;
     opencode_dir?: string;
+    cursor_dir?: string;
     overwrite: boolean;
   }) =>
     invokeCommand<RestoreResult[]>("restore_all", {
@@ -1136,6 +1216,7 @@ export const api = {
       codexDir: p.codex_dir,
       claudeDir: p.claude_dir,
       opencodeDir: p.opencode_dir,
+      cursorDir: p.cursor_dir,
       overwrite: p.overwrite,
     }),
   deleteBackup: (backupDir: string, backupPath: string) =>
@@ -1148,6 +1229,7 @@ export const api = {
     codex_dir: string;
     claude_dir?: string;
     opencode_dir?: string;
+    cursor_dir?: string;
     from_ts: number | null;
     to_ts: number | null;
     bucket: "day" | "week";
@@ -1160,6 +1242,7 @@ export const api = {
       codexDir: p.codex_dir,
       claudeDir: p.claude_dir,
       opencodeDir: p.opencode_dir,
+      cursorDir: p.cursor_dir,
       fromTs: p.from_ts,
       toTs: p.to_ts,
       bucket: p.bucket,
@@ -1169,13 +1252,32 @@ export const api = {
     }),
 
   revealCwd: (cwd: string) => invokeCommand<void>("reveal_cwd", { cwd }),
-  copyResumeCommand: async (provider: SessionProvider, sessionId: string, cwd?: string) => {
+  /**
+   * 复制续聊命令。
+   *
+   * `precomputed` 是后端随会话给出的命令：Cursor 只有 cursor-agent 会话能续聊，
+   * 光靠 provider 推不出来，必须用会话自己带的那一条。
+   */
+  copyResumeCommand: async (
+    provider: SessionProvider,
+    sessionId: string,
+    cwd?: string,
+    precomputed?: string,
+  ) => {
+    const explicit = precomputed?.trim();
+    if (explicit) {
+      await copyText(explicit);
+      return explicit;
+    }
     if (isWebRuntime()) {
       const text = resumeCommandText(provider, sessionId, cwd);
+      if (!text) throw new Error("该会话没有可续聊的命令行入口");
       await copyText(text);
       return text;
     }
-    return invokeCommand<string>("copy_resume_command", { provider, sessionId, cwd });
+    const text = await invokeCommand<string>("copy_resume_command", { provider, sessionId, cwd });
+    if (!text) throw new Error("该会话没有可续聊的命令行入口");
+    return text;
   },
 
   // ========================= 修复 =========================
@@ -1234,14 +1336,19 @@ export const api = {
   convertSessionProvider: (p: {
     codex_dir: string;
     claude_dir: string;
+    cursor_dir?: string;
     source_provider: SessionProvider;
+    /** Cursor 两个方向都能去，必须显式指定；Codex 与 Claude 各自只有一个目标。 */
+    target_provider?: CoreSessionProvider;
     rollout_path: string;
     conversion_mode?: SessionConversionMode;
   }) =>
     invokeCommand<ConvertReport>("convert_session_provider", {
       codexDir: p.codex_dir,
       claudeDir: p.claude_dir,
+      cursorDir: p.cursor_dir,
       sourceProvider: p.source_provider,
+      targetProvider: p.target_provider ?? null,
       rolloutPath: p.rollout_path,
       conversionMode: p.conversion_mode ?? null,
     }),
@@ -1438,6 +1545,7 @@ export const api = {
     codex_dir: string;
     claude_dir?: string;
     opencode_dir?: string;
+    cursor_dir?: string;
     out_dir: string;
     ids: string[];
     targets?: BundleExportTarget[];
@@ -1449,6 +1557,7 @@ export const api = {
       codexDir: p.codex_dir,
       claudeDir: p.claude_dir,
       opencodeDir: p.opencode_dir,
+      cursorDir: p.cursor_dir,
       outDir: p.out_dir,
       ids: p.ids,
       targets: p.targets,
@@ -1460,6 +1569,7 @@ export const api = {
     codex_dir: string;
     claude_dir?: string;
     opencode_dir?: string;
+    cursor_dir?: string;
     out_dir: string;
     machine_label?: string;
     export_group?: string;
@@ -1470,6 +1580,7 @@ export const api = {
       codexDir: p.codex_dir,
       claudeDir: p.claude_dir,
       opencodeDir: p.opencode_dir,
+      cursorDir: p.cursor_dir,
       outDir: p.out_dir,
       machineLabel: p.machine_label,
       exportGroup: p.export_group,
@@ -1485,6 +1596,7 @@ export const api = {
     codex_dir: string;
     claude_dir?: string;
     opencode_dir?: string;
+    cursor_dir?: string;
     mode: ImportMode;
     make_visible: boolean;
     strict: boolean;
@@ -1496,6 +1608,7 @@ export const api = {
       codexDir: p.codex_dir,
       claudeDir: p.claude_dir,
       opencodeDir: p.opencode_dir,
+      cursorDir: p.cursor_dir,
       mode: p.mode,
       makeVisible: p.make_visible,
       strict: p.strict,

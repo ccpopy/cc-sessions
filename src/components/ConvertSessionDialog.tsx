@@ -14,6 +14,7 @@ import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import {
   api,
   type ConvertReport,
+  type CoreSessionProvider,
   type SessionConversionMode,
   type SessionSummary,
 } from "@/lib/api";
@@ -32,22 +33,37 @@ export function ConvertSessionDialog({ target, onOpenChange, onDone }: Props) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [conversionMode, setConversionMode] = useState<SessionConversionMode>("simple");
+  // Cursor 只出不进，两个目标都可选；Codex 与 Claude 各自只有一个可能的目标。
+  const isCursorSource = target?.provider === "cursor";
+  const [targetProvider, setTargetProvider] = useState<CoreSessionProvider>("claude");
+  const effectiveTarget: CoreSessionProvider = isCursorSource
+    ? targetProvider
+    : target?.provider === "codex"
+      ? "claude"
+      : "codex";
 
-  const targetProviderLabel = target?.provider === "codex" ? "Claude Code" : "Codex";
-  const sourceProviderLabel = target?.provider === "codex" ? "Codex" : "Claude Code";
-  const nativeModeLabel = target?.provider === "codex" ? "原生Claude（实验）" : "原生Codex（实验）";
+  const providerLabels: Record<string, string> = {
+    codex: "Codex",
+    claude: "Claude Code",
+    cursor: "Cursor",
+  };
+  const targetProviderLabel = providerLabels[effectiveTarget];
+  const sourceProviderLabel = providerLabels[target?.provider ?? ""] ?? "会话";
+  const nativeModeLabel =
+    effectiveTarget === "claude" ? "原生Claude（实验）" : "原生Codex（实验）";
   const simpleModeDescription =
-    target?.provider === "codex"
+    effectiveTarget === "claude"
       ? "只保留真实用户消息和每轮最终答复，不依赖 Claude 的工具事件格式。"
       : "保留可见对话，工具调用和结果转为文本注记，不依赖 Codex 的工具事件格式。";
   const nativeModeDescription =
-    target?.provider === "codex"
+    effectiveTarget === "claude"
       ? "保留过程回复，配对完整的工具事件转为 Claude tool_use/tool_result。"
       : "保留过程回复和图片，配对完整的工具事件转为 Codex function_call/function_call_output。";
 
   useEffect(() => {
     if (!target) return;
     setConversionMode("simple");
+    setTargetProvider("claude");
     setErr(null);
   }, [target?.rollout_path]);
 
@@ -59,7 +75,9 @@ export function ConvertSessionDialog({ target, onOpenChange, onDone }: Props) {
       const report = await api.convertSessionProvider({
         codex_dir: settings.codex_dir,
         claude_dir: settings.claude_dir,
+        cursor_dir: settings.cursor_dir,
         source_provider: target.provider,
+        target_provider: effectiveTarget,
         rollout_path: target.rollout_path,
         conversion_mode: conversionMode,
       });
@@ -106,6 +124,30 @@ export function ConvertSessionDialog({ target, onOpenChange, onDone }: Props) {
             」转换为新的 {targetProviderLabel} 会话。
           </DialogDescription>
         </DialogHeader>
+
+        {isCursorSource && (
+          <div className="space-y-2">
+            <span className="text-sm font-medium text-foreground">转换目标</span>
+            <RadioGroup
+              value={targetProvider}
+              onValueChange={(value) => setTargetProvider(value as CoreSessionProvider)}
+              className="flex gap-2"
+            >
+              {(["claude", "codex"] as const).map((value) => (
+                <Label
+                  key={value}
+                  htmlFor={`convert-to-${value}`}
+                  className="flex flex-1 cursor-pointer items-center gap-2 rounded-md border bg-muted/30 p-3"
+                >
+                  <RadioGroupItem id={`convert-to-${value}`} value={value} />
+                  <span className="text-sm font-medium text-foreground">
+                    {providerLabels[value]}
+                  </span>
+                </Label>
+              ))}
+            </RadioGroup>
+          </div>
+        )}
 
         <RadioGroup
           value={conversionMode}

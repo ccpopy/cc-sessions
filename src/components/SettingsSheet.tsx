@@ -44,10 +44,12 @@ export function SettingsSheet({ trigger }: Props) {
   const [codex, setCodex] = useState("");
   const [claude, setClaude] = useState("");
   const [opencode, setOpenCode] = useState("");
+  const [cursor, setCursor] = useState("");
   const [backup, setBackup] = useState("");
   const [codexValidation, setCodexValidation] = useState<DirValidation | null>(null);
   const [claudeValidation, setClaudeValidation] = useState<DirValidation | null>(null);
   const [opencodeValidation, setOpenCodeValidation] = useState<DirValidation | null>(null);
+  const [cursorValidation, setCursorValidation] = useState<DirValidation | null>(null);
   const [updateState, setUpdateState] = useState<UpdateCheckResult>({ state: "idle" });
   const [currentVersion, setCurrentVersion] = useState("");
   const [currentVersionError, setCurrentVersionError] = useState("");
@@ -58,6 +60,7 @@ export function SettingsSheet({ trigger }: Props) {
     setCodex(settings.codex_dir);
     setClaude(settings.claude_dir);
     setOpenCode(settings.opencode_dir);
+    setCursor(settings.cursor_dir);
     setBackup(settings.backup_dir);
   }, [settings]);
 
@@ -111,6 +114,18 @@ export function SettingsSheet({ trigger }: Props) {
     return () => window.clearTimeout(id);
   }, [opencode]);
 
+  useEffect(() => {
+    if (!cursor) return;
+    const id = window.setTimeout(async () => {
+      try {
+        setCursorValidation(await api.validateCursorDir(cursor));
+      } catch {
+        setCursorValidation(null);
+      }
+    }, 200);
+    return () => window.clearTimeout(id);
+  }, [cursor]);
+
   const pick = async (setter: (s: string) => void, cur: string) => {
     const picked = await pickDirectoryPath({ defaultPath: cur });
     if (picked) setter(picked);
@@ -128,8 +143,18 @@ export function SettingsSheet({ trigger }: Props) {
     setOpenCode(await api.defaultOpenCodeDir());
   };
 
+  const restoreCursorDefault = async () => {
+    setCursor(await api.defaultCursorDir());
+  };
+
   const persistSettings = async () => {
-    await save({ codex_dir: codex, claude_dir: claude, opencode_dir: opencode, backup_dir: backup });
+    await save({
+      codex_dir: codex,
+      claude_dir: claude,
+      opencode_dir: opencode,
+      cursor_dir: cursor,
+      backup_dir: backup,
+    });
     toast.success("设置已保存");
     await load();
   };
@@ -235,6 +260,18 @@ export function SettingsSheet({ trigger }: Props) {
             <ValidationBadge v={opencodeValidation} provider="opencode" />
           </DirField>
 
+          <Separator />
+
+          <DirField
+            label="Cursor 用户数据目录"
+            value={cursor}
+            onChange={setCursor}
+            placeholder={"C:\\Users\\<me>\\AppData\\Roaming\\Cursor\\User"}
+            onPick={() => pick(setCursor, cursor)}
+            onRestoreDefault={restoreCursorDefault}
+          >
+            <ValidationBadge v={cursorValidation} provider="cursor" />
+          </DirField>
           <Separator />
 
           <DirField
@@ -463,7 +500,13 @@ function UpdateStatus({
   );
 }
 
-function ValidationBadge({ v, provider }: { v: DirValidation | null; provider: "codex" | "claude" | "opencode" }) {
+function ValidationBadge({
+  v,
+  provider,
+}: {
+  v: DirValidation | null;
+  provider: "codex" | "claude" | "opencode" | "cursor";
+}) {
   if (!v) return null;
   if (v.valid) {
     return (
@@ -476,6 +519,7 @@ function ValidationBadge({ v, provider }: { v: DirValidation | null; provider: "
   const reasons: string[] = [];
   if (provider === "codex" && !v.has_state_db) reasons.push("缺 state_5.sqlite");
   if (provider === "opencode" && !v.has_state_db) reasons.push("缺 opencode.db");
+  if (provider === "cursor" && !v.has_state_db) reasons.push("缺 state.vscdb");
   if (!v.has_sessions) {
     reasons.push(provider === "codex" ? "缺 sessions/" : provider === "claude" ? "缺 projects/" : "数据库不可用");
   }

@@ -9,6 +9,8 @@ pub struct Settings {
     pub claude_dir: String,
     #[serde(default = "default_opencode_dir")]
     pub opencode_dir: String,
+    #[serde(default = "default_cursor_dir")]
+    pub cursor_dir: String,
     pub backup_dir: String,
     #[serde(default = "default_open_cmd")]
     pub open_command: String,
@@ -37,6 +39,12 @@ fn default_opencode_dir() -> String {
         .into_owned()
 }
 
+fn default_cursor_dir() -> String {
+    crate::paths::default_cursor_dir()
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn default_refresh_ms() -> u64 {
     5000
 }
@@ -46,11 +54,13 @@ impl Default for Settings {
         let codex = crate::paths::default_codex_dir();
         let claude = crate::paths::default_claude_dir();
         let opencode = crate::paths::default_opencode_dir();
+        let cursor = crate::paths::default_cursor_dir();
         let backup = crate::paths::default_backup_dir();
         Self {
             codex_dir: codex.to_string_lossy().into_owned(),
             claude_dir: claude.to_string_lossy().into_owned(),
             opencode_dir: opencode.to_string_lossy().into_owned(),
+            cursor_dir: cursor.to_string_lossy().into_owned(),
             backup_dir: backup.to_string_lossy().into_owned(),
             open_command: "auto".into(),
             refresh_interval_ms: 5000,
@@ -58,6 +68,66 @@ impl Default for Settings {
             preview_collapse_process: true,
         }
     }
+}
+
+/// 各 provider 的数据目录。
+///
+/// provider 每多一个，逐个透传目录就会让 `*_with_opencode` 这类函数变体组合爆炸。
+/// 统一收进一个结构体后，再加 provider 只需要多一个字段，调用点签名不必再改。
+/// 字段为 `None` 表示"用该 provider 的默认目录"。
+#[derive(Debug, Clone, Default)]
+pub struct ProviderDirs {
+    pub codex_dir: String,
+    pub claude_dir: Option<String>,
+    pub opencode_dir: Option<String>,
+    pub cursor_dir: Option<String>,
+    /// cursor-agent 的家目录。不在设置页暴露（一个 Cursor 目录已经够用），
+    /// 但必须可覆盖：否则任何走到 Cursor 分支的代码都会读到本机真实的 `~/.cursor`。
+    pub cursor_agent_dir: Option<String>,
+}
+
+impl ProviderDirs {
+    pub fn new(codex_dir: String) -> Self {
+        Self {
+            codex_dir,
+            ..Self::default()
+        }
+    }
+
+    pub fn codex_path(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from(&self.codex_dir)
+    }
+
+    pub fn claude_path(&self) -> std::path::PathBuf {
+        resolve(&self.claude_dir, crate::paths::default_claude_dir)
+    }
+
+    pub fn opencode_path(&self) -> std::path::PathBuf {
+        resolve(&self.opencode_dir, crate::paths::default_opencode_dir)
+    }
+
+    pub fn cursor_path(&self) -> std::path::PathBuf {
+        resolve(&self.cursor_dir, crate::paths::default_cursor_dir)
+    }
+
+    pub fn cursor_agent_path(&self) -> std::path::PathBuf {
+        resolve(
+            &self.cursor_agent_dir,
+            crate::paths::default_cursor_agent_dir,
+        )
+    }
+}
+
+fn resolve(
+    configured: &Option<String>,
+    fallback: fn() -> std::path::PathBuf,
+) -> std::path::PathBuf {
+    configured
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(fallback)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -891,6 +961,57 @@ pub struct SetArchiveOriginReport {
     pub origin: ArchiveOrigin,
     /// 是否同时同步了 family 分支的 archive_origin 字段（会话不在任何 family 时为 false）
     pub family_synced: bool,
+}
+
+/// Cursor 数据库里一类可清理的残留。
+#[derive(Debug, Clone, Serialize)]
+pub struct CursorResidueGroup {
+    /// 稳定标识，前端按它决定清理哪几类。
+    pub kind: String,
+    pub label: String,
+    pub description: String,
+    /// 涉及的会话数。
+    pub sessions: u32,
+    /// 涉及的 cursorDiskKV 行数。
+    pub rows: u32,
+    /// 这些行占用的字节数；未统计时为 0。
+    pub bytes: u64,
+    /// 删掉会丢失真实对话内容，前端必须额外确认。
+    pub destructive: bool,
+    /// 少量样例，让用户能判断该不该删。
+    pub samples: Vec<CursorResidueSample>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CursorResidueSample {
+    pub id: String,
+    pub title: String,
+    pub cwd: String,
+    pub bubbles: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CursorResidueReport {
+    pub database_path: String,
+    pub database_bytes: u64,
+    /// `composerHeaders` 总行数。
+    pub header_rows: u32,
+    /// 列表里真正能看到的会话数。
+    pub visible_sessions: u32,
+    pub groups: Vec<CursorResidueGroup>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CursorPruneReport {
+    pub database_path: String,
+    pub dry_run: bool,
+    pub removed_header_rows: u32,
+    pub removed_kv_rows: u32,
+    /// 从库里释放出来的字节数。磁盘占用要另外执行"压缩数据库"才会真正回落。
+    pub freed_bytes: u64,
+    pub kinds: Vec<String>,
+    /// 内容块可达性扫描中读不出来的行数。不为 0 时这一类会被整体跳过，其余照常清理。
+    pub blob_scan_errors: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]

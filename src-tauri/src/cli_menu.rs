@@ -3,7 +3,7 @@ use std::io::{self, Write};
 
 use cc_session_manager_lib::models::{
     BackupSummary, BundleExportTarget, BundleListItem, ConvertReport, DeleteTarget, ExportReport,
-    ImportMode, PreviewEvent, ProjectGroup, SessionSummary, SwitchStrategy,
+    ImportMode, PreviewEvent, ProjectGroup, ProviderDirs, SessionSummary, SwitchStrategy,
 };
 use cc_session_manager_lib::{
     backup, bundle, convert, family, paths, repair, rollout, sessions, settings, stats,
@@ -55,7 +55,20 @@ struct MenuContext {
     codex_dir: String,
     claude_dir: String,
     opencode_dir: String,
+    cursor_dir: String,
     family_lock: family::FamilyLock,
+}
+
+impl MenuContext {
+    fn dirs(&self) -> ProviderDirs {
+        ProviderDirs {
+            codex_dir: self.codex_dir.clone(),
+            claude_dir: Some(self.claude_dir.clone()),
+            opencode_dir: Some(self.opencode_dir.clone()),
+            cursor_dir: Some(self.cursor_dir.clone()),
+            cursor_agent_dir: None,
+        }
+    }
 }
 
 pub fn run(
@@ -63,12 +76,14 @@ pub fn run(
     codex_dir: String,
     claude_dir: String,
     opencode_dir: String,
+    cursor_dir: String,
 ) -> MenuResult<()> {
     let mut ctx = MenuContext {
         provider,
         codex_dir,
         claude_dir,
         opencode_dir,
+        cursor_dir,
         family_lock: family::FamilyLock::default(),
     };
 
@@ -87,29 +102,32 @@ fn main_menu(ctx: &mut MenuContext) -> MenuResult<Flow> {
             ("Codex 目录", ctx.codex_dir.as_str()),
             ("Claude 目录", ctx.claude_dir.as_str()),
             ("OpenCode 目录", ctx.opencode_dir.as_str()),
+            ("Cursor 目录", ctx.cursor_dir.as_str()),
         ],
     );
     println!("1. Codex 会话");
     println!("2. Claude 会话");
     println!("3. OpenCode 会话");
-    println!("4. 统计");
-    println!("5. 备份");
-    println!("6. 导入 / 导出 Bundle");
-    println!("7. 修复 / 诊断");
-    println!("8. 设置与路径检查");
-    println!("9. 帮助");
+    println!("4. Cursor 会话");
+    println!("5. 统计");
+    println!("6. 备份");
+    println!("7. 导入 / 导出 Bundle");
+    println!("8. 修复 / 诊断");
+    println!("9. 设置与路径检查");
+    println!("h. 帮助");
     println!("0. 退出");
 
     match prompt("请选择: ")?.as_str() {
         "1" => run_child(|| sessions_menu(ctx, "codex")),
         "2" => run_child(|| sessions_menu(ctx, "claude")),
         "3" => run_child(|| sessions_menu(ctx, "opencode")),
-        "4" => run_child(|| stats_menu(ctx)),
-        "5" => run_child(|| backup_menu(ctx)),
-        "6" => run_child(|| bundle_menu(ctx)),
-        "7" => run_child(|| repair_menu(ctx)),
-        "8" => run_child(|| settings_menu(ctx)),
-        "9" => {
+        "4" => run_child(|| sessions_menu(ctx, "cursor")),
+        "5" => run_child(|| stats_menu(ctx)),
+        "6" => run_child(|| backup_menu(ctx)),
+        "7" => run_child(|| bundle_menu(ctx)),
+        "8" => run_child(|| repair_menu(ctx)),
+        "9" => run_child(|| settings_menu(ctx)),
+        "h" | "H" => {
             show_interactive_help()?;
             Ok(Flow::Main)
         }
@@ -158,11 +176,9 @@ fn sessions_menu(ctx: &mut MenuContext, provider: &str) -> MenuResult<Flow> {
                 let query = prompt_required("请输入搜索关键词: ")?;
                 let include_archived = confirm_default_no("是否包含已归档会话？")?;
                 let scope = prompt_session_scope(provider)?;
-                let mut hits = sessions::search_sessions_with_opencode(
+                let mut hits = sessions::search_sessions_with_dirs(
                     Some(provider.to_string()),
-                    ctx.codex_dir.clone(),
-                    Some(ctx.claude_dir.clone()),
-                    Some(ctx.opencode_dir.clone()),
+                    ctx.dirs(),
                     query,
                 )
                 .map_err(to_string)?;
@@ -276,13 +292,8 @@ fn refresh_browsed_sessions(
     provider: &str,
     current: &[SessionSummary],
 ) -> MenuResult<Vec<SessionSummary>> {
-    let refreshed = sessions::list_sessions_with_opencode(
-        Some(provider.to_string()),
-        ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
-        Some(ctx.opencode_dir.clone()),
-    )
-    .map_err(to_string)?;
+    let refreshed = sessions::list_sessions_with_dirs(Some(provider.to_string()), ctx.dirs())
+        .map_err(to_string)?;
     let mut refreshed_by_key = refreshed
         .into_iter()
         .map(|session| (session_selection_key(&session), session))
@@ -465,8 +476,8 @@ fn session_action_menu(
     provider: &str,
     session: SessionSummary,
 ) -> MenuResult<SessionActionResult> {
-    if provider == "opencode" {
-        return opencode_session_action_menu(ctx, session);
+    if matches!(provider, "opencode" | "cursor") {
+        return simple_session_action_menu(ctx, provider, session);
     }
     loop {
         let target_provider = conversion_target_provider(provider)?;
@@ -537,13 +548,17 @@ fn session_action_menu(
     }
 }
 
-fn opencode_session_action_menu(
+/// 不支持消息级编辑与格式转换的 provider 共用这一套动作菜单。
+fn simple_session_action_menu(
     ctx: &mut MenuContext,
+    provider: &str,
     session: SessionSummary,
 ) -> MenuResult<SessionActionResult> {
+    // Cursor 的会话记录在它自己的数据库里，改 cwd 需要重写工作区归属，本期不做。
+    let supports_move_cwd = provider != "cursor";
     loop {
         print_header(
-            "OpenCode 会话操作",
+            &format!("{} 会话操作", provider_label(provider)),
             &[
                 ("ID", session.id.as_str()),
                 ("标题", session.title.as_str()),
@@ -554,7 +569,9 @@ fn opencode_session_action_menu(
         println!("2. 查看元信息");
         println!("3. 显示 resume 命令");
         println!("4. 重命名会话");
-        println!("5. 移动会话目录");
+        if supports_move_cwd {
+            println!("5. 移动会话目录");
+        }
         println!("6. 创建备份");
         println!("7. 导出 Bundle");
         println!("8. 归档 / 取消归档");
@@ -564,25 +581,25 @@ fn opencode_session_action_menu(
         println!("0. 退出");
 
         match prompt("请选择: ")?.as_str() {
-            "1" => preview_session("opencode", &session)?,
-            "2" => show_session_meta("opencode", &session)?,
-            "3" => show_resume_command("opencode", &session)?,
+            "1" => preview_session(provider, &session)?,
+            "2" => show_session_meta(provider, &session)?,
+            "3" => show_resume_command(provider, &session)?,
             "4" => {
-                rename_session(ctx, "opencode", &session)?;
+                rename_session(ctx, provider, &session)?;
                 return Ok(SessionActionResult::Refresh);
             }
-            "5" => {
-                move_session_cwd(ctx, "opencode", &session)?;
+            "5" if supports_move_cwd => {
+                move_session_cwd(ctx, provider, &session)?;
                 return Ok(SessionActionResult::Refresh);
             }
-            "6" => create_backup_for_session(ctx, "opencode", &session)?,
-            "7" => export_bundle_for_session(ctx, "opencode", &session)?,
+            "6" => create_backup_for_session(ctx, provider, &session)?,
+            "7" => export_bundle_for_session(ctx, provider, &session)?,
             "8" => {
-                toggle_archived(ctx, "opencode", &session)?;
+                toggle_archived(ctx, provider, &session)?;
                 return Ok(SessionActionResult::Refresh);
             }
             "9" => {
-                delete_session(ctx, "opencode", &session)?;
+                delete_session(ctx, provider, &session)?;
                 return Ok(SessionActionResult::Refresh);
             }
             "10" => return Ok(SessionActionResult::Back),
@@ -602,11 +619,9 @@ fn rename_session(ctx: &MenuContext, provider: &str, session: &SessionSummary) -
         println!("标题未变化。");
         return pause().map(|_| ());
     }
-    sessions::rename_session_with_provider_dirs(
+    sessions::rename_session_with_dirs(
         Some(provider.to_string()),
-        ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
-        Some(ctx.opencode_dir.clone()),
+        ctx.dirs(),
         session.id.clone(),
         Some(session.rollout_path.clone()),
         title,
@@ -874,11 +889,9 @@ fn create_backup_for_session(
     let backup_dir = prompt_default("备份目录", &paths::default_backup_dir().to_string_lossy())?;
     let name = prompt_optional("备份名称（留空自动生成）: ")?;
     let note = prompt_optional("备注（可留空）: ")?;
-    let summary = backup::create_backup_with_opencode(
+    let summary = backup::create_backup_with_dirs(
         Some(provider.to_string()),
-        ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
-        Some(ctx.opencode_dir.clone()),
+        ctx.dirs(),
         backup_dir,
         vec![session.id.clone()],
         Some(vec![BundleExportTarget {
@@ -900,11 +913,9 @@ fn export_bundle_for_session(
     session: &SessionSummary,
 ) -> MenuResult<()> {
     let out_dir = prompt_required("导出目录: ")?;
-    let reports = bundle::export_session_bundles_with_opencode(
+    let reports = bundle::export_session_bundles_with_dirs(
         Some(provider.to_string()),
-        ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
-        Some(ctx.opencode_dir.clone()),
+        ctx.dirs(),
         out_dir,
         vec![session.id.clone()],
         Some(vec![BundleExportTarget {
@@ -1011,16 +1022,19 @@ fn toggle_archived(ctx: &MenuContext, provider: &str, session: &SessionSummary) 
         println!("Claude 会话不支持归档。");
         return pause().map(|_| ());
     }
+    if provider == "cursor" && !session.resume_command.is_empty() {
+        println!("cursor-agent 会话不支持归档（Cursor 本身没有这个状态）。");
+        return pause().map(|_| ());
+    }
     let target = !session.archived;
     let label = if target { "归档" } else { "取消归档" };
     if !confirm_yes(&format!("确认要{label}会话 {} 吗？", session.id))? {
         println!("已取消。");
         return pause().map(|_| ());
     }
-    sessions::set_archived_with_provider_dir(
+    sessions::set_archived_with_dirs(
         Some(provider.to_string()),
-        ctx.codex_dir.clone(),
-        Some(ctx.opencode_dir.clone()),
+        ctx.dirs(),
         session.id.clone(),
         target,
         &ctx.family_lock,
@@ -1042,6 +1056,9 @@ fn delete_session(ctx: &MenuContext, provider: &str, session: &SessionSummary) -
         println!(
             "若这是最后一个同 ID 副本，还会清理 history.jsonl、tasks/<id> 与 file-history/<id>；否则保留这些共享数据。"
         );
+    } else if provider == "cursor" {
+        println!("将从 Cursor 的 state.vscdb 删除该会话的会话头、气泡索引与全部气泡。");
+        println!("注意：删除只释放库内页面，磁盘占用需要单独执行“压缩数据库”才会回收。");
     } else {
         println!("将从 opencode.db 删除该会话、全部子会话及其消息、片段和关联事件。");
     }
@@ -1050,11 +1067,9 @@ fn delete_session(ctx: &MenuContext, provider: &str, session: &SessionSummary) -
         pause()?;
         return Ok(());
     }
-    let result = sessions::delete_session_with_provider_dir(
+    let result = sessions::delete_session_with_dirs(
         Some(provider.to_string()),
-        ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
-        Some(ctx.opencode_dir.clone()),
+        ctx.dirs(),
         session.id.clone(),
         Some(DeleteTarget {
             id: session.id.clone(),
@@ -1135,11 +1150,9 @@ fn delete_selected_sessions(
             rollout_path: Some(session.rollout_path.clone()),
         })
         .collect::<Vec<_>>();
-    let results = sessions::delete_sessions_with_provider_dir(
+    let results = sessions::delete_sessions_with_dirs(
         Some(provider.to_string()),
-        ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
-        Some(ctx.opencode_dir.clone()),
+        ctx.dirs(),
         ids,
         Some(targets),
         &ctx.family_lock,
@@ -1222,17 +1235,8 @@ fn stats_provider(ctx: &MenuContext) -> MenuResult<String> {
 
 fn stats_kpi(ctx: &MenuContext) -> MenuResult<()> {
     let provider = stats_provider(ctx)?;
-    let data = stats::stats_kpi(
-        Some(provider),
-        ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
-        Some(ctx.opencode_dir.clone()),
-        None,
-        None,
-        Vec::new(),
-        false,
-    )
-    .map_err(to_string)?;
+    let data = stats::stats_kpi(Some(provider), ctx.dirs(), None, None, Vec::new(), false)
+        .map_err(to_string)?;
     println!("sessions_total           {}", data.sessions_total);
     println!("tokens_total             {}", data.tokens_total);
     println!("active_projects          {}", data.active_projects);
@@ -1249,9 +1253,7 @@ fn stats_projects(ctx: &MenuContext) -> MenuResult<()> {
     let limit = prompt_usize("显示数量", 20)?;
     let data = stats::stats_by_project(
         Some(provider),
-        ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
-        Some(ctx.opencode_dir.clone()),
+        ctx.dirs(),
         None,
         None,
         limit,
@@ -1275,17 +1277,8 @@ fn stats_projects(ctx: &MenuContext) -> MenuResult<()> {
 
 fn stats_models(ctx: &MenuContext) -> MenuResult<()> {
     let provider = stats_provider(ctx)?;
-    let data = stats::stats_by_model(
-        Some(provider),
-        ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
-        Some(ctx.opencode_dir.clone()),
-        None,
-        None,
-        Vec::new(),
-        false,
-    )
-    .map_err(to_string)?;
+    let data = stats::stats_by_model(Some(provider), ctx.dirs(), None, None, Vec::new(), false)
+        .map_err(to_string)?;
     println!("provider  sessions  tokens  model");
     for item in data {
         println!(
@@ -1306,9 +1299,7 @@ fn stats_timeseries(ctx: &MenuContext) -> MenuResult<()> {
     let bucket = prompt_default("时间粒度 day/week", "day")?;
     let data = stats::stats_timeseries(
         Some(provider),
-        ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
-        Some(ctx.opencode_dir.clone()),
+        ctx.dirs(),
         None,
         None,
         bucket,
@@ -1331,17 +1322,8 @@ fn stats_timeseries(ctx: &MenuContext) -> MenuResult<()> {
 
 fn stats_heatmap(ctx: &MenuContext) -> MenuResult<()> {
     let provider = stats_provider(ctx)?;
-    let data = stats::stats_heatmap(
-        Some(provider),
-        ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
-        Some(ctx.opencode_dir.clone()),
-        None,
-        None,
-        Vec::new(),
-        false,
-    )
-    .map_err(to_string)?;
+    let data = stats::stats_heatmap(Some(provider), ctx.dirs(), None, None, Vec::new(), false)
+        .map_err(to_string)?;
     println!("每行从周日到周六，每列为 0-23 点。");
     for row in data {
         println!(
@@ -1407,11 +1389,9 @@ fn backup_create_by_id(ctx: &MenuContext) -> MenuResult<()> {
     let ids = prompt_ids()?;
     let name = prompt_optional("备份名称（留空自动生成）: ")?;
     let note = prompt_optional("备注（可留空）: ")?;
-    let summary = backup::create_backup_with_opencode(
+    let summary = backup::create_backup_with_dirs(
         Some(provider),
-        ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
-        Some(ctx.opencode_dir.clone()),
+        ctx.dirs(),
         backup_dir,
         ids,
         None,
@@ -1478,9 +1458,7 @@ fn backup_restore_one(ctx: &MenuContext) -> MenuResult<()> {
         Some(provider),
         backup_root,
         path,
-        ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
-        Some(ctx.opencode_dir.clone()),
+        ctx.dirs(),
         id,
         None,
         overwrite,
@@ -1508,9 +1486,7 @@ fn backup_restore_all(ctx: &MenuContext) -> MenuResult<()> {
         Some(provider),
         backup_root,
         path,
-        ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
-        Some(ctx.opencode_dir.clone()),
+        ctx.dirs(),
         overwrite,
         &ctx.family_lock,
     )
@@ -1584,11 +1560,9 @@ fn bundle_export(ctx: &MenuContext) -> MenuResult<()> {
     let out_dir = prompt_required("导出目录: ")?;
     let ids = prompt_ids()?;
     let targets = resolve_bundle_export_targets(ctx, &provider, &ids)?;
-    let reports = bundle::export_session_bundles_with_opencode(
+    let reports = bundle::export_session_bundles_with_dirs(
         Some(provider),
-        ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
-        Some(ctx.opencode_dir.clone()),
+        ctx.dirs(),
         out_dir,
         ids,
         targets,
@@ -1611,11 +1585,9 @@ fn bundle_export_all(ctx: &MenuContext) -> MenuResult<()> {
     } else {
         confirm_default_no("是否只导出 active 会话？")?
     };
-    let reports = bundle::export_all_bundles_with_opencode(
+    let reports = bundle::export_all_bundles_with_dirs(
         Some(provider),
-        ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
-        Some(ctx.opencode_dir.clone()),
+        ctx.dirs(),
         out_dir,
         None,
         None,
@@ -1653,9 +1625,7 @@ fn bundle_import(ctx: &MenuContext) -> MenuResult<()> {
     let reports = bundle::import_session_bundles_with_lock(
         Some(provider),
         src_dir,
-        ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
-        Some(ctx.opencode_dir.clone()),
+        ctx.dirs(),
         mode,
         make_visible,
         strict,
@@ -2552,6 +2522,7 @@ fn provider_label(provider: &str) -> &'static str {
         "codex" => "Codex",
         "claude" => "Claude",
         "opencode" => "OpenCode",
+        "cursor" => "Cursor",
         _ => "未知",
     }
 }

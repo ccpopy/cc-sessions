@@ -371,10 +371,11 @@ export const SessionCard = memo(function SessionCard({
               {s.tokens_used > 0 && (
                 <span className="whitespace-nowrap">{humanTokens(s.tokens_used)} tok</span>
               )}
-              {s.tokens_used > 0 && <MetaDot />}
-              <span className="whitespace-nowrap">
-                {humanBytes(s.rollout_bytes)}
-              </span>
+              {s.tokens_used > 0 && s.rollout_bytes > 0 && <MetaDot />}
+              {/* 体积为 0 表示还没算出来（Cursor 的会话体积按需补算），显示"0 B"会让人误以为会话是空的。 */}
+              {s.rollout_bytes > 0 && (
+                <span className="whitespace-nowrap">{humanBytes(s.rollout_bytes)}</span>
+              )}
 
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>

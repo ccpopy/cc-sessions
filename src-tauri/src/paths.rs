@@ -137,6 +137,42 @@ pub fn default_opencode_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".local/share/opencode"))
 }
 
+/// Cursor IDE 的用户数据目录，即 VS Code 系的 `<config>/Cursor/User`。
+///
+/// `dirs::config_dir()` 在三个平台上恰好给出 Cursor 使用的父目录：
+/// macOS `~/Library/Application Support`、Windows `%APPDATA%`、Linux `~/.config`。
+/// 会话主体存放在其下的 `globalStorage/state.vscdb`。
+pub fn default_cursor_dir() -> PathBuf {
+    dirs::config_dir()
+        .map(|config| config.join("Cursor").join("User"))
+        .unwrap_or_else(|| PathBuf::from("Cursor/User"))
+}
+
+/// cursor-agent CLI 的家目录 `~/.cursor`，与 IDE 数据目录相互独立。
+///
+/// 只有 `chats/` 子目录里的会话对本工具有意义；`projects/*/agent-transcripts/`
+/// 是同一批会话的有损展示副本（无工具结果、无时间戳），刻意不读。
+pub fn default_cursor_agent_dir() -> PathBuf {
+    dirs::home_dir()
+        .map(|home| home.join(".cursor"))
+        .unwrap_or_else(|| PathBuf::from(".cursor"))
+}
+
+/// Cursor IDE 的会话数据库。
+pub fn cursor_state_db_path(cursor_dir: &Path) -> PathBuf {
+    cursor_dir.join("globalStorage").join("state.vscdb")
+}
+
+/// VS Code 系的工作区元数据目录，用于把 `workspaceId` 回查成项目路径。
+pub fn cursor_workspace_storage_dir(cursor_dir: &Path) -> PathBuf {
+    cursor_dir.join("workspaceStorage")
+}
+
+/// cursor-agent 的会话根目录，布局为 `chats/<md5(cwd)>/<agentId>/`。
+pub fn cursor_agent_chats_dir(agent_dir: &Path) -> PathBuf {
+    agent_dir.join("chats")
+}
+
 pub fn default_backup_dir() -> PathBuf {
     let cc_root = default_codex_dir();
     cc_root

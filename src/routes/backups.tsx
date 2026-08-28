@@ -160,6 +160,7 @@ export default function BackupsRoute({ provider = "codex" }: { provider?: Sessio
             codex_dir: settings.codex_dir,
             claude_dir: settings.claude_dir,
             opencode_dir: settings.opencode_dir,
+            cursor_dir: settings.cursor_dir,
             overwrite: false,
           });
           const ok = r.filter((x) => x.ok).length;

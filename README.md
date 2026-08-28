@@ -6,7 +6,7 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-CC Sessions 用来管理 Codex、Claude Code 和 OpenCode 保存在本机的会话。你可以在一个界面里查找对话、预览内容、备份恢复、移动会话目录，也可以修复部分索引和可见性问题。
+CC Sessions 用来管理 Codex、Claude Code、OpenCode 和 Cursor 保存在本机的会话。你可以在一个界面里查找对话、预览内容、备份恢复、移动会话目录，也可以修复部分索引和可见性问题。
 
 [下载最新版](https://github.com/ccpopy/cc-sessions/releases/latest) · [查看功能](#功能模块) · [进阶功能](#进阶功能) · [常见问题](#常见问题) · [开发与打包](#开发与打包)
 
@@ -16,7 +16,7 @@ CC Sessions 用来管理 Codex、Claude Code 和 OpenCode 保存在本机的会�
 
 | 你属于哪类用户 | 推荐方式 | 从哪里开始 |
 | --- | --- | --- |
-| 在电脑上使用 Codex、Claude Code 或 OpenCode | 桌面版 | [安装](#安装) |
+| 在电脑上使用 Codex、Claude Code、OpenCode 或 Cursor | 桌面版 | [安装](#安装) |
 | 在 WSL、服务器或 SSH 环境中管理会话 | `cc-sessions` 命令行或自带网页界面 | [命令行与 WSL](#命令行与-wsl) |
 | 想修改源码或自行构建安装包 | 从源码运行 | [开发与打包](#开发与打包) |
 
@@ -24,24 +24,26 @@ CC Sessions 用来管理 Codex、Claude Code 和 OpenCode 保存在本机的会�
 
 ## 功能模块
 
-| 模块 | 可以做什么 | Codex | Claude Code | OpenCode |
-| --- | --- | --- | --- | --- |
-| 会话浏览 | 按标题、首条消息、目录或 ID 查找会话 | 支持 | 支持 | 支持 |
-| 会话整理 | 重命名、删除、按项目分组，并复制继续对话的命令 | 支持 | 支持 | 支持 |
-| 正文搜索与预览 | 搜索完整对话，按时间线查看消息和工具过程 | 支持 | 支持 | 支持 |
-| 编辑与撤销 | 修改文本、删除上下文事件、撤销编辑或恢复原始快照 | 支持 | 支持 | 支持 |
-| 备份与恢复 | 为选中的会话创建备份，并在需要时恢复 | 支持 | 支持 | 支持 |
-| 导入与导出 | 生成可迁移的会话包，或导出为 Markdown | 支持 | 支持 | 支持 |
-| 移动会话目录 | 把会话关联到新的项目目录，并更新相关记录 | 支持 | 支持 | 支持 |
-| 归档 | 隐藏暂时不用的会话，之后可以取消归档 | 支持 | 不支持 | 支持 |
-| 会话转换 | 在 Codex 与 Claude Code 之间创建新的可续聊会话 | 支持 | 支持 | 不支持 |
-| Memory 管理 | 新建、浏览、编辑、重命名和删除项目 Memory 文件 | 不接管 | 支持 | 不支持 |
-| 子代理会话 | 单独筛选由子代理产生的会话 | 支持 | 支持 | 支持 |
-| 分支管理 | 切换模型服务配置后复制会话，或从较早的对话位置创建新分支 | 支持 | 不支持 | 不支持 |
-| 使用统计 | 查看会话趋势、项目、模型和活跃时间 | 支持 | 支持 | 支持 |
-| 修复工具 | 修复部分索引、项目配置和列表可见性问题 | 支持 | 部分支持 | 不支持 |
+| 模块 | 可以做什么 | Codex | Claude Code | OpenCode | Cursor |
+| --- | --- | --- | --- | --- | --- |
+| 会话浏览 | 按标题、首条消息、目录或 ID 查找会话 | 支持 | 支持 | 支持 | 支持 |
+| 会话整理 | 重命名、删除、按项目分组，并复制继续对话的命令 | 支持 | 支持 | 支持 | 支持 |
+| 正文搜索与预览 | 搜索完整对话，按时间线查看消息和工具过程 | 支持 | 支持 | 支持 | 支持 |
+| 编辑与撤销 | 修改文本、删除上下文事件、撤销编辑或恢复原始快照 | 支持 | 支持 | 支持 | 不支持 |
+| 备份与恢复 | 为选中的会话创建备份，并在需要时恢复 | 支持 | 支持 | 支持 | 支持 |
+| 导入与导出 | 生成可迁移的会话包，或导出为 Markdown | 支持 | 支持 | 支持 | 支持 |
+| 移动会话目录 | 把会话关联到新的项目目录，并更新相关记录 | 支持 | 支持 | 支持 | 不支持 |
+| 归档 | 隐藏暂时不用的会话，之后可以取消归档 | 支持 | 不支持 | 支持 | 支持 |
+| 会话转换 | 创建新的可续聊会话 | 支持 | 支持 | 不支持 | 只能转出 |
+| Memory 管理 | 新建、浏览、编辑、重命名和删除项目 Memory 文件 | 不接管 | 支持 | 不支持 | 不支持 |
+| 子代理会话 | 单独筛选由子代理产生的会话 | 支持 | 支持 | 支持 | 随主会话管理 |
+| 分支管理 | 切换模型服务配置后复制会话，或从较早的对话位置创建新分支 | 支持 | 不支持 | 不支持 | 不支持 |
+| 使用统计 | 查看会话趋势、项目、模型和活跃时间 | 支持 | 支持 | 支持 | 支持 |
+| 修复工具 | 修复部分索引、项目配置和列表可见性问题 | 支持 | 部分支持 | 不支持 | 清理数据库残留 |
 
 会话转换会创建新的目标会话，不修改来源文件。编辑、导入、移动、恢复和删除会写入本地数据。桌面版会在高风险操作前显示确认信息，CLI 交互菜单会要求输入 `yes`。
+
+Cursor 的会话存在一个共享数据库里，改动方式和其他三个工具不同，使用前请看 [Cursor 会话](#cursor-会话)。
 
 ## 安装
 
@@ -71,7 +73,7 @@ CC Sessions 用来管理 Codex、Claude Code 和 OpenCode 保存在本机的会�
 
 Release 最下方的 `Source code (zip)` 和 `Source code (tar.gz)` 是 GitHub 自动生成的源码压缩包，不是桌面版安装包。
 
-第一次打开后，到设置页确认 Codex、Claude Code 和 OpenCode 的数据路径。应用会尝试使用默认位置，没有安装的工具可以留空。
+第一次打开后，到设置页确认 Codex、Claude Code、OpenCode 和 Cursor 的数据路径。应用会尝试使用默认位置，没有安装的工具可以留空。
 
 ### 快速开始
 
@@ -90,7 +92,8 @@ Release 最下方的 `Source code (zip)` 和 `Source code (tar.gz)` 是 GitHub �
 - CC Sessions 不要求账号，也不会把会话上传到第三方服务。只有检查更新或打开发布页时会访问 GitHub。
 - 编辑前会保存快照，可以逐步撤销，也可以恢复到编辑前状态。
 - 移动目录会检查目标冲突和写入结果。失败时会尝试恢复原状态。
-- OpenCode 会话包只包含所选会话的数据，不包含账号信息、登录凭据或本机分享密钥。
+- OpenCode 和 Cursor 的会话包只包含所选会话的数据，不包含账号信息、登录凭据或本机分享密钥。Cursor 的 `state.vscdb` 里混有凭据和全部工作区状态，因此备份和会话包都只取该会话自己的记录，不会整库复制。
+- 修改 Cursor 会话前需要完全退出 Cursor。它会在内存里缓存会话状态，运行期间改数据库很可能被它按旧状态覆盖回去，因此应用检测到 Cursor 在运行时会直接拒绝写入。
 - 跨机器导入时，桌面版和自带网页界面可以把原项目路径映射到新电脑的目录。
 - 覆盖导入和覆盖恢复不会自动再创建一份备份。重要会话仍建议保留独立备份，尤其是在移动目录、覆盖恢复或批量删除前。
 
@@ -104,7 +107,7 @@ Release 最下方的 `Source code (zip)` 和 `Source code (tar.gz)` 是 GitHub �
 
 ### 归档
 
-Codex 和 OpenCode 支持归档，Claude Code 暂不支持。归档不会删除会话，普通列表会隐藏归档记录，切换到归档视图后可以取消归档。
+Codex、OpenCode 和 Cursor 支持归档，Claude Code 暂不支持。归档不会删除会话，普通列表会隐藏归档记录，切换到归档视图后可以取消归档。
 
 Codex 归档视图会按归档来源分组显示：我的归档（手动归档，以及没有来源标识的归档）、切换模型服务时自动归档的同步分支、备份恢复或会话包导入产生的迁移记录；可以用顶部筛选条只看某一类。导出页会保留归档记录供手动选择，并显示“已归档”徽标。Codex 使用本地归档目录保存会话文件，OpenCode 使用自身的原生归档状态。
 
@@ -118,17 +121,45 @@ Codex 归档视图会按归档来源分组显示：我的归档（手动归档�
 
 主会话和子代理会话可以分开查看。列表、搜索、项目分组和大小排序都支持子代理筛选，但子代理会话不参与 Codex 与 Claude Code 的格式转换。
 
+Cursor 是例外：它的子会话只跟着主会话管理，列表里不单独出现，删除主会话时会连同它的子会话一起删掉。这样可以避免删掉子会话后，主会话留下指向已消失会话的引用。
+
 Codex 用户还可以处理切换模型服务配置后留下的旧会话，或从较早的稳定对话位置创建新分支。创建回溯分支时，应用会保留来源会话，并把原来的当前分支归档。
 
-### Codex 与 Claude Code 会话转换
+### 会话转换
 
 简洁模式是默认选项，只保留用户消息和稳定的最终答复，适合继续对话。原生模式会尝试保留工具调用、图片和过程消息，适合需要完整上下文的场景，但兼容性不如简洁模式稳定。
 
+Codex 与 Claude Code 之间可以互相转换。Cursor 只能转出，可以转成 Claude Code 或 Codex 会话继续聊，但不能把别的工具的会话转进 Cursor——Cursor 的编辑器内会话没有命令行入口，转进去也没法打开。
+
 转换始终创建新会话，不会修改来源文件。OpenCode 暂不参与格式转换。
+
+### Cursor 会话
+
+Cursor 的会话不是一个会话一个文件，而是全部存在 `state.vscdb` 这一个数据库里，所以有几点和其他工具不同。
+
+**改动前要先退出 Cursor。** 归档、重命名、删除、清理和压缩都会先检查 Cursor 是否在运行，在运行就直接拒绝。
+
+**子会话跟着主会话走。** 详见[子代理与 Codex 分支](#子代理与-codex-分支)。
+
+**删除会真正清干净。** Cursor 自己删会话时，检查点、代码差异、文件快照等数据会留在库里不再回收。CC Sessions 删除时会把这些一并带走。
+
+**数据库可能比你以为的大得多。** 长期使用后，库里会积压大量已删会话的残留。修复页的“Cursor 数据库残留”可以先诊断再清理：
+
+| 类别 | 是什么 | 会不会丢对话 |
+| --- | --- | --- |
+| 空会话 | 只有会话头、一条消息都没有 | 不会 |
+| 孤儿记录 | 会话头已经不在，检查点和气泡还留着 | 不会 |
+| 无引用的内容块 | 没有任何会话引用得到的文件快照和代理消息 | 不会 |
+| 无主子会话 | 父会话已经不在，界面上再也访问不到 | 会 |
+| 项目目录已不存在 | 会话有完整对话，只是当初的项目目录被删或改名 | 会 |
+
+前三类默认勾选，后两类需要自己确认。清理只把数据库内的页面标成空闲，文件不会立刻变小，要点“压缩数据库”才会把磁盘还回去。几 GB 的库压缩需要几分钟。
+
+判断“无引用的内容块”要做一次全库可达性扫描，大库上诊断需要一些时间。判定规则取的是宽松口径，宁可多留也不会误删；扫描中只要有一处读不出来，这一类就整体跳过，不影响其他类别的清理。
 
 ### 统计
 
-统计页汇总本机的 Codex、Claude Code 和 OpenCode 数据，可以查看会话数量、活跃趋势、常用项目、模型分布和活跃时段。没有安装或没有配置的数据源会按零会话处理，不影响其他工具。
+统计页汇总本机的 Codex、Claude Code、OpenCode 和 Cursor 数据，可以查看会话数量、活跃趋势、常用项目、模型分布和活跃时段。没有安装或没有配置的数据源会按零会话处理，不影响其他工具。
 
 ### 修复工具
 
@@ -143,6 +174,8 @@ Codex 用户还可以处理切换模型服务配置后留下的旧会话，或�
 | 克隆到当前模型服务 | Codex 切换模型服务配置后，旧会话无法直接使用 | 创建副本，不改来源 |
 | 补全归档来源标记 | 旧版归档会话缺少来源记录，自动识别切换模型服务产生的克隆分支和回溯分支 | 只写 CC Sessions 自己的来源记录，不改会话文件 |
 | Claude 列表可见性修复 | Claude Code 能续聊，但会话列表不显示标题 | 会在文件末尾补充标题记录 |
+| Cursor 数据库残留 | Cursor 数据库越用越大，里面积压了已删会话的数据 | 只删已经没有会话的记录 |
+| 压缩 Cursor 数据库 | 清理之后磁盘占用没有回落 | 不会改会话数据 |
 
 ## 命令行与 WSL
 
@@ -167,13 +200,14 @@ chmod +x cc-sessions
 
 ### 常用命令
 
-`--provider` 用来选择 Codex、Claude Code 或 OpenCode，可填写 `codex`、`claude` 或 `opencode`。列表、搜索、项目和统计命令还可以使用 `all` 汇总多个数据源。
+`--provider` 用来选择要管理的工具，可填写 `codex`、`claude`、`opencode` 或 `cursor`。列表、搜索、项目和统计命令还可以使用 `all` 汇总多个数据源。
 
 | 用途 | 命令 |
 | --- | --- |
 | 查看完整帮助 | `cc-sessions --help` |
 | 查看最近会话 | `cc-sessions list --limit 20` |
 | 查看 OpenCode 会话 | `cc-sessions --provider opencode list --limit 20` |
+| 查看 Cursor 会话 | `cc-sessions --provider cursor list --limit 20` |
 | 只看子代理会话 | `cc-sessions --provider codex list --subagent` |
 | 按项目查看并包含归档会话 | `cc-sessions --provider codex projects --archived` |
 | 搜索 Claude Code 对话 | `cc-sessions --provider claude search "关键词"` |
@@ -183,10 +217,15 @@ chmod +x cc-sessions
 | 创建备份 | `cc-sessions backup create --backup-dir ./backups --id <session-id> --name my-backup` |
 | 导出会话包 | `cc-sessions bundle export --out-dir ./bundles --id <session-id>` |
 | 导入 OpenCode 会话包 | `cc-sessions --provider opencode bundle import --src-dir ./bundles --mode overwrite --strict` |
+| 把 Cursor 会话转成 Claude Code | `cc-sessions --provider cursor convert <定位符> --to claude` |
 | 检查 Codex 索引问题 | `cc-sessions repair diagnose --json` |
+| 诊断 Cursor 数据库残留 | `cc-sessions repair cursor-residue` |
+| 清理 Cursor 数据库残留 | `cc-sessions repair cursor-residue --prune --kinds orphan_records,orphan_blobs --dry-run` |
 | 启动本地 Web UI | `cc-sessions webui --host 127.0.0.1 --port 17888` |
 
-CLI 默认读取与桌面版相同的数据位置。需要指定其他目录时，可以使用 `--codex-dir`、`--claude-dir` 或 `--opencode-dir`。
+CLI 默认读取与桌面版相同的数据位置。需要指定其他目录时，可以使用 `--codex-dir`、`--claude-dir`、`--opencode-dir` 或 `--cursor-dir`。
+
+清理 Cursor 残留时，`--kinds` 必须自己写明要清哪几类，去掉 `--dry-run` 才会真正执行。可选类别是 `empty_sessions`、`orphan_records`、`orphan_blobs`、`orphan_subagents`、`missing_project`，后两类会丢对话。Cursor 的会话没有单独的文件路径，`convert` 和 `preview` 需要的定位符可以用 `cc-sessions --provider cursor --json list` 从 `rollout_path` 字段取。
 
 `list`、`search` 和 `projects` 默认显示主会话。加入 `--subagent` 后只显示子代理会话。`list` 和 `search` 支持 `--sort size`，可以按会话大小排序。
 
@@ -230,7 +269,7 @@ WSL2 通常可以通过 `http://localhost:17888` 访问。如果必须绑定 `0.
 <details>
 <summary>CC Sessions 默认从哪里读取会话？</summary>
 
-Codex 默认读取 `~/.codex`，Claude Code 默认读取 `~/.claude`，OpenCode 读取当前安装使用的 `opencode.db`。实际路径可以在设置页查看和修改，CLI 也可以通过目录参数覆盖。
+Codex 默认读取 `~/.codex`，Claude Code 默认读取 `~/.claude`，OpenCode 读取当前安装使用的 `opencode.db`。Cursor 读取用户数据目录下的 `globalStorage/state.vscdb`（macOS 在 `~/Library/Application Support/Cursor/User`，Windows 在 `%APPDATA%\Cursor\User`，Linux 在 `~/.config/Cursor/User`），另外还会读取 `~/.cursor/chats` 里 cursor-agent 命令行产生的会话。实际路径可以在设置页查看和修改，CLI 也可以通过目录参数覆盖。
 
 </details>
 
@@ -287,6 +326,38 @@ Codex 归档视图会按归档来源分组：我的归档（手动归档，以�
 <summary>为什么看不到旧版 OpenCode storage 目录里的会话？</summary>
 
 CC Sessions 读取当前 OpenCode 使用的数据库，不会把旧版 `storage/` JSON 与当前数据混在一起。如果旧会话还没有迁入当前 OpenCode，请先用 OpenCode 自身提供的方式处理。
+
+</details>
+
+<details>
+<summary>为什么修改 Cursor 会话前一定要退出 Cursor？</summary>
+
+Cursor 把会话状态缓存在内存里，退出或空闲时才写回数据库。它在运行时改数据库，改动很可能被它按内存中的旧状态覆盖回去，反而更容易出问题。所以 CC Sessions 检测到 Cursor 在运行时会直接拒绝写入，而不是先改了再看运气。后台进程也要一起退出。
+
+</details>
+
+<details>
+<summary>Cursor 数据库为什么会有几个 GB？清理安全吗？</summary>
+
+Cursor 删除会话时只清掉一部分数据，检查点、代码差异、文件快照这些会留在库里，而且没有回收机制，用久了就会积压。
+
+清理只删已经没有会话的记录：按会话归属的数据看它的会话头还在不在，按内容存放的数据则重新算一遍还有没有会话引用得到。判定用的是宽松口径，宁可多留也不会误删；扫描中只要有一处读不出来，那一类就整体跳过。仍然建议清理前先创建备份。
+
+清理完还要点“压缩数据库”，磁盘占用才会真正回落。
+
+</details>
+
+<details>
+<summary>Cursor 的子会话为什么在列表里看不到？</summary>
+
+Cursor 的子会话由主会话持有引用，单独删掉会让主会话指向一个已经不存在的会话。所以它们不在列表里单独出现，只跟着主会话管理，删除主会话时一并删除。如果一个子会话同时被删除范围之外的另一个主会话引用，它会被保留。
+
+</details>
+
+<details>
+<summary>可以把 Claude Code 或 Codex 的会话转成 Cursor 会话吗？</summary>
+
+不可以，只能反过来。Cursor 编辑器内的会话没有命令行入口，就算写进它的数据库也没法从命令行打开继续聊。Cursor 会话可以转成 Claude Code 或 Codex 会话，转完用 `claude --resume` 或 `codex resume` 就能接着聊。
 
 </details>
 

@@ -86,7 +86,10 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const { sessions, allSessions, loading, error, refresh } = useSessions(provider, query);
   const isCodex = provider === "codex";
   const isOpenCode = provider === "opencode";
-  const supportsArchive = isCodex || isOpenCode;
+  const isCursor = provider === "cursor";
+  const supportsArchive = isCodex || isOpenCode || isCursor;
+  // Cursor 的子会话只随父会话管理，没有独立视图。
+  const supportsSubagentView = !isCursor;
   const { index: backupIndex, error: backupIndexError } = useBackupIndex(provider);
   const selected = useSelection((s) => s.selected);
   const setSelection = useSelection((s) => s.set);
@@ -160,11 +163,18 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     settings?.codex_dir ?? "",
     settings?.claude_dir ?? "",
     settings?.opencode_dir ?? "",
+    settings?.cursor_dir ?? "",
     query,
   ]);
   const overlayScopeRef = useRef(overlayScope);
   const refreshScopeRef = useRef(refreshScope);
   const overlayRequestSeq = useRef(0);
+
+  useEffect(() => {
+    if (!supportsSubagentView && showSubagentSessions) {
+      setSubagentView(false);
+    }
+  }, [setSubagentView, showSubagentSessions, supportsSubagentView]);
 
   // 两种视图互斥；同时为 true 只可能来自热更新前的旧状态。
   useEffect(() => {
@@ -530,7 +540,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
 
   const onCopyResume = useCallback(async (s: SessionSummary) => {
     try {
-      const text = await api.copyResumeCommand(s.provider, s.id, s.cwd);
+      const text = await api.copyResumeCommand(s.provider, s.id, s.cwd, s.resume_command);
       toast.success("已复制：" + text);
     } catch (e: any) {
       toast.error("复制失败：" + String(e?.message ?? e));
@@ -554,6 +564,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         s.id,
         !s.archived,
         settings.opencode_dir,
+        settings.cursor_dir,
       );
       toast.success(s.archived ? "已取消归档" : "已归档");
       await refreshAll();
@@ -657,25 +668,28 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
                 <DropdownMenuSeparator />
               </>
             )}
-            <DropdownMenuCheckboxItem
-              checked={showSubagentSessions}
-              onCheckedChange={(checked) => setSubagentView(checked === true)}
-              className="gap-1.5 px-2 [&>span:first-child]:hidden"
-            >
-              <Network className="h-3.5 w-3.5 text-muted-foreground" />
-              <span className="whitespace-nowrap">{isOpenCode ? "子会话" : "子代理"}</span>
-              <span
-                aria-hidden="true"
-                data-state={showSubagentSessions ? "checked" : "unchecked"}
-                className="ml-auto inline-flex h-3.5 w-6 shrink-0 items-center rounded-full bg-input p-0.5 transition-colors data-[state=checked]:bg-primary"
+            {/* Cursor 的子会话记在父会话上，只随父会话一起管理，不提供单独视图。 */}
+            {supportsSubagentView && (
+              <DropdownMenuCheckboxItem
+                checked={showSubagentSessions}
+                onCheckedChange={(checked) => setSubagentView(checked === true)}
+                className="gap-1.5 px-2 [&>span:first-child]:hidden"
               >
+                <Network className="h-3.5 w-3.5 text-muted-foreground" />
+                <span className="whitespace-nowrap">{isOpenCode ? "子会话" : "子代理"}</span>
                 <span
-                  className={`block h-2.5 w-2.5 rounded-full bg-background shadow-sm transition-transform ${
-                    showSubagentSessions ? "translate-x-2.5" : "translate-x-0"
-                  }`}
-                />
-              </span>
-            </DropdownMenuCheckboxItem>
+                  aria-hidden="true"
+                  data-state={showSubagentSessions ? "checked" : "unchecked"}
+                  className="ml-auto inline-flex h-3.5 w-6 shrink-0 items-center rounded-full bg-input p-0.5 transition-colors data-[state=checked]:bg-primary"
+                >
+                  <span
+                    className={`block h-2.5 w-2.5 rounded-full bg-background shadow-sm transition-transform ${
+                      showSubagentSessions ? "translate-x-2.5" : "translate-x-0"
+                    }`}
+                  />
+                </span>
+              </DropdownMenuCheckboxItem>
+            )}
             {supportsArchive && (
               <DropdownMenuCheckboxItem
                 checked={showArchivedSessions}
@@ -818,7 +832,9 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
                   ? "打开 Codex 后会自动出现在此"
                   : provider === "claude"
                     ? "打开 Claude Code 后会自动出现在此"
-                    : "在 OpenCode 中创建会话后会自动出现在此"
+                    : provider === "cursor"
+                      ? "在 Cursor 中创建会话后会自动出现在此"
+                      : "在 OpenCode 中创建会话后会自动出现在此"
             }
             icon={<MessageSquare className="h-10 w-10" />}
           />
@@ -847,7 +863,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             onExportMarkdown={setExportTarget}
             onConvert={isOpenCode ? undefined : setConvertTarget}
             onRename={setRenameTarget}
-            onMoveCwd={setMoveTarget}
+            onMoveCwd={isCursor ? undefined : setMoveTarget}
             onSetArchiveOrigin={isCodex ? onSetArchiveOrigin : undefined}
           />
         )}
@@ -860,6 +876,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         codexDir={settings.codex_dir}
         claudeDir={settings.claude_dir}
         opencodeDir={settings.opencode_dir}
+        cursorDir={settings.cursor_dir}
         showSubagentSessions={showSubagentSessions}
         showArchivedSessions={showArchivedSessions}
         rolloutPaths={contentSearchRolloutPaths}
@@ -916,6 +933,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
               codex_dir: settings.codex_dir,
               claude_dir: settings.claude_dir,
               opencode_dir: settings.opencode_dir,
+              cursor_dir: settings.cursor_dir,
               id: renameTarget.id,
               rollout_path: renameTarget.rollout_path,
               title,
@@ -1031,6 +1049,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
               rollout_path: session.rollout_path,
             })),
             settings.opencode_dir,
+            settings.cursor_dir,
           );
           const okCount = r.filter((x) => x.ok).length;
           const desktopRestartRequired = r.some(
@@ -1158,6 +1177,13 @@ function DeleteSummary({
             history.jsonl 匹配行、tasks/&lt;id&gt; 与 file-history/&lt;id&gt;；仍有同 ID 副本时这些共享数据会保留。
             项目 memory、.claude.json、session-env 和 shell-snapshots 不会被删除。
           </>
+        ) : provider === "cursor" ? (
+          <>
+            将从 Cursor 的 <code>state.vscdb</code> 删除 <b>{targets.length}</b> 个会话的会话头、
+            气泡索引与全部气泡，<b>并连同它们的子会话一起删除</b>，不会触碰项目工作区文件。
+            被其它会话共用的子会话会保留。
+            删除只释放库内页面，磁盘占用需要到「清理」页执行「压缩数据库」才会回收。
+          </>
         ) : (
           <>
             将从 <code>opencode.db</code> 删除 <b>{targets.length}</b> 个会话及其消息、片段和关联记录。
@@ -1169,6 +1195,11 @@ function DeleteSummary({
       {provider === "codex" && (
         <div className="text-amber-600 dark:text-amber-400">
           Codex/ChatGPT Desktop 正在运行时仍会执行删除；{DESKTOP_DELETE_RESTART_NOTICE}
+        </div>
+      )}
+      {provider === "cursor" && (
+        <div className="text-amber-600 dark:text-amber-400">
+          需要先完全退出 Cursor，否则删除会被拒绝——Cursor 运行时会用内存里的旧会话状态覆盖改动。
         </div>
       )}
       {targets.length > 1 && (

@@ -8,7 +8,8 @@ export function useSessions(provider: SessionProvider, query: string) {
   const codexDir = settings?.codex_dir ?? "";
   const claudeDir = settings?.claude_dir ?? "";
   const opencodeDir = settings?.opencode_dir ?? "";
-  const scope = JSON.stringify([settingsReady, provider, codexDir, claudeDir, opencodeDir]);
+  const cursorDir = settings?.cursor_dir ?? "";
+  const scope = JSON.stringify([settingsReady, provider, codexDir, claudeDir, opencodeDir, cursorDir]);
   const [allSessions, setAllSessions] = useState<SessionSummary[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -36,9 +37,14 @@ export function useSessions(provider: SessionProvider, query: string) {
           setError(null);
           return;
         }
-        const providerDir = provider === "claude" ? claudeDir : provider === "opencode" ? opencodeDir : codexDir;
+        const providerDir = providerDirectory(provider, {
+          codexDir,
+          claudeDir,
+          opencodeDir,
+          cursorDir,
+        });
         if (!providerDir) {
-          setError(provider === "claude" ? "尚未配置 Claude 目录" : provider === "opencode" ? "尚未配置 OpenCode 数据目录" : "尚未配置 Codex 目录");
+          setError(missingDirectoryMessage(provider));
           setLoading(false);
           return;
         }
@@ -46,7 +52,7 @@ export function useSessions(provider: SessionProvider, query: string) {
         setLoading(true);
         setError(null);
         try {
-          const list = await api.listSessions(provider, codexDir, claudeDir, opencodeDir);
+          const list = await api.listSessions(provider, codexDir, claudeDir, opencodeDir, cursorDir);
           if (!isCurrent()) return;
           setAllSessions(list);
         } catch (error) {
@@ -64,7 +70,7 @@ export function useSessions(provider: SessionProvider, query: string) {
     });
     inFlight.current = { scope, requestId, promise };
     return promise;
-  }, [claudeDir, codexDir, opencodeDir, provider, scope, settingsReady]);
+  }, [claudeDir, codexDir, cursorDir, opencodeDir, provider, scope, settingsReady]);
 
   useEffect(() => {
     requestSeq.current += 1;
@@ -141,7 +147,12 @@ export function useProjectGroups(provider: SessionProvider) {
       setError(null);
       return;
     }
-    const providerDir = provider === "claude" ? settings.claude_dir : provider === "opencode" ? settings.opencode_dir : settings.codex_dir;
+    const providerDir = providerDirectory(provider, {
+      codexDir: settings.codex_dir,
+      claudeDir: settings.claude_dir,
+      opencodeDir: settings.opencode_dir,
+      cursorDir: settings.cursor_dir,
+    });
     if (!providerDir) {
       setGroups([]);
       setLoading(false);
@@ -150,7 +161,13 @@ export function useProjectGroups(provider: SessionProvider) {
     setLoading(true);
     setError(null);
     try {
-      const next = await api.groupByProject(provider, settings.codex_dir, settings.claude_dir, settings.opencode_dir);
+      const next = await api.groupByProject(
+        provider,
+        settings.codex_dir,
+        settings.claude_dir,
+        settings.opencode_dir,
+        settings.cursor_dir,
+      );
       if (request === requestSeq.current) setGroups(next);
     } catch (error) {
       if (request === requestSeq.current) {
@@ -159,11 +176,41 @@ export function useProjectGroups(provider: SessionProvider) {
     } finally {
       if (request === requestSeq.current) setLoading(false);
     }
-  }, [settings?.codex_dir, settings?.claude_dir, settings?.opencode_dir, provider]);
+  }, [settings?.codex_dir, settings?.claude_dir, settings?.opencode_dir, settings?.cursor_dir, provider]);
 
   useEffect(() => {
     void refresh();
   }, [refresh]);
 
   return { groups, loading, error, refresh };
+}
+
+/** 当前 provider 需要哪个目录才能列出会话。 */
+function providerDirectory(
+  provider: SessionProvider,
+  dirs: { codexDir: string; claudeDir: string; opencodeDir: string; cursorDir: string },
+): string {
+  switch (provider) {
+    case "claude":
+      return dirs.claudeDir;
+    case "opencode":
+      return dirs.opencodeDir;
+    case "cursor":
+      return dirs.cursorDir;
+    default:
+      return dirs.codexDir;
+  }
+}
+
+function missingDirectoryMessage(provider: SessionProvider): string {
+  switch (provider) {
+    case "claude":
+      return "尚未配置 Claude 目录";
+    case "opencode":
+      return "尚未配置 OpenCode 数据目录";
+    case "cursor":
+      return "尚未配置 Cursor 用户数据目录";
+    default:
+      return "尚未配置 Codex 目录";
+  }
 }

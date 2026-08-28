@@ -196,6 +196,9 @@ pub fn resume_command_text(
         "codex" => format!("codex resume {}", session_id),
         "claude" => claude_resume_command(&session_id, cwd.as_deref()),
         "opencode" => format!("opencode --session {}", session_id),
+        // Cursor 的 IDE 会话没有命令行入口；只有 cursor-agent 的会话可以续聊，
+        // 具体命令在 SessionSummary.resume_command 里按会话给出。
+        "cursor" => String::new(),
         other => return Err(AppError::Other(format!("不支持的 provider: {other}"))),
     };
     Ok(text)
