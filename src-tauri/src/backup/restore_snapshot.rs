@@ -11,7 +11,7 @@ use crate::path_safety;
 static RESTORE_SNAPSHOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct RestoreFileSnapshot {
-    label: &'static str,
+    label: String,
     path: PathBuf,
     snapshot_path: Option<PathBuf>,
     original_fingerprint: Option<atomic_file::FileFingerprint>,
@@ -98,7 +98,7 @@ pub(super) fn inject_restore_file_fault(_label: &'static str) -> AppResult<()> {
 }
 
 impl RestoreFileSnapshots {
-    pub(super) fn capture(paths: &[(&'static str, &Path)]) -> AppResult<Self> {
+    pub(super) fn capture_owned(paths: &[(String, PathBuf)]) -> AppResult<Self> {
         let root = loop {
             let sequence = RESTORE_SNAPSHOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let candidate = std::env::temp_dir().join(format!(
@@ -142,8 +142,8 @@ impl RestoreFileSnapshots {
                             )));
                         }
                         Ok(RestoreFileSnapshot {
-                            label,
-                            path: path.to_path_buf(),
+                            label: label.clone(),
+                            path: path.clone(),
                             snapshot_path: Some(snapshot_path),
                             original_fingerprint: Some(before),
                             mutation_started: false,
@@ -153,8 +153,8 @@ impl RestoreFileSnapshots {
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         Ok(RestoreFileSnapshot {
-                            label,
-                            path: path.to_path_buf(),
+                            label: label.clone(),
+                            path: path.clone(),
                             snapshot_path: None,
                             original_fingerprint: None,
                             mutation_started: false,
@@ -187,7 +187,7 @@ impl RestoreFileSnapshots {
         Ok(Self { root, files })
     }
 
-    pub(super) fn start(&mut self, label: &'static str) -> AppResult<()> {
+    pub(super) fn start(&mut self, label: &str) -> AppResult<()> {
         let snapshot = self
             .files
             .iter_mut()
@@ -197,7 +197,7 @@ impl RestoreFileSnapshots {
         Ok(())
     }
 
-    pub(super) fn was_present(&self, label: &'static str) -> AppResult<bool> {
+    pub(super) fn was_present(&self, label: &str) -> AppResult<bool> {
         self.files
             .iter()
             .find(|snapshot| snapshot.label == label)
@@ -205,7 +205,7 @@ impl RestoreFileSnapshots {
             .ok_or_else(|| AppError::Other(format!("缺少 {label} 的还原快照")))
     }
 
-    pub(super) fn finish(&mut self, label: &'static str) -> AppResult<()> {
+    pub(super) fn finish(&mut self, label: &str) -> AppResult<()> {
         let snapshot = self
             .files
             .iter_mut()
@@ -214,16 +214,15 @@ impl RestoreFileSnapshots {
         // The write has returned success. Mark it committed before observing the final
         // fingerprint so an observation failure cannot silently drop it from rollback.
         snapshot.mutation_committed = true;
-        snapshot.expected_after =
-            Some(current_regular_fingerprint(&snapshot.path, snapshot.label)?);
+        snapshot.expected_after = Some(current_regular_fingerprint(
+            &snapshot.path,
+            &snapshot.label,
+        )?);
         Ok(())
     }
 
     #[cfg(test)]
-    pub(super) fn mark_committed_without_observation(
-        &mut self,
-        label: &'static str,
-    ) -> AppResult<()> {
+    pub(super) fn mark_committed_without_observation(&mut self, label: &str) -> AppResult<()> {
         let snapshot = self
             .files
             .iter_mut()
@@ -234,11 +233,7 @@ impl RestoreFileSnapshots {
         Ok(())
     }
 
-    pub(super) fn record_failure(
-        &mut self,
-        label: &'static str,
-        error: &AppError,
-    ) -> AppResult<()> {
+    pub(super) fn record_failure(&mut self, label: &str, error: &AppError) -> AppResult<()> {
         let snapshot = self
             .files
             .iter_mut()
@@ -248,8 +243,10 @@ impl RestoreFileSnapshots {
             return Ok(());
         }
         snapshot.mutation_committed = true;
-        snapshot.expected_after =
-            Some(current_regular_fingerprint(&snapshot.path, snapshot.label)?);
+        snapshot.expected_after = Some(current_regular_fingerprint(
+            &snapshot.path,
+            &snapshot.label,
+        )?);
         Ok(())
     }
 
@@ -258,7 +255,7 @@ impl RestoreFileSnapshots {
         for snapshot in self.files.iter().rev().filter(|snapshot| {
             snapshot.mutation_started
                 && snapshot.mutation_committed
-                && !excluded_labels.contains(&snapshot.label)
+                && !excluded_labels.contains(&snapshot.label.as_str())
         }) {
             if let Err(error) = restore_file_snapshot(snapshot) {
                 errors.push(format!("补偿 {} 失败: {error}", snapshot.label));
@@ -297,7 +294,7 @@ fn current_regular_fingerprint(
 }
 
 fn restore_file_snapshot(snapshot: &RestoreFileSnapshot) -> AppResult<()> {
-    let current = current_regular_fingerprint(&snapshot.path, snapshot.label)?;
+    let current = current_regular_fingerprint(&snapshot.path, &snapshot.label)?;
     if current == snapshot.original_fingerprint {
         return Ok(());
     }

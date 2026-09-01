@@ -20,6 +20,20 @@ pub(crate) struct CodexDeleteOutcome {
     pub(crate) structurally_removed: bool,
 }
 
+struct DeletePreparation {
+    id: String,
+    rollout_files: Vec<PathBuf>,
+    rollout_path: Option<String>,
+    history_thread_ids: Vec<String>,
+}
+
+struct RolloutReference {
+    path: PathBuf,
+    payload_thread_id: Option<String>,
+    file_thread_id: Option<String>,
+    history_base_thread_id: Option<String>,
+}
+
 pub(crate) fn delete_codex_artifacts(codex_dir: &Path, id: &str) -> AppResult<CodexDeleteOutcome> {
     let mut outcomes = delete_codex_artifacts_batch(codex_dir, &[id.to_string()])?;
     outcomes
@@ -58,12 +72,8 @@ pub(crate) fn delete_codex_artifacts_batch_with_family_store(
     if !desktop_restart_required {
         crate::codex_projects::preflight_thread_project_state_cleanup(codex_dir, &unique_ids)?;
     }
-
-    struct DeletePreparation {
-        id: String,
-        rollout_files: Vec<PathBuf>,
-        rollout_path: Option<String>,
-    }
+    preflight_thread_history_database_for_delete(codex_dir)?;
+    let rollout_references = scan_rollout_references(codex_dir)?;
 
     let state = state_db::open(codex_dir)?;
     // 是否挂载子代理关系表：存在时按删除单元同步清理关系边，避免残留孤儿边。
@@ -84,22 +94,37 @@ pub(crate) fn delete_codex_artifacts_batch_with_family_store(
             )
             .optional()?
             .flatten();
-        let mut rollout_files = super::rollout_files_by_id(codex_dir, id)?;
+        let mut rollout_files = rollout_references
+            .iter()
+            .filter(|reference| {
+                reference.payload_thread_id.as_deref() == Some(id.as_str())
+                    || reference.file_thread_id.as_deref() == Some(id.as_str())
+            })
+            .map(|reference| reference.path.clone())
+            .collect::<Vec<_>>();
         if let Some(raw_path) = rollout_path.as_deref() {
             let db_path = PathBuf::from(paths::strip_verbatim(
                 &paths::host_path_string_from_codex_record(codex_dir, raw_path),
             ));
             if db_path.is_file() {
-                super::validate_codex_rollout_path(codex_dir, &db_path, id)?;
+                validate_codex_rollout_path_for_delete(codex_dir, &db_path, id)?;
                 rollout_files.push(db_path);
             }
         }
         let mut canonical_files = Vec::with_capacity(rollout_files.len());
         for path in rollout_files {
-            super::validate_codex_rollout_path(codex_dir, &path, id)?;
+            validate_codex_rollout_path_for_delete(codex_dir, &path, id)?;
             let canonical = path.canonicalize()?;
             if !canonical_files.contains(&canonical) {
                 canonical_files.push(canonical);
+            }
+        }
+        let mut history_thread_ids = vec![id.clone()];
+        for rollout in &canonical_files {
+            if let Some(file_thread_id) = rollout_filename_thread_id(rollout) {
+                if !history_thread_ids.contains(&file_thread_id) {
+                    history_thread_ids.push(file_thread_id);
+                }
             }
         }
         preparations.push(DeletePreparation {
@@ -108,10 +133,14 @@ pub(crate) fn delete_codex_artifacts_batch_with_family_store(
                 .first()
                 .map(|path| path.to_string_lossy().into_owned()),
             rollout_files: canonical_files,
+            history_thread_ids,
         });
     }
 
+    preflight_history_base_references(&preparations, &rollout_references)?;
     let logs_attached = attach_logs_database_for_delete(codex_dir, &transaction)?;
+    let thread_history_attached =
+        attach_thread_history_database_for_delete(codex_dir, &transaction)?;
     let index_path = paths::session_index_path(codex_dir);
     let mut journal = crate::mutation_journal::MutationJournal::default();
     let operation = (|| -> AppResult<Vec<CodexDeleteOutcome>> {
@@ -131,6 +160,11 @@ pub(crate) fn delete_codex_artifacts_batch_with_family_store(
                     "DELETE FROM delete_logs.logs WHERE thread_id = ?",
                     [&prepared.id],
                 )?
+            } else {
+                0
+            };
+            let rows_history = if thread_history_attached {
+                delete_thread_history_rows(&transaction, &prepared.history_thread_ids)?
             } else {
                 0
             };
@@ -156,7 +190,7 @@ pub(crate) fn delete_codex_artifacts_batch_with_family_store(
                     rollout_path: prepared.rollout_path.clone(),
                     threads_rows_deleted: rows as u32,
                     logs_rows_deleted: rows_logs as u32,
-                    history_rows_deleted: 0,
+                    history_rows_deleted: rows_history.min(u32::MAX as usize) as u32,
                     rollout_deleted: !prepared.rollout_files.is_empty(),
                     rollout_missing: prepared.rollout_files.is_empty(),
                     sidecar_deleted: false,
@@ -228,6 +262,261 @@ pub(crate) fn delete_codex_artifacts_batch_with_family_store(
     }
 
     Ok(outcomes)
+}
+
+fn rollout_filename_thread_id(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let rest = stem.strip_prefix("rollout-")?;
+    if rest.len() < 36 {
+        return None;
+    }
+    let candidate = &rest[rest.len() - 36..];
+    let bytes = candidate.as_bytes();
+    let valid = bytes.iter().enumerate().all(|(index, byte)| {
+        if matches!(index, 8 | 13 | 18 | 23) {
+            *byte == b'-'
+        } else {
+            byte.is_ascii_hexdigit()
+        }
+    });
+    valid.then(|| candidate.to_string())
+}
+
+fn scan_rollout_references(codex_dir: &Path) -> AppResult<Vec<RolloutReference>> {
+    let mut rollouts = family::scan_rollouts(codex_dir)?;
+    rollouts.extend(family::scan_archived_rollouts(codex_dir)?);
+    rollouts.sort();
+    rollouts.dedup();
+
+    Ok(rollouts
+        .into_iter()
+        .map(|path| {
+            let (payload_thread_id, history_base_thread_id) = family::read_session_meta(&path)
+                .ok()
+                .map(|meta| {
+                    let payload = meta.get("payload").unwrap_or(&meta);
+                    (
+                        payload
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                        payload
+                            .get("history_base")
+                            .and_then(|base| base.get("thread_id"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                    )
+                })
+                .unwrap_or_default();
+            let file_thread_id = rollout_filename_thread_id(&path);
+            RolloutReference {
+                path,
+                payload_thread_id,
+                file_thread_id,
+                history_base_thread_id,
+            }
+        })
+        .collect())
+}
+
+fn validate_codex_rollout_path_for_delete(
+    codex_dir: &Path,
+    path: &Path,
+    logical_thread_id: &str,
+) -> AppResult<()> {
+    if super::validate_codex_rollout_path(codex_dir, path, logical_thread_id).is_ok() {
+        return Ok(());
+    }
+    let file_thread_id = rollout_filename_thread_id(path).ok_or_else(|| {
+        AppError::Path(format!(
+            "Codex rollout 文件名既不匹配逻辑会话 ID，也不包含有效 UUID: {}",
+            path.to_string_lossy()
+        ))
+    })?;
+    for root in [
+        paths::sessions_dir(codex_dir),
+        paths::archived_sessions_dir(codex_dir),
+    ] {
+        let metadata = match fs::symlink_metadata(&root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_dir() || crate::path_safety::metadata_is_link_or_reparse(&metadata) {
+            return Err(AppError::Path(format!(
+                "Codex rollout 根路径不是普通目录或属于链接/junction: {}",
+                root.to_string_lossy()
+            )));
+        }
+        let clean_root = PathBuf::from(paths::strip_verbatim(&root.to_string_lossy()));
+        let clean_path = PathBuf::from(paths::strip_verbatim(&path.to_string_lossy()));
+        if clean_path.strip_prefix(&clean_root).is_err() {
+            continue;
+        }
+        crate::path_safety::validate_descendant(
+            &root,
+            path,
+            crate::path_safety::EntryKind::File,
+            false,
+            "Codex rollout 删除目标",
+        )?;
+        let meta = family::read_session_meta(path)?;
+        let actual_id = meta
+            .get("payload")
+            .and_then(|payload| payload.get("id"))
+            .and_then(serde_json::Value::as_str);
+        if actual_id == Some(logical_thread_id) || actual_id == Some(file_thread_id.as_str()) {
+            return Ok(());
+        }
+        return Err(AppError::Other(format!(
+            "Codex rollout 内容 ID 既不匹配逻辑会话 {logical_thread_id}，也不匹配文件 UUID {file_thread_id}: {}",
+            path.to_string_lossy()
+        )));
+    }
+    Err(AppError::Path(format!(
+        "Codex rollout 不在 sessions 或 archived_sessions 内，拒绝删除: {}",
+        path.to_string_lossy()
+    )))
+}
+
+fn preflight_history_base_references(
+    preparations: &[DeletePreparation],
+    rollout_references: &[RolloutReference],
+) -> AppResult<()> {
+    let deletion_ids = preparations
+        .iter()
+        .flat_map(|prepared| prepared.history_thread_ids.iter().cloned())
+        .collect::<HashSet<_>>();
+    let deletion_paths = preparations
+        .iter()
+        .flat_map(|prepared| prepared.rollout_files.iter().cloned())
+        .collect::<HashSet<_>>();
+    for reference in rollout_references {
+        let is_selected = reference
+            .path
+            .canonicalize()
+            .ok()
+            .is_some_and(|canonical| deletion_paths.contains(&canonical));
+        if is_selected {
+            continue;
+        }
+        let Some(base_id) = reference.history_base_thread_id.as_deref() else {
+            continue;
+        };
+        if deletion_ids.contains(base_id) {
+            let child_id = reference.payload_thread_id.as_deref().unwrap_or("未知会话");
+            return Err(AppError::Other(format!(
+                "无法删除会话：未选中的派生会话 {child_id} 仍通过 history_base 引用 {base_id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn attach_thread_history_database_for_delete(
+    codex_dir: &Path,
+    transaction: &rusqlite::Transaction<'_>,
+) -> AppResult<bool> {
+    let history_path = codex_dir.join("thread_history_1.sqlite");
+    let metadata = match fs::symlink_metadata(&history_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() || crate::path_safety::metadata_is_link_or_reparse(&metadata) {
+        return Err(AppError::Path(format!(
+            "Codex thread history 数据库不是普通文件: {}",
+            history_path.to_string_lossy()
+        )));
+    }
+    transaction.execute(
+        "ATTACH DATABASE ?1 AS delete_history",
+        [history_path.to_string_lossy().into_owned()],
+    )?;
+    const TABLES: [&str; 4] = [
+        "thread_turns",
+        "thread_items",
+        "thread_history_projection_state",
+        "thread_realtime_items",
+    ];
+    for table in TABLES {
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM delete_history.sqlite_schema WHERE type='table' AND name=?1)",
+            [table],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(AppError::Other(format!(
+                "Codex thread history 数据库缺少 {table} 表: {}",
+                history_path.to_string_lossy()
+            )));
+        }
+    }
+    Ok(true)
+}
+
+fn preflight_thread_history_database_for_delete(codex_dir: &Path) -> AppResult<()> {
+    let history_path = codex_dir.join("thread_history_1.sqlite");
+    let metadata = match fs::symlink_metadata(&history_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() || crate::path_safety::metadata_is_link_or_reparse(&metadata) {
+        return Err(AppError::Path(format!(
+            "Codex thread history 数据库不是普通文件: {}",
+            history_path.to_string_lossy()
+        )));
+    }
+    let connection = rusqlite::Connection::open_with_flags(
+        &history_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    for table in [
+        "thread_turns",
+        "thread_items",
+        "thread_history_projection_state",
+        "thread_realtime_items",
+    ] {
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
+            [table],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(AppError::Other(format!(
+                "Codex thread history 数据库缺少 {table} 表: {}",
+                history_path.to_string_lossy()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn delete_thread_history_rows(
+    transaction: &rusqlite::Transaction<'_>,
+    thread_ids: &[String],
+) -> AppResult<usize> {
+    let mut deleted = 0usize;
+    for thread_id in thread_ids {
+        deleted += transaction.execute(
+            "DELETE FROM delete_history.thread_items WHERE thread_id = ?1",
+            [thread_id],
+        )?;
+        deleted += transaction.execute(
+            "DELETE FROM delete_history.thread_realtime_items WHERE thread_id = ?1",
+            [thread_id],
+        )?;
+        deleted += transaction.execute(
+            "DELETE FROM delete_history.thread_turns WHERE thread_id = ?1",
+            [thread_id],
+        )?;
+        deleted += transaction.execute(
+            "DELETE FROM delete_history.thread_history_projection_state WHERE thread_id = ?1",
+            [thread_id],
+        )?;
+    }
+    Ok(deleted)
 }
 
 fn attach_logs_database_for_delete(

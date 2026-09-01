@@ -3344,6 +3344,69 @@ mod tests {
         .expect("write rollout");
     }
 
+    fn create_thread_history_fixture(codex: &Path, ids: &[&str]) -> AppResult<()> {
+        let connection = rusqlite::Connection::open(codex.join("thread_history_1.sqlite"))?;
+        connection.execute_batch(
+            "CREATE TABLE thread_turns (thread_id TEXT NOT NULL);
+             CREATE TABLE thread_items (thread_id TEXT NOT NULL);
+             CREATE TABLE thread_history_projection_state (thread_id TEXT NOT NULL);
+             CREATE TABLE thread_realtime_items (thread_id TEXT NOT NULL);",
+        )?;
+        for id in ids {
+            for table in [
+                "thread_turns",
+                "thread_items",
+                "thread_history_projection_state",
+                "thread_realtime_items",
+            ] {
+                connection.execute(
+                    &format!("INSERT INTO {table} (thread_id) VALUES (?1)"),
+                    [id],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn thread_history_rows(codex: &Path, id: &str) -> AppResult<i64> {
+        let connection = rusqlite::Connection::open(codex.join("thread_history_1.sqlite"))?;
+        let mut rows = 0i64;
+        for table in [
+            "thread_turns",
+            "thread_items",
+            "thread_history_projection_state",
+            "thread_realtime_items",
+        ] {
+            rows += connection.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE thread_id = ?1"),
+                [id],
+                |row| row.get::<_, i64>(0),
+            )?;
+        }
+        Ok(rows)
+    }
+
+    fn write_history_base_rollout(
+        path: &Path,
+        id: &str,
+        history_base_thread_id: &str,
+    ) -> AppResult<()> {
+        fs::create_dir_all(path.parent().expect("rollout parent"))?;
+        let meta = serde_json::json!({
+            "timestamp": "2026-05-10T10:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": id,
+                "timestamp": "2026-05-10T10:00:00Z",
+                "cwd": "F:\\w",
+                "history_mode": "paginated",
+                "history_base": {"thread_id": history_base_thread_id}
+            }
+        });
+        fs::write(path, format!("{}\n", serde_json::to_string(&meta)?))?;
+        Ok(())
+    }
+
     fn archive_fixture(codex: &Path) -> PathBuf {
         let active = codex
             .join("sessions")
@@ -5040,6 +5103,280 @@ mod tests {
         assert_eq!(result.threads_rows_deleted, 0);
         assert!(!orphan.exists());
 
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn delete_paginated_codex_session_clears_thread_history_projection() -> AppResult<()> {
+        let codex = temp_dir("codex-delete-paginated-history");
+        let rollout = archive_fixture(&codex);
+        let other_id = "019d-history-other-7000-8000-000000000002";
+        create_thread_history_fixture(&codex, &[ARCHIVE_TEST_ID, other_id])?;
+
+        let result = delete_one(&codex, ARCHIVE_TEST_ID)?;
+
+        assert!(result.ok, "{:?}", result.error);
+        assert_eq!(result.history_rows_deleted, 4);
+        assert_eq!(thread_history_rows(&codex, ARCHIVE_TEST_ID)?, 0);
+        assert_eq!(thread_history_rows(&codex, other_id)?, 4);
+        assert!(!rollout.exists());
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn delete_clears_projection_rows_keyed_by_rollout_filename_uuid() -> AppResult<()> {
+        let codex = temp_dir("codex-delete-rollout-uuid-history");
+        let logical_id = "logical-thread-id";
+        let rollout_id = "019d0000-1111-7000-8000-000000000001";
+        let rollout = codex
+            .join("sessions/2026/05/10")
+            .join(format!("rollout-2026-05-10T10-00-00-{rollout_id}.jsonl"));
+        write_test_rollout(&rollout, rollout_id, "replacement rollout");
+        let state = create_codex_threads_table(&codex)?;
+        state.execute(
+            "INSERT INTO threads (
+                id, rollout_path, cwd, title, first_user_message, model, reasoning_effort,
+                tokens_used, created_at, updated_at, archived, archived_at, git_branch, source,
+                agent_nickname, agent_role
+            ) VALUES (?1, ?2, 'F:\\w', ?1, ?1, 'gpt-5', NULL, 0,
+                1770000000, 1770000300, 0, NULL, NULL, NULL, NULL, NULL)",
+            params![logical_id, rollout.to_string_lossy().into_owned()],
+        )?;
+        drop(state);
+        create_thread_history_fixture(&codex, &[rollout_id])?;
+
+        let result = delete_one(&codex, logical_id)?;
+
+        assert!(result.ok, "{:?}", result.error);
+        assert_eq!(result.history_rows_deleted, 4);
+        assert_eq!(thread_history_rows(&codex, rollout_id)?, 0);
+        assert!(!rollout.exists());
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn delete_replacement_chain_removes_every_rollout_and_projection() -> AppResult<()> {
+        let codex = temp_dir("codex-delete-replacement-chain");
+        let logical_id = "019d1000-1111-7000-8000-000000000001";
+        let replacement_ids = [
+            "019d1000-1111-7000-8000-000000000002",
+            "019d1000-1111-7000-8000-000000000003",
+            "019d1000-1111-7000-8000-000000000004",
+        ];
+        let rollout_dir = codex.join("sessions/2026/05/10");
+        let root_rollout =
+            rollout_dir.join(format!("rollout-2026-05-10T10-00-00-{logical_id}.jsonl"));
+        write_test_rollout(&root_rollout, logical_id, "chain root");
+
+        let mut chain_rollouts = vec![root_rollout];
+        let mut history_base_id = logical_id;
+        for (index, replacement_id) in replacement_ids.iter().enumerate() {
+            let rollout = rollout_dir.join(format!(
+                "rollout-2026-05-10T10-00-0{}-{logical_id}_{replacement_id}.jsonl",
+                index + 1
+            ));
+            write_history_base_rollout(&rollout, logical_id, history_base_id)?;
+            chain_rollouts.push(rollout);
+            history_base_id = replacement_id;
+        }
+
+        let state = create_codex_threads_table(&codex)?;
+        state.execute(
+            "INSERT INTO threads (
+                id, rollout_path, cwd, title, first_user_message, model, reasoning_effort,
+                tokens_used, created_at, updated_at, archived, archived_at, git_branch, source,
+                agent_nickname, agent_role
+            ) VALUES (?1, ?2, 'F:\\w', ?1, ?1, 'gpt-5', NULL, 0,
+                1770000000, 1770000300, 0, NULL, NULL, NULL, NULL, NULL)",
+            params![
+                logical_id,
+                chain_rollouts
+                    .last()
+                    .expect("replacement chain has a current rollout")
+                    .to_string_lossy()
+                    .into_owned()
+            ],
+        )?;
+        drop(state);
+
+        let other_id = "019d1000-1111-7000-8000-000000000099";
+        let mut projected_ids = vec![logical_id];
+        projected_ids.extend(replacement_ids);
+        projected_ids.push(other_id);
+        create_thread_history_fixture(&codex, &projected_ids)?;
+
+        let result = delete_one(&codex, logical_id)?;
+
+        assert!(result.ok, "{:?}", result.error);
+        assert_eq!(result.history_rows_deleted, 16);
+        assert!(chain_rollouts.iter().all(|rollout| !rollout.exists()));
+        for id in projected_ids.iter().take(projected_ids.len() - 1) {
+            assert_eq!(thread_history_rows(&codex, id)?, 0, "projection for {id}");
+        }
+        assert_eq!(thread_history_rows(&codex, other_id)?, 4);
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn delete_rejects_incomplete_thread_history_schema_without_mutation() -> AppResult<()> {
+        let codex = temp_dir("codex-delete-broken-history-schema");
+        let rollout = archive_fixture(&codex);
+        let history = rusqlite::Connection::open(codex.join("thread_history_1.sqlite"))?;
+        history.execute("CREATE TABLE thread_turns (thread_id TEXT NOT NULL)", [])?;
+        history.execute(
+            "INSERT INTO thread_turns (thread_id) VALUES (?1)",
+            [ARCHIVE_TEST_ID],
+        )?;
+        drop(history);
+        let rollout_before = fs::read(&rollout)?;
+        let state_before = fs::read(paths::state_db_path(&codex))?;
+
+        let error = delete_one(&codex, ARCHIVE_TEST_ID)
+            .expect_err("incomplete thread history schema must reject deletion");
+
+        assert!(
+            error.to_string().contains("缺少 thread_items 表"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&rollout)?, rollout_before);
+        assert_eq!(fs::read(paths::state_db_path(&codex))?, state_before);
+        let history = rusqlite::Connection::open(codex.join("thread_history_1.sqlite"))?;
+        let rows: i64 = history.query_row(
+            "SELECT COUNT(*) FROM thread_turns WHERE thread_id = ?1",
+            [ARCHIVE_TEST_ID],
+            |row| row.get(0),
+        )?;
+        assert_eq!(rows, 1);
+        drop(history);
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn delete_rejects_parent_still_referenced_by_unselected_history_base() -> AppResult<()> {
+        let codex = temp_dir("codex-delete-history-base-guard");
+        let parent_rollout = archive_fixture(&codex);
+        let child_id = "019d-history-base-child-7000-8000-000000000002";
+        let child_rollout = codex
+            .join("sessions/2026/05/10")
+            .join(format!("rollout-2026-05-10T10-00-01-{child_id}.jsonl"));
+        write_history_base_rollout(&child_rollout, child_id, ARCHIVE_TEST_ID)?;
+        let parent_before = fs::read(&parent_rollout)?;
+
+        let error = delete_one(&codex, ARCHIVE_TEST_ID)
+            .expect_err("unselected paginated child must protect its history base");
+
+        assert!(error.to_string().contains("history_base"), "{error}");
+        assert_eq!(fs::read(&parent_rollout)?, parent_before);
+        assert!(child_rollout.is_file());
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn history_base_guard_recognizes_replacement_rollout_filename_uuid() -> AppResult<()> {
+        let codex = temp_dir("codex-delete-replacement-history-base-guard");
+        let logical_id = "logical-parent-thread";
+        let rollout_id = "019d0000-1111-7000-8000-000000000003";
+        let parent_rollout = codex
+            .join("sessions/2026/05/10")
+            .join(format!("rollout-2026-05-10T10-00-00-{rollout_id}.jsonl"));
+        write_test_rollout(&parent_rollout, rollout_id, "replacement parent");
+        let state = create_codex_threads_table(&codex)?;
+        state.execute(
+            "INSERT INTO threads (
+                id, rollout_path, cwd, title, first_user_message, model, reasoning_effort,
+                tokens_used, created_at, updated_at, archived, archived_at, git_branch, source,
+                agent_nickname, agent_role
+            ) VALUES (?1, ?2, 'F:\\w', ?1, ?1, 'gpt-5', NULL, 0,
+                1770000000, 1770000300, 0, NULL, NULL, NULL, NULL, NULL)",
+            params![logical_id, parent_rollout.to_string_lossy().into_owned()],
+        )?;
+        drop(state);
+        let child_id = "replacement-history-child";
+        let child_rollout = codex
+            .join("sessions/2026/05/10")
+            .join(format!("rollout-{child_id}.jsonl"));
+        write_history_base_rollout(&child_rollout, child_id, rollout_id)?;
+
+        let error = delete_one(&codex, logical_id)
+            .expect_err("replacement rollout UUID must remain protected by history_base");
+
+        assert!(error.to_string().contains(rollout_id), "{error}");
+        assert!(parent_rollout.is_file());
+        assert!(child_rollout.is_file());
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn history_base_guard_protects_intermediate_replacement_rollout() -> AppResult<()> {
+        let codex = temp_dir("codex-delete-intermediate-replacement-guard");
+        let logical_id = "019d2000-1111-7000-8000-000000000001";
+        let intermediate_id = "019d2000-1111-7000-8000-000000000002";
+        let current_id = "019d2000-1111-7000-8000-000000000003";
+        let external_id = "019d2000-1111-7000-8000-000000000004";
+        let rollout_dir = codex.join("sessions/2026/05/10");
+        let root_rollout = rollout_dir.join(format!("rollout-root-{logical_id}.jsonl"));
+        let intermediate_rollout = rollout_dir.join(format!(
+            "rollout-middle-{logical_id}_{intermediate_id}.jsonl"
+        ));
+        let current_rollout =
+            rollout_dir.join(format!("rollout-current-{logical_id}_{current_id}.jsonl"));
+        let external_rollout = rollout_dir.join(format!("rollout-external-{external_id}.jsonl"));
+        write_test_rollout(&root_rollout, logical_id, "chain root");
+        write_history_base_rollout(&intermediate_rollout, logical_id, logical_id)?;
+        write_history_base_rollout(&current_rollout, logical_id, intermediate_id)?;
+        write_history_base_rollout(&external_rollout, external_id, intermediate_id)?;
+
+        let state = create_codex_threads_table(&codex)?;
+        state.execute(
+            "INSERT INTO threads (
+                id, rollout_path, cwd, title, first_user_message, model, reasoning_effort,
+                tokens_used, created_at, updated_at, archived, archived_at, git_branch, source,
+                agent_nickname, agent_role
+            ) VALUES (?1, ?2, 'F:\\w', ?1, ?1, 'gpt-5', NULL, 0,
+                1770000000, 1770000300, 0, NULL, NULL, NULL, NULL, NULL)",
+            params![logical_id, current_rollout.to_string_lossy().into_owned()],
+        )?;
+        drop(state);
+
+        let error = delete_one(&codex, logical_id)
+            .expect_err("an external child must protect every replacement segment");
+
+        assert!(error.to_string().contains(intermediate_id), "{error}");
+        assert!(root_rollout.is_file());
+        assert!(intermediate_rollout.is_file());
+        assert!(current_rollout.is_file());
+        assert!(external_rollout.is_file());
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn delete_allows_parent_and_history_base_child_in_same_batch() -> AppResult<()> {
+        let codex = temp_dir("codex-delete-history-base-batch");
+        let parent_rollout = archive_fixture(&codex);
+        let child_id = "019d-history-base-batch-7000-8000-000000000002";
+        let child_rollout = codex
+            .join("sessions/2026/05/10")
+            .join(format!("rollout-2026-05-10T10-00-01-{child_id}.jsonl"));
+        write_history_base_rollout(&child_rollout, child_id, ARCHIVE_TEST_ID)?;
+
+        let outcomes = delete_codex_artifacts_batch_with_family_store(
+            &codex,
+            &[ARCHIVE_TEST_ID.to_string(), child_id.to_string()],
+            None,
+        )?;
+
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes.iter().all(|outcome| outcome.result.ok));
+        assert!(!parent_rollout.exists());
+        assert!(!child_rollout.exists());
         fs::remove_dir_all(&codex).ok();
         Ok(())
     }

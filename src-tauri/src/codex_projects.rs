@@ -546,14 +546,15 @@ pub(crate) fn pending_thread_project_assignment_cwd(
         .ok_or_else(|| {
             AppError::Other(format!("Codex 会话 {thread_id} 的 projectId 必须是字符串"))
         })?;
-    let pending = assignment
-        .get("pendingCoreUpdate")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| {
-            AppError::Other(format!(
+    let pending = match assignment.get("pendingCoreUpdate") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(pending)) => *pending,
+        Some(_) => {
+            return Err(AppError::Other(format!(
                 "Codex 会话 {thread_id} 的 pendingCoreUpdate 必须是布尔值"
-            ))
-        })?;
+            )));
+        }
+    };
     if !pending {
         return Ok(None);
     }
@@ -1665,6 +1666,10 @@ mod tests {
                     "path": r"F:\fallback\path",
                     "pendingCoreUpdate": true
                 },
+                "minimal-settled-thread": {
+                    "projectKind": "local",
+                    "projectId": "project-settled"
+                },
                 "thread-without-cwd": {"projectKind": "local"}
             }
         }))?;
@@ -1684,6 +1689,10 @@ mod tests {
         assert_eq!(
             pending_thread_project_assignment_cwd(&codex.0, "thread-both")?,
             Some(r"F:\preferred\cwd".to_string())
+        );
+        assert_eq!(
+            pending_thread_project_assignment_cwd(&codex.0, "minimal-settled-thread")?,
+            None
         );
         assert!(pending_thread_project_assignment_cwd(&codex.0, "thread-without-cwd").is_err());
         assert_eq!(
@@ -1723,6 +1732,11 @@ mod tests {
                 },
                 "cloud-thread": {
                     "projectKind": "future-cloud-kind"
+                },
+                "malformed-pending-thread": {
+                    "projectKind": "local",
+                    "projectId": "project-malformed",
+                    "pendingCoreUpdate": "false"
                 }
             }
         }))?;
@@ -1734,6 +1748,9 @@ mod tests {
         assert_eq!(
             pending_thread_project_assignment_cwd(&codex.0, "cloud-thread")?,
             None
+        );
+        assert!(
+            pending_thread_project_assignment_cwd(&codex.0, "malformed-pending-thread").is_err()
         );
         Ok(())
     }

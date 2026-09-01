@@ -1,8 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::atomic_file;
@@ -23,6 +24,13 @@ const PROVIDER_CODEX: &str = "codex";
 const PROVIDER_CLAUDE: &str = "claude";
 const PROVIDER_OPENCODE: &str = "opencode";
 const PROVIDER_CURSOR: &str = "cursor";
+const CODEX_THREAD_HISTORY_FILE: &str = "thread_history.ndjson";
+const CODEX_THREAD_HISTORY_TABLES: [&str; 4] = [
+    "thread_turns",
+    "thread_items",
+    "thread_history_projection_state",
+    "thread_realtime_items",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RolloutPresence {
@@ -32,6 +40,7 @@ enum RolloutPresence {
 
 struct BackupThread {
     id: String,
+    rollout_id: String,
     rollout_path: PathBuf,
     rollout_relpath: PathBuf,
     title: String,
@@ -44,11 +53,128 @@ struct BackupThread {
     rollout_cwd_override: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct CodexHistoryBaseRollout {
+    thread_id: String,
+    source_path: PathBuf,
+    relpath: PathBuf,
+}
+
+struct CodexHistoryBaseRestoreFile {
+    source_path: PathBuf,
+    destination_path: PathBuf,
+    sha256: String,
+    label: String,
+    copy_required: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+enum PortableSqliteValue {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(String),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CodexThreadHistoryBackupRow {
+    table: String,
+    values: BTreeMap<String, PortableSqliteValue>,
+}
+
 fn sha256_file(path: &Path) -> AppResult<String> {
     let mut f = File::open(path)?;
     let mut hasher = Sha256::new();
     std::io::copy(&mut f, &mut hasher)?;
     Ok(hex::encode(hasher.finalize()))
+}
+
+fn same_existing_path(left: &Path, right: &Path) -> AppResult<bool> {
+    let left = left.canonicalize()?;
+    let right = right.canonicalize()?;
+    #[cfg(windows)]
+    {
+        Ok(paths::strip_verbatim(&left.to_string_lossy())
+            .eq_ignore_ascii_case(&paths::strip_verbatim(&right.to_string_lossy())))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(left == right)
+    }
+}
+
+fn codex_rollout_filename_id(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    let rest = stem.strip_prefix("rollout-")?;
+    if rest.len() < 36 {
+        return None;
+    }
+    let candidate = &rest[rest.len() - 36..];
+    is_codex_thread_uuid(candidate).then(|| candidate.to_string())
+}
+
+fn is_codex_thread_uuid(candidate: &str) -> bool {
+    candidate.len() == 36
+        && candidate
+            .as_bytes()
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    *byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            })
+}
+
+fn codex_history_base_thread_id(path: &Path) -> AppResult<Option<String>> {
+    let meta = crate::family::read_session_meta(path).map_err(|error| {
+        AppError::Other(format!(
+            "读取 Codex rollout session_meta 失败 {}: {error}",
+            path.to_string_lossy()
+        ))
+    })?;
+    if meta.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
+        return Err(AppError::Other(format!(
+            "Codex rollout 首行不是 session_meta: {}",
+            path.to_string_lossy()
+        )));
+    }
+    let payload = meta
+        .get("payload")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            AppError::Other(format!(
+                "Codex rollout session_meta.payload 不是对象: {}",
+                path.to_string_lossy()
+            ))
+        })?;
+    let Some(history_base) = payload.get("history_base") else {
+        return Ok(None);
+    };
+    if history_base.is_null() {
+        return Ok(None);
+    }
+    let thread_id = history_base
+        .as_object()
+        .and_then(|base| base.get("thread_id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|thread_id| !thread_id.trim().is_empty())
+        .ok_or_else(|| {
+            AppError::Other(format!(
+                "Codex rollout history_base.thread_id 缺失或无效: {}",
+                path.to_string_lossy()
+            ))
+        })?;
+    if !is_codex_thread_uuid(thread_id) {
+        return Err(AppError::Other(format!(
+            "Codex rollout history_base.thread_id 不是有效 UUID: {thread_id}"
+        )));
+    }
+    Ok(Some(thread_id.to_string()))
 }
 
 /// Copy a Codex rollout into the backup, optionally materializing Desktop's pending cwd into the
@@ -175,6 +301,57 @@ fn verify_restore_source(
         )));
     }
     Ok(())
+}
+
+fn prepare_codex_history_base_restore_files(
+    backup: &Path,
+    codex: &Path,
+    target: &ManifestSession,
+) -> AppResult<Vec<CodexHistoryBaseRestoreFile>> {
+    let validated = validate_codex_history_base_payload(backup, target)?;
+    validated
+        .into_iter()
+        .zip(&target.history_base_rollouts)
+        .enumerate()
+        .map(|(index, (dependency, artifact))| {
+            let destination_path = codex.join(&dependency.relpath);
+            path_safety::validate_descendant(
+                codex,
+                &destination_path,
+                EntryKind::File,
+                true,
+                "Codex history_base 还原目标",
+            )?;
+            let copy_required = match fs::symlink_metadata(&destination_path) {
+                Ok(metadata) => {
+                    if path_safety::metadata_is_link_or_reparse(&metadata) || !metadata.is_file() {
+                        return Err(AppError::Path(format!(
+                            "Codex history_base 还原目标不是普通文件: {}",
+                            destination_path.to_string_lossy()
+                        )));
+                    }
+                    let actual_sha256 = sha256_file(&destination_path)?;
+                    if metadata.len() != artifact.bytes || actual_sha256 != artifact.sha256 {
+                        return Err(AppError::Other(format!(
+                            "目标 Codex home 已有同 UUID 但内容不同的 history_base rollout，拒绝覆盖: id={} path={}",
+                            dependency.thread_id,
+                            destination_path.to_string_lossy()
+                        )));
+                    }
+                    false
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(error) => return Err(error.into()),
+            };
+            Ok(CodexHistoryBaseRestoreFile {
+                source_path: dependency.source_path,
+                destination_path,
+                sha256: artifact.sha256.clone(),
+                label: format!("history base rollout {}", index + 1),
+                copy_required,
+            })
+        })
+        .collect()
 }
 
 fn copy_restore_file_atomically(
@@ -346,14 +523,11 @@ pub fn create_backup_with_dirs(
         let thread = load_backup_thread(&state, &codex, id)?;
         if let Some(requested) = target.rollout_path.as_deref() {
             let requested = PathBuf::from(paths::strip_verbatim(requested));
-            let actual = PathBuf::from(paths::strip_verbatim(
-                &thread.rollout_path.to_string_lossy(),
-            ));
-            if requested != actual {
+            if !same_existing_path(&requested, &thread.rollout_path)? {
                 return Err(AppError::Other(format!(
                     "Codex 备份精确目标与 threads.rollout_path 不一致: id={id} requested={} actual={}",
                     requested.to_string_lossy(),
-                    actual.to_string_lossy()
+                    thread.rollout_path.to_string_lossy()
                 )));
             }
         }
@@ -368,6 +542,22 @@ pub fn create_backup_with_dirs(
         verify_rollout_identity(&thread.rollout_path, id, PROVIDER_CODEX)?;
         backup_threads.push(thread);
     }
+    let history_base_chains = collect_codex_history_base_chains(&codex, &backup_threads)?;
+    let mut rollout_source_fingerprints = HashMap::new();
+    for path in backup_threads
+        .iter()
+        .map(|thread| &thread.rollout_path)
+        .chain(
+            history_base_chains
+                .iter()
+                .flatten()
+                .map(|dependency| &dependency.source_path),
+        )
+    {
+        rollout_source_fingerprints
+            .entry(path.clone())
+            .or_insert(atomic_file::fingerprint(path)?);
+    }
     let history_ids = backup_threads
         .iter()
         .map(|thread| thread.id.clone())
@@ -376,9 +566,63 @@ pub fn create_backup_with_dirs(
         crate::history::collect_lines_for_ids(&paths::history_path(&codex), &history_ids)?;
 
     fs::create_dir_all(tmp.join("sessions"))?;
+    let mut copied_history_base_paths = HashSet::new();
+    for dependency in history_base_chains.iter().flatten() {
+        if !copied_history_base_paths.insert(dependency.relpath.clone()) {
+            continue;
+        }
+        let destination = tmp.join(&dependency.relpath);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        copy_codex_rollout_for_backup(
+            &dependency.source_path,
+            &destination,
+            &dependency.thread_id,
+            None,
+        )?;
+    }
+    // Primary copies run after dependencies so a selected base session has one deterministic
+    // backup representation even when another selected session references it.
+    for thread in &backup_threads {
+        let destination = tmp.join(&thread.rollout_relpath);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        copy_codex_rollout_for_backup(
+            &thread.rollout_path,
+            &destination,
+            &thread.rollout_id,
+            thread.rollout_cwd_override.as_deref(),
+        )?;
+    }
+    let projection_ids = codex_projection_ids_for_backup(&backup_threads, &history_base_chains);
+    let mut modified_rollout_ids = HashSet::new();
+    for thread in &backup_threads {
+        if sha256_file(&thread.rollout_path)? != sha256_file(&tmp.join(&thread.rollout_relpath))? {
+            modified_rollout_ids.insert(thread.id.clone());
+            if let Some(rollout_id) = codex_rollout_filename_id(&thread.rollout_path) {
+                modified_rollout_ids.insert(rollout_id);
+            }
+        }
+    }
+    export_codex_thread_history(
+        &codex,
+        &tmp.join(CODEX_THREAD_HISTORY_FILE),
+        &projection_ids,
+        &modified_rollout_ids,
+    )?;
+    for (path, expected) in &rollout_source_fingerprints {
+        if atomic_file::fingerprint(path)? != *expected {
+            return Err(AppError::Other(format!(
+                "Codex rollout 在备份期间发生变化，请重试: {}",
+                path.to_string_lossy()
+            )));
+        }
+    }
 
     let mut manifest = Manifest {
-        version: 4,
+        version: 6,
         provider: Some(PROVIDER_CODEX.to_string()),
         created_at: chrono::Utc::now().to_rfc3339(),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -392,19 +636,10 @@ pub fn create_backup_with_dirs(
     let mut threads_rows: Vec<serde_json::Value> = Vec::new();
     let mut logs_out = File::create(tmp.join("logs.ndjson"))?;
 
-    for thread in &backup_threads {
+    for (thread, history_base_chain) in backup_threads.iter().zip(&history_base_chains) {
         threads_rows.push(thread.thread_row.clone());
 
         let dest = tmp.join(&thread.rollout_relpath);
-        if let Some(p) = dest.parent() {
-            fs::create_dir_all(p)?;
-        }
-        copy_codex_rollout_for_backup(
-            &thread.rollout_path,
-            &dest,
-            &thread.id,
-            thread.rollout_cwd_override.as_deref(),
-        )?;
         let sha = sha256_file(&dest)?;
         let bytes = fs::metadata(&dest)?.len();
 
@@ -445,11 +680,27 @@ pub fn create_backup_with_dirs(
             .get(&thread.id)
             .map(|rows| rows.len() as u32)
             .unwrap_or(0);
+        let history_base_rollouts = history_base_chain
+            .iter()
+            .map(|dependency| {
+                let path = tmp.join(&dependency.relpath);
+                validate_codex_history_base_relpath(
+                    &dependency.relpath.to_string_lossy(),
+                    &dependency.thread_id,
+                )?;
+                Ok(ManifestArtifact {
+                    relpath: dependency.relpath.to_string_lossy().replace('\\', "/"),
+                    bytes: fs::metadata(&path)?.len(),
+                    sha256: sha256_file(&path)?,
+                })
+            })
+            .collect::<AppResult<Vec<_>>>()?;
 
         manifest.sessions.push(ManifestSession {
             provider: Some(PROVIDER_CODEX.to_string()),
             id: thread.id.clone(),
             rollout_relpath: thread.rollout_relpath.to_string_lossy().replace('\\', "/"),
+            history_base_rollouts,
             source_relpath: None,
             sidecar_relpath: None,
             sidecar_files: Vec::new(),
@@ -482,8 +733,15 @@ pub fn create_backup_with_dirs(
     logs_out.flush()?;
     logs_out.sync_all()?;
     drop(logs_out);
-    manifest.artifacts =
-        collect_backup_artifacts(&tmp, &["threads.json", "logs.ndjson", "history.jsonl"])?;
+    manifest.artifacts = collect_backup_artifacts(
+        &tmp,
+        &[
+            "threads.json",
+            "logs.ndjson",
+            "history.jsonl",
+            CODEX_THREAD_HISTORY_FILE,
+        ],
+    )?;
     fs::write(
         tmp.join("manifest.json"),
         serde_json::to_vec_pretty(&manifest)?,
@@ -653,6 +911,7 @@ fn create_claude_backup(
             provider: Some(PROVIDER_CLAUDE.to_string()),
             id: session.id.clone(),
             rollout_relpath: dest_rel.to_string_lossy().replace('\\', "/"),
+            history_base_rollouts: Vec::new(),
             source_relpath: Some(source_rel_string),
             sidecar_relpath: sidecar_rel,
             sidecar_files,
@@ -766,6 +1025,7 @@ fn create_opencode_backup(
             provider: Some(PROVIDER_OPENCODE.to_string()),
             id: target.id,
             rollout_relpath: relative.to_string_lossy().replace('\\', "/"),
+            history_base_rollouts: Vec::new(),
             source_relpath: None,
             sidecar_relpath: None,
             sidecar_files: Vec::new(),
@@ -873,6 +1133,7 @@ fn create_cursor_backup(
             provider: Some(PROVIDER_CURSOR.to_string()),
             id: target.id,
             rollout_relpath: relative.to_string_lossy().replace('\\', "/"),
+            history_base_rollouts: Vec::new(),
             source_relpath: None,
             sidecar_relpath: None,
             sidecar_files: Vec::new(),
@@ -1072,12 +1333,19 @@ fn load_backup_thread(
         .to_string();
     let rollout_path = paths::host_path_from_codex_record(codex, &rollout_path_raw);
     let rollout_relpath = rel_path(&rollout_path.to_string_lossy(), codex)?;
+    let rollout_brief =
+        crate::repair::read_rollout_brief(codex, &rollout_path)?.ok_or_else(|| {
+            AppError::Other(format!(
+                "Codex rollout 缺少 session_meta: {}",
+                rollout_path.to_string_lossy()
+            ))
+        })?;
     let database_cwd = row_json
         .get("cwd")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_string();
-    let rollout_cwd = crate::codex_rollout_cwd::read_effective_cwd(&rollout_path, id)?;
+    let rollout_cwd = rollout_brief.cwd.clone();
     // Official Desktop moves update the explicit assignment immediately and may defer the Core
     // cwd until the next turn. A backup must preserve that newer intent without carrying the
     // source machine's projectId. Convert the Desktop-visible host path back to this Codex home's
@@ -1103,6 +1371,7 @@ fn load_backup_thread(
 
     Ok(BackupThread {
         id: id.to_string(),
+        rollout_id: rollout_brief.id,
         rollout_path,
         rollout_relpath,
         title: row_json
@@ -1166,12 +1435,372 @@ fn validate_codex_rollout_relpath(raw: &str, id: &str) -> AppResult<PathBuf> {
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("");
-    if stem != id && !stem.ends_with(id) {
+    if stem != id && !stem.ends_with(id) && codex_rollout_filename_id(&relative).is_none() {
         return Err(AppError::Path(format!(
             "Codex rollout 文件名与会话 ID 不匹配: id={id} path={raw}"
         )));
     }
     Ok(relative)
+}
+
+fn validate_codex_history_base_relpath(raw: &str, thread_id: &str) -> AppResult<PathBuf> {
+    let relative = paths::checked_relative_path(raw)?;
+    let root = relative
+        .components()
+        .next()
+        .and_then(|component| match component {
+            std::path::Component::Normal(value) => value.to_str(),
+            _ => None,
+        });
+    if !matches!(root, Some("sessions" | "archived_sessions"))
+        || relative.extension().and_then(|value| value.to_str()) != Some("jsonl")
+        || codex_rollout_filename_id(&relative).as_deref() != Some(thread_id)
+    {
+        return Err(AppError::Path(format!(
+            "Codex history_base rollout 路径与物理线程 UUID 不匹配: id={thread_id} path={raw}"
+        )));
+    }
+    Ok(relative)
+}
+
+fn codex_history_base_rollout_index(codex: &Path) -> AppResult<HashMap<String, Vec<PathBuf>>> {
+    let mut rollouts = crate::family::scan_rollouts(codex)?;
+    rollouts.extend(crate::family::scan_archived_rollouts(codex)?);
+    let mut index = HashMap::<String, Vec<PathBuf>>::new();
+    for rollout in rollouts {
+        if let Some(thread_id) = codex_rollout_filename_id(&rollout) {
+            index.entry(thread_id).or_default().push(rollout);
+        }
+    }
+    Ok(index)
+}
+
+fn collect_codex_history_base_chain(
+    codex: &Path,
+    primary: &Path,
+    index: &HashMap<String, Vec<PathBuf>>,
+) -> AppResult<Vec<CodexHistoryBaseRollout>> {
+    let mut chain = Vec::new();
+    let mut visited = HashSet::new();
+    if let Some(primary_id) = codex_rollout_filename_id(primary) {
+        visited.insert(primary_id);
+    }
+    let mut current = primary.to_path_buf();
+    while let Some(thread_id) = codex_history_base_thread_id(&current)? {
+        if !visited.insert(thread_id.clone()) {
+            return Err(AppError::Other(format!(
+                "Codex history_base 依赖链存在循环引用: {thread_id}"
+            )));
+        }
+        let candidates = index.get(&thread_id).map(Vec::as_slice).unwrap_or(&[]);
+        let source_path = match candidates {
+            [path] => path.clone(),
+            [] => {
+                return Err(AppError::NotFound(format!(
+                    "Codex history_base 依赖 rollout 不存在: {thread_id}"
+                )))
+            }
+            duplicates => {
+                return Err(AppError::Other(format!(
+                    "Codex history_base 依赖 rollout 不唯一: id={thread_id} count={}",
+                    duplicates.len()
+                )))
+            }
+        };
+        path_safety::validate_descendant(
+            codex,
+            &source_path,
+            EntryKind::File,
+            false,
+            "Codex history_base 备份源",
+        )?;
+        let relpath = rel_path(&source_path.to_string_lossy(), codex)?;
+        validate_codex_history_base_relpath(&relpath.to_string_lossy(), &thread_id)?;
+        // Besides checking the physical UUID above, require a readable session_meta before a
+        // dependency can enter a self-contained backup.
+        codex_history_base_thread_id(&source_path)?;
+        chain.push(CodexHistoryBaseRollout {
+            thread_id,
+            source_path: source_path.clone(),
+            relpath,
+        });
+        current = source_path;
+    }
+    Ok(chain)
+}
+
+fn collect_codex_history_base_chains(
+    codex: &Path,
+    threads: &[BackupThread],
+) -> AppResult<Vec<Vec<CodexHistoryBaseRollout>>> {
+    let index = codex_history_base_rollout_index(codex)?;
+    threads
+        .iter()
+        .map(|thread| collect_codex_history_base_chain(codex, &thread.rollout_path, &index))
+        .collect()
+}
+
+fn codex_projection_ids_for_backup(
+    threads: &[BackupThread],
+    chains: &[Vec<CodexHistoryBaseRollout>],
+) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for (thread, chain) in threads.iter().zip(chains) {
+        ids.insert(thread.id.clone());
+        if let Some(rollout_id) = codex_rollout_filename_id(&thread.rollout_path) {
+            ids.insert(rollout_id);
+        }
+        ids.extend(chain.iter().map(|dependency| dependency.thread_id.clone()));
+    }
+    ids
+}
+
+fn codex_projection_ids_for_manifest_session(
+    session: &ManifestSession,
+) -> AppResult<HashSet<String>> {
+    let mut ids = HashSet::from([session.id.clone()]);
+    let primary = paths::checked_relative_path(&session.rollout_relpath)?;
+    if let Some(rollout_id) = codex_rollout_filename_id(&primary) {
+        ids.insert(rollout_id);
+    }
+    for artifact in &session.history_base_rollouts {
+        let relative = paths::checked_relative_path(&artifact.relpath)?;
+        let thread_id = codex_rollout_filename_id(&relative).ok_or_else(|| {
+            AppError::Path(format!(
+                "Codex history_base rollout 文件名缺少物理线程 UUID: {}",
+                artifact.relpath
+            ))
+        })?;
+        ids.insert(thread_id);
+    }
+    Ok(ids)
+}
+
+fn portable_sqlite_value(value: rusqlite::types::ValueRef<'_>) -> PortableSqliteValue {
+    match value {
+        rusqlite::types::ValueRef::Null => PortableSqliteValue::Null,
+        rusqlite::types::ValueRef::Integer(value) => PortableSqliteValue::Integer(value),
+        rusqlite::types::ValueRef::Real(value) => PortableSqliteValue::Real(value),
+        rusqlite::types::ValueRef::Text(value) => {
+            PortableSqliteValue::Text(String::from_utf8_lossy(value).into_owned())
+        }
+        rusqlite::types::ValueRef::Blob(value) => PortableSqliteValue::Blob(hex::encode(value)),
+    }
+}
+
+fn validate_codex_thread_history_schema(
+    connection: &rusqlite::Connection,
+    database: &str,
+) -> AppResult<HashMap<String, HashSet<String>>> {
+    let mut columns = HashMap::new();
+    for table in CODEX_THREAD_HISTORY_TABLES {
+        let exists: bool = connection.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM {database}.sqlite_schema WHERE type='table' AND name=?1)"
+            ),
+            [table],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(AppError::Other(format!(
+                "Codex thread history 数据库缺少 {table} 表"
+            )));
+        }
+        let mut statement =
+            connection.prepare(&format!("PRAGMA {database}.table_info({table})"))?;
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<HashSet<_>, _>>()?;
+        if !names.contains("thread_id") {
+            return Err(AppError::Other(format!(
+                "Codex thread history 的 {table} 表缺少 thread_id 列"
+            )));
+        }
+        columns.insert(table.to_string(), names);
+    }
+    Ok(columns)
+}
+
+fn export_codex_thread_history(
+    codex: &Path,
+    destination: &Path,
+    projection_ids: &HashSet<String>,
+    modified_rollout_ids: &HashSet<String>,
+) -> AppResult<u32> {
+    let mut output = File::create(destination)?;
+    let database_path = codex.join("thread_history_1.sqlite");
+    let metadata = match fs::symlink_metadata(&database_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            output.sync_all()?;
+            return Ok(0);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if path_safety::metadata_is_link_or_reparse(&metadata) || !metadata.is_file() {
+        return Err(AppError::Path(format!(
+            "Codex thread history 数据库不是普通文件: {}",
+            database_path.to_string_lossy()
+        )));
+    }
+    let connection = rusqlite::Connection::open_with_flags(
+        &database_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    validate_codex_thread_history_schema(&connection, "main")?;
+    connection.execute_batch("BEGIN")?;
+    let mut ids = projection_ids.iter().cloned().collect::<Vec<_>>();
+    ids.sort();
+    let mut written = 0u32;
+    for table in CODEX_THREAD_HISTORY_TABLES {
+        let mut statement = connection.prepare(&format!(
+            "SELECT * FROM {table} WHERE thread_id = ?1 ORDER BY rowid"
+        ))?;
+        let column_names = statement
+            .column_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        for thread_id in &ids {
+            // Rewriting even only cwd changes rollout byte offsets. Keeping the old projection
+            // rows with cleared offsets is not enough: Codex deliberately preserves the first
+            // persisted turn boundary on conflict, so those offsets would never be rebuilt and
+            // paginated fork-at-turn would remain broken. Omit this rollout's projection
+            // completely and let the official projector rebuild it from the canonical JSONL.
+            if modified_rollout_ids.contains(thread_id) {
+                continue;
+            }
+            let rows = statement.query_map([thread_id], |row| {
+                let mut values = BTreeMap::new();
+                for (index, name) in column_names.iter().enumerate() {
+                    values.insert(name.clone(), portable_sqlite_value(row.get_ref(index)?));
+                }
+                Ok(values)
+            })?;
+            for values in rows {
+                writeln!(
+                    output,
+                    "{}",
+                    serde_json::to_string(&CodexThreadHistoryBackupRow {
+                        table: table.to_string(),
+                        values: values?,
+                    })?
+                )?;
+                written = written
+                    .checked_add(1)
+                    .ok_or_else(|| AppError::Other("Codex thread history 备份行数溢出".into()))?;
+            }
+        }
+    }
+    connection.execute_batch("COMMIT")?;
+    output.flush()?;
+    output.sync_all()?;
+    Ok(written)
+}
+
+fn codex_thread_history_primary_key(table: &str) -> AppResult<&'static [&'static str]> {
+    match table {
+        "thread_turns" => Ok(&["thread_id", "turn_id"]),
+        "thread_items" => Ok(&["thread_id", "turn_id", "item_id"]),
+        "thread_history_projection_state" => Ok(&["thread_id"]),
+        "thread_realtime_items" => Ok(&["thread_id", "item_id"]),
+        other => Err(AppError::Other(format!(
+            "thread_history.ndjson 包含未知表: {other}"
+        ))),
+    }
+}
+
+fn codex_thread_history_row_thread_id(row: &CodexThreadHistoryBackupRow) -> AppResult<&str> {
+    match row.values.get("thread_id") {
+        Some(PortableSqliteValue::Text(thread_id)) if !thread_id.is_empty() => Ok(thread_id),
+        _ => Err(AppError::Other(format!(
+            "thread_history.ndjson 的 {} 行缺少文本 thread_id",
+            row.table
+        ))),
+    }
+}
+
+fn read_codex_thread_history_backup_rows(
+    backup: &Path,
+) -> AppResult<Vec<CodexThreadHistoryBackupRow>> {
+    let path = backup.join(CODEX_THREAD_HISTORY_FILE);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    if path_safety::metadata_is_link_or_reparse(&metadata) || !metadata.is_file() {
+        return Err(AppError::Path(format!(
+            "Codex thread history 备份不是普通文件: {}",
+            path.to_string_lossy()
+        )));
+    }
+    let mut rows = Vec::new();
+    let mut keys = HashSet::new();
+    for (line_index, line) in BufReader::new(File::open(&path)?).lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: CodexThreadHistoryBackupRow = serde_json::from_str(&line).map_err(|error| {
+            AppError::Other(format!(
+                "thread_history.ndjson 第 {} 行损坏: {error}",
+                line_index + 1
+            ))
+        })?;
+        let primary_key = codex_thread_history_primary_key(&row.table)?;
+        let mut key = vec![row.table.clone()];
+        for column in primary_key {
+            let value = row.values.get(*column).ok_or_else(|| {
+                AppError::Other(format!(
+                    "thread_history.ndjson 的 {} 行缺少主键列 {column}",
+                    row.table
+                ))
+            })?;
+            key.push(serde_json::to_string(value)?);
+        }
+        if !keys.insert(key) {
+            return Err(AppError::Other(format!(
+                "thread_history.ndjson 包含重复的 {} 主键",
+                row.table
+            )));
+        }
+        codex_thread_history_row_thread_id(&row)?;
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+fn validate_codex_thread_history_backup(backup: &Path, manifest: &Manifest) -> AppResult<()> {
+    let mut allowed_ids = HashSet::new();
+    for session in &manifest.sessions {
+        if manifest_session_provider(manifest, session) == PROVIDER_CODEX {
+            allowed_ids.extend(codex_projection_ids_for_manifest_session(session)?);
+        }
+    }
+    for row in read_codex_thread_history_backup_rows(backup)? {
+        let thread_id = codex_thread_history_row_thread_id(&row)?;
+        if !allowed_ids.contains(thread_id) {
+            return Err(AppError::Other(format!(
+                "thread_history.ndjson 包含未声明会话的投影行: {thread_id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn codex_thread_history_rows_for_session(
+    backup: &Path,
+    session: &ManifestSession,
+) -> AppResult<Vec<CodexThreadHistoryBackupRow>> {
+    let ids = codex_projection_ids_for_manifest_session(session)?;
+    let mut selected = Vec::new();
+    for row in read_codex_thread_history_backup_rows(backup)? {
+        if ids.contains(codex_thread_history_row_thread_id(&row)?) {
+            selected.push(row);
+        }
+    }
+    Ok(selected)
 }
 
 fn validate_claude_source_relpath(raw: &str, id: &str) -> AppResult<PathBuf> {
@@ -1213,9 +1842,14 @@ fn snapshot_relpath(provider: &str, id: &str) -> PathBuf {
 }
 
 fn validate_manifest_paths(manifest: &Manifest) -> AppResult<()> {
-    let allowed_artifacts = ["history.jsonl", "logs.ndjson", "threads.json"]
-        .into_iter()
-        .collect::<HashSet<_>>();
+    let allowed_artifacts = [
+        "history.jsonl",
+        "logs.ndjson",
+        "threads.json",
+        CODEX_THREAD_HISTORY_FILE,
+    ]
+    .into_iter()
+    .collect::<HashSet<_>>();
     let mut artifact_paths = HashSet::new();
     for artifact in &manifest.artifacts {
         let relative = paths::checked_relative_path(&artifact.relpath)?;
@@ -1244,6 +1878,14 @@ fn validate_manifest_paths(manifest: &Manifest) -> AppResult<()> {
         let expected = match provider {
             PROVIDER_CLAUDE => ["history.jsonl"].into_iter().collect::<HashSet<_>>(),
             PROVIDER_OPENCODE | PROVIDER_CURSOR => HashSet::new(),
+            _ if manifest.version >= 6 => [
+                "history.jsonl",
+                "logs.ndjson",
+                "threads.json",
+                CODEX_THREAD_HISTORY_FILE,
+            ]
+            .into_iter()
+            .collect::<HashSet<_>>(),
             _ => ["history.jsonl", "logs.ndjson", "threads.json"]
                 .into_iter()
                 .collect::<HashSet<_>>(),
@@ -1261,6 +1903,16 @@ fn validate_manifest_paths(manifest: &Manifest) -> AppResult<()> {
     }
 
     for session in &manifest.sessions {
+        let mut history_base_paths = HashSet::new();
+        for artifact in &session.history_base_rollouts {
+            let relative = paths::checked_relative_path(&artifact.relpath)?;
+            if !history_base_paths.insert(relative) {
+                return Err(AppError::Path(format!(
+                    "Codex history_base manifest 包含重复路径: {}",
+                    artifact.relpath
+                )));
+            }
+        }
         for (label, root, artifacts) in [
             (
                 "sidecar",
@@ -1299,6 +1951,22 @@ fn validate_manifest_paths(manifest: &Manifest) -> AppResult<()> {
         match provider {
             PROVIDER_CODEX => {
                 validate_codex_rollout_relpath(&session.rollout_relpath, &session.id)?;
+                if manifest.version < 5 && !session.history_base_rollouts.is_empty() {
+                    return Err(AppError::Other(format!(
+                        "Codex history_base 文件清单要求备份 manifest v5: {}",
+                        session.id
+                    )));
+                }
+                for artifact in &session.history_base_rollouts {
+                    let relative = paths::checked_relative_path(&artifact.relpath)?;
+                    let thread_id = codex_rollout_filename_id(&relative).ok_or_else(|| {
+                        AppError::Path(format!(
+                            "Codex history_base rollout 文件名缺少物理线程 UUID: {}",
+                            artifact.relpath
+                        ))
+                    })?;
+                    validate_codex_history_base_relpath(&artifact.relpath, &thread_id)?;
+                }
                 if session.sidecar_relpath.is_some()
                     || session.companions_relpath.is_some()
                     || session.tasks_relpath.is_some()
@@ -1313,6 +1981,12 @@ fn validate_manifest_paths(manifest: &Manifest) -> AppResult<()> {
                 }
             }
             PROVIDER_CLAUDE => {
+                if !session.history_base_rollouts.is_empty() {
+                    return Err(AppError::Path(format!(
+                        "Claude 备份不应声明 Codex history_base rollout: {}",
+                        session.id
+                    )));
+                }
                 let source = session.source_relpath.as_deref().ok_or_else(|| {
                     AppError::Path(format!("Claude 备份缺少 source_relpath: {}", session.id))
                 })?;
@@ -1367,7 +2041,8 @@ fn validate_manifest_paths(manifest: &Manifest) -> AppResult<()> {
             // 这两个 provider 都以单份 JSON 快照落盘，不该带任何文件型附属资产。
             PROVIDER_OPENCODE | PROVIDER_CURSOR => {
                 validate_snapshot_relpath(provider, &session.rollout_relpath, &session.id)?;
-                if session.source_relpath.is_some()
+                if !session.history_base_rollouts.is_empty()
+                    || session.source_relpath.is_some()
                     || session.sidecar_relpath.is_some()
                     || session.companions_relpath.is_some()
                     || session.tasks_relpath.is_some()
@@ -1401,10 +2076,11 @@ fn verify_rollout_identity(source: &Path, expected_id: &str, provider: &str) -> 
                 source.to_string_lossy()
             ))
         })?;
-        if brief.id != expected_id {
+        let filename_id = codex_rollout_filename_id(source);
+        if brief.id != expected_id && filename_id.as_deref() != Some(brief.id.as_str()) {
             return Err(AppError::Other(format!(
-                "备份 Codex rollout 内部 ID 不匹配: 期望 {}，实际 {}",
-                expected_id, brief.id
+                "备份 Codex rollout 内部 ID 不匹配: 逻辑会话 {}，文件 UUID {:?}，实际 {}",
+                expected_id, filename_id, brief.id
             )));
         }
         return Ok(());
@@ -1449,6 +2125,65 @@ fn verify_rollout_identity(source: &Path, expected_id: &str, provider: &str) -> 
         "备份 Claude rollout 缺少 sessionId: {}",
         source.to_string_lossy()
     )))
+}
+
+fn validate_codex_history_base_payload(
+    backup: &Path,
+    session: &ManifestSession,
+) -> AppResult<Vec<CodexHistoryBaseRollout>> {
+    let primary_rel = validate_codex_rollout_relpath(&session.rollout_relpath, &session.id)?;
+    let mut current = backup.join(primary_rel);
+    let mut visited = HashSet::new();
+    if let Some(primary_id) = codex_rollout_filename_id(&current) {
+        visited.insert(primary_id);
+    }
+    let mut validated = Vec::with_capacity(session.history_base_rollouts.len());
+    for artifact in &session.history_base_rollouts {
+        let thread_id = codex_history_base_thread_id(&current)?.ok_or_else(|| {
+            AppError::Other(format!(
+                "Codex history_base manifest 声明了多余 rollout: session={} path={}",
+                session.id, artifact.relpath
+            ))
+        })?;
+        if !visited.insert(thread_id.clone()) {
+            return Err(AppError::Other(format!(
+                "Codex history_base 备份依赖链存在循环引用: {thread_id}"
+            )));
+        }
+        let relpath = validate_codex_history_base_relpath(&artifact.relpath, &thread_id)?;
+        let source_path = backup.join(&relpath);
+        path_safety::validate_descendant(
+            backup,
+            &source_path,
+            EntryKind::File,
+            false,
+            "Codex history_base 备份文件",
+        )?;
+        let metadata = fs::symlink_metadata(&source_path)?;
+        let actual_sha256 = sha256_file(&source_path)?;
+        if metadata.len() != artifact.bytes || actual_sha256 != artifact.sha256 {
+            return Err(AppError::Other(format!(
+                "Codex history_base rollout 大小或 sha256 校验失败: {}",
+                artifact.relpath
+            )));
+        }
+        // Parse the dependency now as well as on the next loop iteration so a terminal base with
+        // malformed session_meta cannot pass validation.
+        codex_history_base_thread_id(&source_path)?;
+        validated.push(CodexHistoryBaseRollout {
+            thread_id,
+            source_path: source_path.clone(),
+            relpath,
+        });
+        current = source_path;
+    }
+    if let Some(missing_id) = codex_history_base_thread_id(&current)? {
+        return Err(AppError::Other(format!(
+            "Codex 备份缺少 history_base 依赖 rollout: session={} id={missing_id}",
+            session.id
+        )));
+    }
+    Ok(validated)
 }
 
 fn validate_optional_backup_file(backup: &Path, name: &str, required: bool) -> AppResult<()> {
@@ -1522,6 +2257,14 @@ fn validate_backup_payload_sessions(
         "history.jsonl",
         sessions.iter().any(|session| session.history_rows > 0),
     )?;
+    validate_optional_backup_file(
+        backup,
+        CODEX_THREAD_HISTORY_FILE,
+        has_codex && manifest.version >= 6,
+    )?;
+    if has_codex && backup.join(CODEX_THREAD_HISTORY_FILE).is_file() {
+        validate_codex_thread_history_backup(backup, manifest)?;
+    }
 
     for session in sessions {
         let provider = manifest_session_provider(manifest, session);
@@ -1535,6 +2278,9 @@ fn validate_backup_payload_sessions(
         )?;
         if source_exists {
             verify_rollout_identity(&source, &session.id, provider)?;
+            if provider == PROVIDER_CODEX {
+                validate_codex_history_base_payload(backup, session)?;
+            }
         }
         if let Some(sidecar) = session.sidecar_relpath.as_deref() {
             let sidecar = backup.join(paths::checked_relative_path(sidecar)?);
@@ -2424,6 +3170,170 @@ fn insert_restore_thread(
     Ok(())
 }
 
+fn portable_sql_parameter(value: &PortableSqliteValue) -> AppResult<Box<dyn rusqlite::ToSql>> {
+    Ok(match value {
+        PortableSqliteValue::Null => Box::new(Option::<String>::None),
+        PortableSqliteValue::Integer(value) => Box::new(*value),
+        PortableSqliteValue::Real(value) => Box::new(*value),
+        PortableSqliteValue::Text(value) => Box::new(value.clone()),
+        PortableSqliteValue::Blob(value) => Box::new(hex::decode(value).map_err(|error| {
+            AppError::Other(format!(
+                "thread_history.ndjson 包含无效十六进制 BLOB: {error}"
+            ))
+        })?),
+    })
+}
+
+fn quoted_sql_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn attach_codex_thread_history_for_restore(
+    state: &rusqlite::Connection,
+    codex: &Path,
+    backup_rows: &[CodexThreadHistoryBackupRow],
+) -> AppResult<Option<HashMap<String, HashSet<String>>>> {
+    let history_path = codex.join("thread_history_1.sqlite");
+    let metadata = match fs::symlink_metadata(&history_path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.is_none() {
+        if backup_rows.is_empty() {
+            return Ok(None);
+        }
+        return Err(AppError::NotFound(format!(
+            "备份包含 Codex 分页历史投影，但目标 thread_history_1.sqlite 不存在: {}",
+            history_path.to_string_lossy()
+        )));
+    }
+    let metadata = metadata.expect("checked above");
+    if path_safety::metadata_is_link_or_reparse(&metadata) || !metadata.is_file() {
+        return Err(AppError::Path(format!(
+            "Codex thread history 数据库不是普通文件: {}",
+            history_path.to_string_lossy()
+        )));
+    }
+    state.execute(
+        "ATTACH DATABASE ?1 AS restore_history",
+        [history_path.to_string_lossy().into_owned()],
+    )?;
+    Ok(Some(validate_codex_thread_history_schema(
+        state,
+        "restore_history",
+    )?))
+}
+
+fn codex_projection_owned_ids(session: &ManifestSession) -> AppResult<HashSet<String>> {
+    let mut ids = HashSet::from([session.id.clone()]);
+    let relative = paths::checked_relative_path(&session.rollout_relpath)?;
+    if let Some(rollout_id) = codex_rollout_filename_id(&relative) {
+        ids.insert(rollout_id);
+    }
+    Ok(ids)
+}
+
+fn insert_restore_thread_history_rows(
+    transaction: &rusqlite::Transaction<'_>,
+    rows: &[CodexThreadHistoryBackupRow],
+    owned_ids: &HashSet<String>,
+    overwrite: bool,
+    allowed_columns: &HashMap<String, HashSet<String>>,
+) -> AppResult<u32> {
+    for table in CODEX_THREAD_HISTORY_TABLES {
+        if overwrite {
+            for thread_id in owned_ids {
+                transaction.execute(
+                    &format!("DELETE FROM restore_history.{table} WHERE thread_id = ?1"),
+                    [thread_id],
+                )?;
+            }
+        } else {
+            for thread_id in owned_ids {
+                let exists: bool = transaction.query_row(
+                    &format!(
+                        "SELECT EXISTS(SELECT 1 FROM restore_history.{table} WHERE thread_id = ?1)"
+                    ),
+                    [thread_id],
+                    |row| row.get(0),
+                )?;
+                if exists {
+                    return Err(AppError::Other(format!(
+                        "目标 Codex home 已有孤立的分页历史投影，拒绝非覆盖还原: table={table} thread_id={thread_id}"
+                    )));
+                }
+            }
+        }
+    }
+
+    let mut inserted = 0u32;
+    for row in rows {
+        let allowed = allowed_columns
+            .get(&row.table)
+            .ok_or_else(|| AppError::Other(format!("目标 thread history 缺少表: {}", row.table)))?;
+        if let Some(unknown) = row.values.keys().find(|column| !allowed.contains(*column)) {
+            return Err(AppError::Other(format!(
+                "thread_history.ndjson 包含目标 {} 表不存在的列: {unknown}",
+                row.table
+            )));
+        }
+        let columns = row.values.keys().cloned().collect::<Vec<_>>();
+        let quoted_columns = columns
+            .iter()
+            .map(|column| quoted_sql_identifier(column))
+            .collect::<Vec<_>>();
+        let placeholders = (0..columns.len())
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let parameters = columns
+            .iter()
+            .map(|column| portable_sql_parameter(&row.values[column]))
+            .collect::<AppResult<Vec<_>>>()?;
+        let bound = parameters
+            .iter()
+            .map(|parameter| parameter.as_ref())
+            .collect::<Vec<_>>();
+        let affected = transaction.execute(
+            &format!(
+                "INSERT OR IGNORE INTO restore_history.{} ({}) VALUES ({placeholders})",
+                row.table,
+                quoted_columns.join(",")
+            ),
+            bound.as_slice(),
+        )?;
+        if affected == 1 {
+            inserted = inserted
+                .checked_add(1)
+                .ok_or_else(|| AppError::Other("Codex thread history 还原行数溢出".into()))?;
+            continue;
+        }
+
+        let predicates = quoted_columns
+            .iter()
+            .map(|column| format!("{column} IS ?"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let identical: bool = transaction.query_row(
+            &format!(
+                "SELECT EXISTS(SELECT 1 FROM restore_history.{} WHERE {predicates})",
+                row.table
+            ),
+            bound.as_slice(),
+            |existing| existing.get(0),
+        )?;
+        if !identical {
+            return Err(AppError::Other(format!(
+                "目标 Codex home 已有主键相同但内容不同的分页历史投影: table={} thread_id={}",
+                row.table,
+                codex_thread_history_row_thread_id(row)?
+            )));
+        }
+    }
+    Ok(inserted)
+}
+
 fn insert_restore_logs(
     transaction: &rusqlite::Transaction<'_>,
     thread_id: &str,
@@ -2531,6 +3441,9 @@ fn restore_one(
         result.conflict = true;
         return Ok(result);
     }
+    let history_base_restore_files =
+        prepare_codex_history_base_restore_files(backup, codex, target)?;
+    let backup_thread_history_rows = codex_thread_history_rows_for_session(backup, target)?;
     if crate::codex_projects::desktop_state_initialized(codex)? {
         crate::codex_projects::ensure_desktop_not_running(codex)?;
     }
@@ -2638,7 +3551,10 @@ fn restore_one(
             )));
         }
     }
-    // 3) threads 与 logs 先在同一 SQLite 事务中实际执行所有约束，但暂不提交。
+    let allowed_thread_history_columns =
+        attach_codex_thread_history_for_restore(&state, codex, &backup_thread_history_rows)?;
+    let projection_owned_ids = codex_projection_owned_ids(target)?;
+    // 3) threads、logs 与分页历史先在同一 SQLite 事务中实际执行所有约束，但暂不提交。
     let transaction = state.transaction()?;
     let database_stage = (|| -> AppResult<()> {
         insert_restore_thread(&transaction, codex, &target_rel, row)?;
@@ -2646,6 +3562,15 @@ fn restore_one(
         if restore_logs {
             result.logs_inserted =
                 insert_restore_logs(&transaction, &target.id, &backup_log_rows, overwrite)?;
+        }
+        if let Some(allowed_columns) = allowed_thread_history_columns.as_ref() {
+            insert_restore_thread_history_rows(
+                &transaction,
+                &backup_thread_history_rows,
+                &projection_owned_ids,
+                overwrite,
+                allowed_columns,
+            )?;
         }
         Ok(())
     })();
@@ -2668,12 +3593,24 @@ fn restore_one(
     let history_path = paths::history_path(codex);
     let index_path = paths::session_index_path(codex);
     let global_state_path = paths::codex_global_state_json_path(codex);
-    let mut snapshots = match RestoreFileSnapshots::capture(&[
-        ("rollout", &dest),
-        ("history", &history_path),
-        ("session index", &index_path),
-        ("Codex global state", &global_state_path),
-    ]) {
+    let mut snapshot_paths = vec![("rollout".to_string(), dest.clone())];
+    snapshot_paths.extend(
+        history_base_restore_files
+            .iter()
+            .filter(|dependency| dependency.copy_required)
+            .map(|dependency| {
+                (
+                    dependency.label.clone(),
+                    dependency.destination_path.clone(),
+                )
+            }),
+    );
+    snapshot_paths.extend([
+        ("history".to_string(), history_path.clone()),
+        ("session index".to_string(), index_path.clone()),
+        ("Codex global state".to_string(), global_state_path.clone()),
+    ]);
+    let mut snapshots = match RestoreFileSnapshots::capture_owned(&snapshot_paths) {
         Ok(snapshots) => snapshots,
         Err(error) => {
             let rollback_error = transaction.rollback().err();
@@ -2693,6 +3630,24 @@ fn restore_one(
 
     let mut project_state_receipt = None;
     let file_stage = (|| -> AppResult<()> {
+        for dependency in history_base_restore_files
+            .iter()
+            .filter(|dependency| dependency.copy_required)
+        {
+            snapshots.start(&dependency.label)?;
+            if let Err(error) = copy_restore_file_atomically(
+                codex,
+                &dependency.source_path,
+                &dependency.destination_path,
+                &dependency.sha256,
+                "Codex history_base 还原目标",
+            ) {
+                snapshots.record_failure(&dependency.label, &error)?;
+                return Err(error);
+            }
+            snapshots.finish(&dependency.label)?;
+        }
+
         snapshots.start("rollout")?;
         if let Err(error) = copy_restore_file_atomically(
             codex,
@@ -2891,6 +3846,7 @@ mod tests {
             provider: Some(PROVIDER_CODEX.to_string()),
             id: id.to_string(),
             rollout_relpath: rollout_relpath.to_string(),
+            history_base_rollouts: Vec::new(),
             source_relpath: None,
             sidecar_relpath: None,
             sidecar_files: Vec::new(),
@@ -3199,6 +4155,22 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn codex_backup_exact_target_accepts_equivalent_windows_path_forms() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-windows-path-identity-test");
+        fs::create_dir_all(&root)?;
+        let rollout = root.join("Rollout-Path-Identity.jsonl");
+        fs::write(&rollout, b"fixture")?;
+        let verbatim = PathBuf::from(format!(r"\\?\{}", rollout.to_string_lossy()));
+        let case_variant = PathBuf::from(rollout.to_string_lossy().to_uppercase());
+
+        assert!(same_existing_path(&verbatim, &case_variant)?);
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
     fn write_codex_restore_backup(
         backup: &Path,
         id: &str,
@@ -3233,6 +4205,7 @@ mod tests {
             provider: Some(PROVIDER_CODEX.to_string()),
             id: id.to_string(),
             rollout_relpath: relative.to_string_lossy().replace('\\', "/"),
+            history_base_rollouts: Vec::new(),
             source_relpath: None,
             sidecar_relpath: None,
             sidecar_files: Vec::new(),
@@ -3257,6 +4230,138 @@ mod tests {
         })
     }
 
+    fn attach_history_base_to_restore_backup(
+        backup: &Path,
+        target: &mut ManifestSession,
+        history_base_id: &str,
+        history_base_relative: &Path,
+    ) -> AppResult<Vec<u8>> {
+        let primary = backup.join(&target.rollout_relpath);
+        let mut meta: serde_json::Value =
+            serde_json::from_str(fs::read_to_string(&primary)?.trim())?;
+        meta["payload"]["history_mode"] = serde_json::Value::String("paginated".to_string());
+        meta["payload"]["history_base"] = serde_json::json!({"thread_id": history_base_id});
+        fs::write(&primary, format!("{meta}\n"))?;
+        target.bytes_rollout = fs::metadata(&primary)?.len();
+        target.sha256_rollout = sha256_file(&primary)?;
+
+        let history_base = backup.join(history_base_relative);
+        fs::create_dir_all(history_base.parent().unwrap_or(backup))?;
+        fs::write(
+            &history_base,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "timestamp": "2026-07-09T00:00:00Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": history_base_id,
+                        "model_provider": "openai",
+                        "cwd": r"F:\work\restored",
+                        "history_mode": "paginated"
+                    }
+                })
+            ),
+        )?;
+        let bytes = fs::read(&history_base)?;
+        target.history_base_rollouts = vec![ManifestArtifact {
+            relpath: history_base_relative.to_string_lossy().replace('\\', "/"),
+            bytes: bytes.len() as u64,
+            sha256: sha256_file(&history_base)?,
+        }];
+        Ok(bytes)
+    }
+
+    fn create_minimal_codex_restore_state(codex: &Path) -> AppResult<()> {
+        fs::create_dir_all(codex)?;
+        let state = rusqlite::Connection::open(paths::state_db_path(codex))?;
+        state.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    fn create_codex_thread_history_fixture(codex: &Path) -> AppResult<rusqlite::Connection> {
+        let connection = rusqlite::Connection::open(codex.join("thread_history_1.sqlite"))?;
+        connection.execute_batch(
+            "CREATE TABLE thread_turns (
+                thread_id TEXT NOT NULL, turn_id TEXT NOT NULL, rollout_ordinal INTEGER NOT NULL,
+                status TEXT NOT NULL, rollout_byte_offset INTEGER, rollout_end_ordinal INTEGER,
+                rollout_end_byte_offset INTEGER, PRIMARY KEY(thread_id, turn_id)
+             );
+             CREATE TABLE thread_items (
+                thread_id TEXT NOT NULL, turn_id TEXT NOT NULL, item_id TEXT NOT NULL,
+                rollout_ordinal INTEGER NOT NULL, created_at_ms INTEGER NOT NULL,
+                item_json TEXT NOT NULL, item_type TEXT NOT NULL DEFAULT '',
+                updated_at_ordinal INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(thread_id, turn_id, item_id)
+             );
+             CREATE TABLE thread_history_projection_state (
+                thread_id TEXT PRIMARY KEY, next_rollout_byte_offset INTEGER NOT NULL,
+                next_rollout_ordinal INTEGER NOT NULL
+             );
+             CREATE TABLE thread_realtime_items (
+                thread_id TEXT NOT NULL, item_id TEXT NOT NULL, rollout_ordinal INTEGER NOT NULL,
+                created_at_ms INTEGER NOT NULL, item_type TEXT NOT NULL, item_json TEXT NOT NULL,
+                PRIMARY KEY(thread_id, item_id)
+             );",
+        )?;
+        Ok(connection)
+    }
+
+    #[test]
+    fn modified_rollouts_omit_projection_rows_for_official_reprojection() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-modified-projection-backup-test");
+        fs::create_dir_all(&root)?;
+        let modified_id = "modified-rollout";
+        let preserved_id = "preserved-rollout";
+        let history = create_codex_thread_history_fixture(&root)?;
+        history.execute(
+            "INSERT INTO thread_turns
+                (thread_id, turn_id, rollout_ordinal, status, rollout_byte_offset,
+                 rollout_end_ordinal, rollout_end_byte_offset)
+             VALUES (?1, 'turn-1', 1, 'completed', 10, 2, 20)",
+            [modified_id],
+        )?;
+        history.execute(
+            "INSERT INTO thread_items
+                (thread_id, turn_id, item_id, rollout_ordinal, created_at_ms, item_json,
+                 item_type, updated_at_ordinal)
+             VALUES (?1, 'turn-1', 'item-1', 1, 1000, '{}', 'userMessage', 1)",
+            [modified_id],
+        )?;
+        history.execute(
+            "INSERT INTO thread_history_projection_state VALUES (?1, 30, 3)",
+            [modified_id],
+        )?;
+        history.execute(
+            "INSERT INTO thread_realtime_items
+                (thread_id, item_id, rollout_ordinal, created_at_ms, item_type, item_json)
+             VALUES (?1, 'realtime-1', 2, 1001, 'realtime_session_started', '{}')",
+            [modified_id],
+        )?;
+        history.execute(
+            "INSERT INTO thread_history_projection_state VALUES (?1, 40, 4)",
+            [preserved_id],
+        )?;
+        drop(history);
+
+        let destination = root.join(CODEX_THREAD_HISTORY_FILE);
+        let projection_ids = HashSet::from([modified_id.to_string(), preserved_id.to_string()]);
+        let modified_ids = HashSet::from([modified_id.to_string()]);
+        assert_eq!(
+            export_codex_thread_history(&root, &destination, &projection_ids, &modified_ids,)?,
+            1
+        );
+        let rows = read_codex_thread_history_backup_rows(&root)?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(codex_thread_history_row_thread_id(&rows[0])?, preserved_id);
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
     #[test]
     fn restore_thread_host_cwd_maps_wsl_record_before_desktop_assignment() {
         let codex = Path::new(r"\\wsl.localhost\Ubuntu\home\alice\.codex");
@@ -3265,6 +4370,7 @@ mod tests {
             provider: Some(PROVIDER_CODEX.to_string()),
             id: "wsl-restore".to_string(),
             rollout_relpath: "sessions/rollout-wsl-restore.jsonl".to_string(),
+            history_base_rollouts: Vec::new(),
             source_relpath: None,
             sidecar_relpath: None,
             sidecar_files: Vec::new(),
@@ -3468,6 +4574,404 @@ mod tests {
         assert_eq!(restored_meta["payload"]["cwd"], pending_host_cwd);
 
         drop(restored_state);
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn codex_backup_and_restore_preserve_paginated_history_base_chain() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-paginated-rollout-identity-test");
+        let codex = root.join("source-codex");
+        let backups = root.join("backups");
+        let logical_id = "logical-paginated-thread";
+        let rollout_id = "019d0000-1111-7000-8000-000000000010";
+        let history_base_id = "019d0000-1111-7000-8000-000000000009";
+        let rollout = codex
+            .join("sessions/2026/08/31")
+            .join(format!("rollout-2026-08-31T10-00-00-{rollout_id}.jsonl"));
+        fs::create_dir_all(rollout.parent().unwrap_or(&codex))?;
+        let history_base = codex.join("sessions/2026/08/31").join(format!(
+            "rollout-2026-08-31T09-00-00-{history_base_id}.jsonl"
+        ));
+        fs::write(
+            &history_base,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "timestamp": "2026-08-31T09:00:00Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": history_base_id,
+                        "cwd": r"F:\work\paginated",
+                        "model_provider": "openai",
+                        "history_mode": "paginated"
+                    }
+                })
+            ),
+        )?;
+        let history_base_bytes = fs::read(&history_base)?;
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-08-31T10:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": logical_id,
+                    "cwd": r"F:\work\paginated",
+                    "model_provider": "openai",
+                    "history_mode": "paginated",
+                    "history_base": {"thread_id": history_base_id}
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-08-31T10:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "thread_id": logical_id,
+                    "item": {
+                        "type": "UserMessage",
+                        "content": [{"type": "text", "text": "paginated backup"}]
+                    }
+                }
+            }),
+        ];
+        fs::write(
+            &rollout,
+            format!(
+                "{}\n",
+                lines
+                    .iter()
+                    .map(serde_json::Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        )?;
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        state.execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT,
+                first_user_message TEXT, preview TEXT, created_at INTEGER, updated_at INTEGER,
+                tokens_used INTEGER, model TEXT, history_mode TEXT
+            );",
+        )?;
+        state.execute(
+            "INSERT INTO threads VALUES (?1, ?2, 'F:\\work\\paginated', 'Paginated',
+                'paginated backup', 'paginated backup', 1, 2, 3, 'gpt-5', 'paginated')",
+            rusqlite::params![logical_id, rollout.to_string_lossy().into_owned()],
+        )?;
+        drop(state);
+        let history = create_codex_thread_history_fixture(&codex)?;
+        history.execute(
+            "INSERT INTO thread_turns
+                (thread_id, turn_id, rollout_ordinal, status, rollout_byte_offset,
+                 rollout_end_ordinal, rollout_end_byte_offset)
+             VALUES (?1, 'turn-current', 10, 'completed', 100, 20, 200)",
+            [logical_id],
+        )?;
+        history.execute(
+            "INSERT INTO thread_items
+                (thread_id, turn_id, item_id, rollout_ordinal, created_at_ms, item_json,
+                 item_type, updated_at_ordinal)
+             VALUES (?1, 'turn-current', 'item-current', 11, 1000, '{}', 'userMessage', 11)",
+            [logical_id],
+        )?;
+        history.execute(
+            "INSERT INTO thread_history_projection_state VALUES (?1, 300, 30)",
+            [logical_id],
+        )?;
+        history.execute(
+            "INSERT INTO thread_history_projection_state VALUES (?1, 50, 5)",
+            [history_base_id],
+        )?;
+        drop(history);
+
+        let summary = create_backup(
+            Some(PROVIDER_CODEX.to_string()),
+            codex.to_string_lossy().into_owned(),
+            None,
+            backups.to_string_lossy().into_owned(),
+            vec![logical_id.to_string()],
+            None,
+            Some("paginated".to_string()),
+            None,
+        )?;
+        let backup = PathBuf::from(summary.path);
+        let detail = open_backup(
+            backups.to_string_lossy().into_owned(),
+            backup.to_string_lossy().into_owned(),
+        )?;
+        let target = &detail.manifest.sessions[0];
+        assert_eq!(detail.manifest.version, 6);
+        assert_eq!(target.id, logical_id);
+        assert_eq!(
+            crate::family::read_session_meta(&backup.join(&target.rollout_relpath))?["payload"]
+                ["id"],
+            logical_id
+        );
+        assert_eq!(target.history_base_rollouts.len(), 1);
+        let history_base_artifact = &target.history_base_rollouts[0];
+        assert!(history_base_artifact
+            .relpath
+            .ends_with(&format!("{history_base_id}.jsonl")));
+        assert_eq!(
+            fs::read(backup.join(&history_base_artifact.relpath))?,
+            history_base_bytes
+        );
+
+        let restored_codex = root.join("restored-codex");
+        fs::create_dir_all(&restored_codex)?;
+        let restored_state = rusqlite::Connection::open(paths::state_db_path(&restored_codex))?;
+        restored_state.execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT,
+                preview TEXT, history_mode TEXT
+            );",
+        )?;
+        drop(restored_state);
+        drop(create_codex_thread_history_fixture(&restored_codex)?);
+        let restored = restore_one(&backup, &restored_codex, target, false)?;
+        assert!(restored.ok, "restore failed: {:?}", restored.error);
+        let restored_state = state_db::open_ro(&restored_codex)?;
+        let restored_history_mode: String = restored_state.query_row(
+            "SELECT history_mode FROM threads WHERE id = ?1",
+            [logical_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(restored_history_mode, "paginated");
+        let restored_meta =
+            crate::family::read_session_meta(&restored_codex.join(&target.rollout_relpath))?;
+        assert_eq!(restored_meta["payload"]["id"], logical_id);
+        assert_eq!(
+            fs::read(restored_codex.join(&history_base_artifact.relpath))?,
+            history_base_bytes
+        );
+        let restored_history =
+            rusqlite::Connection::open(restored_codex.join("thread_history_1.sqlite"))?;
+        let restored_turns: i64 = restored_history.query_row(
+            "SELECT COUNT(*) FROM thread_turns WHERE thread_id = ?1",
+            [logical_id],
+            |row| row.get(0),
+        )?;
+        let restored_items: i64 = restored_history.query_row(
+            "SELECT COUNT(*) FROM thread_items WHERE thread_id = ?1",
+            [logical_id],
+            |row| row.get(0),
+        )?;
+        let restored_base_state: i64 = restored_history.query_row(
+            "SELECT COUNT(*) FROM thread_history_projection_state WHERE thread_id = ?1",
+            [history_base_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            (restored_turns, restored_items, restored_base_state),
+            (1, 1, 1)
+        );
+        drop(restored_history);
+
+        drop(restored_state);
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn empty_projection_restore_rejects_existing_orphan_rows() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-empty-projection-orphan-test");
+        let backup = root.join("backup");
+        let codex = root.join("codex");
+        let id = "empty-projection-restore";
+        let relative = PathBuf::from(format!("sessions/2026/08/31/rollout-{id}.jsonl"));
+        let target = write_codex_restore_backup(
+            &backup,
+            id,
+            &relative,
+            serde_json::json!({
+                "id": id,
+                "rollout_path": relative.to_string_lossy(),
+                "cwd": r"F:\work\restored",
+                "title": "empty projection restore"
+            }),
+            r"F:\work\restored",
+        )?;
+        create_minimal_codex_restore_state(&codex)?;
+        let history = create_codex_thread_history_fixture(&codex)?;
+        history.execute(
+            "INSERT INTO thread_history_projection_state VALUES (?1, 99, 9)",
+            [id],
+        )?;
+        drop(history);
+
+        let restored = restore_one(&backup, &codex, &target, false)?;
+
+        assert!(!restored.ok);
+        assert!(
+            restored
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("孤立的分页历史投影")),
+            "{:?}",
+            restored.error
+        );
+        assert!(!codex.join(&relative).exists());
+        let state = state_db::open_ro(&codex)?;
+        let thread_count: i64 =
+            state.query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))?;
+        assert_eq!(thread_count, 0);
+        drop(state);
+        let history = rusqlite::Connection::open(codex.join("thread_history_1.sqlite"))?;
+        let projection_count: i64 = history.query_row(
+            "SELECT COUNT(*) FROM thread_history_projection_state WHERE thread_id = ?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(projection_count, 1);
+        drop(history);
+
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn codex_backup_rejects_missing_history_base_without_partial_output() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-missing-history-base-test");
+        let codex = root.join("source-codex");
+        let backups = root.join("backups");
+        let logical_id = "logical-missing-history-base";
+        let rollout_id = "019d0000-1111-7000-8000-000000000020";
+        let missing_id = "019d0000-1111-7000-8000-000000000019";
+        let rollout = codex
+            .join("sessions/2026/08/31")
+            .join(format!("rollout-2026-08-31T10-00-00-{rollout_id}.jsonl"));
+        fs::create_dir_all(rollout.parent().unwrap_or(&codex))?;
+        fs::write(
+            &rollout,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "timestamp": "2026-08-31T10:00:00Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": logical_id,
+                        "cwd": r"F:\work\paginated",
+                        "model_provider": "openai",
+                        "history_mode": "paginated",
+                        "history_base": {"thread_id": missing_id}
+                    }
+                })
+            ),
+        )?;
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        state.execute_batch(
+            "CREATE TABLE threads (
+                id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT,
+                created_at INTEGER, updated_at INTEGER, tokens_used INTEGER, model TEXT,
+                history_mode TEXT
+            );",
+        )?;
+        state.execute(
+            "INSERT INTO threads VALUES (?1, ?2, 'F:\\work\\paginated', 'Missing base',
+                1, 2, 3, 'gpt-5', 'paginated')",
+            rusqlite::params![logical_id, rollout.to_string_lossy().into_owned()],
+        )?;
+        drop(state);
+
+        let error = create_backup(
+            Some(PROVIDER_CODEX.to_string()),
+            codex.to_string_lossy().into_owned(),
+            None,
+            backups.to_string_lossy().into_owned(),
+            vec![logical_id.to_string()],
+            None,
+            Some("missing-base".to_string()),
+            None,
+        )
+        .expect_err("a non-self-contained paginated backup must fail closed");
+
+        assert!(error.to_string().contains(missing_id), "{error}");
+        assert!(!backups.join("missing-base").exists());
+        assert!(!backups.join(".missing-base.partial").exists());
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn codex_history_base_restore_reuses_rejects_and_compensates() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-history-base-restore-test");
+        let backup = root.join("backup");
+        let logical_id = "logical-history-base-restore";
+        let rollout_id = "019d0000-1111-7000-8000-000000000030";
+        let history_base_id = "019d0000-1111-7000-8000-000000000029";
+        let relative = PathBuf::from(format!(
+            "sessions/2026/08/31/rollout-2026-08-31T10-00-00-{rollout_id}.jsonl"
+        ));
+        let history_base_relative = PathBuf::from(format!(
+            "sessions/2026/08/31/rollout-2026-08-31T09-00-00-{history_base_id}.jsonl"
+        ));
+        let mut target = write_codex_restore_backup(
+            &backup,
+            logical_id,
+            &relative,
+            serde_json::json!({
+                "id": logical_id,
+                "rollout_path": relative.to_string_lossy(),
+                "cwd": r"F:\work\restored",
+                "title": "history base restore"
+            }),
+            r"F:\work\restored",
+        )?;
+        let history_base_bytes = attach_history_base_to_restore_backup(
+            &backup,
+            &mut target,
+            history_base_id,
+            &history_base_relative,
+        )?;
+
+        let reuse_codex = root.join("reuse-codex");
+        create_minimal_codex_restore_state(&reuse_codex)?;
+        let reuse_base = reuse_codex.join(&history_base_relative);
+        fs::create_dir_all(reuse_base.parent().unwrap_or(&reuse_codex))?;
+        fs::write(&reuse_base, &history_base_bytes)?;
+        let reused = restore_one(&backup, &reuse_codex, &target, false)?;
+        assert!(reused.ok, "restore failed: {:?}", reused.error);
+        assert_eq!(fs::read(&reuse_base)?, history_base_bytes);
+
+        let conflict_codex = root.join("conflict-codex");
+        create_minimal_codex_restore_state(&conflict_codex)?;
+        let conflict_base = conflict_codex.join(&history_base_relative);
+        fs::create_dir_all(conflict_base.parent().unwrap_or(&conflict_codex))?;
+        fs::write(&conflict_base, b"different rollout with the same UUID\n")?;
+        let error = restore_one(&backup, &conflict_codex, &target, false)
+            .expect_err("a same-UUID dependency conflict must be rejected");
+        assert!(error.to_string().contains("同 UUID 但内容不同"), "{error}");
+        assert!(!conflict_codex.join(&relative).exists());
+
+        let rollback_codex = root.join("rollback-codex");
+        create_minimal_codex_restore_state(&rollback_codex)?;
+        let rollback_index = paths::session_index_path(&rollback_codex);
+        fs::write(&rollback_index, b"original index\n")?;
+        let fault = RestoreFileTestFaultGuard::replace_and_conflict(
+            "session index",
+            rollback_index.clone(),
+            b"concurrent index\n".to_vec(),
+        );
+        let rolled_back = restore_one(&backup, &rollback_codex, &target, false)?;
+        drop(fault);
+        assert!(!rolled_back.ok);
+        assert!(!rollback_codex.join(&relative).exists());
+        assert!(!rollback_codex.join(&history_base_relative).exists());
+        assert_eq!(fs::read(&rollback_index)?, b"concurrent index\n");
+        let state = state_db::open_ro(&rollback_codex)?;
+        let rows: i64 = state.query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))?;
+        assert_eq!(rows, 0);
+        drop(state);
+
+        fs::write(
+            backup.join(&history_base_relative),
+            b"tampered dependency\n",
+        )?;
+        let error = validate_codex_history_base_payload(&backup, &target)
+            .expect_err("tampered dependency must fail validation");
+        assert!(error.to_string().contains("sha256"), "{error}");
+
         fs::remove_dir_all(root).ok();
         Ok(())
     }
@@ -3895,6 +5399,7 @@ mod tests {
             provider: Some(PROVIDER_CODEX.to_string()),
             id: "orphan".to_string(),
             rollout_relpath: relative.to_string_lossy().replace('\\', "/"),
+            history_base_rollouts: Vec::new(),
             source_relpath: None,
             sidecar_relpath: None,
             sidecar_files: Vec::new(),
@@ -4417,7 +5922,8 @@ mod tests {
         fs::create_dir_all(&root)?;
         let path = root.join("session_index.jsonl");
         fs::write(&path, b"before\n")?;
-        let mut snapshots = RestoreFileSnapshots::capture(&[("session index", &path)])?;
+        let mut snapshots =
+            RestoreFileSnapshots::capture_owned(&[("session index".to_string(), path.clone())])?;
         snapshots.start("session index")?;
 
         // Model a successful writer followed by a failure while observing the resulting path.
@@ -4523,6 +6029,7 @@ mod tests {
             provider: Some(PROVIDER_CODEX.to_string()),
             id: id.to_string(),
             rollout_relpath: relative.to_string_lossy().replace('\\', "/"),
+            history_base_rollouts: Vec::new(),
             source_relpath: None,
             sidecar_relpath: None,
             sidecar_files: Vec::new(),
@@ -4676,6 +6183,7 @@ mod tests {
                 provider: Some(PROVIDER_CODEX.to_string()),
                 id: "malicious".to_string(),
                 rollout_relpath: "config.toml".to_string(),
+                history_base_rollouts: Vec::new(),
                 source_relpath: None,
                 sidecar_relpath: None,
                 sidecar_files: Vec::new(),
@@ -4744,6 +6252,7 @@ mod tests {
                 provider: Some(PROVIDER_CODEX.to_string()),
                 id: "missing".to_string(),
                 rollout_relpath: "sessions/2026/07/10/rollout-missing.jsonl".to_string(),
+                history_base_rollouts: Vec::new(),
                 source_relpath: None,
                 sidecar_relpath: None,
                 sidecar_files: Vec::new(),
@@ -4833,6 +6342,7 @@ mod tests {
                 provider: Some(PROVIDER_CODEX.to_string()),
                 id: "linked".to_string(),
                 rollout_relpath: "sessions/rollout-linked.jsonl".to_string(),
+                history_base_rollouts: Vec::new(),
                 source_relpath: None,
                 sidecar_relpath: None,
                 sidecar_files: Vec::new(),

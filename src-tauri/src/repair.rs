@@ -777,16 +777,10 @@ fn read_rollout_brief_impl(
                     .or_else(|| metadata_string_field(payload, "reasoning_effort"));
             }
             "event_msg" if first_user.is_none() => {
-                let payload = v.get("payload");
-                let pt = payload
-                    .and_then(|p| p.get("type"))
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("");
-                if pt == "user_message" {
-                    first_user = payload
-                        .and_then(user_message_preview)
-                        .map(|text| text.chars().take(200).collect());
-                }
+                first_user = v
+                    .get("payload")
+                    .and_then(event_user_message_preview)
+                    .map(|text| text.chars().take(200).collect());
             }
             _ => {}
         }
@@ -822,6 +816,38 @@ fn read_rollout_brief_impl(
 
 const USER_MESSAGE_BEGIN: &str = "## My request for Codex:";
 const IMAGE_ONLY_USER_MESSAGE_PLACEHOLDER: &str = "[Image]";
+
+fn event_user_message_preview(payload: &Value) -> Option<String> {
+    match payload.get("type").and_then(Value::as_str) {
+        Some("user_message") => user_message_preview(payload),
+        Some("item_completed") => payload
+            .get("item")
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("UserMessage"))
+            .and_then(paginated_user_message_preview),
+        _ => None,
+    }
+}
+
+fn paginated_user_message_preview(item: &Value) -> Option<String> {
+    let content = item.get("content").and_then(Value::as_array)?;
+    let message = content
+        .iter()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let message = strip_user_message_prefix(&message).trim();
+    if !message.is_empty() {
+        return Some(message.to_string());
+    }
+
+    content
+        .iter()
+        .any(|part| part.get("type").and_then(Value::as_str) == Some("local_image"))
+        .then(|| IMAGE_ONLY_USER_MESSAGE_PLACEHOLDER.to_string())
+}
 
 fn user_message_preview(payload: &Value) -> Option<String> {
     let message = payload
@@ -5807,6 +5833,95 @@ mod tests {
 
     fn write_rollout(codex: &Path, id: &str, provider: &str) -> AppResult<()> {
         write_rollout_in(codex, "sessions", id, provider)
+    }
+
+    fn write_rollout_with_events(codex: &Path, id: &str, events: &[Value]) -> AppResult<PathBuf> {
+        let rollout_dir = codex.join("sessions").join("2026").join("04").join("22");
+        fs::create_dir_all(&rollout_dir)?;
+        let rollout = rollout_dir.join(format!("rollout-{id}.jsonl"));
+        let mut lines = vec![serde_json::json!({
+            "timestamp": "2026-04-22T00:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": id,
+                "model_provider": DEFAULT_PROVIDER,
+                "cwd": r"F:\project\example",
+                "history_mode": "paginated"
+            }
+        })];
+        lines.extend_from_slice(events);
+        fs::write(
+            &rollout,
+            format!(
+                "{}\n",
+                lines
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        )?;
+        Ok(rollout)
+    }
+
+    #[test]
+    fn rollout_brief_reads_paginated_user_message() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-paginated-preview-test");
+        let rollout = write_rollout_with_events(
+            &codex,
+            "paginated-preview",
+            &[serde_json::json!({
+                "timestamp": "2026-04-22T00:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "thread_id": "paginated-preview",
+                    "turn_id": "turn-1",
+                    "item": {
+                        "type": "UserMessage",
+                        "content": [
+                            {"type": "text", "text": "## My request for Codex:\n修复新版会话"},
+                            {"type": "local_image", "path": r"C:\temp\reference.png"}
+                        ]
+                    }
+                }
+            })],
+        )?;
+
+        let brief = read_rollout_brief(&codex, &rollout)?.expect("rollout brief");
+        assert_eq!(brief.first_user_message, "修复新版会话");
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn rollout_brief_uses_placeholder_for_paginated_image_only_message() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-paginated-image-preview-test");
+        let rollout = write_rollout_with_events(
+            &codex,
+            "paginated-image-preview",
+            &[serde_json::json!({
+                "timestamp": "2026-04-22T00:00:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "UserMessage",
+                        "content": [{"type": "local_image", "path": r"C:\temp\reference.png"}]
+                    }
+                }
+            })],
+        )?;
+
+        let brief = read_rollout_brief(&codex, &rollout)?.expect("rollout brief");
+        assert_eq!(
+            brief.first_user_message,
+            IMAGE_ONLY_USER_MESSAGE_PLACEHOLDER
+        );
+
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
     }
 
     /// 与 write_rollout_in 相同，但 session_meta 带 source 字段（子代理场景）。

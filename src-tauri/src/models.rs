@@ -387,6 +387,8 @@ pub struct ManifestSession {
     pub provider: Option<String>,
     pub id: String,
     pub rollout_relpath: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history_base_rollouts: Vec<ManifestArtifact>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_relpath: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

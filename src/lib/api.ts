@@ -368,6 +368,11 @@ export type ManifestSession = {
   provider: SessionProvider | null;
   id: string;
   rollout_relpath: string;
+  history_base_rollouts?: Array<{
+    relpath: string;
+    bytes: number;
+    sha256: string;
+  }>;
   source_relpath: string | null;
   sidecar_relpath: string | null;
   sidecar_files?: Array<{
