@@ -71,7 +71,8 @@ function DatePicker({
         <Calendar
           mode="single"
           captionLayout="dropdown"
-          navLayout="around"
+          navLayout="after"
+          reverseYears
           selected={selectedDate}
           defaultMonth={selectedDate ?? maximumDate ?? new Date()}
           onSelect={(date) => {
