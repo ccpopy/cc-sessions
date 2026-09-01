@@ -373,7 +373,10 @@ export function ContentSearchDialog({
           )}
         </form>
 
-        <ScrollArea className="min-h-0 flex-1">
+        <ScrollArea
+          className="min-h-0 flex-1"
+          viewportClassName="[&>div]:!block"
+        >
           {!status ? (
             <div className="grid min-h-64 place-items-center px-6 text-center text-sm text-muted-foreground">
               <div>
@@ -386,7 +389,7 @@ export function ContentSearchDialog({
               {status.state === "running" ? "正在查找匹配内容" : "没有匹配的对话"}
             </div>
           ) : (
-            <div className="divide-y divide-border/60">
+            <div className="w-full min-w-0 divide-y divide-border/60">
               {status.results.map((result) => (
                 <section key={sessionIdentity(result.session)} className="px-4 py-4 sm:px-6">
                   <div className="mb-2.5 flex min-w-0 items-center gap-2">
