@@ -230,6 +230,12 @@ pub struct BundleExportTarget {
     pub rollout_path: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct BackupRestoreTarget {
+    pub id: String,
+    pub backup_rollout_relpath: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DeleteResult {
     pub id: String,

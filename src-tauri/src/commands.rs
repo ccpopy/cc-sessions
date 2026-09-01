@@ -192,16 +192,18 @@ pub async fn restore_all(
     claude_dir: Option<String>,
     opencode_dir: Option<String>,
     cursor_dir: Option<String>,
+    targets: Option<Vec<BackupRestoreTarget>>,
     overwrite: bool,
     lock: SharedLock<'_>,
 ) -> AppResult<Vec<RestoreResult>> {
     let lock = lock.inner().clone();
     run_blocking(move || {
-        crate::backup::restore_all_with_lock(
+        crate::backup::restore_selected_with_lock(
             provider,
             backup_dir,
             backup_path,
             provider_dirs(codex_dir, claude_dir, opencode_dir, cursor_dir),
+            targets,
             overwrite,
             &lock,
         )

@@ -9,8 +9,8 @@ use crate::atomic_file;
 use crate::error::{AppError, AppResult};
 use crate::logs_db;
 use crate::models::{
-    ArchiveOrigin, BackupDetail, BackupSummary, BundleExportTarget, Manifest, ManifestArtifact,
-    ManifestSession, ProviderDirs, RestoreResult, VerifyItem, VerifyReport,
+    ArchiveOrigin, BackupDetail, BackupRestoreTarget, BackupSummary, BundleExportTarget, Manifest,
+    ManifestArtifact, ManifestSession, ProviderDirs, RestoreResult, VerifyItem, VerifyReport,
 };
 use crate::path_safety::{self, EntryKind};
 use crate::paths;
@@ -1477,6 +1477,16 @@ fn validate_backup_payload(
     manifest: &Manifest,
     rollout_presence: RolloutPresence,
 ) -> AppResult<()> {
+    let sessions = manifest.sessions.iter().collect::<Vec<_>>();
+    validate_backup_payload_sessions(backup, manifest, &sessions, rollout_presence)
+}
+
+fn validate_backup_payload_sessions(
+    backup: &Path,
+    manifest: &Manifest,
+    sessions: &[&ManifestSession],
+    rollout_presence: RolloutPresence,
+) -> AppResult<()> {
     if manifest.version >= 4 {
         for artifact in &manifest.artifacts {
             let relative = paths::checked_relative_path(&artifact.relpath)?;
@@ -1498,29 +1508,22 @@ fn validate_backup_payload(
             }
         }
     }
-    let has_codex = manifest
-        .sessions
+    let has_codex = sessions
         .iter()
         .any(|session| manifest_session_provider(manifest, session) == PROVIDER_CODEX);
     validate_optional_backup_file(backup, "threads.json", has_codex)?;
     validate_optional_backup_file(
         backup,
         "logs.ndjson",
-        manifest
-            .sessions
-            .iter()
-            .any(|session| session.logs_count > 0),
+        sessions.iter().any(|session| session.logs_count > 0),
     )?;
     validate_optional_backup_file(
         backup,
         "history.jsonl",
-        manifest
-            .sessions
-            .iter()
-            .any(|session| session.history_rows > 0),
+        sessions.iter().any(|session| session.history_rows > 0),
     )?;
 
-    for session in &manifest.sessions {
+    for session in sessions {
         let provider = manifest_session_provider(manifest, session);
         let source = backup.join(paths::checked_relative_path(&session.rollout_relpath)?);
         let source_exists = path_safety::validate_descendant(
@@ -1973,15 +1976,27 @@ pub fn restore_all_with_dirs(
     dirs: ProviderDirs,
     overwrite: bool,
 ) -> AppResult<Vec<RestoreResult>> {
+    restore_selected_with_dirs(provider, backup_dir, backup_path, dirs, None, overwrite)
+}
+
+pub fn restore_selected_with_dirs(
+    provider: Option<String>,
+    backup_dir: String,
+    backup_path: String,
+    dirs: ProviderDirs,
+    targets: Option<Vec<BackupRestoreTarget>>,
+    overwrite: bool,
+) -> AppResult<Vec<RestoreResult>> {
     let backup = validated_backup_path(Path::new(&backup_dir), Path::new(&backup_path))?;
     let codex = dirs.codex_path();
     let claude = dirs.claude_path();
     let opencode = dirs.opencode_path();
     let cursor = dirs.cursor_path();
     let manifest = load_backup_manifest(&backup)?;
-    validate_backup_payload(&backup, &manifest, RolloutPresence::Required)?;
+    let selected = select_manifest_sessions(&manifest, targets.as_deref())?;
+    validate_backup_payload_sessions(&backup, &manifest, &selected, RolloutPresence::Required)?;
     if let Some(requested) = provider.as_deref() {
-        for session in &manifest.sessions {
+        for session in &selected {
             let actual = manifest_session_provider(&manifest, session);
             if actual != requested {
                 return Err(AppError::Other(format!(
@@ -1992,7 +2007,7 @@ pub fn restore_all_with_dirs(
         }
     }
     let mut out = Vec::new();
-    for s in &manifest.sessions {
+    for s in selected {
         let session_provider = provider
             .as_deref()
             .unwrap_or_else(|| manifest_session_provider(&manifest, s));
@@ -2027,8 +2042,28 @@ pub fn restore_all_with_lock(
     overwrite: bool,
     lock: &crate::family::FamilyLock,
 ) -> AppResult<Vec<RestoreResult>> {
+    restore_selected_with_lock(
+        provider,
+        backup_dir,
+        backup_path,
+        dirs,
+        None,
+        overwrite,
+        lock,
+    )
+}
+
+pub fn restore_selected_with_lock(
+    provider: Option<String>,
+    backup_dir: String,
+    backup_path: String,
+    dirs: ProviderDirs,
+    targets: Option<Vec<BackupRestoreTarget>>,
+    overwrite: bool,
+    lock: &crate::family::FamilyLock,
+) -> AppResult<Vec<RestoreResult>> {
     crate::family::with_lock(lock, |_guard| {
-        restore_all_with_dirs(provider, backup_dir, backup_path, dirs, overwrite)
+        restore_selected_with_dirs(provider, backup_dir, backup_path, dirs, targets, overwrite)
     })
 }
 
@@ -2042,6 +2077,47 @@ fn manifest_session_provider<'a>(manifest: &'a Manifest, session: &'a ManifestSe
         .as_deref()
         .or(manifest.provider.as_deref())
         .unwrap_or(PROVIDER_CODEX)
+}
+
+fn select_manifest_sessions<'a>(
+    manifest: &'a Manifest,
+    targets: Option<&[BackupRestoreTarget]>,
+) -> AppResult<Vec<&'a ManifestSession>> {
+    let Some(targets) = targets else {
+        return Ok(manifest.sessions.iter().collect());
+    };
+    if targets.is_empty() {
+        return Err(AppError::Other("至少选择一个要还原的会话".to_string()));
+    }
+
+    let mut seen = HashSet::with_capacity(targets.len());
+    let mut selected = Vec::with_capacity(targets.len());
+    for target in targets {
+        let key = (target.id.as_str(), target.backup_rollout_relpath.as_str());
+        if !seen.insert(key) {
+            return Err(AppError::Other(format!(
+                "还原目标重复: id={} rollout_relpath={}",
+                target.id, target.backup_rollout_relpath
+            )));
+        }
+        let mut matches = manifest.sessions.iter().filter(|session| {
+            session.id == target.id && session.rollout_relpath == target.backup_rollout_relpath
+        });
+        let session = matches.next().ok_or_else(|| {
+            AppError::NotFound(format!(
+                "备份中不存在精确还原目标: id={} rollout_relpath={}",
+                target.id, target.backup_rollout_relpath
+            ))
+        })?;
+        if matches.next().is_some() {
+            return Err(AppError::Other(format!(
+                "备份包含重复的精确还原目标: id={} rollout_relpath={}",
+                target.id, target.backup_rollout_relpath
+            )));
+        }
+        selected.push(session);
+    }
+    Ok(selected)
 }
 
 fn read_backup_log_rows(
@@ -2809,6 +2885,158 @@ fn _unused() {
 mod tests {
     use super::restore_snapshot::RestoreFileTestFaultGuard;
     use super::*;
+
+    fn selection_manifest_session(id: &str, rollout_relpath: &str) -> ManifestSession {
+        ManifestSession {
+            provider: Some(PROVIDER_CODEX.to_string()),
+            id: id.to_string(),
+            rollout_relpath: rollout_relpath.to_string(),
+            source_relpath: None,
+            sidecar_relpath: None,
+            sidecar_files: Vec::new(),
+            companions_relpath: None,
+            companion_files: Vec::new(),
+            tasks_relpath: None,
+            task_files: Vec::new(),
+            title: id.to_string(),
+            cwd: String::new(),
+            created_at: 0,
+            updated_at: 0,
+            tokens_used: 0,
+            model: None,
+            bytes_rollout: 0,
+            logs_count: 0,
+            history_rows: 0,
+            sha256_rollout: String::new(),
+        }
+    }
+
+    fn selection_manifest(sessions: Vec<ManifestSession>) -> Manifest {
+        Manifest {
+            version: 5,
+            provider: Some(PROVIDER_CODEX.to_string()),
+            created_at: "2026-09-01T00:00:00Z".to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            codex_dir: String::new(),
+            claude_dir: None,
+            opencode_dir: None,
+            note: None,
+            artifacts: Vec::new(),
+            sessions,
+        }
+    }
+
+    #[test]
+    fn selective_restore_matches_duplicate_ids_by_rollout_relpath() -> AppResult<()> {
+        let first_relpath = "sessions/2026/09/01/rollout-shared-first.jsonl";
+        let second_relpath = "sessions/2026/09/01/rollout-shared-second.jsonl";
+        let manifest = selection_manifest(vec![
+            selection_manifest_session("shared", first_relpath),
+            selection_manifest_session("shared", second_relpath),
+        ]);
+        let targets = vec![BackupRestoreTarget {
+            id: "shared".to_string(),
+            backup_rollout_relpath: second_relpath.to_string(),
+        }];
+
+        let selected = select_manifest_sessions(&manifest, Some(&targets))?;
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].rollout_relpath, second_relpath);
+        Ok(())
+    }
+
+    #[test]
+    fn selective_restore_rejects_empty_or_unknown_targets() {
+        let manifest = selection_manifest(vec![selection_manifest_session(
+            "known",
+            "sessions/rollout-known.jsonl",
+        )]);
+
+        assert!(select_manifest_sessions(&manifest, Some(&[]))
+            .expect_err("empty selection must be rejected")
+            .to_string()
+            .contains("至少选择"));
+        let unknown = vec![BackupRestoreTarget {
+            id: "known".to_string(),
+            backup_rollout_relpath: "sessions/rollout-other.jsonl".to_string(),
+        }];
+        assert!(select_manifest_sessions(&manifest, Some(&unknown))
+            .expect_err("unknown exact target must be rejected")
+            .to_string()
+            .contains("不存在精确还原目标"));
+    }
+
+    #[test]
+    fn selective_restore_does_not_require_unselected_rollout_payloads() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-selective-restore-payload-test");
+        let backup_root = root.join("backups");
+        let backup = backup_root.join("full-backup");
+        let codex = root.join("codex");
+        let selected_id = "selected-session";
+        let selected_relpath = PathBuf::from("sessions/2026/09/01/rollout-selected-session.jsonl");
+        let selected = write_codex_restore_backup(
+            &backup,
+            selected_id,
+            &selected_relpath,
+            serde_json::json!({
+                "id": selected_id,
+                "rollout_path": backup.join(&selected_relpath).to_string_lossy(),
+                "cwd": r"F:\work\selected",
+                "title": "selected"
+            }),
+            r"F:\work\selected",
+        )?;
+        let mut unselected = selection_manifest_session(
+            "unselected-session",
+            "sessions/2026/09/01/rollout-unselected-session.jsonl",
+        );
+        unselected.sha256_rollout = "missing-on-purpose".to_string();
+        let manifest = Manifest {
+            version: 3,
+            provider: Some(PROVIDER_CODEX.to_string()),
+            created_at: "2026-09-01T00:00:00Z".to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            codex_dir: String::new(),
+            claude_dir: None,
+            opencode_dir: None,
+            note: None,
+            artifacts: Vec::new(),
+            sessions: vec![selected, unselected],
+        };
+        fs::write(
+            backup.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest)?,
+        )?;
+        fs::create_dir_all(&codex)?;
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        state.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT)",
+            [],
+        )?;
+        drop(state);
+
+        let results = restore_selected_with_dirs(
+            Some(PROVIDER_CODEX.to_string()),
+            backup_root.to_string_lossy().into_owned(),
+            backup.to_string_lossy().into_owned(),
+            ProviderDirs::new(codex.to_string_lossy().into_owned()),
+            Some(vec![BackupRestoreTarget {
+                id: selected_id.to_string(),
+                backup_rollout_relpath: selected_relpath.to_string_lossy().replace('\\', "/"),
+            }]),
+            false,
+        )?;
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].ok, "{:?}", results[0].error);
+        assert_eq!(results[0].id, selected_id);
+        assert!(!codex
+            .join("sessions/2026/09/01/rollout-unselected-session.jsonl")
+            .exists());
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
 
     fn assert_waits_for_family_lock<T: Send + 'static>(
         run: impl FnOnce(std::sync::Arc<crate::family::FamilyLock>) -> AppResult<T> + Send + 'static,

@@ -390,11 +390,12 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             bool_arg(&args, "overwrite")?,
             &state.family_lock,
         )),
-        "restore_all" => to_result_value(backup::restore_all_with_lock(
+        "restore_all" => to_result_value(backup::restore_selected_with_lock(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "backupDir")?,
             string_arg(&args, "backupPath")?,
             provider_dirs_arg(&args)?,
+            opt_arg(&args, "targets")?,
             bool_arg(&args, "overwrite")?,
             &state.family_lock,
         )),

@@ -818,6 +818,11 @@ export type BundleExportTarget = {
   rollout_path?: string;
 };
 
+export type BackupRestoreTarget = {
+  id: string;
+  backup_rollout_relpath: string;
+};
+
 export type BundleListItem = {
   bundle_dir: string;
   manifest: BundleManifest;
@@ -1207,6 +1212,7 @@ export const api = {
     claude_dir?: string;
     opencode_dir?: string;
     cursor_dir?: string;
+    targets?: BackupRestoreTarget[];
     overwrite: boolean;
   }) =>
     invokeCommand<RestoreResult[]>("restore_all", {
@@ -1217,6 +1223,7 @@ export const api = {
       claudeDir: p.claude_dir,
       opencodeDir: p.opencode_dir,
       cursorDir: p.cursor_dir,
+      targets: p.targets,
       overwrite: p.overwrite,
     }),
   deleteBackup: (backupDir: string, backupPath: string) =>

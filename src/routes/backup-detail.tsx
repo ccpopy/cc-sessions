@@ -7,6 +7,7 @@ import { TopBar } from "@/components/TopBar";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Checkbox } from "@/components/ui/checkbox";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { DangerDialog } from "@/components/DangerDialog";
 import { PreviewDialog } from "@/components/PreviewDialog";
@@ -57,6 +58,8 @@ export default function BackupDetailRoute({ provider = "codex" }: { provider?: S
   const verifyGeneration = useRef(0);
   const [preview, setPreview] = useState<{ session: SessionSummary; rollout: string } | null>(null);
   const [restoreTarget, setRestoreTarget] = useState<ManifestSession | null>(null);
+  const [selectedRestoreKeys, setSelectedRestoreKeys] = useState<Set<string>>(new Set());
+  const [restoreSelectionOpen, setRestoreSelectionOpen] = useState(false);
   const [overwrite, setOverwrite] = useState<"skip" | "overwrite">("skip");
 
   const backupPath = useMemo(() => {
@@ -87,6 +90,9 @@ export default function BackupDetailRoute({ provider = "codex" }: { provider?: S
     const generation = ++loadGeneration.current;
     ++verifyGeneration.current;
     setVerification(null);
+    setSelectedRestoreKeys(new Set());
+    setRestoreSelectionOpen(false);
+    setRestoreTarget(null);
 
     if (!requestScope) {
       setLoadState(null);
@@ -116,6 +122,28 @@ export default function BackupDetailRoute({ provider = "codex" }: { provider?: S
   }, [backupPath, reloadKey, settings?.backup_dir]);
 
   const items = useMemo(() => detail?.manifest.sessions ?? [], [detail]);
+  const selectedItems = useMemo(
+    () => items.filter((item) => selectedRestoreKeys.has(manifestSessionIdentity(item))),
+    [items, selectedRestoreKeys],
+  );
+  const allItemsSelected =
+    items.length > 0 && items.every((item) => selectedRestoreKeys.has(manifestSessionIdentity(item)));
+  const someItemsSelected =
+    !allItemsSelected && items.some((item) => selectedRestoreKeys.has(manifestSessionIdentity(item)));
+  const toggleAllItems = () => {
+    setSelectedRestoreKeys(
+      allItemsSelected ? new Set() : new Set(items.map((item) => manifestSessionIdentity(item))),
+    );
+  };
+  const toggleRestoreItem = (item: ManifestSession) => {
+    const identity = manifestSessionIdentity(item);
+    setSelectedRestoreKeys((current) => {
+      const next = new Set(current);
+      if (next.has(identity)) next.delete(identity);
+      else next.add(identity);
+      return next;
+    });
+  };
 
   const onVerify = async () => {
     const requestScope = currentScopeRef.current;
@@ -189,6 +217,35 @@ export default function BackupDetailRoute({ provider = "codex" }: { provider?: S
           <EmptyState title="备份为空" />
         ) : (
           <div className="space-y-3">
+            <div className="flex flex-wrap items-center gap-2 rounded-lg border bg-muted/25 px-3 py-2.5">
+              <Checkbox
+                checked={allItemsSelected ? true : someItemsSelected ? "indeterminate" : false}
+                onCheckedChange={toggleAllItems}
+                aria-label="全选备份中的会话"
+              />
+              <button
+                type="button"
+                onClick={toggleAllItems}
+                className="text-xs text-muted-foreground hover:text-foreground"
+              >
+                {allItemsSelected ? "取消全选" : "全选"}
+              </button>
+              <span className="text-xs text-muted-foreground">
+                已选 {selectedItems.length}/{items.length}
+              </span>
+              <Button
+                size="sm"
+                className="ml-auto gap-1.5"
+                disabled={selectedItems.length === 0}
+                onClick={() => {
+                  setOverwrite("skip");
+                  setRestoreSelectionOpen(true);
+                }}
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+                还原所选（{selectedItems.length}）
+              </Button>
+            </div>
             {items.map((s) => {
               const itemProvider = manifestSessionProvider(s, detail?.manifest.provider, provider);
               const sess = toSessionSummary(s, backupPath, itemProvider);
@@ -200,6 +257,11 @@ export default function BackupDetailRoute({ provider = "codex" }: { provider?: S
                   className="p-0 shadow-sm transition-all hover:shadow-md"
                 >
                   <CardContent className="flex items-center gap-4 p-4">
+                    <Checkbox
+                      checked={selectedRestoreKeys.has(identity)}
+                      onCheckedChange={() => toggleRestoreItem(s)}
+                      aria-label={`选择会话 ${s.id}`}
+                    />
                     <div className="min-w-0 flex-1 space-y-1.5">
                       <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                         <span className="font-mono">{s.id.slice(0, 8)}</span>
@@ -353,6 +415,73 @@ export default function BackupDetailRoute({ provider = "codex" }: { provider?: S
             <div className="flex items-center gap-2">
               <RadioGroupItem id="overwrite" value="overwrite" />
               <Label htmlFor="overwrite" className="cursor-pointer">
+                覆盖（不可撤销）
+              </Label>
+            </div>
+          </RadioGroup>
+        </div>
+      </DangerDialog>
+
+      <DangerDialog
+        open={restoreSelectionOpen}
+        onOpenChange={(open) => {
+          setRestoreSelectionOpen(open);
+          if (!open) setOverwrite("skip");
+        }}
+        title={`还原所选 ${selectedItems.length} 条会话`}
+        confirmText={`还原所选（${selectedItems.length}）`}
+        onConfirm={async () => {
+          if (!settings || !backupPath || selectedItems.length === 0) return;
+          const results = await api.restoreAll({
+            provider,
+            backup_dir: settings.backup_dir,
+            backup_path: backupPath,
+            codex_dir: settings.codex_dir,
+            claude_dir: settings.claude_dir,
+            opencode_dir: settings.opencode_dir,
+            cursor_dir: settings.cursor_dir,
+            targets: selectedItems.map((item) => ({
+              id: item.id,
+              backup_rollout_relpath: item.rollout_relpath,
+            })),
+            overwrite: overwrite === "overwrite",
+          });
+          const succeeded = results.filter((result) => result.ok).length;
+          const conflicts = results.filter((result) => result.conflict).length;
+          const failed = results.length - succeeded;
+          setSelectedRestoreKeys(new Set());
+          if (failed === 0) {
+            toast.success(`已还原 ${succeeded} 条会话`);
+          } else {
+            const errors = results
+              .filter((result) => !result.ok && result.error)
+              .slice(0, 3)
+              .map((result) => `${result.id.slice(0, 8)}：${result.error}`)
+              .join("；");
+            toast.warning(
+              `已还原 ${succeeded}/${results.length} 条${conflicts ? `，${conflicts} 条冲突` : ""}`,
+              errors ? { description: errors } : undefined,
+            );
+          }
+        }}
+      >
+        <div className="space-y-3">
+          <p>只会还原当前勾选的会话，未勾选条目不会被还原或修改。</p>
+          <div>若目标已存在，如何处理：</div>
+          <RadioGroup
+            value={overwrite}
+            onValueChange={(value) => setOverwrite(value as "skip" | "overwrite")}
+            className="gap-1"
+          >
+            <div className="flex items-center gap-2">
+              <RadioGroupItem id="bulk-skip" value="skip" />
+              <Label htmlFor="bulk-skip" className="cursor-pointer">
+                跳过（保留当前数据）
+              </Label>
+            </div>
+            <div className="flex items-center gap-2">
+              <RadioGroupItem id="bulk-overwrite" value="overwrite" />
+              <Label htmlFor="bulk-overwrite" className="cursor-pointer">
                 覆盖（不可撤销）
               </Label>
             </div>
