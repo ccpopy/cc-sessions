@@ -12,6 +12,7 @@ import {
   Search,
   ShieldAlert,
   Upload,
+  X,
 } from "lucide-react";
 import { toast } from "sonner";
 
@@ -26,6 +27,7 @@ import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { Checkbox } from "@/components/ui/checkbox";
+import { DatePicker } from "@/components/ui/date-picker";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
@@ -66,6 +68,7 @@ import { pickDirectoryPath, pickFilePath, saveFilePath } from "@/lib/dialog";
 import { humanBytes, humanTokens } from "@/lib/format";
 import { providerLabel } from "@/lib/providerTheme";
 import { basename, dirname, joinPath } from "@/lib/cwd";
+import { exportDateRange, parseLocalDate } from "@/lib/exportDateRange";
 
 const SESSION_PAGE_SIZE = 500;
 
@@ -228,6 +231,10 @@ function ExportPanel({
     () => exportDateRange(updatedFromDate, updatedToDate),
     [updatedFromDate, updatedToDate],
   );
+  const updatedFrom = useMemo(() => parseLocalDate(updatedFromDate), [updatedFromDate]);
+  const updatedTo = useMemo(() => parseLocalDate(updatedToDate), [updatedToDate]);
+  const today = new Date();
+  const updatedFromMax = updatedTo && updatedTo < today ? updatedTo : today;
 
   const filteredSessions = useMemo(() => {
     const terms = sessionSearch
@@ -455,43 +462,45 @@ function ExportPanel({
             </div>
           </div>
           <div className="space-y-1.5">
-            <div className="flex flex-wrap items-end gap-2">
-              <div className="space-y-1.5">
-                <Label htmlFor="export-updated-from" className="text-xs">
-                  更新时间（开始）
-                </Label>
-                <Input
-                  id="export-updated-from"
-                  type="date"
-                  value={updatedFromDate}
-                  onChange={(event) => setUpdatedFromDate(event.target.value)}
-                  className="h-9 w-40 text-xs"
-                />
-              </div>
-              <span className="pb-2 text-xs text-muted-foreground">至</span>
-              <div className="space-y-1.5">
-                <Label htmlFor="export-updated-to" className="text-xs">
-                  更新时间（结束，含当天）
-                </Label>
-                <Input
-                  id="export-updated-to"
-                  type="date"
-                  value={updatedToDate}
-                  onChange={(event) => setUpdatedToDate(event.target.value)}
-                  className="h-9 w-40 text-xs"
-                />
-              </div>
+            <Label id="export-updated-range-label" className="text-xs">
+              更新时间
+            </Label>
+            <div
+              role="group"
+              aria-labelledby="export-updated-range-label"
+              className="flex flex-wrap items-center gap-2"
+            >
+              <DatePicker
+                id="export-updated-from"
+                value={updatedFromDate}
+                onChange={setUpdatedFromDate}
+                placeholder="开始日期"
+                maxDate={updatedFromMax}
+                ariaLabel="选择更新时间的开始日期"
+              />
+              <span className="text-xs text-muted-foreground">至</span>
+              <DatePicker
+                id="export-updated-to"
+                value={updatedToDate}
+                onChange={setUpdatedToDate}
+                placeholder="结束日期"
+                minDate={updatedFrom}
+                maxDate={today}
+                ariaLabel="选择更新时间的结束日期"
+              />
               {(updatedFromDate || updatedToDate) && (
                 <Button
                   type="button"
                   variant="ghost"
-                  size="sm"
+                  size="icon"
+                  aria-label="清除时间范围"
+                  className="shrink-0 text-muted-foreground"
                   onClick={() => {
                     setUpdatedFromDate("");
                     setUpdatedToDate("");
                   }}
                 >
-                  清除时间范围
+                  <X />
                 </Button>
               )}
             </div>
@@ -733,42 +742,6 @@ function zipSourceFromReports(reports: ExportReport[]): string | null {
 
   const parentDirs = Array.from(new Set(bundlePaths.map(dirname)));
   return parentDirs.length === 1 ? parentDirs[0] : null;
-}
-
-type ExportDateRange = {
-  from?: number;
-  to?: number;
-  error?: string;
-};
-
-function exportDateRange(fromDate: string, toDate: string): ExportDateRange {
-  const from = fromDate ? localDateBoundary(fromDate, 0) : undefined;
-  const to = toDate ? localDateBoundary(toDate, 1) : undefined;
-  if ((fromDate && from === undefined) || (toDate && to === undefined)) {
-    return { error: "时间范围包含无效日期" };
-  }
-  if (from !== undefined && to !== undefined && from >= to) {
-    return { from, to, error: "开始日期不能晚于结束日期" };
-  }
-  return { from, to };
-}
-
-function localDateBoundary(value: string, dayOffset: number): number | undefined {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
-  if (!match) return undefined;
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  const base = new Date(year, month - 1, day);
-  if (
-    base.getFullYear() !== year ||
-    base.getMonth() !== month - 1 ||
-    base.getDate() !== day
-  ) {
-    return undefined;
-  }
-  const boundary = new Date(year, month - 1, day + dayOffset);
-  return Math.floor(boundary.getTime() / 1000);
 }
 
 function notifyExportResult(reports: ExportReport[], summary: string) {
