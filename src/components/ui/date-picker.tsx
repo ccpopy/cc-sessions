@@ -70,6 +70,8 @@ function DatePicker({
       <PopoverContent align="start" className="w-auto p-0">
         <Calendar
           mode="single"
+          captionLayout="dropdown"
+          navLayout="around"
           selected={selectedDate}
           defaultMonth={selectedDate ?? maximumDate ?? new Date()}
           onSelect={(date) => {

@@ -9,12 +9,14 @@ function Calendar({
   className,
   classNames,
   showOutsideDays = true,
+  captionLayout = "label",
   components,
   ...props
 }: React.ComponentProps<typeof DayPicker>) {
   return (
     <DayPicker
       showOutsideDays={showOutsideDays}
+      captionLayout={captionLayout}
       className={cn("relative p-3", className)}
       classNames={{
         months: "flex flex-col gap-4 sm:flex-row",
@@ -29,7 +31,16 @@ function Calendar({
           "absolute right-3 top-3 h-8 w-8 bg-transparent p-0 opacity-70 hover:opacity-100",
         ),
         month_caption: "flex h-8 items-center justify-center px-8",
-        caption_label: "text-sm font-medium",
+        dropdowns: "flex h-8 items-center justify-center gap-1.5 text-sm font-medium",
+        dropdown_root:
+          "relative rounded-md border border-input shadow-sm focus-within:ring-1 focus-within:ring-ring data-[disabled=true]:opacity-50",
+        dropdown: "absolute inset-0 cursor-pointer bg-popover opacity-0 disabled:cursor-not-allowed",
+        caption_label: cn(
+          "font-medium",
+          captionLayout === "label"
+            ? "text-sm"
+            : "flex h-8 items-center gap-1 rounded-md px-2 text-sm [&>svg]:h-3.5 [&>svg]:w-3.5 [&>svg]:text-muted-foreground",
+        ),
         month_grid: "w-full border-collapse",
         weekdays: "flex",
         weekday:
