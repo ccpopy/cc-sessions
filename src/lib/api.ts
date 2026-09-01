@@ -1586,6 +1586,8 @@ export const api = {
     machine_label?: string;
     export_group?: string;
     active_only: boolean;
+    from_updated_at?: number;
+    to_updated_at?: number;
   }) =>
     invokeCommand<ExportReport[]>("export_all_bundles", {
       provider: p.provider,
@@ -1597,6 +1599,8 @@ export const api = {
       machineLabel: p.machine_label,
       exportGroup: p.export_group,
       activeOnly: p.active_only,
+      fromUpdatedAt: p.from_updated_at,
+      toUpdatedAt: p.to_updated_at,
     }),
   listBundles: (srcDir: string, provider?: SessionProvider) =>
     invokeCommand<BundleListItem[]>("list_bundles", { srcDir, provider }),

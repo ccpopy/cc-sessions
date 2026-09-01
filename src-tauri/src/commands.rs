@@ -249,15 +249,19 @@ pub async fn export_all_bundles(
     machine_label: Option<String>,
     export_group: Option<String>,
     active_only: bool,
+    from_updated_at: Option<i64>,
+    to_updated_at: Option<i64>,
 ) -> AppResult<Vec<ExportReport>> {
     run_blocking(move || {
-        crate::bundle::export_all_bundles_with_dirs(
+        crate::bundle::export_all_bundles_in_range_with_dirs(
             provider,
             provider_dirs(codex_dir, claude_dir, opencode_dir, cursor_dir),
             out_dir,
             machine_label,
             export_group,
             active_only,
+            from_updated_at,
+            to_updated_at,
         )
     })
     .await

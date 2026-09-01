@@ -599,13 +599,15 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             opt_string_arg(&args, "machineLabel")?,
             opt_string_arg(&args, "exportGroup")?,
         )),
-        "export_all_bundles" => to_result_value(bundle::export_all_bundles_with_dirs(
+        "export_all_bundles" => to_result_value(bundle::export_all_bundles_in_range_with_dirs(
             opt_string_arg(&args, "provider")?,
             provider_dirs_arg(&args)?,
             string_arg(&args, "outDir")?,
             opt_string_arg(&args, "machineLabel")?,
             opt_string_arg(&args, "exportGroup")?,
             bool_arg(&args, "activeOnly")?,
+            opt_i64_arg(&args, "fromUpdatedAt")?,
+            opt_i64_arg(&args, "toUpdatedAt")?,
         )),
         "list_bundles" => to_result_value(bundle::list_bundles(
             string_arg(&args, "srcDir")?,

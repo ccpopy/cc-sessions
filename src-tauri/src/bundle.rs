@@ -1355,6 +1355,29 @@ pub fn export_all_bundles_with_dirs(
     export_group: Option<String>,
     active_only: bool,
 ) -> AppResult<Vec<ExportReport>> {
+    export_all_bundles_in_range_with_dirs(
+        provider,
+        dirs,
+        out_dir,
+        machine_label,
+        export_group,
+        active_only,
+        None,
+        None,
+    )
+}
+
+pub fn export_all_bundles_in_range_with_dirs(
+    provider: Option<String>,
+    dirs: ProviderDirs,
+    out_dir: String,
+    machine_label: Option<String>,
+    export_group: Option<String>,
+    active_only: bool,
+    from_updated_at: Option<i64>,
+    to_updated_at: Option<i64>,
+) -> AppResult<Vec<ExportReport>> {
+    validate_updated_at_range(from_updated_at, to_updated_at)?;
     let codex_dir = dirs.codex_dir.clone();
     let claude_dir = Some(dirs.claude_path().to_string_lossy().into_owned());
     let opencode_dir = Some(dirs.opencode_path().to_string_lossy().into_owned());
@@ -1369,6 +1392,9 @@ pub fn export_all_bundles_with_dirs(
         validate_plain_directory_tree(&projects, "Claude projects")?;
         let targets = crate::claude_sessions::scan_sessions(&claude)?
             .into_iter()
+            .filter(|session| {
+                updated_at_in_range(session.updated_at, from_updated_at, to_updated_at)
+            })
             .map(|session| BundleExportTarget {
                 id: session.id,
                 rollout_path: Some(session.rollout_path),
@@ -1390,6 +1416,9 @@ pub fn export_all_bundles_with_dirs(
         let targets = crate::opencode_sessions::list_sessions(&data_dir)?
             .into_iter()
             .filter(|session| !active_only || !session.archived)
+            .filter(|session| {
+                updated_at_in_range(session.updated_at, from_updated_at, to_updated_at)
+            })
             .map(|session| BundleExportTarget {
                 id: session.id,
                 rollout_path: Some(session.rollout_path),
@@ -1414,6 +1443,9 @@ pub fn export_all_bundles_with_dirs(
                 // cursor-agent 会话不落在 state.vscdb 里，导出格式另说，本期不导。
                 .filter(|session| session.resume_command.is_empty())
                 .filter(|session| !active_only || !session.archived)
+                .filter(|session| {
+                    updated_at_in_range(session.updated_at, from_updated_at, to_updated_at)
+                })
                 .map(|session| BundleExportTarget {
                     id: session.id,
                     rollout_path: Some(session.rollout_path),
@@ -1451,6 +1483,30 @@ pub fn export_all_bundles_with_dirs(
     } else {
         ids.extend(rollout_index.keys().cloned());
     }
+    if from_updated_at.is_some() || to_updated_at.is_some() {
+        let updated_by_id = crate::sessions::list_sessions_with_dirs(
+            Some(PROVIDER_CODEX.to_string()),
+            dirs.clone(),
+        )?
+        .into_iter()
+        .fold(HashMap::<String, i64>::new(), |mut values, session| {
+            values
+                .entry(session.id)
+                .and_modify(|updated| *updated = (*updated).max(session.updated_at))
+                .or_insert(session.updated_at);
+            values
+        });
+        ids.retain(|id| {
+            let updated_at = updated_by_id.get(id).copied().or_else(|| {
+                rollout_index
+                    .get(id)
+                    .and_then(|source| latest_jsonl_timestamp_seconds(&source.abs).ok().flatten())
+            });
+            updated_at.is_some_and(|updated_at| {
+                updated_at_in_range(updated_at, from_updated_at, to_updated_at)
+            })
+        });
+    }
     ids.sort();
     ids.dedup();
     export_session_bundles_from_index(
@@ -1461,6 +1517,27 @@ pub fn export_all_bundles_with_dirs(
         export_group.as_deref(),
         &rollout_index,
     )
+}
+
+fn validate_updated_at_range(
+    from_updated_at: Option<i64>,
+    to_updated_at: Option<i64>,
+) -> AppResult<()> {
+    if matches!((from_updated_at, to_updated_at), (Some(from), Some(to)) if from >= to) {
+        return Err(AppError::Other(
+            "导出时间范围无效：开始时间必须早于结束时间".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn updated_at_in_range(
+    updated_at: i64,
+    from_updated_at: Option<i64>,
+    to_updated_at: Option<i64>,
+) -> bool {
+    from_updated_at.is_none_or(|from| updated_at >= from)
+        && to_updated_at.is_none_or(|to| updated_at < to)
 }
 
 // ========================= 列出 / 校验 =========================
@@ -4621,6 +4698,74 @@ mod tests {
         assert_eq!(ids, HashSet::from([active_id, unregistered_id]));
         assert!(!ids.contains(archived_id));
 
+        fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn export_updated_at_range_is_start_inclusive_and_end_exclusive() -> AppResult<()> {
+        validate_updated_at_range(Some(100), Some(200))?;
+        assert!(updated_at_in_range(100, Some(100), Some(200)));
+        assert!(updated_at_in_range(199, Some(100), Some(200)));
+        assert!(!updated_at_in_range(99, Some(100), Some(200)));
+        assert!(!updated_at_in_range(200, Some(100), Some(200)));
+        assert!(updated_at_in_range(200, None, None));
+
+        let error = validate_updated_at_range(Some(200), Some(200))
+            .expect_err("empty or reversed export range must be rejected");
+        assert!(error.to_string().contains("开始时间必须早于结束时间"));
+        Ok(())
+    }
+
+    #[test]
+    fn export_all_applies_updated_at_range_before_building_codex_targets() -> AppResult<()> {
+        let root = temp_dir("cc-session-manager-export-range-test");
+        let codex = root.join("codex");
+        let out = root.join("bundles");
+        let early_id = "range-early";
+        let included_id = "range-included";
+        let early_rollout =
+            write_codex_rollout_only(&codex.join("sessions/2026/05/12"), early_id, "early")?;
+        let included_rollout =
+            write_codex_rollout_only(&codex.join("sessions/2026/05/13"), included_id, "included")?;
+        let state = create_bundle_state(&codex)?;
+        state.execute_batch(
+            "ALTER TABLE threads ADD COLUMN model TEXT;
+             ALTER TABLE threads ADD COLUMN reasoning_effort TEXT;
+             ALTER TABLE threads ADD COLUMN git_branch TEXT;
+             ALTER TABLE threads ADD COLUMN agent_nickname TEXT;
+             ALTER TABLE threads ADD COLUMN agent_role TEXT;",
+        )?;
+        for (id, rollout, updated_at) in [
+            (early_id, &early_rollout, 99_i64),
+            (included_id, &included_rollout, 150_i64),
+        ] {
+            state.execute(
+                "INSERT INTO threads (
+                    id, rollout_path, created_at, updated_at, source, model_provider, cwd, title,
+                    sandbox_policy, approval_mode, memory_mode, archived, tokens_used,
+                    has_user_event, first_user_message, cli_version
+                ) VALUES (?1, ?2, ?3, ?3, 'cli', 'openai', 'F:\\project\\range',
+                    ?1, 'read-only', 'on-request', 'enabled', 0, 0, 1, ?1, '')",
+                params![id, rollout.to_string_lossy().into_owned(), updated_at],
+            )?;
+        }
+        drop(state);
+
+        let reports = export_all_bundles_in_range_with_dirs(
+            Some(PROVIDER_CODEX.to_string()),
+            ProviderDirs::new(codex.to_string_lossy().into_owned()),
+            out.to_string_lossy().into_owned(),
+            Some("test-machine".to_string()),
+            Some("default".to_string()),
+            false,
+            Some(100),
+            Some(200),
+        )?;
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].session_id, included_id);
+        assert!(reports[0].ok, "{:?}", reports[0].error);
         fs::remove_dir_all(root).ok();
         Ok(())
     }

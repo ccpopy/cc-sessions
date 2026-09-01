@@ -151,6 +151,8 @@ function ExportPanel({
   const [machineLabel, setMachineLabel] = useState("");
   const [exportGroup, setExportGroup] = useState("default");
   const [activeOnly, setActiveOnly] = useState(true);
+  const [updatedFromDate, setUpdatedFromDate] = useState("");
+  const [updatedToDate, setUpdatedToDate] = useState("");
   const [sessionSearch, setSessionSearch] = useState("");
   // issue #30：默认只列正常会话，子代理/归档会话按需从下拉里切换
   const [sessionScope, setSessionScope] = useState<SessionScopeFilter>("main");
@@ -172,11 +174,18 @@ function ExportPanel({
     setLastZipSource(null);
     setSessionScope("main");
     setVisibleSessionLimit(SESSION_PAGE_SIZE);
+    setUpdatedFromDate("");
+    setUpdatedToDate("");
   }, [provider]);
 
   useEffect(() => {
     setVisibleSessionLimit(SESSION_PAGE_SIZE);
-  }, [sessionScope, sessionSearch]);
+  }, [sessionScope, sessionSearch, updatedFromDate, updatedToDate]);
+
+  useEffect(() => {
+    setSelectedSessionKeys(new Set());
+    setLastZipSource(null);
+  }, [updatedFromDate, updatedToDate]);
 
   const toggle = (session: SessionSummary) => {
     const key = sessionIdentity(session);
@@ -215,6 +224,10 @@ function ExportPanel({
     () => filterSessionsByScope(sessions, sessionScope),
     [sessions, sessionScope],
   );
+  const updatedAtRange = useMemo(
+    () => exportDateRange(updatedFromDate, updatedToDate),
+    [updatedFromDate, updatedToDate],
+  );
 
   const filteredSessions = useMemo(() => {
     const terms = sessionSearch
@@ -222,9 +235,16 @@ function ExportPanel({
       .toLowerCase()
       .split(/\s+/)
       .filter(Boolean);
-    if (terms.length === 0) return scopedSessions;
+    if (updatedAtRange.error) return [];
 
-    return scopedSessions.filter((s) => {
+    const sessionsInRange = scopedSessions.filter(
+      (session) =>
+        (updatedAtRange.from === undefined || session.updated_at >= updatedAtRange.from) &&
+        (updatedAtRange.to === undefined || session.updated_at < updatedAtRange.to),
+    );
+    if (terms.length === 0) return sessionsInRange;
+
+    return sessionsInRange.filter((s) => {
       const haystack = [
         s.id,
         s.title,
@@ -240,7 +260,7 @@ function ExportPanel({
         .toLowerCase();
       return terms.every((term) => haystack.includes(term));
     });
-  }, [scopedSessions, sessionSearch]);
+  }, [scopedSessions, sessionSearch, updatedAtRange]);
   const filteredArchivedCount = useMemo(
     () => filteredSessions.filter((session) => session.archived).length,
     [filteredSessions],
@@ -319,6 +339,7 @@ function ExportPanel({
 
   const exportAll = async () => {
     if (!outDir) return toast.error("请先选择导出目录");
+    if (updatedAtRange.error) return toast.error(updatedAtRange.error);
     setRunning(true);
     try {
       const r = await api.exportAllBundles({
@@ -331,6 +352,8 @@ function ExportPanel({
         machine_label: machineLabel || undefined,
         export_group: exportGroup || undefined,
         active_only: activeOnly,
+        from_updated_at: updatedAtRange.from,
+        to_updated_at: updatedAtRange.to,
       });
       const ok = r.filter((x) => x.ok).length;
       notifyExportResult(
@@ -431,6 +454,54 @@ function ExportPanel({
               </div>
             </div>
           </div>
+          <div className="space-y-1.5">
+            <div className="flex flex-wrap items-end gap-2">
+              <div className="space-y-1.5">
+                <Label htmlFor="export-updated-from" className="text-xs">
+                  更新时间（开始）
+                </Label>
+                <Input
+                  id="export-updated-from"
+                  type="date"
+                  value={updatedFromDate}
+                  onChange={(event) => setUpdatedFromDate(event.target.value)}
+                  className="h-9 w-40 text-xs"
+                />
+              </div>
+              <span className="pb-2 text-xs text-muted-foreground">至</span>
+              <div className="space-y-1.5">
+                <Label htmlFor="export-updated-to" className="text-xs">
+                  更新时间（结束，含当天）
+                </Label>
+                <Input
+                  id="export-updated-to"
+                  type="date"
+                  value={updatedToDate}
+                  onChange={(event) => setUpdatedToDate(event.target.value)}
+                  className="h-9 w-40 text-xs"
+                />
+              </div>
+              {(updatedFromDate || updatedToDate) && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setUpdatedFromDate("");
+                    setUpdatedToDate("");
+                  }}
+                >
+                  清除时间范围
+                </Button>
+              )}
+            </div>
+            {updatedAtRange.error && (
+              <p className="text-xs text-destructive">{updatedAtRange.error}</p>
+            )}
+            <p className="text-[11px] text-muted-foreground">
+              按会话最后更新时间筛选；开始日和结束日均包含当天。
+            </p>
+          </div>
           <Separator />
           <div className="flex flex-wrap items-center gap-3">
             {provider !== "claude" && (
@@ -461,12 +532,12 @@ function ExportPanel({
               <Button
                 size="sm"
                 onClick={exportAll}
-                disabled={running}
+                disabled={running || !!updatedAtRange.error}
                 className="gap-1.5"
-                title="导出该服务商的全部会话，不受下方会话列表的筛选与搜索影响"
+                title="导出该服务商在时间范围内的全部会话；不受下方搜索和会话范围筛选影响"
               >
                 <Upload className="h-3.5 w-3.5" />
-                导出全部
+                {updatedFromDate || updatedToDate ? "导出范围内全部" : "导出全部"}
               </Button>
               <Button
                 size="sm"
@@ -662,6 +733,42 @@ function zipSourceFromReports(reports: ExportReport[]): string | null {
 
   const parentDirs = Array.from(new Set(bundlePaths.map(dirname)));
   return parentDirs.length === 1 ? parentDirs[0] : null;
+}
+
+type ExportDateRange = {
+  from?: number;
+  to?: number;
+  error?: string;
+};
+
+function exportDateRange(fromDate: string, toDate: string): ExportDateRange {
+  const from = fromDate ? localDateBoundary(fromDate, 0) : undefined;
+  const to = toDate ? localDateBoundary(toDate, 1) : undefined;
+  if ((fromDate && from === undefined) || (toDate && to === undefined)) {
+    return { error: "时间范围包含无效日期" };
+  }
+  if (from !== undefined && to !== undefined && from >= to) {
+    return { from, to, error: "开始日期不能晚于结束日期" };
+  }
+  return { from, to };
+}
+
+function localDateBoundary(value: string, dayOffset: number): number | undefined {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return undefined;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const base = new Date(year, month - 1, day);
+  if (
+    base.getFullYear() !== year ||
+    base.getMonth() !== month - 1 ||
+    base.getDate() !== day
+  ) {
+    return undefined;
+  }
+  const boundary = new Date(year, month - 1, day + dayOffset);
+  return Math.floor(boundary.getTime() / 1000);
 }
 
 function notifyExportResult(reports: ExportReport[], summary: string) {
