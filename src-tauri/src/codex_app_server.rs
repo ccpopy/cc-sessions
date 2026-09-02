@@ -308,10 +308,12 @@ mod tests {
         });
         let fork = parse_fork_result(&result)?;
         assert_eq!(fork.id, "new-thread");
-        assert!(fork
-            .path
-            .as_deref()
-            .is_some_and(|path| path.ends_with("rollout-new-thread.jsonl")));
+        assert_eq!(
+            fork.path.as_deref(),
+            Some(Path::new(
+                r"C:\Users\me\.codex\sessions\rollout-new-thread.jsonl"
+            ))
+        );
         assert_eq!(fork.model_provider.as_deref(), Some("custom"));
         Ok(())
     }
