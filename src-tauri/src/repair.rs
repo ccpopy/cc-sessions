@@ -591,6 +591,7 @@ pub(crate) struct RolloutBrief {
     pub(crate) relpath: PathBuf,
     pub(crate) id: String,
     pub(crate) model_provider: Option<String>,
+    pub(crate) history_mode: String,
     pub(crate) source: Option<String>,
     pub(crate) cwd: Option<String>,
     pub(crate) sandbox_policy: Option<String>,
@@ -703,6 +704,7 @@ fn read_rollout_brief_impl(
     let reader = BufReader::new(f);
     let mut id: Option<String> = None;
     let mut model_provider: Option<String> = None;
+    let mut history_mode: Option<String> = None;
     let mut source: Option<String> = None;
     let mut cwd_tracker = crate::codex_rollout_cwd::EffectiveCwdTracker::default();
     let mut sandbox_policy: Option<String> = None;
@@ -754,6 +756,12 @@ fn read_rollout_brief_impl(
                         .and_then(|x| x.as_str())
                         .map(String::from)
                 });
+                history_mode = history_mode.or_else(|| {
+                    payload
+                        .and_then(|p| p.get("history_mode"))
+                        .and_then(|x| x.as_str())
+                        .map(String::from)
+                });
                 source =
                     source.or_else(|| payload.and_then(|p| metadata_string_field(p, "source")));
                 memory_mode = memory_mode
@@ -800,6 +808,7 @@ fn read_rollout_brief_impl(
         relpath,
         id,
         model_provider: Some(model_provider.unwrap_or_else(|| DEFAULT_PROVIDER.to_string())),
+        history_mode: history_mode.unwrap_or_else(|| "legacy".to_string()),
         source,
         cwd,
         sandbox_policy,
@@ -2789,6 +2798,23 @@ fn carry_thread_title(
     Ok(())
 }
 
+fn thread_display_name(state: &rusqlite::Connection, id: &str) -> AppResult<Option<String>> {
+    let has_name = threads_table_columns(state)?
+        .iter()
+        .any(|column| column == "name");
+    let sql = if has_name {
+        "SELECT COALESCE(NULLIF(TRIM(name), ''), NULLIF(TRIM(title), ''), '')
+         FROM threads WHERE id = ?"
+    } else {
+        "SELECT COALESCE(NULLIF(TRIM(title), ''), '') FROM threads WHERE id = ?"
+    };
+    match state.query_row(sql, [id], |row| row.get::<_, String>(0)) {
+        Ok(name) if !name.is_empty() => Ok(Some(name)),
+        Ok(_) | Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn require_thread_row(state: &rusqlite::Connection, id: &str) -> AppResult<()> {
     match state.query_row("SELECT 1 FROM threads WHERE id = ?", [id], |_| Ok(())) {
         Ok(()) => Ok(()),
@@ -3912,9 +3938,18 @@ fn duplicate_session_locked(
     session_id: String,
     rollout_path: String,
 ) -> AppResult<DuplicateSessionReport> {
+    let mut forker = OfficialProviderThreadForker::new(PathBuf::from(&codex_dir));
+    duplicate_session_locked_with_forker(codex_dir, session_id, rollout_path, &mut forker)
+}
+
+fn duplicate_session_locked_with_forker(
+    codex_dir: String,
+    session_id: String,
+    rollout_path: String,
+    provider_forker: &mut dyn ProviderThreadForker,
+) -> AppResult<DuplicateSessionReport> {
     let codex = PathBuf::from(&codex_dir);
     let codex = codex.canonicalize().unwrap_or(codex);
-    crate::codex_projects::ensure_desktop_not_running(&codex)?;
 
     let source = paths::host_path_from_codex_record(&codex, &rollout_path);
     let source_abs = source.canonicalize().map_err(|error| {
@@ -3936,6 +3971,13 @@ fn duplicate_session_locked(
             session_id, source_brief.id
         )));
     }
+
+    if source_brief.history_mode == "paginated" {
+        // paginated rollout 只是 history_base 链上的增量，不能按 JSONL 整体复制；
+        // 交给官方 thread/fork（带全部对话）生成，再登记到本工具的索引与项目状态。
+        return duplicate_paginated_session(&codex, &session_id, &source_brief, provider_forker);
+    }
+    crate::codex_projects::ensure_desktop_not_running(&codex)?;
 
     let provider = source_brief
         .model_provider
@@ -4007,7 +4049,157 @@ fn duplicate_session_locked(
         new_id,
         new_rollout_path: new_abs.to_string_lossy().into_owned(),
         total_lines,
+        desktop_restart_required: false,
     })
+}
+
+/// paginated 会话的“完整 Fork”：官方 thread/fork 负责 rollout + threads 行，
+/// 本工具补齐标题、来源溯源、session_index 与项目归属；任一步失败则删除官方 fork。
+fn duplicate_paginated_session(
+    codex: &Path,
+    session_id: &str,
+    source_brief: &RolloutBrief,
+    provider_forker: &mut dyn ProviderThreadForker,
+) -> AppResult<DuplicateSessionReport> {
+    let provider = source_brief
+        .model_provider
+        .clone()
+        .unwrap_or_else(|| DEFAULT_PROVIDER.to_string());
+    let defer_desktop_state = crate::codex_projects::should_defer_desktop_state_mutation();
+    let source_thread_name = {
+        ensure_state_db_exists(codex)?;
+        let state = state_db::open_ro(codex)?;
+        thread_display_name(&state, session_id)?.or_else(|| {
+            (!source_brief.first_user_message.is_empty())
+                .then(|| source_brief.first_user_message.clone())
+        })
+    };
+
+    let fork = provider_forker.fork_paginated_thread_with_turns(session_id, &provider)?;
+    if fork.id == session_id {
+        return Err(AppError::Other(
+            "Codex thread/fork 返回了源会话 ID，拒绝继续登记".into(),
+        ));
+    }
+    let new_id = fork.id.clone();
+    let result = (|| -> AppResult<(PathBuf, u64)> {
+        if let Some(name) = source_thread_name.as_deref() {
+            provider_forker.set_forked_thread_name(&new_id, name)?;
+        }
+        let response_path = fork
+            .path
+            .as_ref()
+            .ok_or_else(|| AppError::Other("Codex thread/fork 响应缺少 rollout 路径".into()))?;
+        let fork_path = paths::host_path_from_codex_record(codex, &response_path.to_string_lossy());
+        let new_abs = fork_path.canonicalize().map_err(|error| {
+            AppError::NotFound(format!(
+                "Codex thread/fork 未生成可访问的 rollout：{} ({error})",
+                fork_path.to_string_lossy()
+            ))
+        })?;
+        crate::sessions::validate_codex_rollout_path(codex, &new_abs, &new_id)?;
+        let new_brief = read_rollout_brief(codex, &new_abs)?.ok_or_else(|| {
+            AppError::Other(format!(
+                "Codex thread/fork rollout 缺少有效 session_meta.id：{}",
+                new_abs.to_string_lossy()
+            ))
+        })?;
+        if new_brief.id != new_id {
+            return Err(AppError::Other(format!(
+                "Codex thread/fork 响应 ID 与 rollout 不一致：响应 {new_id}，rollout {}",
+                new_brief.id
+            )));
+        }
+        if new_brief.history_mode != "paginated" {
+            return Err(AppError::Other(format!(
+                "Codex thread/fork 返回 history_mode={}，期望 paginated",
+                new_brief.history_mode
+            )));
+        }
+
+        let state = state_db::open(codex)?;
+        require_thread_row(&state, &new_id)?;
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&state, rusqlite::TransactionBehavior::Immediate)?;
+        let mut journal = MutationJournal::default();
+        let operation = (|| -> AppResult<u64> {
+            carry_thread_title(&transaction, session_id, &new_id)?;
+            let provenance_path = paths::session_provenance_path(codex);
+            journal.mutate_file(&provenance_path, || {
+                crate::provenance::copy_conversion_origin(codex, "codex", session_id, &new_id)
+            })?;
+            let thread_name = thread_display_name(&transaction, &new_id)?
+                .or_else(|| source_thread_name.clone())
+                .unwrap_or_else(|| new_brief.first_user_message.clone());
+            let index_path = paths::session_index_path(codex);
+            journal.mutate_file(&index_path, || {
+                append_index_line(codex, &new_id, &thread_name, &new_abs)
+            })?;
+            if !defer_desktop_state {
+                if let Some((thread_id, host_cwd)) = project_assignment_record(codex, &new_brief) {
+                    if let Some(receipt) =
+                        crate::codex_projects::sync_thread_project_assignment_with_receipt(
+                            codex, &thread_id, &host_cwd,
+                        )?
+                    {
+                        journal.register_project_state_receipt(receipt);
+                    }
+                }
+            }
+            inject_repair_fault("paginated_duplicate_after_index")?;
+            // paginated fork 自身只含增量行，继承的历史长度记录在 history_base 中；
+            // 合并后才与“完整 Fork”对旧版 rollout 报告的行数语义一致。
+            let file = fs::File::open(&new_abs)?;
+            let own_lines = std::io::BufReader::new(file).lines().count() as u64;
+            Ok(own_lines + paginated_history_base_len(&new_abs)?)
+        })();
+        let manager_result = match operation {
+            Ok(total_lines) => {
+                commit_transaction_with_compensation(transaction, journal).map(|()| total_lines)
+            }
+            Err(error) => Err(rollback_transaction_with_compensation(
+                transaction,
+                journal,
+                error,
+            )),
+        };
+        drop(state);
+        let total_lines = manager_result?;
+        Ok((new_abs, total_lines))
+    })();
+
+    let (new_abs, total_lines) = match result {
+        Ok(value) => value,
+        Err(error) => {
+            return Err(compensate_official_provider_fork(
+                provider_forker,
+                &new_id,
+                error,
+            ));
+        }
+    };
+    Ok(DuplicateSessionReport {
+        source_id: session_id.to_string(),
+        new_id,
+        new_rollout_path: paths::strip_verbatim(&new_abs.to_string_lossy()),
+        total_lines,
+        desktop_restart_required: defer_desktop_state,
+    })
+}
+
+/// 读取 paginated rollout 首行 `history_base.end_ordinal_exclusive`，即从源会话继承的历史行数。
+fn paginated_history_base_len(rollout: &Path) -> AppResult<u64> {
+    let raw = fs::read_to_string(rollout)?;
+    let Some(first) = raw.lines().find(|line| !line.trim().is_empty()) else {
+        return Ok(0);
+    };
+    let meta: Value = serde_json::from_str(first)?;
+    Ok(meta
+        .get("payload")
+        .and_then(|payload| payload.get("history_base"))
+        .and_then(|base| base.get("end_ordinal_exclusive"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0))
 }
 
 pub fn duplicate_session_with_lock(
@@ -4224,6 +4416,76 @@ pub fn clone_session_for_provider_with_lock(
     })
 }
 
+trait ProviderThreadForker {
+    fn fork_paginated_thread(
+        &mut self,
+        thread_id: &str,
+        model_provider: &str,
+    ) -> AppResult<crate::codex_app_server::ForkedThread>;
+
+    /// 官方 thread/fork 带全部对话（excludeTurns=false），用于 paginated 会话的“完整 Fork”。
+    fn fork_paginated_thread_with_turns(
+        &mut self,
+        thread_id: &str,
+        model_provider: &str,
+    ) -> AppResult<crate::codex_app_server::ForkedThread>;
+
+    fn set_forked_thread_name(&mut self, thread_id: &str, name: &str) -> AppResult<()>;
+
+    fn delete_forked_thread(&mut self, thread_id: &str) -> AppResult<()>;
+}
+
+struct OfficialProviderThreadForker {
+    codex: PathBuf,
+    app_server: Option<crate::codex_app_server::CodexAppServer>,
+}
+
+impl OfficialProviderThreadForker {
+    fn new(codex: PathBuf) -> Self {
+        Self {
+            codex,
+            app_server: None,
+        }
+    }
+
+    fn app_server(&mut self) -> AppResult<&mut crate::codex_app_server::CodexAppServer> {
+        if self.app_server.is_none() {
+            self.app_server = Some(crate::codex_app_server::CodexAppServer::start(&self.codex)?);
+        }
+        self.app_server
+            .as_mut()
+            .ok_or_else(|| AppError::Other("Codex app-server 未初始化".into()))
+    }
+}
+
+impl ProviderThreadForker for OfficialProviderThreadForker {
+    fn fork_paginated_thread(
+        &mut self,
+        thread_id: &str,
+        model_provider: &str,
+    ) -> AppResult<crate::codex_app_server::ForkedThread> {
+        self.app_server()?
+            .fork_thread_for_provider(thread_id, model_provider)
+    }
+
+    fn fork_paginated_thread_with_turns(
+        &mut self,
+        thread_id: &str,
+        model_provider: &str,
+    ) -> AppResult<crate::codex_app_server::ForkedThread> {
+        self.app_server()?
+            .fork_thread(thread_id, model_provider, false)
+    }
+
+    fn delete_forked_thread(&mut self, thread_id: &str) -> AppResult<()> {
+        self.app_server()?.delete_thread(thread_id)
+    }
+
+    fn set_forked_thread_name(&mut self, thread_id: &str, name: &str) -> AppResult<()> {
+        self.app_server()?.set_thread_name(thread_id, name)
+    }
+}
+
 fn clone_session_for_provider_locked(
     codex_dir: String,
     session_id: String,
@@ -4231,6 +4493,7 @@ fn clone_session_for_provider_locked(
     strategy: SwitchStrategy,
     dry_run: bool,
 ) -> AppResult<CloneReport> {
+    let mut forker = OfficialProviderThreadForker::new(PathBuf::from(&codex_dir));
     clone_session_for_provider_locked_with_hint(
         codex_dir,
         session_id,
@@ -4238,6 +4501,7 @@ fn clone_session_for_provider_locked(
         strategy,
         dry_run,
         None,
+        &mut forker,
     )
 }
 
@@ -4248,11 +4512,11 @@ fn clone_session_for_provider_locked_with_hint(
     strategy: SwitchStrategy,
     dry_run: bool,
     source_rollout_hint: Option<&Path>,
+    provider_forker: &mut dyn ProviderThreadForker,
 ) -> AppResult<CloneReport> {
     let codex = PathBuf::from(&codex_dir);
-    if !dry_run {
-        crate::codex_projects::ensure_desktop_not_running(&codex)?;
-    }
+    let defer_desktop_state =
+        !dry_run && crate::codex_projects::should_defer_desktop_state_mutation();
     let configured_provider = effective_current_provider(&codex)?;
     let provider = match target_provider {
         Some(provider) => {
@@ -4270,6 +4534,7 @@ fn clone_session_for_provider_locked_with_hint(
         new_id: None,
         new_rollout_path: None,
         new_provider: provider.clone(),
+        desktop_restart_required: false,
         ok: false,
         skipped_reason: None,
         error: None,
@@ -4345,11 +4610,13 @@ fn clone_session_for_provider_locked_with_hint(
                 ensure_state_db_exists(&codex)?;
                 let state = state_db::open(&codex)?;
                 let project_assignment = project_assignment_record(&codex, &src_brief);
-                if let Some(record) = project_assignment.as_ref() {
-                    crate::codex_projects::validate_missing_thread_project_assignment_records(
-                        &codex,
-                        std::slice::from_ref(record),
-                    )?;
+                if !defer_desktop_state {
+                    if let Some(record) = project_assignment.as_ref() {
+                        crate::codex_projects::validate_missing_thread_project_assignment_records(
+                            &codex,
+                            std::slice::from_ref(record),
+                        )?;
+                    }
                 }
 
                 let transaction = rusqlite::Transaction::new_unchecked(
@@ -4368,12 +4635,14 @@ fn clone_session_for_provider_locked_with_hint(
                             &src_brief.path,
                         )
                     })?;
-                    if let Some(record) = project_assignment.as_ref() {
-                        if let Some(receipt) = crate::codex_projects::sync_missing_thread_project_assignment_records_with_receipt(
-                            &codex,
-                            std::slice::from_ref(record),
-                        )? {
-                            journal.register_project_state_receipt(receipt);
+                    if !defer_desktop_state {
+                        if let Some(record) = project_assignment.as_ref() {
+                            if let Some(receipt) = crate::codex_projects::sync_missing_thread_project_assignment_records_with_receipt(
+                                &codex,
+                                std::slice::from_ref(record),
+                            )? {
+                                journal.register_project_state_receipt(receipt);
+                            }
                         }
                     }
                     if !family_was_registered {
@@ -4409,6 +4678,7 @@ fn clone_session_for_provider_locked_with_hint(
                 }
                 report.skipped_reason = Some("已修复并复核本地索引可见性".into());
             }
+            report.desktop_restart_required = defer_desktop_state;
             report.ok = true;
             return Ok(report);
         }
@@ -4457,21 +4727,25 @@ fn clone_session_for_provider_locked_with_hint(
                         paths::host_path_string_from_codex_record(&codex, cwd),
                     )
                 });
-            if let Some(record) = project_assignment.as_ref() {
-                crate::codex_projects::validate_missing_thread_project_assignment_records(
-                    &codex,
-                    std::slice::from_ref(record),
-                )?;
+            if !defer_desktop_state {
+                if let Some(record) = project_assignment.as_ref() {
+                    crate::codex_projects::validate_missing_thread_project_assignment_records(
+                        &codex,
+                        std::slice::from_ref(record),
+                    )?;
+                }
             }
 
             let mut journal = MutationJournal::default();
             let operation = (|| -> AppResult<()> {
-                if let Some(record) = project_assignment.as_ref() {
-                    if let Some(receipt) = crate::codex_projects::sync_missing_thread_project_assignment_records_with_receipt(
-                        &codex,
-                        std::slice::from_ref(record),
-                    )? {
-                        journal.register_project_state_receipt(receipt);
+                if !defer_desktop_state {
+                    if let Some(record) = project_assignment.as_ref() {
+                        if let Some(receipt) = crate::codex_projects::sync_missing_thread_project_assignment_records_with_receipt(
+                            &codex,
+                            std::slice::from_ref(record),
+                        )? {
+                            journal.register_project_state_receipt(receipt);
+                        }
                     }
                 }
                 if !family_was_registered {
@@ -4484,7 +4758,45 @@ fn clone_session_for_provider_locked_with_hint(
                 return Err(journal.compensate_without_transaction(error));
             }
         }
+        report.desktop_restart_required = defer_desktop_state;
         return Ok(report);
+    }
+
+    if src_brief.history_mode == "paginated" && matches!(&strategy, SwitchStrategy::Scatter) {
+        if dry_run {
+            report.ok = true;
+            report.skipped_reason =
+                Some("dry_run: 将通过 Codex 官方 thread/fork 同步分页会话".into());
+            return Ok(report);
+        }
+        return clone_paginated_session_for_provider(
+            &codex,
+            &session_id,
+            &provider,
+            &src_brief,
+            &mut store,
+            &family_id,
+            active_branch.as_ref(),
+            defer_desktop_state,
+            report,
+            provider_forker,
+        );
+    }
+
+    if !dry_run
+        && matches!(
+            &strategy,
+            SwitchStrategy::Follow | SwitchStrategy::Continuous
+        )
+    {
+        if defer_desktop_state {
+            return Err(AppError::Other(
+                "follow/continuous provider 切换会改写或移动当前 rollout；Codex/ChatGPT 桌面应用正在运行，请完全退出后重试"
+                    .into(),
+            ));
+        }
+        // Catch Desktop starting after the initial defer probe but before an unsafe source write.
+        crate::codex_projects::ensure_desktop_not_running(&codex)?;
     }
 
     match strategy {
@@ -4503,12 +4815,14 @@ fn clone_session_for_provider_locked_with_hint(
             )?;
             let mut journal = MutationJournal::default();
             let operation = (|| -> AppResult<()> {
-                if let Some(record) = project_assignment_record(&codex, &src_brief) {
-                    if let Some(receipt) = crate::codex_projects::sync_missing_thread_project_assignment_records_with_receipt(
-                        &codex,
-                        &[record],
-                    )? {
-                        journal.register_project_state_receipt(receipt);
+                if !defer_desktop_state {
+                    if let Some(record) = project_assignment_record(&codex, &src_brief) {
+                        if let Some(receipt) = crate::codex_projects::sync_missing_thread_project_assignment_records_with_receipt(
+                            &codex,
+                            &[record],
+                        )? {
+                            journal.register_project_state_receipt(receipt);
+                        }
                     }
                 }
                 journal.mutate_file(&src_brief.path, || {
@@ -4550,6 +4864,7 @@ fn clone_session_for_provider_locked_with_hint(
             commit_transaction_with_compensation(transaction, journal)?;
             report.new_id = Some(src_brief.id.clone());
             report.new_rollout_path = Some(src_brief.path.to_string_lossy().into_owned());
+            report.desktop_restart_required = defer_desktop_state;
             report.ok = true;
             Ok(report)
         }
@@ -4652,13 +4967,17 @@ fn clone_session_for_provider_locked_with_hint(
                         new_abs.to_string_lossy()
                     ))
                 })?;
-                if let Some((thread_id, host_cwd)) = project_assignment_record(&codex, &new_brief) {
-                    if let Some(receipt) =
-                        crate::codex_projects::sync_thread_project_assignment_with_receipt(
-                            &codex, &thread_id, &host_cwd,
-                        )?
+                if !defer_desktop_state {
+                    if let Some((thread_id, host_cwd)) =
+                        project_assignment_record(&codex, &new_brief)
                     {
-                        journal.register_project_state_receipt(receipt);
+                        if let Some(receipt) =
+                            crate::codex_projects::sync_thread_project_assignment_with_receipt(
+                                &codex, &thread_id, &host_cwd,
+                            )?
+                        {
+                            journal.register_project_state_receipt(receipt);
+                        }
                     }
                 }
                 carry_thread_title(
@@ -4771,9 +5090,202 @@ fn clone_session_for_provider_locked_with_hint(
 
             report.new_id = Some(new_id);
             report.new_rollout_path = Some(new_abs.to_string_lossy().into_owned());
+            report.desktop_restart_required = defer_desktop_state;
             report.ok = true;
             Ok(report)
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn clone_paginated_session_for_provider(
+    codex: &Path,
+    session_id: &str,
+    provider: &str,
+    src_brief: &RolloutBrief,
+    store: &mut FamilyStore,
+    family_id: &str,
+    active_branch: Option<&FamilyBranch>,
+    defer_desktop_state: bool,
+    mut report: CloneReport,
+    provider_forker: &mut dyn ProviderThreadForker,
+) -> AppResult<CloneReport> {
+    let source_thread_name = {
+        let state = state_db::open_ro(codex)?;
+        thread_display_name(&state, session_id)?.or_else(|| {
+            (!src_brief.first_user_message.is_empty()).then(|| src_brief.first_user_message.clone())
+        })
+    };
+    let fork = provider_forker.fork_paginated_thread(session_id, provider)?;
+    if fork.id == session_id {
+        return Err(AppError::Other(
+            "Codex thread/fork 返回了源会话 ID，拒绝继续登记".into(),
+        ));
+    }
+    let new_id = fork.id.clone();
+    let result = (|| -> AppResult<PathBuf> {
+        if let Some(name) = source_thread_name.as_deref() {
+            provider_forker.set_forked_thread_name(&new_id, name)?;
+        }
+        let codex_root = codex.canonicalize().unwrap_or_else(|_| codex.to_path_buf());
+        let response_path = fork
+            .path
+            .as_ref()
+            .ok_or_else(|| AppError::Other("Codex thread/fork 响应缺少 rollout 路径".into()))?;
+        let fork_path = paths::host_path_from_codex_record(codex, &response_path.to_string_lossy());
+        let new_abs = fork_path.canonicalize().map_err(|error| {
+            AppError::NotFound(format!(
+                "Codex thread/fork 未生成可访问的 rollout：{} ({error})",
+                fork_path.to_string_lossy()
+            ))
+        })?;
+        crate::sessions::validate_codex_rollout_path(&codex_root, &new_abs, &new_id)?;
+        let new_brief = read_rollout_brief(&codex_root, &new_abs)?.ok_or_else(|| {
+            AppError::Other(format!(
+                "Codex thread/fork rollout 缺少有效 session_meta.id：{}",
+                new_abs.to_string_lossy()
+            ))
+        })?;
+        if new_brief.id != new_id {
+            return Err(AppError::Other(format!(
+                "Codex thread/fork 响应 ID 与 rollout 不一致：响应 {new_id}，rollout {}",
+                new_brief.id
+            )));
+        }
+        if new_brief.model_provider.as_deref() != Some(provider)
+            || fork.model_provider.as_deref() != Some(provider)
+        {
+            return Err(AppError::Other(format!(
+                "Codex thread/fork 未写入目标 provider={provider}"
+            )));
+        }
+        if new_brief.history_mode != "paginated" {
+            return Err(AppError::Other(format!(
+                "Codex thread/fork 返回 history_mode={}，期望 paginated",
+                new_brief.history_mode
+            )));
+        }
+        let new_rel = new_abs
+            .strip_prefix(&codex_root)
+            .map(Path::to_path_buf)
+            .map_err(|_| {
+                AppError::Path(format!(
+                    "Codex thread/fork rollout 不在 Codex 目录内：{}",
+                    new_abs.to_string_lossy()
+                ))
+            })?;
+
+        let cloned_from_id = active_branch
+            .map(|branch| branch.id.clone())
+            .unwrap_or_else(|| session_id.to_string());
+        let family = store
+            .families
+            .get_mut(family_id)
+            .ok_or_else(|| AppError::NotFound(format!("provider 同步 family：{family_id}")))?;
+        for branch in &mut family.chain {
+            if matches!(branch.status, BranchStatus::Active) {
+                branch.status = BranchStatus::Archived;
+                branch.archive_origin = Some(ArchiveOrigin::ProviderSync);
+            }
+        }
+        family.chain.push(FamilyBranch {
+            id: new_id.clone(),
+            provider: provider.to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            status: BranchStatus::Active,
+            rollout_relpath: new_rel.to_string_lossy().into_owned(),
+            sha256: None,
+            line_count: None,
+            note: Some(format!("official_fork_from:{cloned_from_id}")),
+            archive_origin: None,
+        });
+        family.active_id = new_id.clone();
+        family.updated_at = chrono::Utc::now().to_rfc3339();
+        store.index.insert(new_id.clone(), family_id.to_string());
+
+        ensure_state_db_exists(codex)?;
+        let state = state_db::open(codex)?;
+        require_thread_row(&state, &new_id)?;
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&state, rusqlite::TransactionBehavior::Immediate)?;
+        let mut journal = MutationJournal::default();
+        let mut thread_name = src_brief.first_user_message.clone();
+        let operation = (|| -> AppResult<()> {
+            carry_thread_title(&transaction, session_id, &new_id)?;
+            if let Some(name) = thread_display_name(&transaction, &new_id)? {
+                thread_name = name;
+            }
+            if !defer_desktop_state {
+                if let Some((thread_id, host_cwd)) = project_assignment_record(codex, &new_brief) {
+                    if let Some(receipt) =
+                        crate::codex_projects::sync_thread_project_assignment_with_receipt(
+                            codex, &thread_id, &host_cwd,
+                        )?
+                    {
+                        journal.register_project_state_receipt(receipt);
+                    }
+                }
+            }
+            let index_path = paths::session_index_path(codex);
+            journal.mutate_file(&index_path, || {
+                append_index_line(codex, &new_id, &thread_name, &new_abs)
+            })?;
+            let family_path = paths::family_store_path(codex);
+            journal.mutate_file(&family_path, || family::save(codex, store))?;
+            inject_repair_fault("paginated_clone_after_family_save")?;
+
+            let states = read_thread_state_map(codex)?;
+            let index_ids = read_session_index_ids(codex)?;
+            if !rollout_is_usable_provider_session(
+                codex, &states, &index_ids, &new_id, provider, &new_abs,
+            )? {
+                return Err(AppError::Other(format!(
+                    "Codex 官方 fork {} 的 provider 可见性复核未通过",
+                    new_id
+                )));
+            }
+            Ok(())
+        })();
+        let manager_result = match operation {
+            Ok(()) => commit_transaction_with_compensation(transaction, journal),
+            Err(error) => Err(rollback_transaction_with_compensation(
+                transaction,
+                journal,
+                error,
+            )),
+        };
+        drop(state);
+        manager_result?;
+        Ok(new_abs)
+    })();
+
+    let new_abs = match result {
+        Ok(path) => path,
+        Err(error) => {
+            return Err(compensate_official_provider_fork(
+                provider_forker,
+                &new_id,
+                error,
+            ));
+        }
+    };
+    report.new_id = Some(new_id);
+    report.new_rollout_path = Some(paths::strip_verbatim(&new_abs.to_string_lossy()));
+    report.desktop_restart_required = defer_desktop_state;
+    report.ok = true;
+    Ok(report)
+}
+
+fn compensate_official_provider_fork(
+    provider_forker: &mut dyn ProviderThreadForker,
+    thread_id: &str,
+    primary_error: AppError,
+) -> AppError {
+    match provider_forker.delete_forked_thread(thread_id) {
+        Ok(()) => primary_error,
+        Err(cleanup_error) => AppError::Other(format!(
+            "{primary_error}；清理 Codex 官方 fork {thread_id} 失败：{cleanup_error}"
+        )),
     }
 }
 
@@ -5046,6 +5558,7 @@ where
         on_progress(0, total, None, None);
 
         let mut out: Vec<CloneReport> = Vec::new();
+        let mut provider_forker = OfficialProviderThreadForker::new(codex.clone());
         for target in targets {
             let id = target.session_id;
             on_progress(out.len(), total, Some(id.clone()), None);
@@ -5056,6 +5569,7 @@ where
                 strategy.clone(),
                 dry_run,
                 Some(&target.rollout_path),
+                &mut provider_forker,
             ) {
                 Ok(report) => report,
                 Err(e) => CloneReport {
@@ -5063,6 +5577,7 @@ where
                     new_id: None,
                     new_rollout_path: None,
                     new_provider: cur.clone(),
+                    desktop_restart_required: false,
                     ok: false,
                     skipped_reason: None,
                     error: Some(e.to_string()),
@@ -5787,6 +6302,107 @@ mod tests {
         std::env::temp_dir().join(unique)
     }
 
+    struct FakeProviderThreadForker {
+        codex: PathBuf,
+        fork_count: usize,
+        delete_count: usize,
+    }
+
+    impl FakeProviderThreadForker {
+        fn new(codex: PathBuf) -> Self {
+            Self {
+                codex,
+                fork_count: 0,
+                delete_count: 0,
+            }
+        }
+    }
+
+    impl FakeProviderThreadForker {
+        fn fake_fork(
+            &mut self,
+            thread_id: &str,
+            model_provider: &str,
+            include_turns: bool,
+        ) -> AppResult<crate::codex_app_server::ForkedThread> {
+            self.fork_count += 1;
+            let source = family::scan_rollouts(&self.codex)?
+                .into_iter()
+                .find(|path| {
+                    read_rollout_identity(path)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|identity| identity.id == thread_id)
+                })
+                .ok_or_else(|| AppError::NotFound(format!("test source: {thread_id}")))?;
+            let raw = fs::read_to_string(source)?;
+            let mut meta: Value = serde_json::from_str(
+                raw.lines()
+                    .next()
+                    .ok_or_else(|| AppError::Other("test source is empty".into()))?,
+            )?;
+            let new_id = format!("official-paginated-fork-{}", self.fork_count);
+            meta["payload"]["id"] = Value::String(new_id.clone());
+            meta["payload"]["model_provider"] = Value::String(model_provider.to_string());
+            meta["payload"]["history_mode"] = Value::String("paginated".to_string());
+            meta["payload"]["history_base"] = serde_json::json!({"thread_id": thread_id});
+            let path = self
+                .codex
+                .join("sessions/2026/04/24")
+                .join(format!("rollout-{new_id}.jsonl"));
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut lines = vec![serde_json::to_string(&meta)?];
+            if include_turns {
+                lines.extend(raw.lines().skip(1).map(str::to_string));
+            }
+            fs::write(&path, format!("{}\n", lines.join("\n")))?;
+            let state = state_db::open(&self.codex)?;
+            sync_thread_from_rollout(&self.codex, &state, &path)?;
+            Ok(crate::codex_app_server::ForkedThread {
+                id: new_id,
+                path: Some(path),
+                model_provider: Some(model_provider.to_string()),
+            })
+        }
+    }
+
+    impl ProviderThreadForker for FakeProviderThreadForker {
+        fn fork_paginated_thread(
+            &mut self,
+            thread_id: &str,
+            model_provider: &str,
+        ) -> AppResult<crate::codex_app_server::ForkedThread> {
+            self.fake_fork(thread_id, model_provider, false)
+        }
+
+        fn fork_paginated_thread_with_turns(
+            &mut self,
+            thread_id: &str,
+            model_provider: &str,
+        ) -> AppResult<crate::codex_app_server::ForkedThread> {
+            self.fake_fork(thread_id, model_provider, true)
+        }
+
+        fn delete_forked_thread(&mut self, thread_id: &str) -> AppResult<()> {
+            self.delete_count += 1;
+            let state = state_db::open(&self.codex)?;
+            state.execute("DELETE FROM threads WHERE id = ?", [thread_id])?;
+            drop(state);
+            for path in family::scan_rollouts(&self.codex)? {
+                if read_rollout_identity(&path)?.is_some_and(|identity| identity.id == thread_id) {
+                    fs::remove_file(path)?;
+                }
+            }
+            Ok(())
+        }
+
+        fn set_forked_thread_name(&mut self, _thread_id: &str, _name: &str) -> AppResult<()> {
+            Ok(())
+        }
+    }
+
     fn write_global_state(codex: &Path, state: Value) -> AppResult<()> {
         fs::create_dir_all(codex)?;
         fs::write(
@@ -6239,6 +6855,21 @@ mod tests {
         }
         write_index_line(codex, id)?;
         write_global_state(codex, serde_json::json!({"local-projects": {}}))?;
+        Ok(source)
+    }
+
+    fn prepare_paginated_provider_switch_fixture(codex: &Path, id: &str) -> AppResult<PathBuf> {
+        let source = prepare_provider_switch_fixture(codex, id)?;
+        let raw = fs::read_to_string(&source)?;
+        let mut lines = raw.lines();
+        let mut meta: Value = serde_json::from_str(lines.next().expect("session meta"))?;
+        meta["payload"]["history_mode"] = Value::String("paginated".to_string());
+        let mut rewritten = vec![serde_json::to_string(&meta)?];
+        rewritten.extend(lines.map(str::to_string));
+        fs::write(&source, format!("{}\n", rewritten.join("\n")))?;
+        let state = state_db::open(codex)?;
+        sync_thread_from_rollout(codex, &state, &source)?;
+        drop(state);
         Ok(source)
     }
 
@@ -6950,6 +7581,168 @@ mod tests {
     }
 
     #[test]
+    fn provider_scatter_sync_supports_paginated_history() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-paginated-provider-sync-test");
+        let source_id = "paginated-provider-source";
+        let source = prepare_paginated_provider_switch_fixture(&codex, source_id)?;
+        let global_path = paths::codex_global_state_json_path(&codex);
+        let global_before = fs::read(&global_path)?;
+        let _desktop = crate::codex_projects::DesktopTestProbeGuard::running();
+
+        let mut provider_forker = FakeProviderThreadForker::new(codex.clone());
+        let report = clone_session_for_provider_locked_with_hint(
+            codex.to_string_lossy().into_owned(),
+            source_id.to_string(),
+            Some(DEFAULT_PROVIDER.to_string()),
+            SwitchStrategy::Scatter,
+            false,
+            Some(&source),
+            &mut provider_forker,
+        )?;
+
+        assert!(report.ok, "{:?}", report.error);
+        assert!(report.desktop_restart_required);
+        assert_eq!(provider_forker.fork_count, 1);
+        assert_eq!(provider_forker.delete_count, 0);
+        assert_eq!(fs::read(&global_path)?, global_before);
+        let new_id = report.new_id.expect("paginated provider target id");
+        let new_path = PathBuf::from(
+            report
+                .new_rollout_path
+                .expect("paginated provider target path"),
+        );
+        let new_meta: Value = serde_json::from_str(
+            fs::read_to_string(new_path)?
+                .lines()
+                .next()
+                .expect("forked session meta"),
+        )?;
+        assert_eq!(new_meta["payload"]["id"], new_id);
+        assert_eq!(new_meta["payload"]["model_provider"], DEFAULT_PROVIDER);
+        assert_eq!(new_meta["payload"]["history_mode"], "paginated");
+
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_session_supports_paginated_history_via_official_fork() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-paginated-duplicate-official-test");
+        let source_id = "paginated-duplicate-source";
+        let source = prepare_paginated_provider_switch_fixture(&codex, source_id)?;
+        let source_lines = fs::read_to_string(&source)?.lines().count() as u64;
+        let global_path = paths::codex_global_state_json_path(&codex);
+        let global_before = fs::read(&global_path)?;
+        let _desktop = crate::codex_projects::DesktopTestProbeGuard::running();
+        let mut provider_forker = FakeProviderThreadForker::new(codex.clone());
+
+        let report = duplicate_session_locked_with_forker(
+            codex.to_string_lossy().into_owned(),
+            source_id.to_string(),
+            source.to_string_lossy().into_owned(),
+            &mut provider_forker,
+        )?;
+
+        assert!(report.desktop_restart_required);
+        assert_eq!(report.total_lines, source_lines);
+        assert_eq!(provider_forker.fork_count, 1);
+        assert_eq!(provider_forker.delete_count, 0);
+        assert_eq!(fs::read(&global_path)?, global_before);
+        assert!(!report.new_rollout_path.starts_with(r"\\?\"));
+        let new_meta: Value = serde_json::from_str(
+            fs::read_to_string(&report.new_rollout_path)?
+                .lines()
+                .next()
+                .expect("forked session meta"),
+        )?;
+        assert_eq!(new_meta["payload"]["id"], report.new_id);
+        assert_eq!(new_meta["payload"]["history_mode"], "paginated");
+        assert!(read_session_index_ids(&codex)?.contains(&report.new_id));
+        let states = read_thread_state_map(&codex)?;
+        assert!(states.contains_key(&report.new_id));
+
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn paginated_duplicate_deletes_official_fork_after_manager_failure() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-paginated-duplicate-compensation-test");
+        let source_id = "paginated-duplicate-compensation-source";
+        let source = prepare_paginated_provider_switch_fixture(&codex, source_id)?;
+        let index_path = paths::session_index_path(&codex);
+        let index_before = fs::read(&index_path)?;
+        let _desktop = crate::codex_projects::DesktopTestProbeGuard::running();
+        let _fault = RepairTestFaultGuard::error("paginated_duplicate_after_index");
+        let mut provider_forker = FakeProviderThreadForker::new(codex.clone());
+
+        let error = duplicate_session_locked_with_forker(
+            codex.to_string_lossy().into_owned(),
+            source_id.to_string(),
+            source.to_string_lossy().into_owned(),
+            &mut provider_forker,
+        )
+        .expect_err("manager failure must delete the official paginated fork");
+
+        assert!(error.to_string().contains("测试故障注入"), "{error}");
+        assert_eq!(provider_forker.fork_count, 1);
+        assert_eq!(provider_forker.delete_count, 1);
+        assert_eq!(fs::read(&index_path)?, index_before);
+        assert_eq!(family::scan_rollouts(&codex)?.len(), 1);
+        let states = read_thread_state_map(&codex)?;
+        assert_eq!(states.len(), 1);
+
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn paginated_provider_sync_deletes_official_fork_after_manager_failure() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-paginated-provider-compensation-test");
+        let source_id = "paginated-provider-compensation-source";
+        let source = prepare_paginated_provider_switch_fixture(&codex, source_id)?;
+        let index_path = paths::session_index_path(&codex);
+        let global_path = paths::codex_global_state_json_path(&codex);
+        let index_before = fs::read(&index_path)?;
+        let global_before = fs::read(&global_path)?;
+        let _desktop = crate::codex_projects::DesktopTestProbeGuard::running();
+        let _fault = RepairTestFaultGuard::error("paginated_clone_after_family_save");
+        let mut provider_forker = FakeProviderThreadForker::new(codex.clone());
+
+        let error = clone_session_for_provider_locked_with_hint(
+            codex.to_string_lossy().into_owned(),
+            source_id.to_string(),
+            Some(DEFAULT_PROVIDER.to_string()),
+            SwitchStrategy::Scatter,
+            false,
+            Some(&source),
+            &mut provider_forker,
+        )
+        .expect_err("manager failure must delete the official paginated fork");
+
+        assert!(error.to_string().contains("测试故障注入"), "{error}");
+        assert_eq!(provider_forker.fork_count, 1);
+        assert_eq!(provider_forker.delete_count, 1);
+        assert_eq!(fs::read(&index_path)?, index_before);
+        assert_eq!(fs::read(&global_path)?, global_before);
+        assert!(!paths::family_store_path(&codex).exists());
+        let states = read_thread_state_map(&codex)?;
+        assert_eq!(states.len(), 1);
+        assert!(states.contains_key(source_id));
+        let rollouts = family::scan_rollouts(&codex)?;
+        assert_eq!(rollouts.len(), 1);
+        assert_eq!(
+            read_rollout_identity(&rollouts[0])?
+                .expect("source identity")
+                .id,
+            source_id
+        );
+
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
     fn cloned_rollout_requires_session_meta_and_leaves_no_destination() -> AppResult<()> {
         let codex = temp_codex_dir("cc-session-manager-clone-invalid-source-test");
         let source = codex.join("sessions/source.jsonl");
@@ -7089,6 +7882,71 @@ mod tests {
         assert_eq!(thread_after.archived, thread_before.archived);
 
         fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn provider_sync_while_desktop_running_updates_core_without_global_state() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-provider-running-desktop-test");
+        let source_id = "provider-running-desktop";
+        prepare_provider_switch_fixture(&codex, source_id)?;
+        let global_path = paths::codex_global_state_json_path(&codex);
+        let global_before = fs::read(&global_path)?;
+        let _desktop = crate::codex_projects::DesktopTestProbeGuard::running();
+
+        let report = clone_session_for_provider_locked(
+            codex.to_string_lossy().into_owned(),
+            source_id.to_string(),
+            Some(DEFAULT_PROVIDER.to_string()),
+            SwitchStrategy::Scatter,
+            false,
+        )?;
+
+        assert!(report.ok, "{:?}", report.error);
+        let new_id = report.new_id.expect("provider sync target id");
+        let states = read_thread_state_map(&codex)?;
+        assert_eq!(
+            states
+                .get(&new_id)
+                .and_then(|state| state.model_provider.as_deref()),
+            Some(DEFAULT_PROVIDER)
+        );
+        assert_eq!(fs::read(&global_path)?, global_before);
+
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn provider_source_mutating_strategies_still_require_desktop_exit() -> AppResult<()> {
+        for (strategy, label) in [
+            (SwitchStrategy::Follow, "follow"),
+            (SwitchStrategy::Continuous, "continuous"),
+        ] {
+            let codex = temp_codex_dir(&format!(
+                "cc-session-manager-provider-running-{label}-guard-test"
+            ));
+            let source_id = format!("provider-running-{label}-guard");
+            let source = prepare_provider_switch_fixture(&codex, &source_id)?;
+            let source_before = fs::read(&source)?;
+            let global_path = paths::codex_global_state_json_path(&codex);
+            let global_before = fs::read(&global_path)?;
+            let _desktop = crate::codex_projects::DesktopTestProbeGuard::running();
+
+            let error = clone_session_for_provider_locked(
+                codex.to_string_lossy().into_owned(),
+                source_id,
+                Some(DEFAULT_PROVIDER.to_string()),
+                strategy,
+                false,
+            )
+            .expect_err("source-mutating provider sync must stay guarded");
+
+            assert!(error.to_string().contains("完全退出"), "{label}: {error}");
+            assert_eq!(fs::read(&source)?, source_before, "{label}");
+            assert_eq!(fs::read(&global_path)?, global_before, "{label}");
+            fs::remove_dir_all(codex).ok();
+        }
         Ok(())
     }
 

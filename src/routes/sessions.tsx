@@ -409,6 +409,9 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         toast.success("已完整 Fork 会话", {
           description: `新会话 ${report.new_id.slice(0, 8)}，共 ${report.total_lines} 行`,
         });
+        if (report.desktop_restart_required) {
+          toast.warning("Fork 已完成，重启 Codex App 后刷新会话列表");
+        }
         await refresh();
         await refreshOverlay();
       } catch (e: any) {
@@ -445,6 +448,9 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
               ? `已跳过：${r.skipped_reason}`
               : `已克隆到 ${r.new_provider}`,
           );
+          if (r.desktop_restart_required) {
+            toast.warning("同步已完成，重启 Codex App 后刷新会话列表");
+          }
           await refresh();
           await refreshOverlay();
         } else {
@@ -479,6 +485,9 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         toast.info("当前没有需要同步的会话");
       } else if (ok > 0) {
         toast.success(`已处理 ${ok}/${r.length}`);
+      }
+      if (r.some((item) => item.ok && item.desktop_restart_required)) {
+        toast.warning("同步已完成，重启 Codex App 后刷新会话列表");
       }
       if (failed.length > 0) {
         const description = failed

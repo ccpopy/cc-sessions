@@ -7,6 +7,7 @@ pub mod bundle;
 pub mod claude_memory;
 pub mod claude_sessions;
 pub mod claude_transfer;
+pub(crate) mod codex_app_server;
 pub mod codex_projects;
 pub mod codex_rollout_cwd;
 #[cfg(feature = "desktop")]

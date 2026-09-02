@@ -642,6 +642,7 @@ export type CloneReport = {
   new_id: string | null;
   new_rollout_path: string | null;
   new_provider: string;
+  desktop_restart_required: boolean;
   ok: boolean;
   skipped_reason: string | null;
   error: string | null;
@@ -724,6 +725,7 @@ export type DuplicateSessionReport = {
   new_id: string;
   new_rollout_path: string;
   total_lines: number;
+  desktop_restart_required?: boolean;
 };
 
 export type SwitchStrategy = "continuous" | "scatter" | "follow";

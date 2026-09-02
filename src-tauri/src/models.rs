@@ -598,6 +598,8 @@ pub struct CloneReport {
     pub new_id: Option<String>,
     pub new_rollout_path: Option<String>,
     pub new_provider: String,
+    /// Desktop 私有项目状态因应用运行中或探测不确定而未同步；重启后刷新 Core 会话列表。
+    pub desktop_restart_required: bool,
     pub ok: bool,
     pub skipped_reason: Option<String>,
     pub error: Option<String>,
@@ -641,6 +643,9 @@ pub struct DuplicateSessionReport {
     pub new_id: String,
     pub new_rollout_path: String,
     pub total_lines: u64,
+    /// paginated 会话经官方 fork 派生时，Desktop 私有项目状态因应用运行中而未同步；重启后刷新。
+    #[serde(default)]
+    pub desktop_restart_required: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -71,6 +71,12 @@ pub(crate) fn desktop_state_initialized(codex: &Path) -> AppResult<bool> {
 /// its process state cannot be determined, callers should remove Core data without writing the
 /// private global state and tell the user to restart Desktop before relying on its cached list.
 pub(crate) fn should_defer_desktop_state_cleanup() -> bool {
+    should_defer_desktop_state_mutation()
+}
+
+/// Core SQLite/rollout writes may proceed while Desktop is running, but its private global state
+/// must be left untouched because Desktop can later overwrite external edits from memory.
+pub(crate) fn should_defer_desktop_state_mutation() -> bool {
     desktop_guard::official_desktop_is_running().unwrap_or(true)
 }
 
