@@ -977,7 +977,15 @@ function ImportPanel({
       }
       if (JSON.stringify(currentScan) !== reviewedScan) {
         setItems(currentScan);
-        setSelectedBundleDirs(new Set(currentScan.map((it) => it.bundle_dir)));
+        // 导入校验失败时保留原有勾选（仅保留仍存在的项），不强制全选
+        setSelectedBundleDirs((prev) => {
+          const base = prev.size > 0 ? prev : selectedAtStart;
+          const next = new Set<string>();
+          for (const it of currentScan) {
+            if (base.has(it.bundle_dir)) next.add(it.bundle_dir);
+          }
+          return next;
+        });
         setVerifiedSource({ dir: sourceAtStart, provider: providerAtStart });
         throw new Error("数据源内容在确认后发生变化，已刷新列表，请核对后重新导入");
       }
@@ -1018,7 +1026,25 @@ function ImportPanel({
       } else {
         toast.success(summary);
       }
-      await rescan(sourceAtStart);
+      // 导入后刷新，保留原勾选（仅保留仍存在的项），不强制全选 — 导入错误时不丢失用户选择
+      try {
+        const refreshed = await api.verifyBundlesCmd(sourceAtStart, providerAtStart);
+        if (
+          latestSource.current === sourceAtStart &&
+          latestProvider.current === providerAtStart
+        ) {
+          setItems(refreshed);
+          setVerifiedSource({ dir: sourceAtStart, provider: providerAtStart });
+          setSelectedBundleDirs((prev) => {
+            const base = prev.size > 0 ? prev : selectedAtStart;
+            const next = new Set<string>();
+            for (const it of refreshed) if (base.has(it.bundle_dir)) next.add(it.bundle_dir);
+            return next;
+          });
+        }
+      } catch {
+        await rescan(sourceAtStart);
+      }
     } catch (e) {
       toast.error(String((e as Error)?.message ?? e));
     } finally {
