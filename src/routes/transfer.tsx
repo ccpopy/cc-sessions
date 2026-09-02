@@ -778,6 +778,7 @@ function ImportPanel({
 }) {
   const [srcDir, setSrcDir] = useState("");
   const [items, setItems] = useState<BundleListItem[]>([]);
+  const [selectedBundleDirs, setSelectedBundleDirs] = useState<Set<string>>(new Set());
   const [mode, setMode] = useState<ImportMode>("skip");
   const [makeVisible, setMakeVisible] = useState(true);
   const [strict, setStrict] = useState(true);
@@ -825,6 +826,7 @@ function ImportPanel({
     async (dir: string) => {
       const generation = ++scanGeneration.current;
       setItems([]);
+      setSelectedBundleDirs(new Set());
       setProjectTargets({});
       setVerifiedSource(null);
       if (!dir) {
@@ -842,6 +844,7 @@ function ImportPanel({
           return;
         }
         setItems(r);
+        setSelectedBundleDirs(new Set(r.map((it) => it.bundle_dir)));
         setVerifiedSource({ dir, provider });
       } catch (e) {
         if (generation === scanGeneration.current) {
@@ -860,15 +863,50 @@ function ImportPanel({
     if (srcDir) void rescan(srcDir);
   }, [srcDir, rescan]);
 
+  // provider 切换时清空选择，避免跨 provider 残留
+  useEffect(() => {
+    setSelectedBundleDirs(new Set());
+  }, [provider]);
+
+  const selectedItems = useMemo(
+    () => items.filter((it) => selectedBundleDirs.has(it.bundle_dir)),
+    [items, selectedBundleDirs],
+  );
+  const selectedCount = selectedItems.length;
+  const allSelected = items.length > 0 && items.every((it) => selectedBundleDirs.has(it.bundle_dir));
+  const someSelected = !allSelected && items.some((it) => selectedBundleDirs.has(it.bundle_dir));
+
+  const toggleBundle = (bundleDir: string) => {
+    setSelectedBundleDirs((prev) => {
+      const next = new Set(prev);
+      if (next.has(bundleDir)) next.delete(bundleDir);
+      else next.add(bundleDir);
+      return next;
+    });
+  };
+  const toggleAllBundles = () => {
+    setSelectedBundleDirs((prev) => {
+      const all = items.length > 0 && items.every((it) => prev.has(it.bundle_dir));
+      if (all) {
+        const next = new Set(prev);
+        for (const it of items) next.delete(it.bundle_dir);
+        return next;
+      }
+      const next = new Set(prev);
+      for (const it of items) next.add(it.bundle_dir);
+      return next;
+    });
+  };
+
   const sourceProjects = useMemo(() => {
     return Array.from(
       new Set(
-        items
+        selectedItems
           .map((item) => item.manifest.session_cwd.trim())
           .filter((cwd) => cwd.length > 0),
       ),
     ).sort((a, b) => a.localeCompare(b));
-  }, [items]);
+  }, [selectedItems]);
 
   useEffect(() => {
     setProjectTargets((prev) => {
@@ -905,9 +943,15 @@ function ImportPanel({
     return mappings;
   };
 
+
+
   const runImport = async () => {
     if (!srcDir) {
       toast.error("请先选择数据所在的目录或解压好的 zip 文件夹");
+      return;
+    }
+    if (selectedCount === 0) {
+      toast.error("请先勾选要导入的会话");
       return;
     }
     if (
@@ -921,6 +965,7 @@ function ImportPanel({
     const sourceAtStart = srcDir;
     const providerAtStart = provider;
     const reviewedScan = JSON.stringify(items);
+    const selectedAtStart = new Set(selectedBundleDirs);
     setRunning(true);
     try {
       const currentScan = await api.verifyBundlesCmd(sourceAtStart, providerAtStart);
@@ -930,11 +975,24 @@ function ImportPanel({
       ) {
         throw new Error("导入期间数据源或服务商已改变，已取消本次导入");
       }
-      setItems(currentScan);
-      setVerifiedSource({ dir: sourceAtStart, provider: providerAtStart });
       if (JSON.stringify(currentScan) !== reviewedScan) {
+        setItems(currentScan);
+        // 导入校验失败时保留原有勾选（仅保留仍存在的项），不强制全选
+        setSelectedBundleDirs((prev) => {
+          const base = prev.size > 0 ? prev : selectedAtStart;
+          const next = new Set<string>();
+          for (const it of currentScan) {
+            if (base.has(it.bundle_dir)) next.add(it.bundle_dir);
+          }
+          return next;
+        });
+        setVerifiedSource({ dir: sourceAtStart, provider: providerAtStart });
         throw new Error("数据源内容在确认后发生变化，已刷新列表，请核对后重新导入");
       }
+      setItems(currentScan);
+      setVerifiedSource({ dir: sourceAtStart, provider: providerAtStart });
+      // 仅对选中项的 bundle_dirs 做导入，未选中的不再要求项目映射
+      const selectedDirsAtRun = Array.from(selectedAtStart);
       const projectMappings = buildProjectMappings();
       const r = await api.importSessionBundles({
         provider: providerAtStart,
@@ -947,6 +1005,7 @@ function ImportPanel({
         make_visible: providerAtStart === "codex" ? makeVisible : false,
         strict,
         project_mappings: projectMappings,
+        bundle_dirs: selectedDirsAtRun,
       });
       const ok = r.filter((x) => x.ok).length;
       const skipped = r.filter((x) => x.skipped_reason).length;
@@ -967,7 +1026,25 @@ function ImportPanel({
       } else {
         toast.success(summary);
       }
-      await rescan(sourceAtStart);
+      // 导入后刷新，保留原勾选（仅保留仍存在的项），不强制全选 — 导入错误时不丢失用户选择
+      try {
+        const refreshed = await api.verifyBundlesCmd(sourceAtStart, providerAtStart);
+        if (
+          latestSource.current === sourceAtStart &&
+          latestProvider.current === providerAtStart
+        ) {
+          setItems(refreshed);
+          setVerifiedSource({ dir: sourceAtStart, provider: providerAtStart });
+          setSelectedBundleDirs((prev) => {
+            const base = prev.size > 0 ? prev : selectedAtStart;
+            const next = new Set<string>();
+            for (const it of refreshed) if (base.has(it.bundle_dir)) next.add(it.bundle_dir);
+            return next;
+          });
+        }
+      } catch {
+        await rescan(sourceAtStart);
+      }
     } catch (e) {
       toast.error(String((e as Error)?.message ?? e));
     } finally {
@@ -977,6 +1054,8 @@ function ImportPanel({
 
   const verified = items.filter((x) => x.verified === true).length;
   const corrupt = items.filter((x) => x.verified === false).length;
+  const verifiedSelected = selectedItems.filter((x) => x.verified === true).length;
+  const corruptSelected = selectedItems.filter((x) => x.verified === false).length;
 
   return (
     <div className="space-y-4">
@@ -1115,14 +1194,17 @@ function ImportPanel({
           <div className="flex flex-wrap items-center gap-3">
             {items.length > 0 && (
               <div className="flex items-center gap-2 text-xs">
-                {corrupt === 0 ? (
+                {corruptSelected === 0 ? (
                   <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
                 ) : (
                   <ShieldAlert className="h-3.5 w-3.5 text-amber-500" />
                 )}
                 <span>
-                  {items.length} 条数据 · 校验 {verified} 通过
+                  {items.length} 条数据 · 已选 {selectedCount} 条 · 校验 {verified} 通过
                   {corrupt ? ` · ${corrupt} 失败` : ""}
+                  {selectedCount !== items.length && corruptSelected !== corrupt
+                    ? ` · 已选 ${verifiedSelected} 通过${corruptSelected ? ` / ${corruptSelected} 失败` : ""}`
+                    : ""}
                 </span>
               </div>
             )}
@@ -1149,13 +1231,14 @@ function ImportPanel({
                   running ||
                   scanLoading ||
                   items.length === 0 ||
+                  selectedCount === 0 ||
                   verifiedSource?.dir !== srcDir ||
                   verifiedSource?.provider !== provider
                 }
                 className="gap-1.5"
               >
                 <Download className="h-3.5 w-3.5" />
-                执行导入
+                执行导入{selectedCount > 0 ? `（${selectedCount}）` : ""}
               </Button>
             </div>
           </div>
@@ -1174,13 +1257,23 @@ function ImportPanel({
             <CardTitle className="flex items-center gap-2 text-base">
               待导入列表
               <Badge variant="secondary" className="h-5 px-1.5 font-normal">
-                {items.length}
+                {selectedCount === items.length ? items.length : `${selectedCount}/${items.length}`}
               </Badge>
+              {items.length > 0 && (
+                <span className="ml-auto text-xs font-normal text-muted-foreground">
+                  已选 {selectedCount}/{items.length}
+                </span>
+              )}
             </CardTitle>
           </CardHeader>
           <CardContent>
             <div className="rounded-md border">
-              <div className="grid grid-cols-[8rem_minmax(0,1fr)_8rem_7rem_9rem_4rem] items-center gap-2 border-b bg-muted/40 px-3 py-2 text-[11px] font-medium text-muted-foreground">
+              <div className="grid grid-cols-[2rem_8rem_minmax(0,1fr)_8rem_7rem_9rem_4rem] items-center gap-2 border-b bg-muted/40 px-3 py-2 text-[11px] font-medium text-muted-foreground">
+                <Checkbox
+                  checked={allSelected ? true : someSelected ? "indeterminate" : false}
+                  onCheckedChange={toggleAllBundles}
+                  aria-label="全选待导入列表"
+                />
                 <span>id</span>
                 <span>标题</span>
                 <span>源设备(machine)</span>
@@ -1193,8 +1286,13 @@ function ImportPanel({
                   {items.map((it) => (
                     <li
                       key={it.bundle_dir}
-                      className="grid grid-cols-[8rem_minmax(0,1fr)_8rem_7rem_9rem_4rem] items-center gap-2 px-3 py-2 hover:bg-muted/20"
+                      className={`grid grid-cols-[2rem_8rem_minmax(0,1fr)_8rem_7rem_9rem_4rem] items-center gap-2 px-3 py-2 ${selectedBundleDirs.has(it.bundle_dir) ? "bg-primary/5" : "hover:bg-muted/20"}`}
                     >
+                      <Checkbox
+                        checked={selectedBundleDirs.has(it.bundle_dir)}
+                        onCheckedChange={() => toggleBundle(it.bundle_dir)}
+                        aria-label="选择该待导入会话"
+                      />
                       <Tooltip>
                         <TooltipTrigger asChild>
                           <button
@@ -1285,8 +1383,9 @@ function ImportPanel({
         onConfirm={runImport}
       >
         <p>
-          将处理 <b>{items.length}</b> 条 {providerLabel(provider)} 会话，目标目录：
-          <code>{provider === "codex" ? codexDir : provider === "claude" ? claudeDir : opencodeDir}</code>。
+          将处理 <b>{selectedCount}</b> 条 {providerLabel(provider)} 会话
+          {selectedCount !== items.length ? `（已选 ${selectedCount}/${items.length}）` : ""}，目标目录：
+          <code>{provider === "codex" ? codexDir : provider === "claude" ? claudeDir : provider === "cursor" ? cursorDir : opencodeDir}</code>。
         </p>
         <p>
           {mode === "overwrite"

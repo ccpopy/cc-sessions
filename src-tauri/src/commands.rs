@@ -295,6 +295,7 @@ pub async fn import_session_bundles(
     make_visible: bool,
     strict: bool,
     project_mappings: Vec<ProjectPathMapping>,
+    bundle_dirs: Option<Vec<String>>,
     lock: SharedLock<'_>,
 ) -> AppResult<Vec<ImportReport>> {
     let lock = lock.inner().clone();
@@ -307,6 +308,7 @@ pub async fn import_session_bundles(
             make_visible,
             strict,
             project_mappings,
+            bundle_dirs,
             &lock,
         )
     })

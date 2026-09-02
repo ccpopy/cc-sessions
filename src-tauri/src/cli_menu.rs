@@ -1630,6 +1630,7 @@ fn bundle_import(ctx: &MenuContext) -> MenuResult<()> {
         make_visible,
         strict,
         Vec::new(),
+        None,
         &ctx.family_lock,
     )
     .map_err(to_string)?;

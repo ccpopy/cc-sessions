@@ -1677,6 +1677,7 @@ pub fn import_session_bundles(
     make_visible: bool,
     strict: bool,
     project_mappings: Vec<ProjectPathMapping>,
+    bundle_dirs: Option<Vec<String>>,
 ) -> AppResult<Vec<ImportReport>> {
     import_session_bundles_with_opencode(
         provider,
@@ -1688,6 +1689,7 @@ pub fn import_session_bundles(
         make_visible,
         strict,
         project_mappings,
+        bundle_dirs,
     )
 }
 
@@ -1701,6 +1703,7 @@ pub fn import_session_bundles_with_opencode(
     make_visible: bool,
     strict: bool,
     project_mappings: Vec<ProjectPathMapping>,
+    bundle_dirs: Option<Vec<String>>,
 ) -> AppResult<Vec<ImportReport>> {
     import_session_bundles_with_dirs(
         provider,
@@ -1715,6 +1718,7 @@ pub fn import_session_bundles_with_opencode(
         make_visible,
         strict,
         project_mappings,
+        bundle_dirs,
     )
 }
 
@@ -1726,6 +1730,7 @@ pub fn import_session_bundles_with_dirs(
     make_visible: bool,
     strict: bool,
     project_mappings: Vec<ProjectPathMapping>,
+    bundle_dirs: Option<Vec<String>>,
 ) -> AppResult<Vec<ImportReport>> {
     let codex_dir = dirs.codex_dir.clone();
     let claude_dir = Some(dirs.claude_path().to_string_lossy().into_owned());
@@ -1740,7 +1745,13 @@ pub fn import_session_bundles_with_dirs(
             .unwrap_or_else(|| paths::default_opencode_dir().to_string_lossy().into_owned()),
     );
     let project_mappings = build_project_mapping(project_mappings)?;
-    let items = list_bundles(src_dir, provider.clone())?;
+    let mut items = list_bundles(src_dir, provider.clone())?;
+    if let Some(filter) = bundle_dirs {
+        if !filter.is_empty() {
+            let set: HashSet<String> = filter.into_iter().collect();
+            items.retain(|it| set.contains(&it.bundle_dir));
+        }
+    }
     let mut reports: Vec<ImportReport> = Vec::with_capacity(items.len());
     for it in items {
         let item_provider = provider
@@ -1783,6 +1794,7 @@ pub fn import_session_bundles_with_lock(
     make_visible: bool,
     strict: bool,
     project_mappings: Vec<ProjectPathMapping>,
+    bundle_dirs: Option<Vec<String>>,
     lock: &crate::family::FamilyLock,
 ) -> AppResult<Vec<ImportReport>> {
     crate::family::with_lock(lock, |_guard| {
@@ -1794,6 +1806,7 @@ pub fn import_session_bundles_with_lock(
             make_visible,
             strict,
             project_mappings,
+            bundle_dirs,
         )
     })
 }
@@ -4174,6 +4187,7 @@ mod tests {
                 false,
                 false,
                 Vec::new(),
+                None,
                 &worker_lock,
             );
             sender.send(result.map(|_| ())).unwrap();
@@ -4913,6 +4927,7 @@ mod tests {
             false,
             true,
             vec![],
+            None,
         )?;
         assert_eq!(keep_local.len(), 1);
         assert!(keep_local[0].ok);
@@ -4939,6 +4954,7 @@ mod tests {
             false,
             true,
             vec![],
+            None,
         )?;
         assert_eq!(overwrite.len(), 1);
         assert!(overwrite[0].ok);
@@ -5003,6 +5019,7 @@ mod tests {
             false,
             true,
             vec![],
+            None,
         )?;
         assert_eq!(imported.len(), 1);
         assert!(imported[0].ok);
@@ -5051,6 +5068,7 @@ mod tests {
             false,
             true,
             vec![],
+            None,
         )?;
         assert_eq!(imported.len(), 1);
         assert!(!imported[0].ok);
@@ -5256,6 +5274,7 @@ mod tests {
             false,
             true,
             vec![],
+            None,
         )?;
         assert_eq!(escaped.len(), 1);
         assert!(!escaped[0].ok);
@@ -5287,6 +5306,7 @@ mod tests {
             false,
             true,
             vec![],
+            None,
         )?;
         assert_eq!(identity.len(), 1);
         assert!(!identity[0].ok);
@@ -5342,6 +5362,7 @@ mod tests {
             false,
             true,
             vec![],
+            None,
         )?;
         assert_eq!(imported.len(), 1);
         assert!(!imported[0].ok);
@@ -5393,6 +5414,7 @@ mod tests {
             false,
             true,
             vec![],
+            None,
         )?;
 
         assert_eq!(imported.len(), 1);
@@ -5462,6 +5484,7 @@ mod tests {
                 source_cwd: r"F:\work\sample-project".to_string(),
                 target_cwd: r"D:\work\sample-project".to_string(),
             }],
+            None,
         )?;
         assert_eq!(imported.len(), 1);
         assert!(imported[0].ok, "{:?}", imported[0].error);
@@ -5509,6 +5532,7 @@ mod tests {
                 source_cwd: r"F:\work\sample-project".to_string(),
                 target_cwd: r"D:\work\sample-project".to_string(),
             }],
+            None,
         )?;
         assert_eq!(skipped.len(), 1);
         assert!(skipped[0].ok);
@@ -5530,6 +5554,7 @@ mod tests {
             false,
             true,
             vec![],
+            None,
         )?;
         assert!(!rejected[0].ok);
         assert!(!rejected[0].rollout_written);
@@ -5592,6 +5617,7 @@ mod tests {
                 source_cwd: source_cwd.to_string_lossy().into_owned(),
                 target_cwd: target_cwd.to_string_lossy().into_owned(),
             }],
+            None,
         )?;
         assert_eq!(imported.len(), 1);
         assert!(imported[0].ok);
@@ -5706,6 +5732,7 @@ mod tests {
                 source_cwd: r"F:\project\portable-context".to_string(),
                 target_cwd: r"D:\work\portable-context".to_string(),
             }],
+            None,
         )?;
         assert_eq!(imported.len(), 1);
         assert!(imported[0].ok);
@@ -5821,6 +5848,7 @@ mod tests {
             true,
             true,
             vec![],
+            None,
         )?;
         assert_eq!(imported.len(), 1);
         assert!(imported[0].ok);
@@ -5901,6 +5929,7 @@ mod tests {
             true,
             true,
             vec![],
+            None,
         )?;
         assert_eq!(imported.len(), 1);
         assert!(!imported[0].ok);
@@ -6005,6 +6034,7 @@ mod tests {
             true,
             true,
             vec![],
+            None,
         )?;
 
         assert_eq!(imported.len(), 1);
@@ -6091,6 +6121,7 @@ mod tests {
             true,
             true,
             vec![],
+            None,
         )?;
         assert_eq!(imported.len(), 1);
         assert!(!imported[0].ok);
@@ -6189,6 +6220,7 @@ mod tests {
             false,
             false,
             vec![],
+            None,
         )?;
 
         assert_eq!(imported.len(), 1);
@@ -6262,6 +6294,7 @@ mod tests {
             true,
             true,
             vec![],
+            None,
         )?;
         assert_eq!(imported.len(), 1);
         assert!(!imported[0].ok);
@@ -6347,6 +6380,7 @@ mod tests {
                     source_cwd: r"F:\project\portable-context".to_string(),
                     target_cwd: r"D:\bundle\mapped-project".to_string(),
                 }],
+                None,
             )?;
             assert_eq!(report.len(), 1);
             assert!(report[0].ok, "{:?}", report[0].error);
