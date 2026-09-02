@@ -920,6 +920,7 @@ fn cmd_bundle(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
                 make_visible,
                 strict,
                 Vec::new(),
+                None,
                 &ctx.family_lock,
             )?;
             output(ctx, &reports, |reports| {

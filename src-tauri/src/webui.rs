@@ -625,6 +625,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             bool_arg(&args, "makeVisible")?,
             bool_arg(&args, "strict")?,
             arg::<Vec<ProjectPathMapping>>(&args, "projectMappings")?,
+            opt_arg::<Vec<String>>(&args, "bundleDirs")?,
             &state.family_lock,
         )),
         "pack_bundles_zip" => to_result_value(bundle::pack_bundles_zip(

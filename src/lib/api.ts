@@ -1617,6 +1617,7 @@ export const api = {
     make_visible: boolean;
     strict: boolean;
     project_mappings: ProjectPathMapping[];
+    bundle_dirs?: string[] | null;
   }) =>
     invokeCommand<ImportReport[]>("import_session_bundles", {
       provider: p.provider,
@@ -1629,6 +1630,7 @@ export const api = {
       makeVisible: p.make_visible,
       strict: p.strict,
       projectMappings: p.project_mappings,
+      bundleDirs: p.bundle_dirs ?? null,
     }),
   packBundlesZip: (srcDir: string, zipPath: string) =>
     invokeCommand<ZipReport>("pack_bundles_zip", { srcDir, zipPath }),
