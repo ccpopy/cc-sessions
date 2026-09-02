@@ -6380,6 +6380,7 @@ mod tests {
                     source_cwd: r"F:\project\portable-context".to_string(),
                     target_cwd: r"D:\bundle\mapped-project".to_string(),
                 }],
+                None,
             )?;
             assert_eq!(report.len(), 1);
             assert!(report[0].ok, "{:?}", report[0].error);
