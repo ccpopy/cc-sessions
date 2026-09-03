@@ -1107,6 +1107,12 @@ pub struct MarkdownExportOptions {
     /// 仅导出这些事件（按 PreviewEvent.index / 文件行号）；None = 全部对话
     #[serde(default)]
     pub selected_indices: Option<Vec<usize>>,
+    /// 仅导出时间戳不早于该 epoch 秒的事件（含）；None = 不限。与 selected_indices 取交集
+    #[serde(default)]
+    pub time_from: Option<i64>,
+    /// 仅导出时间戳早于该 epoch 秒的事件（不含）；None = 不限
+    #[serde(default)]
+    pub time_to: Option<i64>,
 }
 
 /// 由前端从 SessionSummary 透传的展示信息（标题/模型/时间等不一定都在 rollout 里）。
@@ -1139,6 +1145,8 @@ pub struct MarkdownExportReport {
     pub markdown: String,
     /// 实际导出的 user/assistant 对话条数
     pub message_count: u32,
+    /// 会话内全部 user/assistant 对话条数（未经片段与时间范围过滤）
+    pub total_message_count: u32,
     pub bytes: u64,
 }
 

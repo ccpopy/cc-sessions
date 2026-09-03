@@ -1,10 +1,12 @@
 import type { PreviewEvent } from "@/lib/api";
-import { formatTimeString } from "@/lib/format";
+import { eventEpochSeconds } from "@/lib/exportTimeRange";
 
 export type ConversationMessage = {
   index: number;
   role: "user" | "assistant";
-  time: string;
+  /** 事件时间戳换算的 epoch 秒；无法解析时为 null（不参与时间范围过滤） */
+  ts: number | null;
+  timestamp: string;
   text: string;
 };
 
@@ -25,7 +27,13 @@ export function extractConversationMessages(events: PreviewEvent[]): Conversatio
   for (const e of events) {
     const seg = classifyMessage(e);
     if (seg) {
-      out.push({ index: e.index, role: seg.role, time: timeOf(e), text: seg.text });
+      out.push({
+        index: e.index,
+        role: seg.role,
+        ts: eventEpochSeconds(e.timestamp),
+        timestamp: e.timestamp,
+        text: seg.text,
+      });
     }
   }
   return out;
@@ -99,11 +107,4 @@ function isInternalText(text: string): boolean {
     return true;
   }
   return false;
-}
-
-function timeOf(e: PreviewEvent): string {
-  const formatted = formatTimeString(e.timestamp);
-  // 只取 HH:mm，列表里更紧凑
-  const m = /\b(\d{2}:\d{2})(?::\d{2})?$/.exec(formatted);
-  return m ? m[1] : "";
 }

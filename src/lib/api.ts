@@ -886,6 +886,10 @@ export type MarkdownExportOptions = {
   include_tools: boolean;
   ai_handoff_preamble: boolean;
   selected_indices?: number[] | null;
+  /** 仅导出时间戳不早于该 epoch 秒的事件（含）；与 selected_indices 同时给出时取交集 */
+  time_from?: number | null;
+  /** 仅导出时间戳早于该 epoch 秒的事件（不含） */
+  time_to?: number | null;
 };
 
 export type MarkdownExportHeader = {
@@ -906,6 +910,8 @@ export type MarkdownExportReport = {
   out_path: string | null;
   markdown: string;
   message_count: number;
+  /** 会话内全部对话条数；大于 message_count 时说明导出的是节选 */
+  total_message_count: number;
   bytes: number;
 };
 
