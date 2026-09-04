@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Copy, Download, FileText, Loader2, RotateCcw } from "lucide-react";
+import { Clock, Copy, Download, FileText, Loader2, RotateCcw } from "lucide-react";
 import { toast } from "sonner";
 
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -307,9 +307,12 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
 
         <div className="grid min-h-0 flex-1 grid-cols-1 overflow-hidden md:grid-cols-[300px_minmax(0,1fr)]">
           {/* 左侧：选项 + 选择 */}
-          <div className="flex min-h-0 flex-col border-b border-border/60 md:border-b-0 md:border-r">
-            <ScrollArea className="min-h-0 flex-1">
-              <div className="space-y-4 px-5 py-4">
+          <div className="flex min-h-0 min-w-0 max-w-full flex-col overflow-hidden border-b border-border/60 md:border-b-0 md:border-r">
+            <ScrollArea
+              className="min-h-0 min-w-0 max-w-full flex-1 overflow-hidden"
+              viewportClassName="overflow-x-hidden [&>div]:!block [&>div]:min-w-0 [&>div]:max-w-full"
+            >
+              <div className="min-w-0 max-w-full space-y-4 overflow-hidden px-5 py-4">
                 <div className="space-y-3">
                   <h3 className="text-xs font-semibold text-muted-foreground">内容</h3>
                   <SwitchRow
@@ -443,7 +446,7 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
                 </div>
 
                 {selectionMode && (
-                  <div className="space-y-1">
+                  <div className="min-w-0 max-w-full space-y-1 overflow-hidden">
                     {loadingMessages ? (
                       <div className="flex justify-center py-6">
                         <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
@@ -473,7 +476,7 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
                               }
                             }}
                             className={cn(
-                              "flex w-full cursor-pointer select-none items-start gap-2 rounded-md border border-transparent px-2 py-1.5 text-left text-xs hover:bg-muted/50",
+                              "flex w-full min-w-0 max-w-full cursor-pointer select-none items-start gap-2 overflow-hidden rounded-md border border-transparent px-2 py-1.5 text-left text-xs hover:bg-muted/50",
                               checked.has(m.index) && "border-border/60 bg-muted/40",
                             )}
                           >
@@ -481,7 +484,7 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
                               checked={checked.has(m.index)}
                               className="pointer-events-none mt-0.5 shrink-0"
                             />
-                            <span className="min-w-0 flex-1">
+                            <span className="min-w-0 max-w-full flex-1 wrap-anywhere">
                               <span
                                 className={cn(
                                   "mr-1.5 font-medium",
@@ -493,7 +496,7 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
                               {timeLabel && (
                                 <span className="mr-1.5 tabular-nums text-muted-foreground/70">{timeLabel}</span>
                               )}
-                              <span className="text-muted-foreground">{singleLine(m.text)}</span>
+                              <span className="wrap-anywhere text-muted-foreground">{singleLine(m.text)}</span>
                             </span>
                           </div>
                         );
@@ -600,6 +603,8 @@ function DateTimeField({
   minDate?: Date;
   maxDate?: Date;
 }) {
+  const timeInputRef = useRef<HTMLInputElement>(null);
+
   return (
     <div className="flex items-center gap-1.5">
       <span className="w-6 shrink-0 text-[11px] text-muted-foreground">{label}</span>
@@ -612,15 +617,31 @@ function DateTimeField({
         ariaLabel={`${label}日期`}
         className="h-8 w-[124px] px-2"
       />
-      <Input
-        id={`${idPrefix}-time`}
-        type="time"
-        step={60}
-        value={value.time}
-        onChange={(e) => onChange({ ...value, time: e.target.value })}
-        aria-label={`${label}时间`}
-        className="h-8 w-[92px] px-2 text-xs"
-      />
+      <div className="relative w-[92px] shrink-0">
+        <Input
+          ref={timeInputRef}
+          id={`${idPrefix}-time`}
+          type="time"
+          step={60}
+          value={value.time}
+          onChange={(e) => onChange({ ...value, time: e.target.value })}
+          aria-label={`${label}时间`}
+          className="h-8 w-full py-0 pl-2 pr-7 text-xs leading-none [&::-webkit-calendar-picker-indicator]:hidden [&::-webkit-datetime-edit]:flex [&::-webkit-datetime-edit]:h-full [&::-webkit-datetime-edit]:items-center [&::-webkit-datetime-edit]:p-0"
+        />
+        <button
+          type="button"
+          aria-label={`打开${label}时间选择器`}
+          className="absolute right-2 top-1/2 flex h-3.5 w-3.5 -translate-y-1/2 items-center justify-center"
+          onClick={() => {
+            const input = timeInputRef.current;
+            if (!input) return;
+            input.focus();
+            input.showPicker?.();
+          }}
+        >
+          <Clock className="h-3.5 w-3.5" />
+        </button>
+      </div>
     </div>
   );
 }
