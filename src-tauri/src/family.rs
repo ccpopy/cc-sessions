@@ -264,20 +264,28 @@ fn replace_file_atomically(temp_path: &Path, final_path: &Path) -> std::io::Resu
 /// 同值；`line_count` 是物理行数（按 `\n` 切分得到的非空片段数），用作参考指标。
 /// 两者语义彼此独立。
 pub fn compute_integrity(path: &Path) -> AppResult<(String, u64)> {
-    let mut f = fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    std::io::copy(&mut f, &mut hasher)?;
-    let sha = hex::encode(hasher.finalize());
+    compute_integrity_from_reader(&mut BufReader::new(fs::File::open(path)?))
+}
 
-    let f = fs::File::open(path)?;
+fn compute_integrity_from_reader(reader: &mut impl BufRead) -> AppResult<(String, u64)> {
+    let mut hasher = Sha256::new();
     let mut lines: u64 = 0;
-    for line in BufReader::new(f).lines() {
-        let line = line?;
-        if !line.is_empty() {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        hasher.update(line.as_bytes());
+        let content = line
+            .strip_suffix('\n')
+            .map(|text| text.strip_suffix('\r').unwrap_or(text))
+            .unwrap_or(&line);
+        if !content.is_empty() {
             lines += 1;
         }
     }
-    Ok((sha, lines))
+    Ok((hex::encode(hasher.finalize()), lines))
 }
 
 fn now_iso() -> String {
@@ -1117,6 +1125,45 @@ mod tests {
     use crate::models::{BranchStatus, Family, FamilyBranch, FamilyStore};
     use rusqlite::params;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn integrity_reads_bytes_once_and_preserves_physical_line_counts() -> AppResult<()> {
+        struct CountedReader {
+            inner: std::io::Cursor<Vec<u8>>,
+            bytes_read: usize,
+        }
+        impl std::io::Read for CountedReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.inner.read(buffer)?;
+                self.bytes_read += count;
+                Ok(count)
+            }
+        }
+        for (bytes, expected_lines) in [
+            (Vec::new(), 0),
+            (b"\n\r\n".to_vec(), 0),
+            (b"a\n\nb\r\n\r\nc".to_vec(), 3),
+            (b"\r".to_vec(), 1),
+            ("中文\r\nhello\n".as_bytes().to_vec(), 2),
+            (vec![b'x'; 20_000], 1),
+        ] {
+            let expected_sha = hex::encode(Sha256::digest(&bytes));
+            let length = bytes.len();
+            let mut reader = CountedReader {
+                inner: std::io::Cursor::new(bytes),
+                bytes_read: 0,
+            };
+            let (sha, lines) = compute_integrity_from_reader(&mut BufReader::new(&mut reader))?;
+            assert_eq!(sha, expected_sha);
+            assert_eq!(lines, expected_lines);
+            assert_eq!(
+                reader.bytes_read, length,
+                "integrity must read each byte only once"
+            );
+        }
+        assert!(compute_integrity_from_reader(&mut std::io::Cursor::new(vec![0xff])).is_err());
+        Ok(())
+    }
 
     fn temp_codex_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

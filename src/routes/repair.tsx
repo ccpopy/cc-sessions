@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertCircle,
   CheckCircle2,
@@ -94,7 +94,8 @@ function CodexRepairRoute() {
   const [familyPrunePreview, setFamilyPrunePreview] = useState<OrphanPruneReport | null>(null);
   const [backfillPreview, setBackfillPreview] = useState<ArchiveOriginBackfillReport | null>(null);
   const [loading, setLoading] = useState(false);
-  const [strategy, setStrategy] = useState<SwitchStrategy>("continuous");
+  const [refreshing, setRefreshing] = useState(false);
+  const [strategy, setStrategy] = useState<SwitchStrategy>("scatter");
   const [confirmBatch, setConfirmBatch] = useState(false);
   const [confirmProjectConfigRepair, setConfirmProjectConfigRepair] = useState(false);
   const [confirmPrune, setConfirmPrune] = useState<
@@ -102,9 +103,29 @@ function CodexRepairRoute() {
   >(null);
   const [confirmBackfill, setConfirmBackfill] = useState(false);
   const [running, setRunning] = useState<string | null>(null);
+  const [refreshingAfterRepair, setRefreshingAfterRepair] = useState(false);
   const [providerSyncProgress, setProviderSyncProgress] = useState<ProviderSyncStatus | null>(null);
   const [dryRun, setDryRun] = useState(false);
+  const refreshFlight = useRef<{ codexDir: string; promise: Promise<void> } | null>(null);
+  const refreshMounted = useRef(false);
+  const refreshDir = useRef(codexDir);
+  refreshDir.current = codexDir;
   const providerSyncRunning = running === "clone" || running === "clone_do";
+  const indexBusyLabel = running === "index"
+    ? refreshingAfterRepair
+      ? "索引修复已完成，正在刷新诊断…"
+      : dryRun ? "预览索引修复中…" : "修复索引中…"
+    : null;
+  const threadsBusyLabel = running === "threads"
+    ? refreshingAfterRepair
+      ? "索引表重建已完成，正在刷新诊断…"
+      : dryRun ? "预览索引表重建中…" : "重建索引表中…"
+    : null;
+  const activityStatus = indexBusyLabel ?? threadsBusyLabel ?? (
+    loading
+      ? "正在诊断会话索引与数据库…"
+      : refreshing ? "总览诊断已完成，正在检查项目配置与归档…" : null
+  );
   const expectedThreadsCount =
     diag == null ? null : diag.rollout_count + diag.archived_rollout_count;
   const threadsStatHint =
@@ -118,50 +139,109 @@ function CodexRepairRoute() {
       familyPrunePreview.families_normalized
     : 0;
 
-  const refresh = useCallback(async () => {
-    if (!codexDir) return;
-    setLoading(true);
-    try {
-      const [d, p, c, i, familyPreview, backfillPreview] = await Promise.all([
-        api.diagnoseCodexState(codexDir),
-        api.getProviderInfo(codexDir),
-        api.diagnoseProjectConfigs(codexDir),
-        api.verifyFamilyIntegrity(codexDir),
-        api.pruneOrphanEntries({
-          codex_dir: codexDir,
-          prune_index: false,
-          prune_threads: false,
-          prune_family: true,
-          prune_subagents: false,
-          dry_run: true,
-        }),
-        api.backfillArchiveOrigins(codexDir, true),
-      ]);
-      setDiag(d);
-      setProvider(p);
-      setProjectConfig(c);
-      setIntegrity(i);
-      setFamilyPrunePreview(familyPreview);
-      setBackfillPreview(backfillPreview);
-    } catch (e) {
-      toast.error(`诊断失败：${String((e as Error)?.message ?? e)}`);
-    } finally {
-      setLoading(false);
+  const refresh = useCallback((force = false): Promise<void> => {
+    if (!refreshMounted.current || !codexDir || refreshDir.current !== codexDir) {
+      if (refreshMounted.current && refreshDir.current === codexDir) {
+        setLoading(false);
+        setRefreshing(false);
+      }
+      return Promise.resolve();
     }
+    const active = refreshFlight.current;
+    if (active?.codexDir === codexDir) {
+      return force
+        ? active.promise.catch(() => undefined).then(() => refresh(true))
+        : active.promise;
+    }
+
+    setLoading(true);
+    setRefreshing(true);
+    let promise!: Promise<void>;
+    const isCurrent = () =>
+      refreshMounted.current &&
+      refreshDir.current === codexDir &&
+      refreshFlight.current?.promise === promise;
+    promise = (async () => {
+      try {
+        const nextDiag = await api.diagnoseCodexState(codexDir);
+        if (!isCurrent()) return;
+        setDiag(nextDiag);
+        setLoading(false);
+
+        const showAuxiliaryError = (label: string, error: unknown) => {
+          if (isCurrent()) {
+            toast.error(`${label}检查失败：${String((error as Error)?.message ?? error)}`);
+          }
+        };
+        await Promise.all([
+          api.getProviderInfo(codexDir).then(
+            (result) => isCurrent() && setProvider(result),
+            (error) => showAuxiliaryError("服务商信息", error),
+          ),
+          api.diagnoseProjectConfigs(codexDir).then(
+            (result) => isCurrent() && setProjectConfig(result),
+            (error) => showAuxiliaryError("项目配置", error),
+          ),
+          api.verifyFamilyIntegrity(codexDir).then(
+            (result) => isCurrent() && setIntegrity(result),
+            (error) => showAuxiliaryError("会话完整性", error),
+          ),
+          api.pruneOrphanEntries({
+            codex_dir: codexDir,
+            prune_index: false,
+            prune_threads: false,
+            prune_family: true,
+            prune_subagents: false,
+            dry_run: true,
+          }).then(
+            (result) => isCurrent() && setFamilyPrunePreview(result),
+            (error) => showAuxiliaryError("family 残留", error),
+          ),
+          api.backfillArchiveOrigins(codexDir, true).then(
+            (result) => isCurrent() && setBackfillPreview(result),
+            (error) => showAuxiliaryError("归档来源标记", error),
+          ),
+        ]);
+      } catch (e) {
+        if (isCurrent()) {
+          toast.error(`诊断失败：${String((e as Error)?.message ?? e)}`);
+        }
+      } finally {
+        if (isCurrent()) {
+          setLoading(false);
+          setRefreshing(false);
+        }
+        if (refreshFlight.current?.promise === promise) refreshFlight.current = null;
+      }
+    })();
+    refreshFlight.current = { codexDir, promise };
+    return promise;
   }, [codexDir]);
 
   useEffect(() => {
+    refreshMounted.current = true;
+    setDiag(null);
+    setProvider(null);
+    setProjectConfig(null);
+    setIntegrity(null);
+    setFamilyPrunePreview(null);
+    setBackfillPreview(null);
     void refresh();
+    return () => {
+      refreshMounted.current = false;
+    };
   }, [refresh]);
 
   const run = async (key: string, fn: () => Promise<void>) => {
     setRunning(key);
+    setRefreshingAfterRepair(false);
     try {
       await fn();
     } catch (e) {
       toast.error(String((e as Error)?.message ?? e));
     } finally {
       setProviderSyncProgress(null);
+      setRefreshingAfterRepair(false);
       setRunning(null);
     }
   };
@@ -201,7 +281,7 @@ function CodexRepairRoute() {
 
   return (
     <>
-      <TopBar title="修复" onRefresh={refresh} showListTools={false} />
+      <TopBar title="修复" onRefresh={() => void refresh()} refreshing={refreshing} showListTools={false} />
       <ScrollArea className="flex-1">
         <div className="min-w-0 max-w-full space-y-4 p-4 sm:p-6">
           {!codexDir ? (
@@ -230,11 +310,23 @@ function CodexRepairRoute() {
                   </CardTitle>
                 </CardHeader>
                 <CardContent className="min-w-0 space-y-3">
+                  <div
+                    role="status"
+                    aria-live="polite"
+                    aria-atomic="true"
+                    className={activityStatus
+                      ? "flex items-center gap-2 rounded-md border border-primary/20 bg-primary/5 px-3 py-2 text-sm"
+                      : "sr-only"}
+                  >
+                    {activityStatus && <Loader2 aria-hidden="true" className="h-4 w-4 shrink-0 animate-spin text-primary" />}
+                    <span className="font-medium">{activityStatus}</span>
+                  </div>
                   <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
                     <Stat label="本地会话文件" value={diag?.rollout_count ?? "-"} />
                     <Stat
                       label="会话索引 (index)"
                       value={diag?.index_count ?? "-"}
+                      hint="session_index.jsonl 的收录数量，不等同于 Codex App 当前显示的会话数量。"
                       warn={
                         diag != null && diag.index_count !== diag.rollout_count
                       }
@@ -259,19 +351,19 @@ function CodexRepairRoute() {
                   </div>
                   <Separator />
                   <DiffRow
-                    label="存在会话文件，但在应用列表中漏显"
+                    label="存在会话文件，但未收录到会话索引"
                     ids={diag?.missing_in_index ?? []}
                     color="amber"
-                    recommendation="下方点「修复会话索引 (index)」，会从本地文件重建 session_index.jsonl"
+                    recommendation="可用「修复会话索引」补齐 session_index.jsonl；未收录到索引不代表 Codex App 中不可见。"
                   />
                   <DiffRow
-                    label="存在会话文件，但左侧边栏看不到"
+                    label="存在会话文件，但数据库缺少会话记录"
                     ids={diag?.missing_in_threads ?? []}
                     color="rose"
                     recommendation="下方点「重建会话索引表」，会把会话文件同步到 threads 表"
                   />
                   <DiffRow
-                    label="列表中残留：实际上会话文件已丢失"
+                    label="索引残留：对应的会话文件已丢失"
                     ids={diag?.orphan_in_index ?? []}
                     color="muted"
                     recommendation="若不打算恢复，下方点「清理索引残留」即可（或直接跑「修复会话索引」也会顺带清掉）"
@@ -288,6 +380,7 @@ function CodexRepairRoute() {
                         id="dry-run"
                         checked={dryRun}
                         onCheckedChange={setDryRun}
+                        disabled={!!running}
                       />
                       <Label htmlFor="dry-run" className="flex items-center gap-1 text-xs">
                         效果预览
@@ -316,14 +409,20 @@ function CodexRepairRoute() {
                                   ? `预览：将写入 ${r.written} 行（救援 ${r.salvaged}），扫描 ${r.scanned}`
                                   : `已写入 ${r.written} 行（救援 ${r.salvaged}）`,
                               );
-                              if (!dryRun) await refresh();
+                              if (!dryRun) {
+                                setRefreshingAfterRepair(true);
+                                await refresh(true);
+                              }
                             })
                           }
                           disabled={!!running}
-                          className="gap-1.5"
+                          aria-busy={running === "index"}
+                          className={`gap-1.5 ${running === "index" ? "disabled:opacity-100" : ""}`}
                         >
-                          <Wand2 className="h-3.5 w-3.5" />
-                          修复会话索引 (index)
+                          {running === "index"
+                            ? <Loader2 aria-hidden="true" className="h-3.5 w-3.5 animate-spin" />
+                            : <Wand2 aria-hidden="true" className="h-3.5 w-3.5" />}
+                          修复会话索引
                         </Button>
                       </TooltipTrigger>
                       <TooltipContent className="max-w-sm text-xs">
@@ -346,13 +445,19 @@ function CodexRepairRoute() {
                                   ? `预览：将同步 ${r.upserted} 条（跳过 ${r.skipped}）`
                                   : `已同步 ${r.upserted} 条（跳过 ${r.skipped}）`,
                               );
-                              if (!dryRun) await refresh();
+                              if (!dryRun) {
+                                setRefreshingAfterRepair(true);
+                                await refresh(true);
+                              }
                             })
                           }
                           disabled={!!running}
-                          className="gap-1.5"
+                          aria-busy={running === "threads"}
+                          className={`gap-1.5 ${running === "threads" ? "disabled:opacity-100" : ""}`}
                         >
-                          <Database className="h-3.5 w-3.5" />
+                          {running === "threads"
+                            ? <Loader2 aria-hidden="true" className="h-3.5 w-3.5 animate-spin" />
+                            : <Database aria-hidden="true" className="h-3.5 w-3.5" />}
                           重建会话索引表
                         </Button>
                       </TooltipTrigger>
@@ -690,11 +795,11 @@ function CodexRepairRoute() {
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
-                          <SelectItem value="continuous">
-                            连续模式（推荐，自动归档旧节点）
-                          </SelectItem>
                           <SelectItem value="scatter">
-                            散点模式（每个 provider 独立副本）
+                            散点模式（推荐，保留独立副本）
+                          </SelectItem>
+                          <SelectItem value="continuous">
+                            连续模式（自动归档旧节点）
                           </SelectItem>
                           <SelectItem value="follow">
                             跟随模式（就地改写，不克隆）
@@ -708,12 +813,14 @@ function CodexRepairRoute() {
                       <>
                         为当前服务商（provider）创建一份最新的会话副本，原记录会立即自动归档备用至 <code>archived_sessions/</code>，
                         在应用中每条会话始终只会显示一个最新入口，保持整洁。归档时固化 sha256 + 行数用于完整性校验。
+                        此模式仅支持旧格式会话；分页会话请选择散点模式。
                       </>
                     )}
                     {strategy === "scatter" && (
                       <>
                         每个服务商下都保留一份独立的会话副本。
                         不归档旧会话，它们会随着你在不同服务商下的使用各自独立发展。
+                        支持分页会话，也可在 Codex App 运行时执行。
                       </>
                     )}
                     {strategy === "follow" && (
@@ -1066,7 +1173,7 @@ function CodexRepairRoute() {
                   const r = await api.repairProjectConfigs(codexDir, false);
                   const suffix = r.errors.length > 0 ? `，失败 ${r.errors.length} 个` : "";
                   toast.success(`已修复 ${r.repaired_count} 个项目配置${suffix}`);
-                  await refresh();
+                  await refresh(true);
                 });
               }}
             >
@@ -1083,9 +1190,13 @@ function CodexRepairRoute() {
             <AlertDialogDescription>
               目标服务商 (provider)：<b>{provider?.current}</b>；策略：
               <b>{strategy}</b>
-              。操作会写入新的会话文件
-              {strategy === "continuous" ? "并把旧会话归档" : ""}；
-              可在 <code>archived_sessions/</code> 中找回历史记录。
+              。{strategy === "follow" ? (
+                "操作会直接修改原会话的服务商标记。"
+              ) : strategy === "continuous" ? (
+                <>操作会创建新副本，并将旧会话归档到 <code>archived_sessions/</code>。</>
+              ) : (
+                "操作会为目标服务商创建独立副本，原会话文件会保留。"
+              )}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -1101,7 +1212,7 @@ function CodexRepairRoute() {
                   }, setProviderSyncProgress);
                   const ok = r.filter((x) => x.ok).length;
                   const failed = r.filter((x) => !x.ok);
-                  await refresh();
+                  await refresh(true);
                   if (r.length === 0) {
                     toast.info("当前没有需要同步的会话");
                   } else if (ok > 0) {
@@ -1214,7 +1325,7 @@ function CodexRepairRoute() {
                       description: DESKTOP_DELETE_RESTART_NOTICE,
                     });
                   }
-                  await refresh();
+                  await refresh(true);
                 });
               }}
             >

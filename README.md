@@ -387,6 +387,22 @@ xattr -d com.apple.quarantine "/Applications/CC Sessions.app"
 </details>
 
 <details>
+<summary>Codex 会话未收录到索引，为什么在官方 App 里仍然可见？</summary>
+
+`session_index.jsonl` 的收录状态不等同于 Codex App 的实际可见性。修复页分别检查会话文件、索引和 `threads` 数据库记录；“修复会话索引”只重建 `session_index.jsonl`，“重建会话索引表”只更新数据库记录，都不会调整 Desktop 项目归属，也不要求先退出 Codex App。官方 App 的显示还受到服务商和归档状态等因素影响。
+
+</details>
+
+<details>
+<summary>Codex 分页会话同步应选择哪种策略？</summary>
+
+选择默认的“散点模式”：它通过当前 Codex App / CLI 的官方派生功能同步分页会话并保留完整历史，可在 Codex App 运行时执行。连续模式会克隆并归档原会话，目前仅支持旧格式会话；分页会话在预览阶段就会提示改用散点模式。
+
+CLI 的 `repair clone` 和 `repair batch-clone` 未指定 `--strategy` 时也默认使用 `scatter`；显式指定的策略仍按原选择执行。
+
+</details>
+
+<details>
 <summary>修复功能会改写会话正文吗？</summary>
 
 Codex 修复主要处理本地索引和列表可见性，不会重写对话正文，也不能恢复已经删除的会话文件。Claude Code 的列表可见性修复可能会在文件末尾补充标题记录，执行前可以先打开“仅预览”查看报告。

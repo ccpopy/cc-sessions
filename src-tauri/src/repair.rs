@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
@@ -248,24 +248,71 @@ pub fn repair_project_configs(
     })
 }
 
+/// 配置诊断只需会话 ID 和最新 cwd，不展开消息正文；读取范围固定在打开时的文件长度。
+fn read_rollout_project(path: &Path) -> AppResult<Option<(String, Option<String>)>> {
+    #[derive(serde::Deserialize)]
+    struct RecordType {
+        #[serde(rename = "type")]
+        kind: String,
+    }
+
+    let file = fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    let mut reader = BufReader::new(file.take(length));
+    let mut line = Vec::new();
+    let mut id = None;
+    let mut cwd_tracker = crate::codex_rollout_cwd::EffectiveCwdTracker::default();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        let Ok(record) = serde_json::from_slice::<RecordType>(&line) else {
+            continue;
+        };
+        if record.kind != "session_meta" && record.kind != "turn_context" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        cwd_tracker.observe(&value);
+        if record.kind == "session_meta" && id.is_none() {
+            id = value
+                .get("payload")
+                .and_then(|payload| payload.get("id"))
+                .and_then(Value::as_str)
+                .map(String::from);
+        }
+    }
+    Ok(id.map(|id| {
+        let cwd = cwd_tracker.effective_for(&id);
+        (id, cwd)
+    }))
+}
+
 fn collect_project_config_candidates(
     codex: &Path,
 ) -> AppResult<(u32, BTreeMap<PathBuf, ProjectConfigCandidate>)> {
-    let mut projects: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut projects: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
     let mut candidates: BTreeMap<PathBuf, ProjectConfigCandidate> = BTreeMap::new();
 
     for rollout_path in family::scan_rollouts(codex)? {
-        let Some(brief) = read_rollout_brief(codex, &rollout_path)? else {
+        let Some((id, cwd)) = read_rollout_project(&rollout_path)? else {
             continue;
         };
-        let Some(cwd) = brief.cwd.as_deref().map(normalize_project_cwd) else {
+        let Some(cwd) = cwd.as_deref().map(normalize_project_cwd) else {
             continue;
         };
         if cwd.as_os_str().is_empty() {
             continue;
         }
 
-        projects.insert(cwd.clone());
+        projects.entry(cwd).or_default().insert(id);
+    }
+
+    let scanned_projects = projects.len() as u32;
+    for (cwd, session_ids) in projects {
         let config_path = cwd
             .join(PROJECT_CODEX_CONFIG_RELPATH[0])
             .join(PROJECT_CODEX_CONFIG_RELPATH[1]);
@@ -273,23 +320,17 @@ fn collect_project_config_candidates(
             continue;
         }
 
-        candidates
-            .entry(config_path.clone())
-            .and_modify(|candidate| {
-                candidate.session_ids.insert(brief.id.clone());
-            })
-            .or_insert_with(|| {
-                let mut session_ids = BTreeSet::new();
-                session_ids.insert(brief.id);
-                ProjectConfigCandidate {
-                    project_cwd: cwd,
-                    config_path,
-                    session_ids,
-                }
-            });
+        candidates.insert(
+            config_path.clone(),
+            ProjectConfigCandidate {
+                project_cwd: cwd,
+                config_path,
+                session_ids,
+            },
+        );
     }
 
-    Ok((projects.len() as u32, candidates))
+    Ok((scanned_projects, candidates))
 }
 
 fn normalize_project_cwd(raw: &str) -> PathBuf {
@@ -1013,13 +1054,12 @@ pub fn diagnose_codex_state(codex_dir: String) -> AppResult<DiagnosticReport> {
 
     // 1) 扫 sessions/。这里的 rollout_count 只统计 active 会话，和官方 thread/list
     // archived=false 的默认语义保持一致。
-    let rollouts = family::scan_rollouts(&codex)?;
-    let mut rollout_ids: Vec<String> = Vec::new();
-    for p in &rollouts {
-        if let Ok(Some(b)) = read_rollout_brief(&codex, p) {
-            rollout_ids.push(b.id);
-        }
-    }
+    // 总览只核对身份信息，复用同一批头部记录进行 provider 检查。
+    let active_rollouts = scan_active_rollout_identities(&codex)?;
+    let mut rollout_ids: Vec<String> = active_rollouts
+        .iter()
+        .map(|(_, identity)| identity.id.clone())
+        .collect();
     rollout_ids.sort();
     rollout_ids.dedup();
     let rollout_count = rollout_ids.len() as u32;
@@ -1029,8 +1069,8 @@ pub fn diagnose_codex_state(codex_dir: String) -> AppResult<DiagnosticReport> {
     let mut archived_ids: Vec<String> = Vec::new();
     let archived_count = archived_rollouts.len() as u32;
     for p in &archived_rollouts {
-        if let Ok(Some(b)) = read_rollout_brief(&codex, p) {
-            archived_ids.push(b.id);
+        if let Ok(Some(identity)) = read_rollout_identity(p) {
+            archived_ids.push(identity.id);
         }
     }
     archived_ids.sort();
@@ -1109,7 +1149,8 @@ pub fn diagnose_codex_state(codex_dir: String) -> AppResult<DiagnosticReport> {
     // 6) provider mismatch —— 与 batch_clone 共用实现。
     // config.toml 没显式写 model_provider 时 Codex 默认 "openai"，这里也按默认值比较。
     let cur_provider = effective_current_provider(&codex)?;
-    let mismatch = list_mismatched_session_ids(&codex, &cur_provider)?.len() as u32;
+    let mismatch = list_mismatched_sessions_from_rollouts(&codex, &cur_provider, active_rollouts)?
+        .len() as u32;
 
     Ok(DiagnosticReport {
         rollout_count,
@@ -1461,14 +1502,14 @@ fn prune_orphan_entries_locked(
     let rollouts = family::scan_rollouts(&codex)?;
     let mut rollout_ids: BTreeSet<String> = BTreeSet::new();
     for p in &rollouts {
-        if let Ok(Some(b)) = read_rollout_brief(&codex, p) {
-            rollout_ids.insert(b.id);
+        if let Ok(Some(identity)) = read_rollout_identity(p) {
+            rollout_ids.insert(identity.id);
         }
     }
     let mut all_rollout_ids = rollout_ids.clone();
     for p in family::scan_archived_rollouts(&codex)? {
-        if let Ok(Some(b)) = read_rollout_brief(&codex, &p) {
-            all_rollout_ids.insert(b.id);
+        if let Ok(Some(identity)) = read_rollout_identity(&p) {
+            all_rollout_ids.insert(identity.id);
         }
     }
 
@@ -1750,20 +1791,20 @@ fn backfill_archive_origins_locked(
     let rollouts = family::scan_archived_rollouts(&codex)?;
     report.scanned = rollouts.len() as u32;
     for path in &rollouts {
-        let Some(brief) = read_rollout_brief(&codex, path)? else {
+        let Some(identity) = read_rollout_identity(path)? else {
             continue; // 无法读出 id 的 rollout 跳过（与 prune 扫描同一容错策略）
         };
-        if ledger.entries.contains_key(&brief.id) {
+        if ledger.entries.contains_key(&identity.id) {
             report.skipped_existing += 1;
             continue;
         }
         // 子代理会话不参与归档来源登记（归档视图按设计不展示子代理，前端
         // selectSessionsForView 强制过滤）。静默跳过：不写 ledger，也不计入
         // 报告任何类别——子代理来源无法也无须推断。
-        if is_subagent_source(brief.source.as_deref()) {
+        if is_subagent_source(identity.source.as_deref()) {
             continue;
         }
-        let origin = infer_backfill_origin(&store, &brief.id);
+        let origin = infer_backfill_origin(&store, &identity.id);
         match origin {
             ArchiveOrigin::Fork => report.fork_marked += 1,
             ArchiveOrigin::ProviderSync => report.provider_sync_marked += 1,
@@ -1782,9 +1823,9 @@ fn backfill_archive_origins_locked(
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| path.to_string_lossy().into_owned());
             ledger.entries.insert(
-                brief.id.clone(),
+                identity.id.clone(),
                 ArchiveLedgerEntry {
-                    session_id: brief.id.clone(),
+                    session_id: identity.id.clone(),
                     origin: origin.clone(),
                     archived_at,
                     source_path: Some(source_path),
@@ -1797,7 +1838,7 @@ fn backfill_archive_origins_locked(
             // 徽标显示读分支字段、来源筛选读 ledger，两处必须一致，否则会出现
             // 徽标显示"来源未知"却按 ledger 归入其他组的矛盾（fork/manual 会话
             // 的 backfill 典型场景）。会话不属于任何 family 时 no-op。
-            family::set_archive_origin_for_session(&codex, &brief.id, origin)?;
+            family::set_archive_origin_for_session(&codex, &identity.id, origin)?;
         }
     }
     if !dry_run && (!ledger.entries.is_empty() || replace_corrupt_ledger) {
@@ -4548,6 +4589,17 @@ fn clone_session_for_provider_locked_with_hint(
         Some(path) => read_rollout_brief(&codex, path)?,
         None => None,
     };
+    if source_rollout_hint.is_none() {
+        for p in family::scan_rollouts(&codex)? {
+            let Some(identity) = read_rollout_identity(&p)? else {
+                continue;
+            };
+            if identity.id == session_id {
+                src_brief = read_rollout_brief(&codex, &p)?;
+                break;
+            }
+        }
+    }
     if src_brief
         .as_ref()
         .is_some_and(|brief| brief.id != session_id)
@@ -4559,17 +4611,6 @@ fn clone_session_for_provider_locked_with_hint(
                 .map(|brief| brief.id.as_str())
                 .unwrap_or("")
         )));
-    }
-    if source_rollout_hint.is_none() {
-        for p in family::scan_rollouts(&codex)? {
-            let Some(b) = read_rollout_brief(&codex, &p)? else {
-                continue;
-            };
-            if b.id == session_id {
-                src_brief = Some(b);
-                break;
-            }
-        }
     }
     let src_brief = match src_brief {
         Some(b) => b,
@@ -4760,6 +4801,13 @@ fn clone_session_for_provider_locked_with_hint(
         }
         report.desktop_restart_required = defer_desktop_state;
         return Ok(report);
+    }
+
+    if src_brief.history_mode == "paginated" && matches!(&strategy, SwitchStrategy::Continuous) {
+        return Err(AppError::Other(
+            "分页会话不支持连续模式；请选择散点模式（scatter），通过 Codex 官方派生保留完整历史，可在 Codex App 运行时执行"
+                .into(),
+        ));
     }
 
     if src_brief.history_mode == "paginated" && matches!(&strategy, SwitchStrategy::Scatter) {
@@ -5404,13 +5452,24 @@ fn list_mismatched_sessions(
     codex: &Path,
     target_provider: &str,
 ) -> AppResult<Vec<ProviderSyncTarget>> {
+    list_mismatched_sessions_from_rollouts(
+        codex,
+        target_provider,
+        scan_active_rollout_identities(codex)?,
+    )
+}
+
+fn list_mismatched_sessions_from_rollouts(
+    codex: &Path,
+    target_provider: &str,
+    active_rollouts: Vec<(PathBuf, RolloutIdentity)>,
+) -> AppResult<Vec<ProviderSyncTarget>> {
     use std::collections::BTreeSet;
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut family_managed_ids: BTreeSet<String> = BTreeSet::new();
     let mut out: Vec<ProviderSyncTarget> = Vec::new();
     let thread_states = read_thread_state_map(codex)?;
     let index_ids = read_session_index_ids(codex)?;
-    let active_rollouts = scan_active_rollout_identities(codex)?;
     let active_rollout_paths = active_rollouts
         .iter()
         .map(|(path, identity)| (identity.id.as_str(), path))
@@ -7224,6 +7283,40 @@ mod tests {
     }
 
     #[test]
+    fn provider_clone_finds_target_by_header_before_reading_unrelated_rollouts() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-provider-clone-header-scan-test");
+        for id in ["provider-scan-a", "provider-scan-b", "provider-scan-c"] {
+            write_rollout(&codex, id, DEFAULT_PROVIDER)?;
+        }
+
+        // Select the final path returned by the real scanner. This keeps the regression
+        // meaningful without assuming WalkDir's ordering contract.
+        let rollouts = family::scan_rollouts(&codex)?;
+        let target = rollouts.last().expect("fixture rollouts");
+        let target_id = read_rollout_identity(target)?.expect("target identity").id;
+        for rollout in rollouts.iter().take(rollouts.len().saturating_sub(1)) {
+            append_unfinished_rollout_body(rollout)?;
+        }
+
+        let report = clone_session_for_provider_locked(
+            codex.to_string_lossy().into_owned(),
+            target_id,
+            Some("custom".to_string()),
+            SwitchStrategy::Scatter,
+            true,
+        )?;
+
+        assert!(report.ok);
+        assert_eq!(report.new_provider, "custom");
+        assert_eq!(
+            report.skipped_reason.as_deref(),
+            Some("dry_run: 不会写入磁盘")
+        );
+        fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
     fn cloned_rollout_never_has_updated_at_before_created_at() -> AppResult<()> {
         let codex = temp_codex_dir("cc-session-manager-clone-time-test");
         let source = write_conversation_rollout(&codex, "clone-time-source")?;
@@ -7577,6 +7670,44 @@ mod tests {
         assert!(error.to_string().contains("paginated"), "{error}");
         assert!(!target.exists());
         fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn paginated_continuous_sync_reports_supported_strategy_before_writes() -> AppResult<()> {
+        for dry_run in [true, false] {
+            let codex = temp_codex_dir("cc-session-manager-paginated-continuous-preflight");
+            let source_id = "paginated-continuous-source";
+            let source = prepare_paginated_provider_switch_fixture(&codex, source_id)?;
+            let source_before = fs::read(&source)?;
+            let index_path = paths::session_index_path(&codex);
+            let index_before = fs::read(&index_path)?;
+            let global_path = paths::codex_global_state_json_path(&codex);
+            let global_before = fs::read(&global_path)?;
+            let _desktop = crate::codex_projects::DesktopTestProbeGuard::running();
+            let mut forker = FakeProviderThreadForker::new(codex.clone());
+
+            let error = clone_session_for_provider_locked_with_hint(
+                codex.to_string_lossy().into_owned(),
+                source_id.to_string(),
+                Some(DEFAULT_PROVIDER.to_string()),
+                SwitchStrategy::Continuous,
+                dry_run,
+                Some(&source),
+                &mut forker,
+            )
+            .expect_err("unsupported paginated strategy must also fail during preview");
+
+            assert!(error.to_string().contains("散点模式"), "{error}");
+            assert_eq!(forker.fork_count, 0);
+            assert_eq!(fs::read(&source)?, source_before);
+            assert_eq!(fs::read(&index_path)?, index_before);
+            assert_eq!(fs::read(&global_path)?, global_before);
+            assert_eq!(family::scan_rollouts(&codex)?.len(), 1);
+            assert_eq!(read_thread_state_map(&codex)?.len(), 1);
+            assert!(!paths::family_store_path(&codex).exists());
+            fs::remove_dir_all(codex).ok();
+        }
         Ok(())
     }
 
@@ -9435,6 +9566,123 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_read_only_headers_while_desktop_and_wal_writer_are_running() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-live-diagnostic-headers-test");
+        write_rollout(&codex, "live-session", "custom")?;
+        write_rollout_in(&codex, "archived_sessions", "archived-session", "custom")?;
+        for path in family::scan_rollouts(&codex)?
+            .into_iter()
+            .chain(family::scan_archived_rollouts(&codex)?)
+        {
+            append_unfinished_rollout_body(&path)?;
+        }
+        write_index_line(&codex, "live-session")?;
+        write_global_state(&codex, serde_json::json!({"local-projects": {}}))?;
+        let global_path = paths::codex_global_state_json_path(&codex);
+        let global_before = fs::read(&global_path)?;
+        let index_before = fs::read(paths::session_index_path(&codex))?;
+        let state = create_minimal_state(&codex)?;
+        state.pragma_update(None, "journal_mode", "WAL")?;
+        for (id, archived) in [("live-session", 0), ("archived-session", 1)] {
+            state.execute(
+                "INSERT INTO threads (id, model_provider, source, archived) VALUES (?1, 'custom', 'cli', ?2)",
+                (id, archived),
+            )?;
+        }
+        state.execute_batch("BEGIN IMMEDIATE; UPDATE threads SET model_provider = 'pending';")?;
+        let _desktop = crate::codex_projects::DesktopTestProbeGuard::running();
+
+        let report = diagnose_codex_state(codex.to_string_lossy().into_owned())?;
+
+        assert_eq!(report.rollout_ids, vec!["live-session"]);
+        assert_eq!(report.archived_rollout_count, 1);
+        assert_eq!(report.threads_active_count, 1);
+        assert_eq!(report.threads_archived_count, 1);
+        assert_eq!(report.provider_mismatched_families, 1);
+        assert!(report.missing_in_index.is_empty());
+        assert!(report.orphan_in_index.is_empty());
+        assert!(report.orphan_in_threads.is_empty());
+        assert_eq!(fs::read(&global_path)?, global_before);
+        assert_eq!(fs::read(paths::session_index_path(&codex))?, index_before);
+        state.execute_batch("ROLLBACK")?;
+        assert_eq!(
+            state.query_row(
+                "SELECT COUNT(*) FROM threads WHERE model_provider = 'custom'",
+                [],
+                |r| r.get::<_, u32>(0)
+            )?,
+            2
+        );
+        drop(state);
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    fn append_unfinished_rollout_body(path: &Path) -> AppResult<()> {
+        let mut file = fs::OpenOptions::new().append(true).open(path)?;
+        file.write_all(&vec![b'x'; 256 * 1024])?;
+        // 模拟 Codex 正在追加正文时尚未写完的 UTF-8 字符；身份诊断不应读到这里。
+        file.write_all(&[0xe4])?;
+        Ok(())
+    }
+
+    #[test]
+    fn prune_preview_reads_only_headers_of_active_and_archived_rollouts() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-prune-header-preview-test");
+        write_rollout(&codex, "live-session", DEFAULT_PROVIDER)?;
+        write_rollout_in(
+            &codex,
+            "archived_sessions",
+            "archived-session",
+            DEFAULT_PROVIDER,
+        )?;
+        for path in family::scan_rollouts(&codex)?
+            .into_iter()
+            .chain(family::scan_archived_rollouts(&codex)?)
+        {
+            append_unfinished_rollout_body(&path)?;
+        }
+        write_index_line(&codex, "live-session")?;
+        let state = create_minimal_state(&codex)?;
+        state.execute_batch(
+            "INSERT INTO threads (id) VALUES ('live-session'), ('archived-session');",
+        )?;
+        let report = prune_orphan_entries(
+            codex.to_string_lossy().into_owned(),
+            true,
+            true,
+            true,
+            true,
+            true,
+        )?;
+        assert_eq!(report.index_removed, 0);
+        assert_eq!(report.threads_removed, 0);
+        drop(state);
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn backfill_preview_reads_only_archived_rollout_headers() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-backfill-header-preview-test");
+        write_rollout_in(
+            &codex,
+            "archived_sessions",
+            "archived-session",
+            DEFAULT_PROVIDER,
+        )?;
+        for path in family::scan_archived_rollouts(&codex)? {
+            append_unfinished_rollout_body(&path)?;
+        }
+        let report = backfill_archive_origins(codex.to_string_lossy().into_owned(), true)?;
+        assert_eq!(report.scanned, 1);
+        assert_eq!(report.unknown_marked, 1);
+        assert!(crate::archive_ledger::load(&codex)?.entries.is_empty());
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
     fn diagnostics_do_not_treat_archived_rollouts_as_orphan_threads() -> AppResult<()> {
         let codex = temp_codex_dir("cc-session-manager-archived-test");
         write_rollout_in(
@@ -10662,6 +10910,56 @@ mod tests {
             BranchStatus::Active
         ));
         assert!(!restored.index.contains_key("missing-new-active"));
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn project_config_diagnosis_reads_latest_cwd_despite_unfinished_body() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-project-cwd-live-test");
+        let old_project = codex.join("old-project");
+        let project = codex.join("current-project");
+        fs::create_dir_all(project.join(".codex"))?;
+        fs::write(
+            project.join(".codex/config.toml"),
+            "[features.multi_agent_v2]\nmin_wait_timeout_ms = 480000\n",
+        )?;
+        write_rollout_with_cwd(&codex, "project-cwd-live", &old_project)?;
+        let rollout = family::scan_rollouts(&codex)?.remove(0);
+        let mut file = fs::OpenOptions::new().append(true).open(&rollout)?;
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"type":"event_msg", "payload":{"type":"agent_message", "message":"x".repeat(256 * 1024)}})
+        )?;
+        // 旧格式的顶层 cwd、转义的字段名和空 payload 都沿用 EffectiveCwdTracker 的语义。
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"type":"turn_context", "cwd":old_project})
+        )?;
+        let latest = serde_json::json!({"type":"turn_context", "payload":{"cwd":project}})
+            .to_string()
+            .replace("turn_context", "turn\\u005fcontext")
+            .replace("\"cwd\"", "\"c\\u0077d\"");
+        writeln!(file, "{latest}")?;
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"type":"turn_context", "payload":null, "cwd":old_project})
+        )?;
+        file.write_all(&[0xe4])?;
+        drop(file);
+        let before = fs::read(&rollout)?;
+        let _desktop = crate::codex_projects::DesktopTestProbeGuard::running();
+
+        let report = diagnose_project_configs(codex.to_string_lossy().into_owned())?;
+
+        assert_eq!(report.scanned_projects, 1);
+        assert_eq!(report.issue_count, 1);
+        assert_eq!(report.issues[0].project_cwd, project.to_string_lossy());
+        assert_eq!(report.issues[0].session_ids, vec!["project-cwd-live"]);
+        assert_eq!(fs::read(&rollout)?, before);
         fs::remove_dir_all(&codex).ok();
         Ok(())
     }
