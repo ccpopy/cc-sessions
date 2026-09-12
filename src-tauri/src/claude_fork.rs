@@ -49,6 +49,7 @@ pub fn fork_session_at_event_with_lock(
         )?;
         let cut = output.cut.expect("validated cutoff is present");
         Ok(ForkSessionReport {
+            desktop_restart_required: false,
             source_id: session_id,
             new_id: output.new_id,
             new_rollout_path: paths::strip_verbatim(&destination.to_string_lossy()),

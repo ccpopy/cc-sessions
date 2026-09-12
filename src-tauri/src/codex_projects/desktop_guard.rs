@@ -5,8 +5,6 @@ use std::path::Path;
 
 use crate::error::{AppError, AppResult};
 
-const DESKTOP_RUNNING_ERROR: &str =
-    "Codex/ChatGPT 桌面应用正在运行；为避免其内存中的旧项目状态覆盖本次修改，请完全退出桌面应用（包括后台进程）后重试";
 #[cfg(any(windows, test))]
 const WINDOWS_DESKTOP_EXECUTABLE: &str = "ChatGPT.exe";
 #[cfg(any(windows, test))]
@@ -57,22 +55,16 @@ impl Drop for DesktopTestProbeGuard {
     }
 }
 
-pub(super) fn ensure_official_desktop_not_running() -> AppResult<()> {
-    ensure_not_running_with(official_desktop_is_running)
-}
-
-fn ensure_not_running_with(detect: impl FnOnce() -> AppResult<bool>) -> AppResult<()> {
-    if detect()? {
-        Err(AppError::Other(DESKTOP_RUNNING_ERROR.to_string()))
-    } else {
-        Ok(())
-    }
-}
-
 pub(super) fn official_desktop_is_running() -> AppResult<bool> {
     #[cfg(test)]
     {
-        return match TEST_DESKTOP_PROBES.with_borrow_mut(|probes| probes.pop_front()) {
+        return match TEST_DESKTOP_PROBES.with_borrow_mut(|probes| {
+            if probes.len() > 1 {
+                probes.pop_front()
+            } else {
+                probes.front().cloned()
+            }
+        }) {
             Some(TestDesktopProbe::Running(running)) => Ok(running),
             Some(TestDesktopProbe::Error(message)) => Err(AppError::Other(message.to_string())),
             None => Ok(false),

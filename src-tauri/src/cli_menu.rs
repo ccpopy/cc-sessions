@@ -656,7 +656,9 @@ fn move_session_cwd(ctx: &MenuContext, provider: &str, session: &SessionSummary)
     if report.history_rows_updated > 0 {
         println!("更新 history.jsonl {} 行。", report.history_rows_updated);
     }
-    if provider == "codex" && !report.desktop_project_synced {
+    if report.desktop_restart_required {
+        println!("工作目录已更新，重启 Codex App 后刷新列表；Desktop 项目归属未同步。");
+    } else if provider == "codex" && !report.desktop_project_synced {
         println!("警告：Core 已移动，但 Codex App 全局状态未初始化，项目归属未同步。");
     }
     if report.requires_project_open {

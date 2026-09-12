@@ -1007,6 +1007,9 @@ function ImportPanel({
         project_mappings: projectMappings,
         bundle_dirs: selectedDirsAtRun,
       });
+      if (r.some((item) => item.ok && item.desktop_restart_required)) {
+        toast.info("重启 Codex App 后刷新列表；Desktop 项目归属未同步");
+      }
       const ok = r.filter((x) => x.ok).length;
       const skipped = r.filter((x) => x.skipped_reason).length;
       const fail = r.filter((x) => x.error).length;

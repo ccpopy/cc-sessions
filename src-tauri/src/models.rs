@@ -257,6 +257,8 @@ pub struct DeleteResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MoveSessionCwdReport {
+    #[serde(default)]
+    pub desktop_restart_required: bool,
     pub old_cwd: String,
     pub new_cwd: String,
     pub threads_updated: u32,
@@ -431,6 +433,7 @@ pub struct BackupDetail {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RestoreResult {
+    pub desktop_restart_required: bool,
     pub id: String,
     pub ok: bool,
     pub threads_inserted: bool,
@@ -627,6 +630,7 @@ pub struct ProviderSyncStatus {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ForkSessionReport {
+    pub desktop_restart_required: bool,
     pub source_id: String,
     pub new_id: String,
     pub new_rollout_path: String,
@@ -871,6 +875,7 @@ pub struct ProjectPathMapping {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ImportReport {
+    pub desktop_restart_required: bool,
     pub session_id: String,
     pub ok: bool,
     pub rollout_written: bool,

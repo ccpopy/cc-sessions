@@ -2765,6 +2765,7 @@ pub fn restore_selected_with_dirs(
                 _ => restore_one(&backup, &codex, s, overwrite),
             })
             .unwrap_or_else(|e| RestoreResult {
+                desktop_restart_required: false,
                 id: s.id.clone(),
                 ok: false,
                 threads_inserted: false,
@@ -2914,6 +2915,7 @@ fn restore_one_claude(
     overwrite: bool,
 ) -> AppResult<RestoreResult> {
     let mut result = RestoreResult {
+        desktop_restart_required: false,
         id: target.id.clone(),
         ok: false,
         threads_inserted: false,
@@ -3018,6 +3020,7 @@ fn restore_one_opencode(
     overwrite: bool,
 ) -> AppResult<RestoreResult> {
     let mut result = RestoreResult {
+        desktop_restart_required: false,
         id: target.id.clone(),
         ok: false,
         threads_inserted: false,
@@ -3050,6 +3053,7 @@ fn restore_one_cursor(
     overwrite: bool,
 ) -> AppResult<RestoreResult> {
     let mut result = RestoreResult {
+        desktop_restart_required: false,
         id: target.id.clone(),
         ok: false,
         threads_inserted: false,
@@ -3416,6 +3420,7 @@ fn restore_one(
     overwrite: bool,
 ) -> AppResult<RestoreResult> {
     let mut result = RestoreResult {
+        desktop_restart_required: false,
         id: target.id.clone(),
         ok: false,
         threads_inserted: false,
@@ -3444,9 +3449,6 @@ fn restore_one(
     let history_base_restore_files =
         prepare_codex_history_base_restore_files(backup, codex, target)?;
     let backup_thread_history_rows = codex_thread_history_rows_for_session(backup, target)?;
-    if crate::codex_projects::desktop_state_initialized(codex)? {
-        crate::codex_projects::ensure_desktop_not_running(codex)?;
-    }
 
     // 1) 在打开任何目标数据库前先解析备份行并验证 Desktop 项目状态。SQLite 打开
     // 本身可能更新 header/WAL，因此所有无需目标数据库的严格预检必须先完成。
@@ -3482,6 +3484,17 @@ fn restore_one(
         )?;
     }
 
+    let mut activity_paths = vec![dest.clone()];
+    activity_paths.extend(
+        history_base_restore_files
+            .iter()
+            .filter(|file| file.copy_required)
+            .map(|file| file.destination_path.clone()),
+    );
+    let activity = crate::codex_activity::SessionActivityGuard::observe(
+        codex,
+        vec![(target.id.clone(), activity_paths)],
+    )?;
     // 2) 冲突检测及依赖目标 schema 的日志校验。
     let mut state = state_db::open(codex)?;
     let thread_exists =
@@ -3557,6 +3570,7 @@ fn restore_one(
     // 3) threads、logs 与分页历史先在同一 SQLite 事务中实际执行所有约束，但暂不提交。
     let transaction = state.transaction()?;
     let database_stage = (|| -> AppResult<()> {
+        activity.ensure_unchanged()?;
         insert_restore_thread(&transaction, codex, &target_rel, row)?;
         result.threads_inserted = true;
         if restore_logs {
@@ -3753,6 +3767,7 @@ fn restore_one(
     }
 
     result.ok = true;
+    result.desktop_restart_required = crate::codex_projects::should_defer_desktop_state_mutation();
     // 归档来源账本：还原到 archived_sessions/ 的会话记录为 Restore（D10）。
     // 无 MutationJournal（RestoreFileSnapshots 补偿），因此放在 commit 之后最后一步，
     // 失败仅记入 result.error，不回滚已成功的主流程（与 cleanup 失败同模式）。
@@ -5646,7 +5661,8 @@ mod tests {
     }
 
     #[test]
-    fn codex_restore_while_desktop_running_preserves_every_target_store() -> AppResult<()> {
+    fn codex_restore_while_desktop_running_updates_core_and_defers_private_state() -> AppResult<()>
+    {
         let root = temp_dir("cc-session-manager-codex-restore-desktop-running-test");
         let backup_root = root.join("backups");
         let backup = backup_root.join("desktop-running");
@@ -5707,7 +5723,6 @@ mod tests {
         )?;
         let index_path = paths::session_index_path(&codex);
         let history_path = paths::history_path(&codex);
-        let state_path = paths::state_db_path(&codex);
         let global_state_path = paths::codex_global_state_json_path(&codex);
         fs::write(&index_path, b"index-before\r\n")?;
         fs::write(&history_path, b"history-before\r\n")?;
@@ -5731,33 +5746,43 @@ mod tests {
             }))?,
         )?;
 
-        let rollout_before = fs::read(&destination)?;
-        let state_before = fs::read(&state_path)?;
-        let index_before = fs::read(&index_path)?;
         let history_before = fs::read(&history_path)?;
         let global_state_before = fs::read(&global_state_path)?;
 
         let _desktop_running = crate::codex_projects::DesktopTestProbeGuard::running();
-        let error = restore_session(
-            Some(PROVIDER_CODEX.to_string()),
-            backup_root.to_string_lossy().into_owned(),
-            backup.to_string_lossy().into_owned(),
-            codex.to_string_lossy().into_owned(),
-            None,
-            id.to_string(),
-            Some(relative.to_string_lossy().replace('\\', "/")),
-            true,
-        )
-        .expect_err("running Desktop must reject restore before any target mutation");
-        let error = error.to_string();
-        assert!(error.contains("Codex/ChatGPT 桌面应用正在运行"), "{error}");
-        assert!(
-            error.contains("请完全退出桌面应用（包括后台进程）后重试"),
-            "{error}"
-        );
-        assert_eq!(fs::read(&destination)?, rollout_before);
-        assert_eq!(fs::read(&state_path)?, state_before);
-        assert_eq!(fs::read(&index_path)?, index_before);
+        let run = || {
+            restore_session(
+                Some(PROVIDER_CODEX.to_string()),
+                backup_root.to_string_lossy().into_owned(),
+                backup.to_string_lossy().into_owned(),
+                codex.to_string_lossy().into_owned(),
+                None,
+                id.to_string(),
+                Some(relative.to_string_lossy().replace('\\', "/")),
+                true,
+            )
+        };
+        let writing = destination.clone();
+        crate::codex_activity::during_observation(move || {
+            let mut bytes = fs::read(&writing).unwrap();
+            bytes.extend_from_slice(b"\n");
+            fs::write(writing, bytes).unwrap();
+        });
+        let busy = run().expect_err("a writing restore target must be blocked");
+        assert!(matches!(busy, AppError::SessionBusy(_)), "{busy}");
+        assert!(destination.is_file());
+        assert_eq!(fs::read(&global_state_path)?, global_state_before);
+        let result = run()?;
+        assert!(result.ok, "{:?}", result.error);
+        assert!(result.desktop_restart_required);
+        assert!(result.rollout_copied && result.threads_inserted);
+        assert_eq!(fs::read(&destination)?, fs::read(backup.join(&relative))?);
+        assert!(fs::read_to_string(&index_path)?.contains(id));
+        let state = state_db::open_ro(&codex)?;
+        let cwd: String =
+            state.query_row("SELECT cwd FROM threads WHERE id=?1", [id], |r| r.get(0))?;
+        assert_eq!(cwd, r"F:\work\restored");
+        drop(state);
         assert_eq!(fs::read(&history_path)?, history_before);
         assert_eq!(fs::read(&global_state_path)?, global_state_before);
 

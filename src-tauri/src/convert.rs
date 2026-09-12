@@ -281,10 +281,8 @@ fn write_codex_session(
     let title = conversion_title(parsed.title.as_deref(), &parsed.messages);
     let desktop_cwd = desktop_project_cwd(&codex, &cwd);
 
-    // Project membership is part of making a converted Codex session usable. Refuse before the
-    // first file/database write while Desktop owns the global state in memory; do not downgrade
-    // this into a warning after leaving a partially visible conversion behind.
-    crate::codex_projects::ensure_desktop_not_running(&codex)?;
+    // Validate writable project state before Core changes. A running Desktop only defers its
+    // private cache update; rollout, SQLite and index writes remain available.
     crate::codex_projects::validate_thread_project_assignment(&codex, &new_id, &desktop_cwd)?;
 
     // rollout、threads、session_index 和 Desktop 项目归属共同决定会话是否可见。
@@ -383,6 +381,9 @@ fn write_codex_session(
         warnings.push(format!("记录转换来源失败（不影响会话使用）: {error}"));
     }
 
+    if crate::codex_projects::should_defer_desktop_state_mutation() {
+        warnings.push("会话已转换，重启 Codex App 后刷新列表；Desktop 项目归属未同步。".into());
+    }
     Ok(ConvertReport {
         source_id: source_id.to_string(),
         source_provider: source_provider.to_string(),
@@ -1424,6 +1425,15 @@ fn convert_codex_to_claude(
 ) -> AppResult<ConvertReport> {
     let codex = PathBuf::from(codex_dir);
     let source = PathBuf::from(rollout_path);
+    let meta = family::read_session_meta(&source)?;
+    let observed_id = meta
+        .pointer("/payload/id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let activity = crate::codex_activity::SessionActivityGuard::observe(
+        &codex,
+        vec![(observed_id.to_string(), vec![source.clone()])],
+    )?;
     let mut parsed = parse_codex_rollout(&source)?;
     let source_id = parsed.source_id.clone().unwrap_or_else(|| {
         source
@@ -1439,6 +1449,7 @@ fn convert_codex_to_claude(
             Err(error) => warnings.push(format!("读取 Codex 标题失败，已保留内容转换: {error}")),
         }
     }
+    activity.ensure_unchanged()?;
     write_claude_session(
         codex_dir, claude_dir, "codex", &source_id, &parsed, mode, warnings,
     )
@@ -3494,7 +3505,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_to_codex_while_desktop_running_preserves_every_target_store() {
+    fn claude_to_codex_while_desktop_running_creates_target_and_preserves_private_state() {
         let root = temp_dir("cla2codex-desktop-running");
         let codex = root.join("codex");
         fs::create_dir_all(&codex).unwrap();
@@ -3503,7 +3514,7 @@ mod tests {
             &source,
             &[claude_record(
                 "user",
-                "Desktop 运行时不得产生转换目标",
+                "Desktop 运行时允许创建转换目标",
                 "F:\\demo\\project",
             )],
         );
@@ -3527,7 +3538,6 @@ mod tests {
             .unwrap();
         drop(state);
         let index_path = paths::session_index_path(&codex);
-        let state_path = paths::state_db_path(&codex);
         let global_state_path = paths::codex_global_state_json_path(&codex);
         fs::write(&index_path, b"index-before\r\n").unwrap();
         fs::write(
@@ -3547,13 +3557,11 @@ mod tests {
 
         let rollouts_before = family::scan_rollouts(&codex).unwrap();
         let existing_rollout_before = fs::read(&existing_rollout).unwrap();
-        let state_before = fs::read(&state_path).unwrap();
-        let index_before = fs::read(&index_path).unwrap();
         let global_state_before = fs::read(&global_state_path).unwrap();
 
         let _desktop_running = crate::codex_projects::DesktopTestProbeGuard::running();
         let lock = family::FamilyLock::default();
-        let error = convert_session_with_lock(
+        let report = convert_session_with_lock(
             codex.to_string_lossy().into_owned(),
             root.join("claude").to_string_lossy().into_owned(),
             "claude".to_string(),
@@ -3561,28 +3569,35 @@ mod tests {
             Some("simple".to_string()),
             &lock,
         )
-        .expect_err("running Desktop must reject conversion before any target mutation");
-        let error = error.to_string();
-        assert!(error.contains("Codex/ChatGPT 桌面应用正在运行"), "{error}");
-        assert!(
-            error.contains("请完全退出桌面应用（包括后台进程）后重试"),
-            "{error}"
+        .expect("running Desktop allows conversion");
+        assert!(report.warnings.iter().any(|w| w.contains("重启 Codex App")));
+        assert_eq!(
+            family::scan_rollouts(&codex).unwrap().len(),
+            rollouts_before.len() + 1
         );
-        assert_eq!(family::scan_rollouts(&codex).unwrap(), rollouts_before);
         assert_eq!(
             fs::read(&existing_rollout).unwrap(),
             existing_rollout_before
         );
-        assert_eq!(fs::read(&state_path).unwrap(), state_before);
-        assert_eq!(fs::read(&index_path).unwrap(), index_before);
+        let state = state_db::open_ro(&codex).unwrap();
+        assert_eq!(
+            state
+                .query_row("SELECT COUNT(*) FROM threads", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert!(fs::read_to_string(&index_path)
+            .unwrap()
+            .contains(&report.new_id));
+        drop(state);
         assert_eq!(fs::read(&global_state_path).unwrap(), global_state_before);
-        assert!(!paths::session_provenance_path(&codex).exists());
+        assert!(paths::session_provenance_path(&codex).exists());
 
         fs::remove_dir_all(root).ok();
     }
 
     #[test]
-    fn claude_to_codex_rolls_back_when_desktop_starts_before_project_commit() {
+    fn claude_to_codex_keeps_core_when_desktop_starts_before_project_commit() {
         let root = temp_dir("cla2codex-desktop-starts-during-commit");
         let codex = root.join("codex");
         fs::create_dir_all(&codex).unwrap();
@@ -3591,7 +3606,7 @@ mod tests {
             &source,
             &[claude_record(
                 "user",
-                "项目状态提交前启动 Desktop 必须全量回滚",
+                "项目状态提交前启动 Desktop 仅推迟私有状态同步",
                 r"F:\demo\project",
             )],
         );
@@ -3619,27 +3634,30 @@ mod tests {
         )
         .unwrap();
         let rollouts_before = family::scan_rollouts(&codex).unwrap();
-        let index_before = fs::read(&index_path).unwrap();
         let global_state_before = fs::read(&global_state_path).unwrap();
 
         // Conversion preflight consumes the first probe. The project-state mutation consumes the
-        // second immediately before touching JSON and must compensate rollout/index/SQLite.
+        // second immediately before touching JSON and leaves committed Core data in place.
         let _desktop = crate::codex_projects::DesktopTestProbeGuard::running_after_not_running(1);
-        let error = convert_claude_to_codex(
+        let report = convert_claude_to_codex(
             codex.to_string_lossy().as_ref(),
             source.to_string_lossy().as_ref(),
             CodexImportMode::Simple,
         )
-        .expect_err("Desktop starting after preflight must abort the whole conversion");
-
-        assert!(error.to_string().contains("完全退出桌面应用"), "{error}");
-        assert_eq!(family::scan_rollouts(&codex).unwrap(), rollouts_before);
+        .expect("Desktop starting only defers private state");
+        assert!(report.warnings.iter().any(|w| w.contains("重启 Codex App")));
+        assert_eq!(
+            family::scan_rollouts(&codex).unwrap().len(),
+            rollouts_before.len() + 1
+        );
         let state = state_db::open_ro(&codex).unwrap();
         let thread_count: i64 = state
             .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(thread_count, 0);
-        assert_eq!(fs::read(&index_path).unwrap(), index_before);
+        assert_eq!(thread_count, 1);
+        assert!(fs::read_to_string(&index_path)
+            .unwrap()
+            .contains(&report.new_id));
         assert_eq!(fs::read(&global_state_path).unwrap(), global_state_before);
 
         drop(state);

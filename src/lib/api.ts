@@ -2,8 +2,26 @@ import { invoke } from "@tauri-apps/api/core";
 import { copyText } from "@/lib/clipboard";
 import { isTauriRuntime, isWebRuntime, webuiApiToken } from "@/lib/runtime";
 import { compareVersions, normalizeVersion } from "@/lib/version";
+import { cleanSessionBusyErrors, notifySessionBusy, sessionBusyMessages } from "@/lib/session-activity";
 
 async function invokeCommand<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  try {
+    const result = await invokeCommandRaw<T>(command, args);
+    // Background job reports are cumulative; show them once at completion.
+    if (!(result && typeof result === "object" && "state" in result && result.state === "running")) {
+      if (result && typeof result === "object") notifySessionBusy(result);
+    }
+    return cleanSessionBusyErrors(result);
+  } catch (error) {
+    notifySessionBusy(error);
+    if (sessionBusyMessages(error).length) {
+      throw new Error(cleanSessionBusyErrors(error instanceof Error ? error.message : String(error), true));
+    }
+    throw error;
+  }
+}
+
+async function invokeCommandRaw<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   if (isTauriRuntime()) {
     return invoke<T>(command, args);
   }
@@ -343,6 +361,7 @@ export type EditHistory = {
 };
 
 export type MoveSessionCwdReport = {
+  desktop_restart_required?: boolean;
   old_cwd: string;
   new_cwd: string;
   threads_updated: number;
@@ -424,6 +443,7 @@ export type Manifest = {
 export type BackupDetail = { summary: BackupSummary; manifest: Manifest };
 
 export type RestoreResult = {
+  desktop_restart_required?: boolean;
   id: string;
   ok: boolean;
   threads_inserted: boolean;
@@ -710,6 +730,7 @@ export type BranchSyncState = {
 };
 
 export type ForkSessionReport = {
+  desktop_restart_required?: boolean;
   source_id: string;
   new_id: string;
   new_rollout_path: string;
@@ -866,6 +887,7 @@ export type ProjectPathMapping = {
 };
 
 export type ImportReport = {
+  desktop_restart_required?: boolean;
   session_id: string;
   ok: boolean;
   rollout_written: boolean;

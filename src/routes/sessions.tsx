@@ -992,7 +992,9 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
                     ? `（移动 ${r.artifacts_moved} 项会话资产）`
                     : ""),
             );
-            if (provider === "codex" && !r.desktop_project_synced) {
+            if (r.desktop_restart_required) {
+              toast.info("工作目录已更新，重启 Codex App 后刷新列表；Desktop 项目归属未同步");
+            } else if (provider === "codex" && !r.desktop_project_synced) {
               toast.warning("Core 已移动，但 Codex App 全局状态未初始化，项目归属未同步");
             }
             if (r.requires_project_open) {
@@ -1212,7 +1214,7 @@ function DeleteSummary({
       <div className="text-destructive">此操作不可撤销，也不会自动备份。</div>
       {provider === "codex" && (
         <div className="text-amber-600 dark:text-amber-400">
-          Codex/ChatGPT Desktop 正在运行时仍会执行删除；{DESKTOP_DELETE_RESTART_NOTICE}
+          Codex App 运行时也可删除空闲会话；检测到目标会话写入时会停止并提示。{DESKTOP_DELETE_RESTART_NOTICE}
         </div>
       )}
       {provider === "cursor" && (

@@ -1765,6 +1765,13 @@ fn prune_orphan_entries_locked(
     }
 
     if !dry_run {
+        let activity = crate::codex_activity::SessionActivityGuard::observe(
+            &codex,
+            orphan_ids
+                .iter()
+                .map(|id| (id.clone(), Vec::new()))
+                .collect(),
+        )?;
         let mut journal = MutationJournal::default();
         let family_path = paths::family_store_path(&codex);
         let state = if prune_threads && state_db_exists {
@@ -1780,6 +1787,7 @@ fn prune_orphan_entries_locked(
             None => None,
         };
         let operation = (|| -> AppResult<()> {
+            activity.ensure_unchanged()?;
             if let Some(store) = changed_family_store.as_ref() {
                 journal.mutate_file(&family_path, || family::save(&codex, store))?;
             }
@@ -1832,7 +1840,8 @@ fn prune_orphan_entries_locked(
         families_recovered,
         families_normalized,
         families_skipped,
-        desktop_restart_required,
+        desktop_restart_required: desktop_restart_required
+            || (!dry_run && crate::codex_projects::should_defer_desktop_state_cleanup()),
         dry_run,
     })
 }
@@ -4161,8 +4170,11 @@ fn duplicate_session_locked_with_forker(
         // 交给官方 thread/fork（带全部对话）生成，再登记到本工具的索引与项目状态。
         return duplicate_paginated_session(&codex, &session_id, &source_brief, provider_forker);
     }
-    crate::codex_projects::ensure_desktop_not_running(&codex)?;
 
+    let activity = crate::codex_activity::SessionActivityGuard::observe(
+        &codex,
+        vec![(session_id.clone(), vec![source_abs.clone()])],
+    )?;
     let provider = source_brief
         .model_provider
         .clone()
@@ -4179,6 +4191,7 @@ fn duplicate_session_locked_with_forker(
         rusqlite::Transaction::new_unchecked(&state, rusqlite::TransactionBehavior::Immediate)?;
     let mut journal = MutationJournal::default();
     let operation = (|| -> AppResult<u64> {
+        activity.ensure_unchanged()?;
         journal.mutate_file(&new_abs, || {
             write_duplicated_rollout(&source_abs, &new_abs, &new_id, &provider, &session_id)
         })?;
@@ -4233,7 +4246,7 @@ fn duplicate_session_locked_with_forker(
         new_id,
         new_rollout_path: new_abs.to_string_lossy().into_owned(),
         total_lines,
-        desktop_restart_required: false,
+        desktop_restart_required: crate::codex_projects::should_defer_desktop_state_mutation(),
     })
 }
 
@@ -4405,9 +4418,12 @@ fn fork_session_at_event_locked(
 ) -> AppResult<ForkSessionReport> {
     let codex = PathBuf::from(&codex_dir);
     let codex = codex.canonicalize().unwrap_or(codex);
-    crate::codex_projects::ensure_desktop_not_running(&codex)?;
     let (source_abs, source_brief) =
         resolve_fork_source_rollout(&codex, &session_id, &rollout_path)?;
+    let activity = crate::codex_activity::SessionActivityGuard::observe(
+        &codex,
+        vec![(session_id.clone(), vec![source_abs.clone()])],
+    )?;
     let prefix = collect_stable_prefix(&source_abs, event_index)?;
     let provider = source_brief
         .model_provider
@@ -4485,6 +4501,7 @@ fn fork_session_at_event_locked(
         rusqlite::Transaction::new_unchecked(&state, rusqlite::TransactionBehavior::Immediate)?;
     let mut journal = MutationJournal::default();
     let operation = (|| -> AppResult<u64> {
+        activity.ensure_unchanged()?;
         let included_lines = journal.mutate_file(&new_abs, || {
             write_forked_rollout_prefix(&prefix, &new_abs, &new_id, &provider)
         })?;
@@ -4575,6 +4592,7 @@ fn fork_session_at_event_locked(
     };
 
     Ok(ForkSessionReport {
+        desktop_restart_required: crate::codex_projects::should_defer_desktop_state_mutation(),
         source_id: session_id,
         new_id,
         new_rollout_path: new_abs.to_string_lossy().into_owned(),
@@ -4763,6 +4781,14 @@ fn clone_session_for_provider_locked_with_hint(
         }
     };
 
+    let activity = if !dry_run && src_brief.history_mode != "paginated" {
+        Some(crate::codex_activity::SessionActivityGuard::observe(
+            &codex,
+            vec![(session_id.clone(), vec![src_brief.path.clone()])],
+        )?)
+    } else {
+        None
+    };
     // 注册/定位家族
     let family_was_registered = store.index.contains_key(&session_id);
     let family_id = family::ensure_family_for(
@@ -4819,6 +4845,9 @@ fn clone_session_for_provider_locked_with_hint(
                 )?;
                 let mut journal = MutationJournal::default();
                 let operation = (|| -> AppResult<()> {
+                    if let Some(activity) = &activity {
+                        activity.ensure_unchanged()?;
+                    }
                     sync_thread_from_rollout(&codex, &transaction, &src_brief.path)?;
                     let index_path = paths::session_index_path(&codex);
                     journal.mutate_file(&index_path, || {
@@ -4932,6 +4961,9 @@ fn clone_session_for_provider_locked_with_hint(
 
             let mut journal = MutationJournal::default();
             let operation = (|| -> AppResult<()> {
+                if let Some(activity) = &activity {
+                    activity.ensure_unchanged()?;
+                }
                 if !defer_desktop_state {
                     if let Some(record) = project_assignment.as_ref() {
                         if let Some(receipt) = crate::codex_projects::sync_missing_thread_project_assignment_records_with_receipt(
@@ -4990,22 +5022,6 @@ fn clone_session_for_provider_locked_with_hint(
         );
     }
 
-    if !dry_run
-        && matches!(
-            &strategy,
-            SwitchStrategy::Follow | SwitchStrategy::Continuous
-        )
-    {
-        if defer_desktop_state {
-            return Err(AppError::Other(
-                "follow/continuous provider 切换会改写或移动当前 rollout；Codex/ChatGPT 桌面应用正在运行，请完全退出后重试"
-                    .into(),
-            ));
-        }
-        // Catch Desktop starting after the initial defer probe but before an unsafe source write.
-        crate::codex_projects::ensure_desktop_not_running(&codex)?;
-    }
-
     match strategy {
         SwitchStrategy::Follow => {
             // 直接改 src 文件第一行的 model_provider（不克隆）
@@ -5022,6 +5038,9 @@ fn clone_session_for_provider_locked_with_hint(
             )?;
             let mut journal = MutationJournal::default();
             let operation = (|| -> AppResult<()> {
+                if let Some(activity) = &activity {
+                    activity.ensure_unchanged()?;
+                }
                 if !defer_desktop_state {
                     if let Some(record) = project_assignment_record(&codex, &src_brief) {
                         if let Some(receipt) = crate::codex_projects::sync_missing_thread_project_assignment_records_with_receipt(
@@ -5152,6 +5171,9 @@ fn clone_session_for_provider_locked_with_hint(
             )?;
             let mut journal = MutationJournal::default();
             let operation = (|| -> AppResult<()> {
+                if let Some(activity) = &activity {
+                    activity.ensure_unchanged()?;
+                }
                 // 1) 基于固定源快照写新文件并登记新 threads 行。
                 journal.mutate_file(&new_abs, || {
                     write_cloned_rollout(
@@ -5865,7 +5887,6 @@ fn rollback_family_active_locked(
     target_branch_id: String,
 ) -> AppResult<()> {
     let codex = PathBuf::from(&codex_dir);
-    crate::codex_projects::ensure_desktop_not_running(&codex)?;
     ensure_state_db_exists(&codex)?;
     let state = state_db::open(&codex)?;
     let mut store = family::load(&codex)?;
@@ -5954,6 +5975,13 @@ fn rollback_family_active_locked(
             target_branch_id, target_brief.id
         )));
     }
+    let activity = crate::codex_activity::SessionActivityGuard::observe(
+        &codex,
+        vec![
+            (cur_active.id.clone(), vec![cur_abs.clone()]),
+            (target_branch_id.clone(), vec![target_source_abs.clone()]),
+        ],
+    )?;
     let current_lines = read_rollout_lines(&cur_abs)?;
     let target_lines = read_rollout_lines(&target_source_abs)?;
     let (relation, _, appendable_to_target) = compare_rollout_lines(&current_lines, &target_lines);
@@ -5968,6 +5996,7 @@ fn rollback_family_active_locked(
         rusqlite::Transaction::new_unchecked(&state, rusqlite::TransactionBehavior::Immediate)?;
     let mut journal = MutationJournal::default();
     let operation = (|| -> AppResult<()> {
+        activity.ensure_unchanged()?;
         if let Some(record) = project_assignment_record(&codex, &target_brief) {
             if let Some(receipt) =
                 crate::codex_projects::sync_missing_thread_project_assignment_records_with_receipt(
@@ -6269,7 +6298,6 @@ fn append_branch_extras_locked(
     target_branch_id: String,
 ) -> AppResult<BranchSyncReport> {
     let codex = PathBuf::from(&codex_dir);
-    crate::codex_projects::ensure_desktop_not_running(&codex)?;
     let mut store = family::load(&codex)?;
     let family = store
         .families
@@ -6295,6 +6323,13 @@ fn append_branch_extras_locked(
     let source_abs = resolve_branch_rollout(&codex, &source_branch)?;
     let target_abs = resolve_branch_rollout(&codex, &target_branch)?;
     let target_archived = target_abs.starts_with(paths::archived_sessions_dir(&codex));
+    let activity = crate::codex_activity::SessionActivityGuard::observe(
+        &codex,
+        vec![
+            (source_branch_id.clone(), vec![source_abs.clone()]),
+            (target_branch_id.clone(), vec![target_abs.clone()]),
+        ],
+    )?;
     let source_lines = read_rollout_lines(&source_abs)?;
     let target_fingerprint = atomic_file::fingerprint(&target_abs)?;
     let target_lines = read_rollout_lines(&target_abs)?;
@@ -6330,6 +6365,7 @@ fn append_branch_extras_locked(
         rusqlite::Transaction::new_unchecked(&state, rusqlite::TransactionBehavior::Immediate)?;
     let mut journal = MutationJournal::default();
     let operation = (|| -> AppResult<()> {
+        activity.ensure_unchanged()?;
         journal.mutate_file(&target_abs, || {
             atomic_file::replace_with_writer_if_unchanged(
                 &target_abs,
@@ -8310,7 +8346,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_source_mutating_strategies_still_require_desktop_exit() -> AppResult<()> {
+    fn provider_source_mutating_strategies_work_while_desktop_runs() -> AppResult<()> {
         for (strategy, label) in [
             (SwitchStrategy::Follow, "follow"),
             (SwitchStrategy::Continuous, "continuous"),
@@ -8319,23 +8355,34 @@ mod tests {
                 "cc-session-manager-provider-running-{label}-guard-test"
             ));
             let source_id = format!("provider-running-{label}-guard");
-            let source = prepare_provider_switch_fixture(&codex, &source_id)?;
-            let source_before = fs::read(&source)?;
+            let _source = prepare_provider_switch_fixture(&codex, &source_id)?;
             let global_path = paths::codex_global_state_json_path(&codex);
             let global_before = fs::read(&global_path)?;
             let _desktop = crate::codex_projects::DesktopTestProbeGuard::running();
 
-            let error = clone_session_for_provider_locked(
+            let report = clone_session_for_provider_locked(
                 codex.to_string_lossy().into_owned(),
                 source_id,
                 Some(DEFAULT_PROVIDER.to_string()),
                 strategy,
                 false,
-            )
-            .expect_err("source-mutating provider sync must stay guarded");
+            )?;
 
-            assert!(error.to_string().contains("完全退出"), "{label}: {error}");
-            assert_eq!(fs::read(&source)?, source_before, "{label}");
+            assert!(report.ok && report.desktop_restart_required);
+            let target = paths::host_path_from_codex_record(
+                &codex,
+                report.new_rollout_path.as_deref().unwrap(),
+            );
+            let brief = read_rollout_brief(&codex, &target)?.unwrap();
+            assert_eq!(brief.model_provider.as_deref(), Some(DEFAULT_PROVIDER));
+            let state = state_db::open_ro(&codex)?;
+            let provider: String = state.query_row(
+                "SELECT model_provider FROM threads WHERE id=?1",
+                [report.new_id.as_deref().unwrap()],
+                |r| r.get(0),
+            )?;
+            assert_eq!(provider, DEFAULT_PROVIDER);
+            drop(state);
             assert_eq!(fs::read(&global_path)?, global_before, "{label}");
             fs::remove_dir_all(codex).ok();
         }
@@ -11122,7 +11169,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_compensates_core_when_desktop_starts_after_preflight() -> AppResult<()> {
+    fn prune_keeps_core_cleanup_when_desktop_starts_after_preflight() -> AppResult<()> {
         let codex = temp_codex_dir("cc-session-manager-prune-desktop-race-test");
         let live_id = "prune-race-live";
         let orphan_id = "prune-race-orphan";
@@ -11153,7 +11200,7 @@ mod tests {
         // First probe is the business preflight; the second is the guarded state mutation.
         let _desktop = crate::codex_projects::DesktopTestProbeGuard::running_after_not_running(1);
 
-        let error = prune_orphan_entries_with_lock(
+        let report = prune_orphan_entries_with_lock(
             codex.to_string_lossy().into_owned(),
             true,
             true,
@@ -11161,18 +11208,19 @@ mod tests {
             false,
             false,
             &family::FamilyLock::default(),
-        )
-        .expect_err("Desktop start after preflight must abort and compensate Core changes");
+        )?;
 
-        assert!(error.to_string().contains("完全退出桌面应用"), "{error}");
-        assert_eq!(fs::read(&index_path)?, index_before);
+        assert!(report.desktop_restart_required);
+        assert_eq!(report.threads_removed, 1);
+        assert_ne!(fs::read(&index_path)?, index_before);
+        assert!(!fs::read_to_string(&index_path)?.contains(orphan_id));
         assert_eq!(fs::read(&global_path)?, global_before);
         let state = state_db::open_ro(&codex)?;
         let ids = state
             .prepare("SELECT id FROM threads ORDER BY id")?
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
-        assert_eq!(ids, vec![live_id.to_string(), orphan_id.to_string()]);
+        assert_eq!(ids, vec![live_id.to_string()]);
         drop(state);
 
         fs::remove_dir_all(&codex).ok();

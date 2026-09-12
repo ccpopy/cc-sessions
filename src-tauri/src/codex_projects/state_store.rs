@@ -79,7 +79,6 @@ pub(crate) struct StateMutationReceipt {
 
 impl StateMutationReceipt {
     pub(crate) fn compensate(&self) -> AppResult<()> {
-        ensure_state_path_desktop_not_running(&self.path)?;
         let metadata = fs::symlink_metadata(&self.path)?;
         if !metadata.is_file() || crate::path_safety::metadata_is_link_or_reparse(&metadata) {
             return Err(AppError::Path(format!(
@@ -108,7 +107,9 @@ pub(super) fn mutate_existing_state_with_receipt<T>(
     codex: &Path,
     mut mutation: impl FnMut(&mut Map<String, Value>) -> AppResult<T>,
 ) -> AppResult<Option<(T, Option<StateMutationReceipt>)>> {
-    super::ensure_desktop_not_running(codex)?;
+    if super::should_defer_desktop_state_mutation() {
+        return Ok(None);
+    }
     for attempt in 0..STATE_WRITE_ATTEMPTS {
         let snapshot = match load_state(codex) {
             Ok(snapshot) => snapshot,
@@ -142,8 +143,10 @@ pub(super) fn mutate_existing_state_with_receipt<T>(
             after_fingerprint: atomic_file::fingerprint_bytes(&after),
         };
         // Recheck immediately before every compare-and-swap attempt to narrow the process-start
-        // race after the earlier business-level preflight.
-        super::ensure_desktop_not_running(codex)?;
+        // race after the earlier private-state check.
+        if super::should_defer_desktop_state_mutation() {
+            return Ok(None);
+        }
         match write_state_bytes_if_unchanged(&snapshot.path, &snapshot.fingerprint, &after) {
             Ok(()) => return Ok(Some((result, Some(receipt)))),
             Err(error)
@@ -164,15 +167,6 @@ pub(super) fn mutate_existing_state_with_receipt<T>(
         }
     }
     unreachable!("state mutation attempts are non-zero")
-}
-
-fn ensure_state_path_desktop_not_running(state_path: &Path) -> AppResult<()> {
-    match fs::symlink_metadata(state_path) {
-        Ok(metadata) => validate_state_file_metadata(state_path, &metadata)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    }
-    super::desktop_guard::ensure_official_desktop_not_running()
 }
 
 pub(super) fn load_state(codex: &Path) -> AppResult<Option<StateSnapshot>> {

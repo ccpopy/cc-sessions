@@ -865,13 +865,19 @@ fn sync_codex_desktop_project_assignments(
     ids: &[String],
     host_cwd: &str,
 ) -> AppResult<(bool, Option<crate::codex_projects::StateMutationReceipt>)> {
+    if crate::codex_projects::should_defer_desktop_state_mutation() {
+        return Ok((false, None));
+    }
     // The project helper reports whether it changed the JSON. The move report instead tells the
     // caller whether Desktop had initialized its state and accepted the sync; an already-correct
     // assignment is therefore still synchronized successfully.
     let desktop_state_initialized = crate::codex_projects::desktop_state_initialized(codex)?;
     let receipt =
         crate::codex_projects::sync_thread_project_assignments_with_receipt(codex, ids, host_cwd)?;
-    Ok((desktop_state_initialized, receipt))
+    Ok((
+        desktop_state_initialized && !crate::codex_projects::should_defer_desktop_state_mutation(),
+        receipt,
+    ))
 }
 
 fn move_session_cwd_locked_with_post_project_sync(
@@ -887,7 +893,6 @@ fn move_session_cwd_locked_with_post_project_sync(
             paths::state_db_path(&codex).to_string_lossy()
         )));
     }
-    crate::codex_projects::ensure_desktop_not_running(&codex)?;
 
     let (target_host, target_record) = normalize_move_target_cwd(&codex, &target_cwd)?;
     let new_cwd = paths::strip_verbatim(&target_host.to_string_lossy());
@@ -905,6 +910,13 @@ fn move_session_cwd_locked_with_post_project_sync(
         }
         rollouts.insert(sid.clone(), rollout);
     }
+    let activity = crate::codex_activity::SessionActivityGuard::observe(
+        &codex,
+        rollouts
+            .iter()
+            .map(|(id, path)| (id.clone(), vec![path.clone()]))
+            .collect(),
+    )?;
     let index_ids = crate::repair::read_session_index_ids(&codex)?;
     let state = state_db::open(&codex)?;
     let has_name = crate::repair::threads_table_columns(&state)?
@@ -920,6 +932,7 @@ fn move_session_cwd_locked_with_post_project_sync(
     let mut journal = crate::mutation_journal::MutationJournal::default();
     let mut rollout_rewritten = false;
     let operation = (|| -> AppResult<(u32, bool)> {
+        activity.ensure_unchanged()?;
         for sid in &ids {
             let rollout = rollouts
                 .get(sid)
@@ -1017,6 +1030,7 @@ fn move_session_cwd_locked_with_post_project_sync(
     };
 
     Ok(MoveSessionCwdReport {
+        desktop_restart_required: crate::codex_projects::should_defer_desktop_state_mutation(),
         old_cwd,
         new_cwd,
         threads_updated,
@@ -1160,6 +1174,10 @@ fn set_archived_codex_locked(codex_dir: String, id: String, v: bool) -> AppResul
         return Err(AppError::Other("rollout 路径缺少文件名".into()));
     };
 
+    let activity = crate::codex_activity::SessionActivityGuard::observe(
+        &codex,
+        vec![(id.clone(), vec![current.clone()])],
+    )?;
     // 2) 移动文件到目标位置
     let target = if v {
         paths::archived_sessions_dir(&codex).join(&file_name)
@@ -1171,6 +1189,7 @@ fn set_archived_codex_locked(codex_dir: String, id: String, v: bool) -> AppResul
             .join(d)
             .join(&file_name)
     };
+    activity.ensure_unchanged()?;
     if current != target {
         if target.exists() {
             return Err(AppError::Other(format!(
@@ -4297,7 +4316,8 @@ mod tests {
     }
 
     #[test]
-    fn move_session_cwd_rejects_running_desktop_before_writing_core_state() -> AppResult<()> {
+    fn move_session_cwd_while_desktop_runs_updates_core_and_defers_private_state() -> AppResult<()>
+    {
         let codex = temp_dir("move-cwd-desktop-running");
         let session_id = "019d-move-desktop-running";
         let paths_by_id = codex_family_fixture(
@@ -4310,39 +4330,57 @@ mod tests {
             }],
         )?;
         fs::write(paths::codex_global_state_json_path(&codex), "{}")?;
-        let target = codex.join("projects").join("blocked-target");
+        let target = codex.join("projects").join("running-target");
         fs::create_dir_all(&target)?;
-        let tracked_paths = [
-            paths_by_id[session_id].clone(),
-            paths::state_db_path(&codex),
-            paths::session_index_path(&codex),
-            paths::family_store_path(&codex),
-            paths::codex_global_state_json_path(&codex),
-        ];
-        let before = tracked_paths
-            .iter()
-            .map(|path| fs::read(path).map(|bytes| (path.clone(), bytes)))
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let global_path = paths::codex_global_state_json_path(&codex);
+        let global_before = fs::read(&global_path)?;
         let _desktop = crate::codex_projects::DesktopTestProbeGuard::running();
 
-        let error = move_session_cwd_with_lock(
+        let writing_path = paths_by_id[session_id].clone();
+        let old_rollout = fs::read(&writing_path)?;
+        crate::codex_activity::during_observation(move || {
+            let mut bytes = old_rollout;
+            bytes.extend_from_slice(b"\n");
+            fs::write(writing_path, bytes).unwrap();
+        });
+        let busy = move_session_cwd_with_lock(
             Some("codex".into()),
             codex.to_string_lossy().into_owned(),
             session_id.into(),
             target.to_string_lossy().into_owned(),
             &family::FamilyLock::default(),
         )
-        .expect_err("running Desktop must reject the whole move");
+        .expect_err("a changing selected session must block the move");
+        assert!(matches!(busy, AppError::SessionBusy(_)), "{busy}");
+        assert_eq!(fs::read(&global_path)?, global_before);
 
-        assert!(error.to_string().contains("完全退出桌面应用"), "{error}");
-        for (path, expected) in before {
-            assert_eq!(
-                fs::read(&path)?,
-                expected,
-                "must not modify {}",
-                path.display()
-            );
-        }
+        let report = move_session_cwd_with_lock(
+            Some("codex".into()),
+            codex.to_string_lossy().into_owned(),
+            session_id.into(),
+            target.to_string_lossy().into_owned(),
+            &family::FamilyLock::default(),
+        )?;
+
+        assert!(report.desktop_restart_required);
+        assert!(!report.desktop_project_synced);
+        assert!(report.rollout_rewritten);
+        assert_eq!(report.threads_updated, 1);
+        assert_eq!(fs::read(&global_path)?, global_before);
+        let cwd =
+            crate::codex_rollout_cwd::read_effective_cwd(&paths_by_id[session_id], session_id)?
+                .unwrap();
+        assert_eq!(
+            paths::host_path_string_from_codex_record(&codex, &cwd),
+            report.new_cwd
+        );
+        let state = state_db::open_ro(&codex)?;
+        let stored: String =
+            state.query_row("SELECT cwd FROM threads WHERE id=?1", [session_id], |r| {
+                r.get(0)
+            })?;
+        assert_eq!(stored, cwd);
+        drop(state);
         fs::remove_dir_all(codex).ok();
         Ok(())
     }
@@ -5410,6 +5448,19 @@ mod tests {
         let global_state_before = fs::read(&global_state_path)?;
         let _desktop = crate::codex_projects::DesktopTestProbeGuard::running();
 
+        let writing = rollout.clone();
+        crate::codex_activity::during_observation(move || {
+            let mut bytes = fs::read(&writing).unwrap();
+            bytes.extend_from_slice(b"\n");
+            fs::write(writing, bytes).unwrap();
+        });
+        let busy =
+            delete_one(&codex, ARCHIVE_TEST_ID).expect_err("a writing session must not be deleted");
+        assert!(matches!(busy, AppError::SessionBusy(_)), "{busy}");
+        assert!(rollout.is_file());
+        assert_eq!(desktop_thread_cache_rows(&codex, ARCHIVE_TEST_ID)?, (1, 1));
+        assert_eq!(fs::read(&global_state_path)?, global_state_before);
+
         let result = delete_one(&codex, ARCHIVE_TEST_ID)?;
 
         assert!(result.ok, "{:?}", result.error);
@@ -5644,7 +5695,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_codex_rolls_back_core_when_desktop_starts_after_preflight() -> AppResult<()> {
+    fn delete_codex_keeps_core_deletion_when_desktop_starts_after_preflight() -> AppResult<()> {
         let codex = temp_dir("codex-delete-desktop-race-rollback");
         let rollout = archive_fixture(&codex);
         write_codex_project_state_fixture(&codex, &[ARCHIVE_TEST_ID])?;
@@ -5659,20 +5710,16 @@ mod tests {
         )?;
         drop(logs);
 
-        let rollout_before = fs::read(&rollout)?;
         let index_path = paths::session_index_path(&codex);
-        let index_before = fs::read(&index_path)?;
         let global_path = paths::codex_global_state_json_path(&codex);
         let global_before = fs::read(&global_path)?;
         // batch pre-check, mutation-entry check, then the final pre-CAS check observes Desktop.
         let _desktop = crate::codex_projects::DesktopTestProbeGuard::running_after_not_running(2);
 
-        let error = delete_one(&codex, ARCHIVE_TEST_ID)
-            .expect_err("a Desktop start immediately before project-state CAS must abort delete");
-
-        assert!(error.to_string().contains("完全退出桌面应用"), "{error}");
-        assert_eq!(fs::read(&rollout)?, rollout_before);
-        assert_eq!(fs::read(&index_path)?, index_before);
+        let result = delete_one(&codex, ARCHIVE_TEST_ID)?;
+        assert!(result.ok && result.desktop_restart_required);
+        assert!(!rollout.exists());
+        assert!(!fs::read_to_string(&index_path)?.contains(ARCHIVE_TEST_ID));
         assert_eq!(fs::read(&global_path)?, global_before);
         let state = state_db::open_ro(&codex)?;
         let threads: i64 = state.query_row(
@@ -5680,14 +5727,14 @@ mod tests {
             [ARCHIVE_TEST_ID],
             |row| row.get(0),
         )?;
-        assert_eq!(threads, 1);
+        assert_eq!(threads, 0);
         let logs = logs_db::open_ro(&codex)?;
         let log_rows: i64 = logs.query_row(
             "SELECT COUNT(*) FROM logs WHERE thread_id = ?1",
             [ARCHIVE_TEST_ID],
             |row| row.get(0),
         )?;
-        assert_eq!(log_rows, 1);
+        assert_eq!(log_rows, 0);
         drop((state, logs));
         fs::remove_dir_all(&codex).ok();
         Ok(())

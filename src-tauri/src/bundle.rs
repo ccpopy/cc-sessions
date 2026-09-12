@@ -1769,6 +1769,7 @@ pub fn import_session_bundles_with_dirs(
                 _ => import_one(&codex, &it, &mode, make_visible, strict, &project_mappings),
             })
             .unwrap_or_else(|e| ImportReport {
+                desktop_restart_required: false,
                 session_id: it.manifest.session_id.clone(),
                 ok: false,
                 rollout_written: false,
@@ -2122,6 +2123,7 @@ fn import_one_claude(
     project_mappings: &HashMap<String, String>,
 ) -> AppResult<ImportReport> {
     let mut report = ImportReport {
+        desktop_restart_required: false,
         session_id: item.manifest.session_id.clone(),
         ok: false,
         rollout_written: false,
@@ -2315,6 +2317,7 @@ fn import_one_opencode(
     project_mappings: &HashMap<String, String>,
 ) -> AppResult<ImportReport> {
     let mut report = ImportReport {
+        desktop_restart_required: false,
         session_id: item.manifest.session_id.clone(),
         ok: false,
         rollout_written: false,
@@ -2476,6 +2479,7 @@ fn import_one_cursor(
     strict: bool,
 ) -> AppResult<ImportReport> {
     let mut report = ImportReport {
+        desktop_restart_required: false,
         session_id: item.manifest.session_id.clone(),
         ok: false,
         rollout_written: false,
@@ -3328,6 +3332,7 @@ fn import_one(
     project_mappings: &HashMap<String, String>,
 ) -> AppResult<ImportReport> {
     let mut report = ImportReport {
+        desktop_restart_required: false,
         session_id: item.manifest.session_id.clone(),
         ok: false,
         rollout_written: false,
@@ -3339,9 +3344,6 @@ fn import_one(
         verified: false,
         sha_mismatch: false,
     };
-    if make_visible {
-        crate::codex_projects::ensure_desktop_not_running(codex)?;
-    }
 
     // 1) 找源文件
     let rel = validate_codex_bundle_rollout_relpath(
@@ -3423,6 +3425,10 @@ fn import_one(
         true,
         "Codex bundle 导入目标",
     )?;
+    let activity = crate::codex_activity::SessionActivityGuard::observe(
+        codex,
+        vec![(item.manifest.session_id.clone(), vec![dest_abs.clone()])],
+    )?;
     let mapped_cwd = mapped_project_cwd(&item.manifest, project_mappings);
     let rollout_cwd =
         crate::codex_rollout_cwd::read_effective_cwd(&src_file, &item.manifest.session_id)?
@@ -3465,6 +3471,7 @@ fn import_one(
             };
             let hist_src = PathBuf::from(&item.bundle_dir).join("history.jsonl");
             let mutation = run_codex_import_atomic(codex, |state, has_state_db, journal| {
+                activity.ensure_unchanged()?;
                 let history_appended = if hist_src.is_file() {
                     let history_path = paths::history_path(codex);
                     journal.mutate_file(&history_path, || {
@@ -3509,6 +3516,8 @@ fn import_one(
             report.threads_upserted = outcome.threads_upserted;
             report.index_appended = outcome.index_appended;
             report.ok = true;
+            report.desktop_restart_required =
+                make_visible && crate::codex_projects::should_defer_desktop_state_mutation();
             return Ok(report);
         }
     }
@@ -3535,6 +3544,7 @@ fn import_one(
 
     let hist_src = PathBuf::from(&item.bundle_dir).join("history.jsonl");
     let mutation = run_codex_import_atomic(codex, |state, has_state_db, journal| {
+        activity.ensure_unchanged()?;
         journal.mutate_file(&dest_abs, || {
             copy_codex_rollout_with_cwd(
                 &src_file,
@@ -3605,6 +3615,8 @@ fn import_one(
     report.threads_upserted = outcome.threads_upserted;
     report.index_appended = outcome.index_appended;
     report.ok = true;
+    report.desktop_restart_required =
+        make_visible && crate::codex_projects::should_defer_desktop_state_mutation();
     Ok(report)
 }
 
@@ -5964,7 +5976,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_import_while_desktop_running_preserves_every_target_store() -> AppResult<()> {
+    fn codex_import_while_desktop_running_updates_core_and_defers_private_state() -> AppResult<()> {
         let root = temp_dir("cc-session-manager-codex-bundle-desktop-running-test");
         let source_codex = root.join("source-codex");
         let import_codex = root.join("import-codex");
@@ -6013,45 +6025,62 @@ mod tests {
         )?;
         let index_path = paths::session_index_path(&import_codex);
         let history_path = paths::history_path(&import_codex);
-        let state_path = paths::state_db_path(&import_codex);
         let global_state_path = paths::codex_global_state_json_path(&import_codex);
         fs::write(&index_path, b"index-before\r\n")?;
         fs::write(&history_path, b"history-before\r\n")?;
 
         let rollout_before = fs::read(&destination)?;
-        let state_before = fs::read(&state_path)?;
-        let index_before = fs::read(&index_path)?;
         let history_before = fs::read(&history_path)?;
         let global_state_before = fs::read(&global_state_path)?;
 
         let _desktop_running = crate::codex_projects::DesktopTestProbeGuard::running();
-        let imported = import_session_bundles(
-            Some(PROVIDER_CODEX.to_string()),
-            bundle_dir.to_string_lossy().into_owned(),
-            import_codex.to_string_lossy().into_owned(),
-            None,
-            ImportMode::Overwrite,
-            true,
-            true,
-            vec![],
-            None,
-        )?;
+        let run = || {
+            import_session_bundles(
+                Some(PROVIDER_CODEX.to_string()),
+                bundle_dir.to_string_lossy().into_owned(),
+                import_codex.to_string_lossy().into_owned(),
+                None,
+                ImportMode::Overwrite,
+                true,
+                true,
+                vec![],
+                None,
+            )
+        };
+        let writing = destination.clone();
+        crate::codex_activity::during_observation(move || {
+            let mut bytes = fs::read(&writing).unwrap();
+            bytes.extend_from_slice(b"\n");
+            fs::write(writing, bytes).unwrap();
+        });
+        let busy = run()?;
+        assert!(!busy[0].ok);
+        assert!(busy[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("[SESSION_BUSY]"));
+        assert!(destination.is_file());
+        assert_eq!(fs::read(&global_state_path)?, global_state_before);
+        let imported = run()?;
 
         assert_eq!(imported.len(), 1);
-        assert!(!imported[0].ok);
-        assert!(!imported[0].rollout_written);
-        assert!(!imported[0].threads_upserted);
-        assert!(!imported[0].index_appended);
-        assert_eq!(imported[0].history_appended, 0);
-        let error = imported[0].error.as_deref().unwrap_or_default();
-        assert!(error.contains("Codex/ChatGPT 桌面应用正在运行"), "{error}");
+        assert!(imported[0].ok, "{:?}", imported[0].error);
+        assert!(imported[0].desktop_restart_required);
         assert!(
-            error.contains("请完全退出桌面应用（包括后台进程）后重试"),
-            "{error}"
+            imported[0].rollout_written
+                && imported[0].threads_upserted
+                && imported[0].index_appended
         );
-        assert_eq!(fs::read(&destination)?, rollout_before);
-        assert_eq!(fs::read(&state_path)?, state_before);
-        assert_eq!(fs::read(&index_path)?, index_before);
+        assert_ne!(fs::read(&destination)?, rollout_before);
+        assert!(fs::read_to_string(&destination)?.contains(id));
+        assert!(fs::read_to_string(&index_path)?.contains(id));
+        let state = state_db::open_ro(&import_codex)?;
+        assert_eq!(
+            state.query_row("SELECT COUNT(*) FROM threads", [], |r| r.get::<_, i64>(0))?,
+            2
+        );
+        drop(state);
         assert_eq!(fs::read(&history_path)?, history_before);
         assert_eq!(fs::read(&global_state_path)?, global_state_before);
 

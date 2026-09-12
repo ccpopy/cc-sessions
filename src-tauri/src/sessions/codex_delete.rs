@@ -75,6 +75,23 @@ pub(crate) fn delete_codex_artifacts_batch_with_family_store(
     preflight_thread_history_database_for_delete(codex_dir)?;
     let rollout_references = scan_rollout_references(codex_dir)?;
 
+    let activity = crate::codex_activity::SessionActivityGuard::observe(
+        codex_dir,
+        unique_ids
+            .iter()
+            .map(|id| {
+                let files = rollout_references
+                    .iter()
+                    .filter(|reference| {
+                        reference.payload_thread_id.as_deref() == Some(id.as_str())
+                            || reference.file_thread_id.as_deref() == Some(id.as_str())
+                    })
+                    .map(|reference| reference.path.clone())
+                    .collect();
+                (id.clone(), files)
+            })
+            .collect(),
+    )?;
     let state = state_db::open(codex_dir)?;
     // 是否挂载子代理关系表：存在时按删除单元同步清理关系边，避免残留孤儿边。
     let spawn_edges_attached: bool = state.query_row(
@@ -84,6 +101,7 @@ pub(crate) fn delete_codex_artifacts_batch_with_family_store(
     )?;
     let transaction =
         rusqlite::Transaction::new_unchecked(&state, rusqlite::TransactionBehavior::Immediate)?;
+    activity.ensure_unchanged()?;
     let mut preparations = Vec::with_capacity(unique_ids.len());
     for id in &unique_ids {
         let rollout_path: Option<String> = transaction
@@ -144,6 +162,7 @@ pub(crate) fn delete_codex_artifacts_batch_with_family_store(
     let index_path = paths::session_index_path(codex_dir);
     let mut journal = crate::mutation_journal::MutationJournal::default();
     let operation = (|| -> AppResult<Vec<CodexDeleteOutcome>> {
+        activity.ensure_unchanged()?;
         let mut outcomes = Vec::with_capacity(preparations.len());
         for prepared in &preparations {
             let rows = transaction.execute("DELETE FROM threads WHERE id = ?", [&prepared.id])?;
@@ -205,8 +224,8 @@ pub(crate) fn delete_codex_artifacts_batch_with_family_store(
             });
         }
 
-        // Keep this after every Core file mutation so late Desktop/CAS failures exercise the same
-        // compensation path as other write failures.
+        // Only actual state write conflicts participate in compensation. A Desktop process
+        // starting during deletion merely defers its private cache cleanup.
         if !desktop_restart_required {
             if let Some(receipt) = crate::codex_projects::clear_thread_project_states_with_receipt(
                 codex_dir,
@@ -237,6 +256,11 @@ pub(crate) fn delete_codex_artifacts_batch_with_family_store(
             );
         }
     };
+    if crate::codex_projects::should_defer_desktop_state_cleanup() {
+        for outcome in &mut outcomes {
+            outcome.result.desktop_restart_required = true;
+        }
+    }
 
     // Desktop's catalog and generated summaries live outside Core's state database. SQLite safely
     // coordinates this external writer even while Desktop is running, so clear these rows now.

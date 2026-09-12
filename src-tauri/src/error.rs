@@ -18,6 +18,8 @@ pub enum AppError {
     NotFound(String),
     #[error("cancelled")]
     Cancelled,
+    #[error("[SESSION_BUSY] 检测到会话 {0} 的记录正在变化，已阻止本次操作。请先停止该会话的生成或等待完成后重试，无需退出 Codex App。")]
+    SessionBusy(String),
     /// An atomic writer rejected the operation before replacing the destination because another
     /// writer won the compare-and-swap/create race. Callers may retry from a fresh snapshot.
     #[error("{0}")]

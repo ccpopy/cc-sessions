@@ -163,6 +163,9 @@ export default function BackupsRoute({ provider = "codex" }: { provider?: Sessio
             cursor_dir: settings.cursor_dir,
             overwrite: false,
           });
+          if (r.some((item) => item.ok && item.desktop_restart_required)) {
+            toast.info("重启 Codex App 后刷新列表；Desktop 项目归属未同步");
+          }
           const ok = r.filter((x) => x.ok).length;
           const conflict = r.filter((x) => x.conflict).length;
           const failed = r.filter((x) => !x.ok && !x.conflict);

@@ -65,6 +65,7 @@ pub fn move_session_cwd_with_options(
         same_existing_entry(&source_transcript, &destination_transcript)?;
     if transcript_stays_in_place && session.cwd == target_cwd {
         return Ok(MoveSessionCwdReport {
+            desktop_restart_required: false,
             old_cwd: session.cwd,
             new_cwd: target_cwd,
             threads_updated: 0,
@@ -248,6 +249,7 @@ pub fn move_session_cwd_with_options(
     }
 
     Ok(MoveSessionCwdReport {
+        desktop_restart_required: false,
         old_cwd: session.cwd,
         new_cwd: target_cwd,
         threads_updated: 0,

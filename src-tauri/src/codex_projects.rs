@@ -36,24 +36,6 @@ const PROJECT_ORDER: &str = "project-order";
 const THREAD_ASSIGNMENTS: &str = "thread-project-assignments";
 const PROJECTLESS_THREADS: &str = "projectless-thread-ids";
 
-/// Refuse external writes while the official Desktop process owns this state in memory.
-///
-/// Codex Desktop does not reload `.codex-global-state.json` after another process changes it and
-/// can later overwrite that change from its stale in-memory copy. This check intentionally looks
-/// only for the packaged GUI executable, never `codex`/`codex.exe`, so CLI and app-server
-/// processes do not block session management.
-pub(crate) fn ensure_desktop_not_running(codex: &Path) -> AppResult<()> {
-    let state_path = paths::codex_global_state_json_path(codex);
-    match fs::symlink_metadata(&state_path) {
-        Ok(metadata) => {
-            validate_state_file_metadata(&state_path, &metadata)?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    }
-    desktop_guard::ensure_official_desktop_not_running()
-}
-
 /// Whether this Codex home has Desktop-owned state that would be mutated by these workflows.
 pub(crate) fn desktop_state_initialized(codex: &Path) -> AppResult<bool> {
     let state_path = paths::codex_global_state_json_path(codex);
@@ -282,6 +264,9 @@ fn validate_project_assignment_records(
     }
     for (thread_id, _) in records {
         validate_thread_id(thread_id)?;
+    }
+    if should_defer_desktop_state_mutation() {
+        return Ok(());
     }
     let Some(mut snapshot) = load_state(codex)? else {
         return Ok(());
@@ -1048,16 +1033,14 @@ mod tests {
     }
 
     #[test]
-    fn running_desktop_rejects_state_mutation_without_changing_bytes() -> AppResult<()> {
+    fn running_desktop_defers_state_mutation_without_changing_bytes() -> AppResult<()> {
         let codex = TestDir::new("desktop-running")?;
         codex.write_state(&json!({"future-field": {"keep": true}}))?;
         let before = fs::read(codex.state_path())?;
         let _desktop = DesktopTestProbeGuard::running();
 
-        let error = sync_thread_project_assignment(&codex.0, "thread-1", r"F:\work")
-            .expect_err("running Desktop must own its global state");
-
-        assert!(error.to_string().contains("完全退出桌面应用"), "{error}");
+        let result = sync_thread_project_assignment(&codex.0, "thread-1", r"F:\work");
+        assert!(result.is_ok());
         assert_eq!(fs::read(codex.state_path())?, before);
         Ok(())
     }
@@ -1099,7 +1082,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_starting_before_commit_rejects_write() -> AppResult<()> {
+    fn desktop_starting_before_commit_defers_write() -> AppResult<()> {
         let codex = TestDir::new("desktop-start-before-commit")?;
         codex.write_state(&json!({}))?;
         let before = fs::read(codex.state_path())?;
@@ -1108,24 +1091,21 @@ mod tests {
             TestDesktopProbe::Running(true),
         ]);
 
-        let error = sync_thread_project_assignment(&codex.0, "thread-1", r"F:\work")
-            .expect_err("second guard must catch Desktop starting before CAS");
-
-        assert!(error.to_string().contains("完全退出桌面应用"), "{error}");
+        let result = sync_thread_project_assignment(&codex.0, "thread-1", r"F:\work");
+        assert!(result.is_ok());
         assert_eq!(fs::read(codex.state_path())?, before);
         Ok(())
     }
 
     #[test]
-    fn desktop_probe_error_fails_closed() -> AppResult<()> {
+    fn desktop_probe_error_defers_private_state() -> AppResult<()> {
         let codex = TestDir::new("desktop-probe-error")?;
         codex.write_state(&json!({}))?;
         let _desktop = DesktopTestProbeGuard::sequence([TestDesktopProbe::Error("probe failed")]);
 
-        let error = sync_thread_project_assignment(&codex.0, "thread-1", r"F:\work")
-            .expect_err("unknown Desktop state must reject writes");
-
-        assert!(error.to_string().contains("probe failed"), "{error}");
+        let result = sync_thread_project_assignment(&codex.0, "thread-1", r"F:\work");
+        assert!(result.is_ok());
+        assert_eq!(codex.read_state()?, json!({}));
         Ok(())
     }
 
@@ -1886,25 +1866,20 @@ mod tests {
     }
 
     #[test]
-    fn mutation_receipt_refuses_compensation_while_desktop_runs() -> AppResult<()> {
+    fn mutation_receipt_compensates_unchanged_bytes_while_desktop_runs() -> AppResult<()> {
         let codex = TestDir::new("project-state-receipt-running")?;
         codex.write_state(&json!({
             LOCAL_PROJECTS: {
                 "project": {"id": "project", "rootPaths": [r"F:\repo"]}
             }
         }))?;
+        let before = fs::read(codex.state_path())?;
         let receipt =
             sync_thread_project_assignment_with_receipt(&codex.0, "thread-1", r"F:\repo")?
                 .expect("assignment must mutate state");
-        let after = fs::read(codex.state_path())?;
         let _desktop = DesktopTestProbeGuard::running();
-
-        let error = receipt
-            .compensate()
-            .expect_err("compensation must not overwrite Desktop-owned state");
-
-        assert!(error.to_string().contains("完全退出桌面应用"), "{error}");
-        assert_eq!(fs::read(codex.state_path())?, after);
+        receipt.compensate()?;
+        assert_eq!(fs::read(codex.state_path())?, before);
         Ok(())
     }
 

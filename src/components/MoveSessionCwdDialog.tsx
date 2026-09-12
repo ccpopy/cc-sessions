@@ -83,7 +83,7 @@ export function MoveSessionCwdDialog({
               ? "移动主 transcript、同名 sidecar 与 companion 文件，并同步改写 JSONL cwd 和 history 项目路径。"
               : session?.provider === "opencode"
                 ? "在同一 SQLite 事务中更新会话及其子会话的项目标识、目录和兼容 path 字段。"
-                : "已添加到 Codex Desktop 的项目，推荐优先使用官方的移动功能。本功能主要用于 CLI 会话，或移动到尚未添加的新目录；操作前请完全退出 Codex Desktop。"}
+                : "更新会话和相关分支的工作目录。Codex App 打开时也可执行，操作后重启 App 刷新列表；项目归属会在可写时同步。"}
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-2">

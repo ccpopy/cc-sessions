@@ -394,6 +394,7 @@ export default function BackupDetailRoute({ provider = "codex" }: { provider?: S
             throw new Error("目标会话或 rollout 文件已存在。若确认要替换本地数据，请选择「覆盖」后重试。");
           } else if (r.ok) {
             toast.success("已还原");
+            if (r.desktop_restart_required) toast.info("重启 Codex App 后刷新列表；Desktop 项目归属未同步");
           } else {
             throw new Error(r.error ?? "还原未完整完成");
           }
@@ -446,6 +447,9 @@ export default function BackupDetailRoute({ provider = "codex" }: { provider?: S
             })),
             overwrite: overwrite === "overwrite",
           });
+          if (results.some((item) => item.ok && item.desktop_restart_required)) {
+            toast.info("重启 Codex App 后刷新列表；Desktop 项目归属未同步");
+          }
           const succeeded = results.filter((result) => result.ok).length;
           const conflicts = results.filter((result) => result.conflict).length;
           const failed = results.length - succeeded;

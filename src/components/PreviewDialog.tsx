@@ -673,6 +673,9 @@ export function PreviewDialog({
       toast.success(provider === "codex" ? "已创建回溯分支" : "已复制到所选消息", {
         description: `新会话 ${report.new_id.slice(0, 8)}，已复制 ${count}`,
       });
+      if ("desktop_restart_required" in report && report.desktop_restart_required) {
+        toast.info("操作已完成，重启 Codex App 后刷新会话列表");
+      }
       setForkTarget(null);
       onOpenChange(false);
       await onForked?.();
