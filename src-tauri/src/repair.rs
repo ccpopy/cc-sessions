@@ -3139,6 +3139,46 @@ pub(crate) fn thread_fields_match_usable_provider(
     provider == Some(expected) && is_desktop_visible_source(source) && !archived
 }
 
+/// 判断 candidate 是否为 recorded 同一会话的更新分页延续文件。
+///
+/// 两个路径都必须是官方命名的延续文件（rollout-<ts>-<thread_id>_<rollout_id>.jsonl），
+/// id 段完全相同且 candidate 时间戳更晚。此时 threads 与 family 指向不同延续文件
+/// 属于 Codex 的正常滚动，不构成 provider 状态漂移。
+fn rolls_forward_paginated_continuation(candidate: &Path, recorded: &Path) -> bool {
+    fn parse(path: &Path) -> Option<(&str, &str)> {
+        let name = path.file_name()?.to_str()?;
+        let stem = name.strip_suffix(".jsonl")?;
+        let rest = stem.strip_prefix("rollout-")?;
+        let timestamp = rest.get(..19)?;
+        if rest.get(19..20) != Some("-") {
+            return None;
+        }
+        let ids = rest.get(20..)?;
+        if !ids.contains('_') {
+            return None;
+        }
+        Some((ids, timestamp))
+    };
+    let (candidate_ids, candidate_ts) = match parse(candidate) {
+        Some(parts) => parts,
+        None => return false,
+    };
+    let (recorded_ids, recorded_ts) = match parse(recorded) {
+        Some(parts) => parts,
+        None => return false,
+    };
+    if candidate_ids != recorded_ids {
+        return false;
+    }
+    match (
+        chrono::NaiveDateTime::parse_from_str(candidate_ts, "%Y-%m-%dT-%H-%M-%S"),
+        chrono::NaiveDateTime::parse_from_str(recorded_ts, "%Y-%m-%dT-%H-%M-%S"),
+    ) {
+        (Ok(candidate_time), Ok(recorded_time)) => candidate_time > recorded_time,
+        _ => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rollout_record_is_usable_provider(
     codex: &Path,
@@ -3167,7 +3207,17 @@ pub(crate) fn rollout_record_is_usable_provider(
     let recorded_path = PathBuf::from(paths::strip_verbatim(
         &paths::host_path_string_from_codex_record(codex, recorded_rollout_path),
     ));
-    if !recorded_path.is_file() || recorded_path.canonicalize()? != rollout.canonicalize()? {
+    if !recorded_path.is_file() {
+        return Ok(false);
+    }
+    let recorded_canonical = recorded_path.canonicalize()?;
+    let rollout_canonical = rollout.canonicalize()?;
+    if recorded_canonical != rollout_canonical
+        // Codex 分页会话在 App 内继续对话时会不断生成新的延续文件，threads 表会
+        // 滚动指向最新延续文件，而 family store 仍停留在 CC Sessions 上次操作时的
+        // 路径。这类同 id 的新延续文件不代表 provider 状态漂移，不应计入待同步。
+        && !rolls_forward_paginated_continuation(&rollout_canonical, &recorded_canonical)
+    {
         return Ok(false);
     }
     let Some(identity) = read_rollout_identity(rollout)? else {
@@ -9828,6 +9878,49 @@ mod tests {
             }
             drop(state);
             fs::remove_dir_all(codex).ok();
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn provider_sync_plan_ignores_newer_paginated_continuation_drift() -> AppResult<()> {
+        for registered in [false, true] {
+            let codex = temp_codex_dir("cc-session-manager-paginated-drift-false-positive");
+            let id = "019ff1a2-b3c4-7d5e-8f60-112233445566";
+            let registered_cont = prepare_paginated_provider_switch_fixture(&codex, id)?;
+            let dir = registered_cont.parent().unwrap().to_path_buf();
+            let current = dir.join(format!(
+                "rollout-2026-09-11T14-01-00-{id}_019ff1a2-b3c4-7d5e-8f60-667788990012.jsonl"
+            ));
+            fs::copy(&registered_cont, &current)?;
+            let state = state_db::open(&codex)?;
+            sync_thread_from_rollout(&codex, &state, &current)?;
+            drop(state);
+            if registered {
+                let mut store = family::load(&codex)?;
+                let rel = registered_cont
+                    .strip_prefix(&codex)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                family::ensure_family_for(&mut store, id, "custom", &rel, "source");
+                family::save(&codex, &store)?;
+            }
+
+            let rollouts = [registered_cont.clone(), current.clone()]
+                .into_iter()
+                .map(|path| {
+                    Ok((
+                        path.clone(),
+                        read_rollout_identity(&path)?.expect("rollout identity"),
+                    ))
+                })
+                .collect::<AppResult<Vec<_>>>()?;
+            assert!(
+                list_mismatched_sessions_from_rollouts(&codex, "custom", rollouts)?.is_empty(),
+                "threads 指向更新延续文件而 family 停留在旧文件时不构成状态漂移 (registered={registered})"
+            );
+            fs::remove_dir_all(&codex).ok();
         }
         Ok(())
     }
