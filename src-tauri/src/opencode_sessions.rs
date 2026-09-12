@@ -527,7 +527,7 @@ fn message_tokens(value: &Value) -> i64 {
         .max(0)
 }
 
-fn encode_locator(db: &Path, session_id: &str) -> AppResult<String> {
+pub(crate) fn encode_locator(db: &Path, session_id: &str) -> AppResult<String> {
     let raw = serde_json::to_vec(&SessionLocator {
         db: db.to_string_lossy().into_owned(),
         session: session_id.to_string(),

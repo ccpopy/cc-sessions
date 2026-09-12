@@ -540,6 +540,13 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
                 &state.family_lock,
             ))
         }
+        "copy_opencode_session" => to_result_value(crate::opencode_fork::copy_session_with_lock(
+            string_arg(&args, "opencodeDir")?,
+            string_arg(&args, "sessionId")?,
+            string_arg(&args, "rolloutPath")?,
+            opt_arg::<crate::models::OpenCodeForkPoint>(&args, "cutoff")?,
+            &state.family_lock,
+        )),
         "get_provider_sync_plan" => to_result_value(repair::get_provider_sync_plan_with_lock(
             string_arg(&args, "codexDir")?,
             &state.family_lock,

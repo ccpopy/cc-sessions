@@ -405,19 +405,24 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
           session_id: s.id,
           rollout_path: s.rollout_path,
         };
-        const report = s.provider === "claude"
-          ? await api.duplicateClaudeSession({ ...target, claude_dir: settings.claude_dir })
-          : await api.duplicateSession({ ...target, codex_dir: settings.codex_dir });
-        toast.success(s.provider === "claude" ? "已复制会话" : "已完整 Fork 会话", {
-          description: `新会话 ${report.new_id.slice(0, 8)}，共 ${report.total_lines} 行`,
+        const report = s.provider === "opencode"
+          ? await api.copyOpenCodeSession({ ...target, opencode_dir: settings.opencode_dir })
+          : s.provider === "claude"
+            ? await api.duplicateClaudeSession({ ...target, claude_dir: settings.claude_dir })
+            : await api.duplicateSession({ ...target, codex_dir: settings.codex_dir });
+        const count = "message_count" in report
+          ? `${report.message_count} 条消息、${report.part_count} 个内容块`
+          : `${report.total_lines} 行`;
+        toast.success(s.provider === "codex" ? "已完整 Fork 会话" : "已复制会话", {
+          description: `新会话 ${report.new_id.slice(0, 8)}，共 ${count}`,
         });
-        if (report.desktop_restart_required) {
+        if ("desktop_restart_required" in report && report.desktop_restart_required) {
           toast.warning("Fork 已完成，重启 Codex App 后刷新会话列表");
         }
         await refresh();
         await refreshOverlay();
       } catch (e: any) {
-        toast.error(s.provider === "claude" ? "复制会话失败" : "Fork 会话失败", {
+        toast.error(s.provider === "codex" ? "Fork 会话失败" : "复制会话失败", {
           description: String(e?.message ?? e),
         });
       } finally {
@@ -871,7 +876,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             onBackup={onBackup}
             onDelete={onDelete}
             onClone={isCodex ? onCloneOne : undefined}
-            onDuplicate={isCodex || provider === "claude" ? setDuplicateTarget : undefined}
+            onDuplicate={isCodex || provider === "claude" || provider === "opencode" ? setDuplicateTarget : undefined}
             onOpenFamily={isCodex ? onOpenFamily : undefined}
             onExportMarkdown={setExportTarget}
             onConvert={isOpenCode ? undefined : setConvertTarget}

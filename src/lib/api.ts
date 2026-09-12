@@ -730,6 +730,20 @@ export type DuplicateSessionReport = {
 
 export type SwitchStrategy = "continuous" | "scatter" | "follow";
 
+export type OpenCodeForkPoint = {
+  event_index: number;
+  message_id: string;
+  part_id: string;
+};
+
+export type OpenCodeCopyReport = {
+  source_id: string;
+  new_id: string;
+  new_rollout_path: string;
+  message_count: number;
+  part_count: number;
+};
+
 // ========================= 家族树 =========================
 
 export type BranchStatus = "active" | "archived" | "deleted";
@@ -1422,6 +1436,17 @@ export const api = {
       eventIndex: p.event_index,
       messageUuid: p.message_uuid,
     }),
+  copyOpenCodeSession: (p: {
+    opencode_dir: string;
+    session_id: string;
+    rollout_path: string;
+    cutoff?: OpenCodeForkPoint;
+  }) => invokeCommand<OpenCodeCopyReport>("copy_opencode_session", {
+    opencodeDir: p.opencode_dir,
+    sessionId: p.session_id,
+    rolloutPath: p.rollout_path,
+    cutoff: p.cutoff ?? null,
+  }),
   duplicateClaudeSession: (p: {
     claude_dir: string;
     session_id: string;

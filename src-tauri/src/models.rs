@@ -659,6 +659,23 @@ pub enum SwitchStrategy {
     Follow,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenCodeForkPoint {
+    pub event_index: usize,
+    pub message_id: String,
+    pub part_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenCodeCopyReport {
+    pub source_id: String,
+    pub new_id: String,
+    pub new_rollout_path: String,
+    pub message_count: u64,
+    pub part_count: u64,
+}
+
 // ========================= 家族树 =========================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

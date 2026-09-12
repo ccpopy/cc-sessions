@@ -351,7 +351,7 @@ export const SessionCard = memo(function SessionCard({
                   ) : (
                     <GitBranch className="h-3.5 w-3.5" />
                   )}
-                  {s.provider === "claude"
+                  {s.provider === "claude" || s.provider === "opencode"
                     ? (duplicating ? "复制中…" : "复制会话")
                     : (duplicating ? "Fork 中…" : "完整 Fork")}
                 </Button>

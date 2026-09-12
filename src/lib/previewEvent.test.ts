@@ -9,6 +9,7 @@ import {
   extractPreviewEventText,
   isConversationMessage,
   isStableForkNode,
+  openCodeForkPoint,
   parseDiffCommentPrompt,
 } from "./previewEvent.ts";
 
@@ -51,6 +52,23 @@ test("Claude tool and signed-thinking messages remain valid inclusive SDK copy b
       { type: "tool_result", tool_use_id: "tool-1", content: "result" },
     ] },
   }, "tool_result"), "claude"), true);
+});
+
+test("OpenCode boundaries retain both message and part identity for whole-message copies", () => {
+  for (const part_type of ["text", "reasoning", "tool"]) {
+    const raw = { message: { role: "assistant" }, opencode: { message_id: "msg_first", part_id: "prt_first", part_type } };
+    const node = event(raw, "assistant");
+    assert.equal(isStableForkNode(node, "opencode"), true);
+    assert.deepEqual(openCodeForkPoint(node), { event_index: 1, message_id: "msg_first", part_id: "prt_first" });
+    for (const broken of [
+      { ...raw, message: undefined },
+      { ...raw, opencode: { ...raw.opencode, message_id: "" } },
+      { ...raw, opencode: { ...raw.opencode, part_id: undefined } },
+      { ...raw, opencode: { ...raw.opencode, part_type: "step-finish" } },
+    ]) assert.equal(isStableForkNode(event(broken), "opencode"), false);
+    assert.equal(openCodeForkPoint({ ...node, index: -1 }), null);
+  }
+  assert.equal(isStableForkNode(event(null), "opencode"), false);
 });
 
 test("Codex retains its existing message and event fork boundaries", () => {

@@ -31,19 +31,25 @@ export function ForkRecommendationDialog({
     ? sessionDisplayTitle(session.title, session.first_user_message)
     : "当前会话";
 
-  if (session?.provider === "claude") {
+  if (session?.provider === "claude" || session?.provider === "opencode") {
     return (
       <AlertDialog open={open} onOpenChange={(value) => !running && onOpenChange(value)}>
         <AlertDialogContent className="sm:max-w-[520px]">
           <AlertDialogHeader>
             <AlertDialogTitle>复制会话</AlertDialogTitle>
             <AlertDialogDescription>
-              在同一项目下创建独立的 Claude 会话副本，保留全部主对话记录。原会话保持原样，副本不包含文件撤销历史。
+              {session.provider === "opencode"
+                ? "在同一项目下创建独立的 OpenCode 会话副本，保留全部消息及其内容块。原会话保持原样，副本不继承待办、分享、撤销或子会话状态。"
+                : "在同一项目下创建独立的 Claude 会话副本，保留全部主对话记录。原会话保持原样，副本不包含文件撤销历史。"}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <div className="rounded-md border bg-muted/40 px-3 py-2 text-sm wrap-anywhere">
             {title}
-            <p className="mt-1 text-xs text-muted-foreground">副本名称将添加「(fork)」，可从会话列表继续对话。</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {session.provider === "opencode"
+                ? "副本名称将添加「(fork #1)」，再次复制副本会递增编号，可从会话列表继续对话。"
+                : "副本名称将添加「(fork)」，可从会话列表继续对话。"}
+            </p>
           </div>
           <AlertDialogFooter>
             <AlertDialogCancel disabled={running}>取消</AlertDialogCancel>

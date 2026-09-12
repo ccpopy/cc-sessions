@@ -30,6 +30,7 @@ pub mod markdown_export;
 pub mod models;
 pub(crate) mod mutation_journal;
 pub mod opencode_edit;
+pub mod opencode_fork;
 pub mod opencode_sessions;
 pub mod opencode_transfer;
 pub mod path_safety;
@@ -150,6 +151,7 @@ pub fn run() {
             commands::duplicate_session,
             commands::fork_claude_session_at_event,
             commands::duplicate_claude_session,
+            commands::copy_opencode_session,
             commands::get_provider_sync_plan,
             commands::batch_clone_for_current_provider,
             commands::start_provider_sync,

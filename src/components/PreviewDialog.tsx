@@ -84,6 +84,7 @@ import {
   isConversationMessage,
   isEventMessage,
   isStableForkNode,
+  openCodeForkPoint,
   parseDiffCommentPrompt,
   payloadType,
   previewEventSearchText,
@@ -187,11 +188,13 @@ export function PreviewDialog({
   const preferenceSaveRef = useRef<Promise<void>>(Promise.resolve());
   const appSettings = useSettings((state) => state.settings);
   const claudeDir = appSettings?.claude_dir;
+  const opencodeDir = appSettings?.opencode_dir;
   const canForkSession = !customRolloutPath && !!session && (
     (provider === "codex" && !!codexDir)
     || (provider === "claude" && !!claudeDir && !isSubagentSession(session))
+    || (provider === "opencode" && !!opencodeDir)
   );
-  const forkLabel = provider === "claude" ? "复制到此处" : "回溯";
+  const forkLabel = provider === "codex" ? "回溯" : "复制到此处";
   // 备份/导入预览（customRolloutPath）不允许编辑，只能编辑真实会话文件
   const canMutateSession =
     !customRolloutPath && !!session && !!backupDir && !!rolloutPath;
@@ -653,21 +656,28 @@ export function PreviewDialog({
         rollout_path: rolloutPath,
         event_index: forkTarget.index,
       };
-      const report = provider === "claude"
-        ? await api.forkClaudeSessionAtEvent({
-            ...target,
-            claude_dir: claudeDir!,
-            message_uuid: (forkTarget.raw as { uuid: string }).uuid,
-          })
-        : await api.forkSessionAtEvent({ ...target, codex_dir: codexDir! });
-      toast.success(provider === "claude" ? "已复制到所选消息" : "已创建回溯分支", {
-        description: `新会话 ${report.new_id.slice(0, 8)}，已复制 ${report.included_lines} 行`,
+      const opencodeCutoff = provider === "opencode" ? openCodeForkPoint(forkTarget) : null;
+      if (provider === "opencode" && !opencodeCutoff) throw new Error("所选消息不支持复制，请刷新预览后重试");
+      const report = provider === "opencode"
+        ? await api.copyOpenCodeSession({ ...target, opencode_dir: opencodeDir!, cutoff: opencodeCutoff! })
+        : provider === "claude"
+          ? await api.forkClaudeSessionAtEvent({
+              ...target,
+              claude_dir: claudeDir!,
+              message_uuid: (forkTarget.raw as { uuid: string }).uuid,
+            })
+          : await api.forkSessionAtEvent({ ...target, codex_dir: codexDir! });
+      const count = "message_count" in report
+        ? `${report.message_count} 条消息、${report.part_count} 个内容块`
+        : `${report.included_lines} 行`;
+      toast.success(provider === "codex" ? "已创建回溯分支" : "已复制到所选消息", {
+        description: `新会话 ${report.new_id.slice(0, 8)}，已复制 ${count}`,
       });
       setForkTarget(null);
       onOpenChange(false);
       await onForked?.();
     } catch (e: any) {
-      toast.error(provider === "claude" ? "复制会话失败" : "创建回溯分支失败", {
+      toast.error(provider === "codex" ? "创建回溯分支失败" : "复制会话失败", {
         description: String(e?.message ?? e),
       });
     } finally {

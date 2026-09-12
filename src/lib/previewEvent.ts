@@ -1,4 +1,4 @@
-import type { PreviewEvent } from "./api.ts";
+import type { OpenCodeForkPoint, PreviewEvent } from "./api.ts";
 import {
   isAssistantTextToolUseEvent,
   isOpenCodeConversationEvent,
@@ -191,7 +191,22 @@ export function isEventMessage(event: PreviewEvent): boolean {
   return payload === "user_message" || payload === "agent_message";
 }
 
+export function openCodeForkPoint(event: PreviewEvent): OpenCodeForkPoint | null {
+  const raw = event.raw as {
+    message?: { role?: unknown };
+    opencode?: { message_id?: unknown; part_id?: unknown; part_type?: unknown };
+  } | null;
+  const source = raw?.opencode;
+  if (!Number.isSafeInteger(event.index) || event.index < 0
+    || (raw?.message?.role !== "user" && raw?.message?.role !== "assistant")
+    || typeof source?.message_id !== "string" || !source.message_id
+    || typeof source.part_id !== "string" || !source.part_id
+    || !["text", "reasoning", "tool"].includes(String(source.part_type))) return null;
+  return { event_index: event.index, message_id: source.message_id, part_id: source.part_id };
+}
+
 export function isStableForkNode(event: PreviewEvent, provider = "codex"): boolean {
+  if (provider === "opencode") return openCodeForkPoint(event) !== null;
   if (provider === "claude") {
     const raw = event.raw as {
       type?: unknown;

@@ -1,0 +1,32 @@
+[
+  {
+    "id": "msg_z9-before", "data": {"role":"user","time":{"created":1000},"agent":"build","model":{"providerID":"fixture","modelID":"fixture-model"}},
+    "parts": [
+      {"id":"prt_a10","created":9000,"data":{"type":"text","text":"Explain the copy boundary."}}
+    ]
+  },
+  {
+    "id": "msg_z1-before-wrap", "data": {"role":"assistant","parentID":"msg_z9-before","time":{"created":2000,"completed":2005},"modelID":"fixture-model","providerID":"fixture","mode":"build","agent":"build","path":{"cwd":"/fixture","root":"/fixture"},"cost":0.25,"tokens":{"input":10,"output":20,"reasoning":3,"cache":{"read":4,"write":5}},"finish":"tool-calls"},
+    "parts": [
+      {"id":"prt_z20","created":2001,"data":{"type":"text","text":"The tool output belongs to this message."}},
+      {"id":"prt_a20","created":2002,"data":{"type":"reasoning","text":"Inspect the stored message.","time":{"start":2000,"end":2001},"metadata":{"signature":"opaque-signature","original":"msg_z9-before"}}},
+      {"id":"prt_b20","created":2003,"data":{"type":"tool","callID":"call-unchanged","tool":"read","state":{"status":"completed","input":{"file":"fixture.txt"},"output":"synthetic result","title":"Read fixture","metadata":{"opaque":[1,"msg_z9-before"]},"time":{"start":2001,"end":2002}}}},
+      {"id":"prt_c20","created":2004,"data":{"type":"step-finish","reason":"tool-calls","cost":0.25,"tokens":{"input":10,"output":20,"reasoning":3,"cache":{"read":4,"write":5}}}}
+    ]
+  },
+  {
+    "id": "msg_a0-after-wrap", "data": {"role":"user","time":{"created":3000},"agent":"build","model":{"providerID":"fixture","modelID":"fixture-model"}},
+    "parts": [
+      {"id":"prt_a30","created":3001,"data":{"type":"compaction","auto":true,"tail_start_id":"msg_z9-before"}},
+      {"id":"prt_b30","created":3002,"data":{"type":"text","text":"Continue after compaction."}},
+      {"id":"prt_c30","created":3003,"data":{"type":"file","mime":"image/png","filename":"pixel.png","url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII="}}
+    ]
+  },
+  {
+    "id": "msg_a1-after", "data": {"role":"assistant","parentID":"msg_a0-after-wrap","time":{"created":4000,"completed":4005},"modelID":"fixture-model","providerID":"fixture","mode":"build","agent":"build","path":{"cwd":"/fixture","root":"/fixture"},"cost":0.5,"tokens":{"input":30,"output":40,"reasoning":6,"cache":{"read":7,"write":8}},"finish":"stop"},
+    "parts": [
+      {"id":"prt_a40","created":4001,"data":{"type":"text","text":"Final answer after the boundary."}},
+      {"id":"prt_b40","created":4002,"data":{"type":"step-finish","reason":"stop","cost":0.5,"tokens":{"input":30,"output":40,"reasoning":6,"cache":{"read":7,"write":8}}}}
+    ]
+  }
+]

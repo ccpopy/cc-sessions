@@ -712,6 +712,27 @@ pub async fn duplicate_claude_session(
 }
 
 #[tauri::command]
+pub async fn copy_opencode_session(
+    opencode_dir: String,
+    session_id: String,
+    rollout_path: String,
+    cutoff: Option<crate::models::OpenCodeForkPoint>,
+    lock: SharedLock<'_>,
+) -> AppResult<crate::models::OpenCodeCopyReport> {
+    let lock = lock.inner().clone();
+    run_blocking(move || {
+        crate::opencode_fork::copy_session_with_lock(
+            opencode_dir,
+            session_id,
+            rollout_path,
+            cutoff,
+            &lock,
+        )
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn convert_session_provider(
     codex_dir: String,
     claude_dir: Option<String>,
