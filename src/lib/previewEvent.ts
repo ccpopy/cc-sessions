@@ -191,7 +191,21 @@ export function isEventMessage(event: PreviewEvent): boolean {
   return payload === "user_message" || payload === "agent_message";
 }
 
-export function isStableForkNode(event: PreviewEvent): boolean {
+export function isStableForkNode(event: PreviewEvent, provider = "codex"): boolean {
+  if (provider === "claude") {
+    const raw = event.raw as {
+      type?: unknown;
+      uuid?: unknown;
+      isMeta?: unknown;
+      isSidechain?: unknown;
+      message?: { role?: unknown };
+    } | null;
+    return (raw?.type === "user" || raw?.type === "assistant")
+      && typeof raw.uuid === "string" && raw.uuid.length > 0
+      && (raw.message?.role === "user" || raw.message?.role === "assistant")
+      && raw.isMeta !== true && raw.isSidechain !== true;
+  }
+  if (provider !== "codex") return false;
   return isConversationMessage(event) || isEventMessage(event);
 }
 

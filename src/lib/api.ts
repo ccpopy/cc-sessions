@@ -1408,6 +1408,30 @@ export const api = {
       sessionId: p.session_id,
       rolloutPath: p.rollout_path,
     }),
+  forkClaudeSessionAtEvent: (p: {
+    claude_dir: string;
+    session_id: string;
+    rollout_path: string;
+    event_index: number;
+    message_uuid: string;
+  }) =>
+    invokeCommand<ForkSessionReport>("fork_claude_session_at_event", {
+      claudeDir: p.claude_dir,
+      sessionId: p.session_id,
+      rolloutPath: p.rollout_path,
+      eventIndex: p.event_index,
+      messageUuid: p.message_uuid,
+    }),
+  duplicateClaudeSession: (p: {
+    claude_dir: string;
+    session_id: string;
+    rollout_path: string;
+  }) =>
+    invokeCommand<DuplicateSessionReport>("duplicate_claude_session", {
+      claudeDir: p.claude_dir,
+      sessionId: p.session_id,
+      rolloutPath: p.rollout_path,
+    }),
   planSessionEventDeletion: (provider: string, rolloutPath: string, lineNos: number[]) =>
     invokeCommand<DeletePlan>("plan_session_event_deletion", {
       provider,

@@ -277,7 +277,7 @@ pub fn validate_main_transcript(
         || source_path.file_name().and_then(|value| value.to_str()) != Some(expected_name.as_str())
     {
         return Err(AppError::Other(
-            "移动项目目录只支持 Claude 主会话；子代理会随主会话 sidecar 一起移动".into(),
+            "此操作只支持 projects 下的 Claude 主会话文件，不支持子代理或其他路径".into(),
         ));
     }
     Ok(())
@@ -585,7 +585,7 @@ fn is_agent_session(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn is_generated_user_prompt(text: &str) -> bool {
+pub(crate) fn is_generated_user_prompt(text: &str) -> bool {
     let trimmed = text.trim_start();
     trimmed.starts_with("Caveat:")
         || trimmed.starts_with('/')
@@ -787,7 +787,7 @@ fn extract_thinking_text(content: Option<&Value>) -> String {
     }
 }
 
-fn extract_text(value: &Value) -> String {
+pub(crate) fn extract_text(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
         Value::Array(items) => items

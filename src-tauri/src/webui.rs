@@ -522,6 +522,24 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "rolloutPath")?,
             &state.family_lock,
         )),
+        "fork_claude_session_at_event" => {
+            to_result_value(crate::claude_fork::fork_session_at_event_with_lock(
+                string_arg(&args, "claudeDir")?,
+                string_arg(&args, "sessionId")?,
+                string_arg(&args, "rolloutPath")?,
+                usize_arg(&args, "eventIndex")?,
+                string_arg(&args, "messageUuid")?,
+                &state.family_lock,
+            ))
+        }
+        "duplicate_claude_session" => {
+            to_result_value(crate::claude_fork::duplicate_session_with_lock(
+                string_arg(&args, "claudeDir")?,
+                string_arg(&args, "sessionId")?,
+                string_arg(&args, "rolloutPath")?,
+                &state.family_lock,
+            ))
+        }
         "get_provider_sync_plan" => to_result_value(repair::get_provider_sync_plan_with_lock(
             string_arg(&args, "codexDir")?,
             &state.family_lock,

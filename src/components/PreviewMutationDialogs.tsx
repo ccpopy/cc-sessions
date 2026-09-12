@@ -57,9 +57,11 @@ export function PreviewMutationDialogs({
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>从此处创建回溯分支</AlertDialogTitle>
+            <AlertDialogTitle>{provider === "claude" ? "复制到此处" : "从此处创建回溯分支"}</AlertDialogTitle>
             <AlertDialogDescription>
-              系统会只复制当前节点之前的有效会话历史，生成一个新的 active 会话分支；原会话会归档到分支历史中，不会被删除。
+              {provider === "claude"
+                ? "复制从会话开头到所选消息的主对话记录（包含这条消息），在同一项目下创建独立副本。原会话保持原样，副本不包含文件撤销历史。"
+                : "系统会只复制当前节点之前的有效会话历史，生成一个新的 active 会话分支；原会话会归档到分支历史中，不会被删除。"}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <div className="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
@@ -77,7 +79,7 @@ export function PreviewMutationDialogs({
                 fork.onConfirm();
               }}
             >
-              创建分支
+              {fork.running ? "创建中…" : provider === "claude" ? "复制到此处" : "创建分支"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

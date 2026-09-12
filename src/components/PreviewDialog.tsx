@@ -63,6 +63,7 @@ import { PromptTimeline } from "@/components/PromptTimeline";
 import { PreviewToolbarActions } from "@/components/PreviewToolbarActions";
 import {
   collectRelatedSubagents,
+  isSubagentSession,
   type RelatedSubagentSession,
 } from "@/lib/sessionSource";
 import { parseEmbeddedTranscriptPrompt, type EmbeddedTranscriptPrompt } from "@/lib/sessionText";
@@ -116,6 +117,7 @@ export type PreviewJump = {
 
 type ForkAction = {
   enabled: boolean;
+  label: string;
   pending: boolean;
   onSelect: (event: PreviewEvent) => void;
 };
@@ -184,7 +186,12 @@ export function PreviewDialog({
   const scrollSpyRafRef = useRef(0);
   const preferenceSaveRef = useRef<Promise<void>>(Promise.resolve());
   const appSettings = useSettings((state) => state.settings);
-  const canForkSession = provider === "codex" && !customRolloutPath && !!session && !!codexDir;
+  const claudeDir = appSettings?.claude_dir;
+  const canForkSession = !customRolloutPath && !!session && (
+    (provider === "codex" && !!codexDir)
+    || (provider === "claude" && !!claudeDir && !isSubagentSession(session))
+  );
+  const forkLabel = provider === "claude" ? "复制到此处" : "回溯";
   // 备份/导入预览（customRolloutPath）不允许编辑，只能编辑真实会话文件
   const canMutateSession =
     !customRolloutPath && !!session && !!backupDir && !!rolloutPath;
@@ -633,28 +640,34 @@ export function PreviewDialog({
   };
 
   const requestForkAt = (event: PreviewEvent) => {
-    if (!canForkSession) return;
+    if (!canForkSession || forking || !isStableForkNode(event, provider)) return;
     setForkTarget(event);
   };
 
   const confirmForkAt = async () => {
-    if (!session || !codexDir || !rolloutPath || !forkTarget) return;
+    if (!canForkSession || !session || !rolloutPath || !forkTarget || forking) return;
     setForking(true);
     try {
-      const report = await api.forkSessionAtEvent({
-        codex_dir: codexDir,
+      const target = {
         session_id: session.id,
         rollout_path: rolloutPath,
         event_index: forkTarget.index,
-      });
-      toast.success("已创建回溯分支", {
+      };
+      const report = provider === "claude"
+        ? await api.forkClaudeSessionAtEvent({
+            ...target,
+            claude_dir: claudeDir!,
+            message_uuid: (forkTarget.raw as { uuid: string }).uuid,
+          })
+        : await api.forkSessionAtEvent({ ...target, codex_dir: codexDir! });
+      toast.success(provider === "claude" ? "已复制到所选消息" : "已创建回溯分支", {
         description: `新会话 ${report.new_id.slice(0, 8)}，已复制 ${report.included_lines} 行`,
       });
       setForkTarget(null);
       onOpenChange(false);
       await onForked?.();
     } catch (e: any) {
-      toast.error("创建回溯分支失败", {
+      toast.error(provider === "claude" ? "复制会话失败" : "创建回溯分支失败", {
         description: String(e?.message ?? e),
       });
     } finally {
@@ -1148,7 +1161,8 @@ export function PreviewDialog({
                           e={event}
                           actions={{
                             fork: {
-                              enabled: canForkSession && isStableForkNode(event),
+                              enabled: canForkSession && isStableForkNode(event, provider),
+                              label: forkLabel,
                               pending: forking,
                               onSelect: requestForkAt,
                             },
@@ -1197,7 +1211,8 @@ export function PreviewDialog({
                       e={row.event}
                       actions={{
                         fork: {
-                          enabled: canForkSession && isStableForkNode(row.event),
+                          enabled: canForkSession && isStableForkNode(row.event, provider),
+                          label: forkLabel,
                           pending: forking,
                           onSelect: requestForkAt,
                         },
@@ -1849,7 +1864,7 @@ function NodeActionButtons({ event, actions }: { event: PreviewEvent; actions: N
           }}
         >
           <GitBranch className="h-3 w-3" />
-          回溯
+          {actions.fork.label}
         </Button>
       )}
       {showEdit && (

@@ -8,6 +8,7 @@ import {
   editableText,
   extractPreviewEventText,
   isConversationMessage,
+  isStableForkNode,
   parseDiffCommentPrompt,
 } from "./previewEvent.ts";
 
@@ -21,6 +22,42 @@ function event(raw: unknown, role: PreviewEvent["role"] = "user"): PreviewEvent 
     raw,
   };
 }
+
+test("Claude copy boundaries require an identified main-chain message", () => {
+  const raw = { type: "user", uuid: "message-uuid", message: { role: "user", content: "hello" } };
+  assert.equal(isStableForkNode(event(raw), "claude"), true);
+  assert.equal(isStableForkNode(event({ ...raw, isMeta: true }), "claude"), false);
+  assert.equal(isStableForkNode(event({ ...raw, isSidechain: true }), "claude"), false);
+  assert.equal(isStableForkNode(event({ ...raw, uuid: undefined }), "claude"), false);
+  assert.equal(isStableForkNode(event({ ...raw, uuid: "" }), "claude"), false);
+  assert.equal(isStableForkNode(event({ ...raw, type: "progress" }), "claude"), false);
+  assert.equal(isStableForkNode(event({ ...raw, type: "custom-title" }), "claude"), false);
+  assert.equal(isStableForkNode(event(null), "claude"), false);
+  assert.equal(isStableForkNode(event(raw), "opencode"), false);
+});
+
+test("Claude tool and signed-thinking messages remain valid inclusive SDK copy boundaries", () => {
+  for (const content of [
+    [{ type: "tool_use", id: "tool-1", name: "Read", input: {} }],
+    [{ type: "text", text: "Inspecting" }, { type: "tool_use", id: "tool-1", name: "Read", input: {} }],
+    [{ type: "thinking", thinking: "reasoning", signature: "opaque" }],
+  ]) {
+    assert.equal(isStableForkNode(event({
+      type: "assistant", uuid: "assistant-uuid", message: { role: "assistant", content },
+    }, "tool_call"), "claude"), true);
+  }
+  assert.equal(isStableForkNode(event({
+    type: "user", uuid: "result-uuid", message: { role: "user", content: [
+      { type: "tool_result", tool_use_id: "tool-1", content: "result" },
+    ] },
+  }, "tool_result"), "claude"), true);
+});
+
+test("Codex retains its existing message and event fork boundaries", () => {
+  assert.equal(isStableForkNode(event({ type: "response_item", payload: { type: "message" } })), true);
+  assert.equal(isStableForkNode(event({ type: "event_msg", payload: { type: "user_message" } })), true);
+  assert.equal(isStableForkNode(event({ type: "response_item", payload: { type: "function_call" } }, "tool_call")), false);
+});
 
 test("extracts editable Codex text and exposes matching edit/delete capabilities", () => {
   const message = event({

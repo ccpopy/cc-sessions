@@ -675,6 +675,43 @@ pub async fn duplicate_session(
 }
 
 #[tauri::command]
+pub async fn fork_claude_session_at_event(
+    claude_dir: String,
+    session_id: String,
+    rollout_path: String,
+    event_index: usize,
+    message_uuid: String,
+    lock: SharedLock<'_>,
+) -> AppResult<ForkSessionReport> {
+    let lock = lock.inner().clone();
+    run_blocking(move || {
+        crate::claude_fork::fork_session_at_event_with_lock(
+            claude_dir,
+            session_id,
+            rollout_path,
+            event_index,
+            message_uuid,
+            &lock,
+        )
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn duplicate_claude_session(
+    claude_dir: String,
+    session_id: String,
+    rollout_path: String,
+    lock: SharedLock<'_>,
+) -> AppResult<DuplicateSessionReport> {
+    let lock = lock.inner().clone();
+    run_blocking(move || {
+        crate::claude_fork::duplicate_session_with_lock(claude_dir, session_id, rollout_path, &lock)
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn convert_session_provider(
     codex_dir: String,
     claude_dir: Option<String>,

@@ -401,12 +401,14 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
       if (!duplicateRegistry.current.tryBegin(s.id)) return;
       publishDuplicateState();
       try {
-        const report = await api.duplicateSession({
-          codex_dir: settings.codex_dir,
+        const target = {
           session_id: s.id,
           rollout_path: s.rollout_path,
-        });
-        toast.success("已完整 Fork 会话", {
+        };
+        const report = s.provider === "claude"
+          ? await api.duplicateClaudeSession({ ...target, claude_dir: settings.claude_dir })
+          : await api.duplicateSession({ ...target, codex_dir: settings.codex_dir });
+        toast.success(s.provider === "claude" ? "已复制会话" : "已完整 Fork 会话", {
           description: `新会话 ${report.new_id.slice(0, 8)}，共 ${report.total_lines} 行`,
         });
         if (report.desktop_restart_required) {
@@ -415,7 +417,9 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         await refresh();
         await refreshOverlay();
       } catch (e: any) {
-        toast.error("Fork 会话失败", { description: String(e?.message ?? e) });
+        toast.error(s.provider === "claude" ? "复制会话失败" : "Fork 会话失败", {
+          description: String(e?.message ?? e),
+        });
       } finally {
         duplicateRegistry.current.finish(s.id);
         publishDuplicateState();
@@ -867,7 +871,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             onBackup={onBackup}
             onDelete={onDelete}
             onClone={isCodex ? onCloneOne : undefined}
-            onDuplicate={isCodex ? setDuplicateTarget : undefined}
+            onDuplicate={isCodex || provider === "claude" ? setDuplicateTarget : undefined}
             onOpenFamily={isCodex ? onOpenFamily : undefined}
             onExportMarkdown={setExportTarget}
             onConvert={isOpenCode ? undefined : setConvertTarget}

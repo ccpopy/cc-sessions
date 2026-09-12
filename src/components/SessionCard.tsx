@@ -338,7 +338,7 @@ export const SessionCard = memo(function SessionCard({
                   重命名
                 </Button>
               )}
-              {onDuplicate && (
+              {onDuplicate && !(s.provider === "claude" && isSubagent) && (
                 <Button
                   variant="ghost"
                   size="sm"
@@ -351,7 +351,9 @@ export const SessionCard = memo(function SessionCard({
                   ) : (
                     <GitBranch className="h-3.5 w-3.5" />
                   )}
-                  {duplicating ? "Fork 中…" : "完整 Fork"}
+                  {s.provider === "claude"
+                    ? (duplicating ? "复制中…" : "复制会话")
+                    : (duplicating ? "Fork 中…" : "完整 Fork")}
                 </Button>
               )}
               {onBackup && (

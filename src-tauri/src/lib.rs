@@ -4,6 +4,7 @@ pub mod archive_ledger;
 pub mod atomic_file;
 pub mod backup;
 pub mod bundle;
+pub mod claude_fork;
 pub mod claude_memory;
 pub mod claude_sessions;
 pub mod claude_transfer;
@@ -147,6 +148,8 @@ pub fn run() {
             commands::convert_session_provider,
             commands::fork_session_at_event,
             commands::duplicate_session,
+            commands::fork_claude_session_at_event,
+            commands::duplicate_claude_session,
             commands::get_provider_sync_plan,
             commands::batch_clone_for_current_provider,
             commands::start_provider_sync,
