@@ -3109,24 +3109,29 @@ fn rollout_is_usable_provider_session(
     )
 }
 
-fn family_branch_is_usable_provider(
+fn usable_family_branch_rollout(
     codex: &Path,
     states: &BTreeMap<String, ThreadRepairState>,
     index_ids: &BTreeSet<String>,
     branch: &FamilyBranch,
     expected_provider: &str,
-) -> AppResult<bool> {
+) -> AppResult<Option<PathBuf>> {
     let relative = paths::checked_relative_path(&branch.rollout_relpath)?;
     if !relative.starts_with("sessions") {
-        return Ok(false);
+        return Ok(None);
     }
-    rollout_is_usable_provider_session(
+    let Some(state) = states.get(&branch.id) else {
+        return Ok(None);
+    };
+    usable_recorded_provider_rollout(
         codex,
-        states,
-        index_ids,
         &branch.id,
         expected_provider,
-        &codex.join(relative),
+        state.rollout_path.as_deref(),
+        state.model_provider.as_deref(),
+        state.source.as_deref(),
+        state.archived,
+        index_ids.contains(&branch.id),
     )
 }
 
@@ -3139,44 +3144,46 @@ pub(crate) fn thread_fields_match_usable_provider(
     provider == Some(expected) && is_desktop_visible_source(source) && !archived
 }
 
-/// 判断 candidate 是否为 recorded 同一会话的更新分页延续文件。
+/// 解析并核对 threads 当前指向的可用 provider 文件。
 ///
-/// 两个路径都必须是官方命名的延续文件（rollout-<ts>-<thread_id>_<rollout_id>.jsonl），
-/// id 段完全相同且 candidate 时间戳更晚。此时 threads 与 family 指向不同延续文件
-/// 属于 Codex 的正常滚动，不构成 provider 状态漂移。
-fn rolls_forward_paginated_continuation(candidate: &Path, recorded: &Path) -> bool {
-    fn parse(path: &Path) -> Option<(&str, &str)> {
-        let name = path.file_name()?.to_str()?;
-        let stem = name.strip_suffix(".jsonl")?;
-        let rest = stem.strip_prefix("rollout-")?;
-        let timestamp = rest.get(..19)?;
-        if rest.get(19..20) != Some("-") {
-            return None;
-        }
-        let ids = rest.get(20..)?;
-        if !ids.contains('_') {
-            return None;
-        }
-        Some((ids, timestamp))
+/// 分页续写后 family 的旧路径可能已过期；可用性由当前文件的身份和
+/// provider 决定，后续操作也应使用这个经过核对的路径。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn usable_recorded_provider_rollout(
+    codex: &Path,
+    id: &str,
+    expected_provider: &str,
+    recorded_rollout_path: Option<&str>,
+    recorded_provider: Option<&str>,
+    recorded_source: Option<&str>,
+    archived: bool,
+    indexed: bool,
+) -> AppResult<Option<PathBuf>> {
+    let Some(recorded) = recorded_rollout_path else {
+        return Ok(None);
     };
-    let (candidate_ids, candidate_ts) = match parse(candidate) {
-        Some(parts) => parts,
-        None => return false,
-    };
-    let (recorded_ids, recorded_ts) = match parse(recorded) {
-        Some(parts) => parts,
-        None => return false,
-    };
-    if candidate_ids != recorded_ids {
-        return false;
+    let rollout = paths::host_path_from_codex_record(codex, recorded);
+    let sessions = paths::sessions_dir(codex);
+    if !rollout.is_file()
+        || !sessions.is_dir()
+        || !rollout
+            .canonicalize()?
+            .starts_with(sessions.canonicalize()?)
+    {
+        return Ok(None);
     }
-    match (
-        chrono::NaiveDateTime::parse_from_str(candidate_ts, "%Y-%m-%dT-%H-%M-%S"),
-        chrono::NaiveDateTime::parse_from_str(recorded_ts, "%Y-%m-%dT-%H-%M-%S"),
-    ) {
-        (Ok(candidate_time), Ok(recorded_time)) => candidate_time > recorded_time,
-        _ => false,
-    }
+    Ok(rollout_record_is_usable_provider(
+        codex,
+        id,
+        expected_provider,
+        &rollout,
+        recorded_rollout_path,
+        recorded_provider,
+        recorded_source,
+        archived,
+        indexed,
+    )?
+    .then_some(rollout))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3207,17 +3214,7 @@ pub(crate) fn rollout_record_is_usable_provider(
     let recorded_path = PathBuf::from(paths::strip_verbatim(
         &paths::host_path_string_from_codex_record(codex, recorded_rollout_path),
     ));
-    if !recorded_path.is_file() {
-        return Ok(false);
-    }
-    let recorded_canonical = recorded_path.canonicalize()?;
-    let rollout_canonical = rollout.canonicalize()?;
-    if recorded_canonical != rollout_canonical
-        // Codex 分页会话在 App 内继续对话时会不断生成新的延续文件，threads 表会
-        // 滚动指向最新延续文件，而 family store 仍停留在 CC Sessions 上次操作时的
-        // 路径。这类同 id 的新延续文件不代表 provider 状态漂移，不应计入待同步。
-        && !rolls_forward_paginated_continuation(&rollout_canonical, &recorded_canonical)
-    {
+    if !recorded_path.is_file() || recorded_path.canonicalize()? != rollout.canonicalize()? {
         return Ok(false);
     }
     let Some(identity) = read_rollout_identity(rollout)? else {
@@ -4891,27 +4888,27 @@ fn clone_session_for_provider_locked_with_hint(
             let thread_states = read_thread_state_map(&codex)?;
             let index_ids = read_session_index_ids(&codex)?;
             for branch in &family.chain {
-                if branch.provider == provider
-                    && family_branch_is_usable_provider(
-                        &codex,
-                        &thread_states,
-                        &index_ids,
-                        branch,
-                        &provider,
-                    )?
-                {
-                    existing_usable_target = Some(branch);
+                if branch.provider != provider {
+                    continue;
+                }
+                if let Some(rollout) = usable_family_branch_rollout(
+                    &codex,
+                    &thread_states,
+                    &index_ids,
+                    branch,
+                    &provider,
+                )? {
+                    existing_usable_target = Some((branch, rollout));
                     break;
                 }
             }
         }
     }
-    if let Some(branch) = existing_usable_target {
+    if let Some((branch, target_rollout)) = existing_usable_target {
         report.new_id = Some(branch.id.clone());
         report.skipped_reason = Some("目标 provider 已有可用分支".into());
         report.ok = true;
         if !dry_run {
-            let target_rollout = codex.join(paths::checked_relative_path(&branch.rollout_relpath)?);
             let target_cwd =
                 crate::codex_rollout_cwd::read_effective_cwd(&target_rollout, &branch.id)?;
             let project_assignment = target_cwd
@@ -9887,8 +9884,12 @@ mod tests {
         for registered in [false, true] {
             let codex = temp_codex_dir("cc-session-manager-paginated-drift-false-positive");
             let id = "019ff1a2-b3c4-7d5e-8f60-112233445566";
-            let registered_cont = prepare_paginated_provider_switch_fixture(&codex, id)?;
-            let dir = registered_cont.parent().unwrap().to_path_buf();
+            let stub = prepare_paginated_provider_switch_fixture(&codex, id)?;
+            let dir = stub.parent().unwrap().to_path_buf();
+            let registered_cont = dir.join(format!(
+                "rollout-2026-09-09T10-42-10-{id}_019ff1a2-b3c4-7d5e-8f60-667788990011.jsonl"
+            ));
+            fs::copy(&stub, &registered_cont)?;
             let current = dir.join(format!(
                 "rollout-2026-09-11T14-01-00-{id}_019ff1a2-b3c4-7d5e-8f60-667788990012.jsonl"
             ));
@@ -9919,6 +9920,226 @@ mod tests {
             assert!(
                 list_mismatched_sessions_from_rollouts(&codex, "custom", rollouts)?.is_empty(),
                 "threads 指向更新延续文件而 family 停留在旧文件时不构成状态漂移 (registered={registered})"
+            );
+            fs::remove_dir_all(&codex).ok();
+        }
+        Ok(())
+    }
+
+    fn prepare_paginated_target_family(
+        codex: &Path,
+        source_id: &str,
+        target_id: &str,
+    ) -> AppResult<(PathBuf, PathBuf, PathBuf)> {
+        let source = prepare_paginated_provider_switch_fixture(codex, source_id)?;
+        let older = codex.join(format!(
+            "sessions/2026/09/09/rollout-2026-09-09T10-42-10-{target_id}_019ff1a2-b3c4-7d5e-8f60-667788990011.jsonl"
+        ));
+        let current = codex.join(format!(
+            "sessions/2026/09/11/rollout-2026-09-11T14-01-00-{target_id}_019ff1a2-b3c4-7d5e-8f60-667788990012.jsonl"
+        ));
+        let raw = fs::read_to_string(&source)?;
+        let mut lines = raw.lines();
+        let mut meta: Value = serde_json::from_str(lines.next().expect("session meta"))?;
+        meta["payload"]["id"] = Value::String(target_id.to_string());
+        meta["payload"]["model_provider"] = Value::String(DEFAULT_PROVIDER.to_string());
+        let mut target_lines = vec![serde_json::to_string(&meta)?];
+        target_lines.extend(lines.map(str::to_string));
+        for path in [&older, &current] {
+            fs::create_dir_all(path.parent().unwrap())?;
+            fs::write(path, format!("{}\n", target_lines.join("\n")))?;
+        }
+        let state = state_db::open(codex)?;
+        sync_thread_from_rollout(codex, &state, &current)?;
+        drop(state);
+        append_index_line(codex, target_id, "target", &current)?;
+        fs::write(
+            paths::config_toml_path(codex),
+            "model_provider = \"openai\"\n",
+        )?;
+        let relative = |path: &Path| {
+            path.strip_prefix(codex)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        };
+        save_two_branch_family(
+            codex,
+            source_id,
+            "custom",
+            &relative(&source),
+            target_id,
+            DEFAULT_PROVIDER,
+            &relative(&older),
+        )?;
+        Ok((source, older, current))
+    }
+
+    #[test]
+    fn paginated_existing_provider_branch_uses_current_rollout() -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-current-provider-branch");
+        let source_id = "019ff1a2-b3c4-7d5e-8f60-112233445500";
+        let target_id = "019ff1a2-b3c4-7d5e-8f60-112233445566";
+        let (source, older, current) =
+            prepare_paginated_target_family(&codex, source_id, target_id)?;
+        let family_before = fs::read(paths::family_store_path(&codex))?;
+        let index_before = fs::read(paths::session_index_path(&codex))?;
+        let current_before = fs::read(&current)?;
+        let mut forker = FakeProviderThreadForker::new(codex.clone());
+        let _desktop = crate::codex_projects::DesktopTestProbeGuard::running();
+
+        // A requested old file must still fail strict record validation. Family callers
+        // resolve the actual current file instead of weakening this invariant.
+        assert!(!rollout_record_is_usable_provider(
+            &codex,
+            target_id,
+            DEFAULT_PROVIDER,
+            &older,
+            Some(current.to_string_lossy().as_ref()),
+            Some(DEFAULT_PROVIDER),
+            Some(DEFAULT_THREAD_SOURCE),
+            false,
+            true,
+        )?);
+        for old_file_exists in [true, false] {
+            if !old_file_exists {
+                fs::remove_file(&older)?;
+            }
+            assert!(list_mismatched_session_ids(&codex, DEFAULT_PROVIDER)?.is_empty());
+            let overlay = family::get_session_family_overlay_with_lock(
+                codex.to_string_lossy().into_owned(),
+                &family::FamilyLock::default(),
+            )?;
+            assert_eq!(
+                overlay
+                    .iter()
+                    .find(|item| item.session_id == source_id)
+                    .unwrap()
+                    .clone_state,
+                "has_clone",
+                "family path exists: {old_file_exists}"
+            );
+            assert_eq!(
+                overlay
+                    .iter()
+                    .find(|item| item.session_id == target_id)
+                    .unwrap()
+                    .clone_state,
+                "matches"
+            );
+            for dry_run in [true, false] {
+                let report = clone_session_for_provider_locked_with_hint(
+                    codex.to_string_lossy().into_owned(),
+                    source_id.to_string(),
+                    Some(DEFAULT_PROVIDER.to_string()),
+                    SwitchStrategy::Scatter,
+                    dry_run,
+                    Some(&source),
+                    &mut forker,
+                )?;
+                assert!(report.ok);
+                assert_eq!(report.new_id.as_deref(), Some(target_id));
+                assert_eq!(
+                    report.skipped_reason.as_deref(),
+                    Some("目标 provider 已有可用分支")
+                );
+            }
+        }
+        assert_eq!(forker.fork_count, 0);
+        assert_eq!(forker.delete_count, 0);
+        assert_eq!(fs::read(paths::family_store_path(&codex))?, family_before);
+        assert_eq!(fs::read(paths::session_index_path(&codex))?, index_before);
+        assert_eq!(fs::read(&current)?, current_before);
+        let states = read_thread_state_map(&codex)?;
+        assert_eq!(states[target_id].rollout_path.as_deref(), current.to_str());
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn paginated_existing_provider_branch_rejects_unusable_current_record() -> AppResult<()> {
+        for failure in [
+            "file_id",
+            "file_provider",
+            "recorded_provider",
+            "missing_file",
+            "missing_thread",
+            "missing_index",
+            "archived",
+            "hidden_source",
+            "outside_sessions",
+        ] {
+            let codex = temp_codex_dir("cc-session-manager-invalid-current-provider-branch");
+            let source_id = "019ff1a2-b3c4-7d5e-8f60-112233445500";
+            let target_id = "019ff1a2-b3c4-7d5e-8f60-112233445566";
+            let (_, _, current) = prepare_paginated_target_family(&codex, source_id, target_id)?;
+            let state = state_db::open(&codex)?;
+            match failure {
+                "file_id" => write_sync_rollout(&current, "another-thread", DEFAULT_PROVIDER, &[])?,
+                "file_provider" => write_sync_rollout(&current, target_id, "wrong-provider", &[])?,
+                "recorded_provider" => {
+                    state.execute(
+                        "UPDATE threads SET model_provider = 'wrong-provider' WHERE id = ?",
+                        [target_id],
+                    )?;
+                }
+                "missing_file" => fs::remove_file(&current)?,
+                "missing_thread" => {
+                    state.execute("DELETE FROM threads WHERE id = ?", [target_id])?;
+                }
+                "missing_index" => write_index_line(&codex, source_id)?,
+                "archived" => {
+                    state.execute("UPDATE threads SET archived = 1 WHERE id = ?", [target_id])?;
+                }
+                "hidden_source" => {
+                    state.execute(
+                        "UPDATE threads SET source = 'cc-session-manager' WHERE id = ?",
+                        [target_id],
+                    )?;
+                }
+                "outside_sessions" => {
+                    let archived = codex
+                        .join("archived_sessions")
+                        .join(current.file_name().unwrap());
+                    fs::create_dir_all(archived.parent().unwrap())?;
+                    fs::copy(&current, &archived)?;
+                    state.execute(
+                        "UPDATE threads SET rollout_path = ? WHERE id = ?",
+                        (archived.to_string_lossy(), target_id),
+                    )?;
+                }
+                _ => unreachable!(),
+            }
+            drop(state);
+            let store = family::load(&codex)?;
+            let branch = store.families[source_id]
+                .chain
+                .iter()
+                .find(|branch| branch.id == target_id)
+                .unwrap();
+            assert!(
+                usable_family_branch_rollout(
+                    &codex,
+                    &read_thread_state_map(&codex)?,
+                    &read_session_index_ids(&codex)?,
+                    branch,
+                    DEFAULT_PROVIDER,
+                )?
+                .is_none(),
+                "{failure}"
+            );
+            let overlay = family::get_session_family_overlay_with_lock(
+                codex.to_string_lossy().into_owned(),
+                &family::FamilyLock::default(),
+            )?;
+            assert_eq!(
+                overlay
+                    .iter()
+                    .find(|item| item.session_id == source_id)
+                    .unwrap()
+                    .clone_state,
+                "clonable",
+                "{failure}"
             );
             fs::remove_dir_all(&codex).ok();
         }

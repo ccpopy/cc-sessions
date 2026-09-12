@@ -1044,17 +1044,18 @@ pub fn get_session_family_overlay_with_lock(
                         if !relative.starts_with("sessions") {
                             continue;
                         }
-                        if crate::repair::rollout_record_is_usable_provider(
+                        if crate::repair::usable_recorded_provider_rollout(
                             &codex,
                             &branch.id,
                             current_provider,
-                            &codex.join(relative),
                             branch_rollout.as_deref(),
                             branch_provider.as_deref(),
                             branch_source.as_deref(),
                             *branch_archived,
                             index_ids.contains(&branch.id),
-                        )? {
+                        )?
+                        .is_some()
+                        {
                             has_clone_in_current = true;
                             break;
                         }
