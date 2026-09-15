@@ -182,7 +182,7 @@ export default function BackupDetailRoute({ provider = "codex" }: { provider?: S
   return (
     <>
       <TopBar title="备份详情" stats={name} />
-      <ScrollArea className="flex-1">
+      <ScrollArea className="flex-1" viewportClassName="[&>div]:!block">
       <div className="space-y-4 p-6">
         <div className="flex items-center gap-2">
           <Button variant="ghost" size="sm" onClick={() => nav(`/${provider}/backups`)} className="gap-1.5">
@@ -295,7 +295,7 @@ export default function BackupDetailRoute({ provider = "codex" }: { provider?: S
                           </Badge>
                         )}
                       </div>
-                      <div className="line-clamp-1 text-sm font-semibold">
+                      <div className="truncate text-sm font-semibold" title={s.title || "(无标题)"}>
                         {s.title || "(无标题)"}
                       </div>
                       <div className="text-xs text-muted-foreground">
