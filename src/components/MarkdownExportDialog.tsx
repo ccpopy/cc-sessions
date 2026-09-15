@@ -301,7 +301,7 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
             导出为 Markdown
           </DialogTitle>
           {session && (
-            <p className="mt-1 line-clamp-1 text-xs text-muted-foreground">{session.title || "(无标题)"}</p>
+            <p className="mt-1 truncate text-xs text-muted-foreground" title={session.title || "(无标题)"}>{session.title || "(无标题)"}</p>
           )}
         </DialogHeader>
 
@@ -522,8 +522,8 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
                 )}
               </span>
             </div>
-            <ScrollArea className="min-h-0 flex-1">
-              <pre className="whitespace-pre-wrap break-words px-4 py-3 font-mono text-xs leading-relaxed text-foreground/90">
+            <ScrollArea className="min-h-0 flex-1" viewportClassName="[&>div]:!block">
+              <pre className="whitespace-pre-wrap wrap-anywhere px-4 py-3 font-mono text-xs leading-relaxed text-foreground/90">
                 {report?.markdown ?? ""}
               </pre>
             </ScrollArea>

@@ -118,7 +118,7 @@ export function ConvertSessionDialog({ target, onOpenChange, onDone }: Props) {
             <ArrowLeftRight className="h-5 w-5 text-emerald-500" />
             转换为 {targetProviderLabel} 会话
           </DialogTitle>
-          <DialogDescription>
+          <DialogDescription className="max-h-24 overflow-y-auto">
             将 {sourceProviderLabel} 会话「
             {target ? sessionDisplayTitle(target.title, target.first_user_message) : ""}
             」转换为新的 {targetProviderLabel} 会话。

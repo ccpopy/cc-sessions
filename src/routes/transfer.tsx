@@ -1271,7 +1271,7 @@ function ImportPanel({
           </CardHeader>
           <CardContent>
             <div className="rounded-md border">
-              <div className="grid grid-cols-[2rem_8rem_minmax(0,1fr)_8rem_7rem_9rem_4rem] items-center gap-2 border-b bg-muted/40 px-3 py-2 text-[11px] font-medium text-muted-foreground">
+              <div className="grid grid-cols-[2rem_5rem_minmax(0,1fr)_5rem_5rem_7rem_3rem] items-center gap-2 border-b bg-muted/40 px-3 py-2 text-[11px] font-medium text-muted-foreground xl:grid-cols-[2rem_8rem_minmax(0,1fr)_8rem_7rem_9rem_4rem]">
                 <Checkbox
                   checked={allSelected ? true : someSelected ? "indeterminate" : false}
                   onCheckedChange={toggleAllBundles}
@@ -1289,7 +1289,7 @@ function ImportPanel({
                   {items.map((it) => (
                     <li
                       key={it.bundle_dir}
-                      className={`grid grid-cols-[2rem_8rem_minmax(0,1fr)_8rem_7rem_9rem_4rem] items-center gap-2 px-3 py-2 ${selectedBundleDirs.has(it.bundle_dir) ? "bg-primary/5" : "hover:bg-muted/20"}`}
+                      className={`grid grid-cols-[2rem_5rem_minmax(0,1fr)_5rem_5rem_7rem_3rem] items-center gap-2 px-3 py-2 xl:grid-cols-[2rem_8rem_minmax(0,1fr)_8rem_7rem_9rem_4rem] ${selectedBundleDirs.has(it.bundle_dir) ? "bg-primary/5" : "hover:bg-muted/20"}`}
                     >
                       <Checkbox
                         checked={selectedBundleDirs.has(it.bundle_dir)}

@@ -43,7 +43,7 @@ export function ForkRecommendationDialog({
                 : "在同一项目下创建独立的 Claude 会话副本，保留全部主对话记录。原会话保持原样，副本不包含文件撤销历史。"}
             </AlertDialogDescription>
           </AlertDialogHeader>
-          <div className="rounded-md border bg-muted/40 px-3 py-2 text-sm wrap-anywhere">
+          <div className="max-h-48 overflow-y-auto rounded-md border bg-muted/40 px-3 py-2 text-sm wrap-anywhere">
             {title}
             <p className="mt-1 text-xs text-muted-foreground">
               {session.provider === "opencode"
@@ -95,7 +95,7 @@ export function ForkRecommendationDialog({
               <p className="text-sm text-muted-foreground">
                 本地 Fork 会复制当前能够安全读取的会话数据。若 Codex 后续采用新的保存格式，可能出现历史不完整或新任务无法继续；检测到无法安全复制时，本次操作会自动停止。
               </p>
-              <div className="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+              <div className="max-h-32 overflow-y-auto rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
                 即将 Fork：<span className="font-medium text-foreground">{title}</span>
               </div>
             </div>
