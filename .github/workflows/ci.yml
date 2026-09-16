@@ -6,6 +6,8 @@ on:
     branches:
       - main
       - master
+    tags:
+      - "v*.*.*"
 
 permissions:
   contents: read
