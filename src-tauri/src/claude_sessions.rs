@@ -11,6 +11,12 @@ use crate::error::{ensure_not_cancelled, AppError, AppResult};
 use crate::models::{PreviewEvent, SessionMetaBrief, SessionSummary};
 use crate::{fs_ops, paths};
 
+mod summary_cache;
+
+pub(crate) fn invalidate_summary(path: &Path) {
+    summary_cache::invalidate(path);
+}
+
 const PROVIDER: &str = "claude";
 const SUBAGENT_SOURCE: &str = "subagent";
 const TITLE_MAX_CHARS: usize = 80;
@@ -31,6 +37,7 @@ fn scan_sessions_impl(
     claude_dir: &Path,
     cancel: Option<&AtomicBool>,
 ) -> AppResult<Vec<SessionSummary>> {
+    let _measurement = crate::operation_metrics::Measurement::for_source("claude_list", "claude");
     ensure_not_cancelled(cancel)?;
     let root = paths::claude_projects_dir(claude_dir);
     if !root.is_dir() {
@@ -43,7 +50,21 @@ fn scan_sessions_impl(
     let mut sessions = Vec::new();
     for file in files {
         ensure_not_cancelled(cancel)?;
-        if let Some(session) = parse_session(&file, cancel)? {
+        let key = file.canonicalize()?;
+        let before = summary_cache::stamp(&file)?;
+        let summary = if let Some(cached) = summary_cache::get(&key, &before) {
+            cached.map(|mut session| {
+                session.rollout_path = file.to_string_lossy().into_owned();
+                session
+            })
+        } else {
+            let summary = parse_session(&file, cancel)?;
+            if before == summary_cache::stamp(&file)? {
+                summary_cache::insert(key, before, summary.clone());
+            }
+            summary
+        };
+        if let Some(session) = summary {
             sessions.push(session);
         }
     }
@@ -52,12 +73,19 @@ fn scan_sessions_impl(
 }
 
 pub fn preview_range(path: &str, offset: usize, limit: usize) -> AppResult<Vec<PreviewEvent>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let f = File::open(PathBuf::from(path))?;
     let reader = BufReader::new(f);
     let mut out = Vec::with_capacity(preview_capacity_hint(limit));
     let mut event_index = 0usize;
     for (i, line) in reader.lines().enumerate() {
         let line = line?;
+        crate::operation_metrics::record(|c| {
+            c.read_bytes += line.len() as u64;
+            c.parsed_lines += 1;
+        });
         if line.trim().is_empty() {
             continue;
         }
@@ -225,21 +253,61 @@ pub fn resolve_session_summary(
     session_id: &str,
     requested_path: Option<&str>,
 ) -> AppResult<SessionSummary> {
-    let sessions = scan_sessions(claude_dir)?;
-    let matches = sessions
-        .into_iter()
-        .filter(|session| session.id == session_id)
-        .collect::<Vec<_>>();
     if let Some(requested_path) = requested_path {
-        let requested = paths::strip_verbatim(requested_path);
-        return matches
-            .into_iter()
-            .find(|session| paths::strip_verbatim(&session.rollout_path) == requested)
+        let requested = PathBuf::from(paths::strip_verbatim(requested_path));
+        if requested
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("jsonl")
+        {
+            return Err(AppError::Path("Claude transcript 必须是 JSONL 文件".into()));
+        }
+        crate::path_safety::validate_descendant(
+            &paths::claude_projects_dir(claude_dir),
+            &requested,
+            crate::path_safety::EntryKind::File,
+            false,
+            "Claude transcript",
+        )?;
+        return parse_session(&requested, None)?
+            .filter(|session| session.id == session_id)
             .ok_or_else(|| {
                 AppError::NotFound(format!(
                     "Claude 会话精确目标不存在或 ID 不匹配: id={session_id} rollout_path={requested_path}"
                 ))
             });
+    }
+    let root = paths::claude_projects_dir(claude_dir);
+    let mut files = Vec::new();
+    if root.is_dir() {
+        collect_jsonl_files(&root, &mut files, None)?;
+    }
+    let mut matches = Vec::new();
+    for file in files {
+        // Only read the identifying prefix; do not parse unrelated conversation bodies.
+        let mut id = infer_session_id_from_filename(&file);
+        if !is_agent_session(&file) {
+            for line in BufReader::new(File::open(&file)?).lines() {
+                let line = line?;
+                crate::operation_metrics::record(|c| {
+                    c.read_bytes += line.len() as u64;
+                    c.parsed_lines += 1;
+                });
+                if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                    if let Some(actual) = value.get("sessionId").and_then(Value::as_str) {
+                        id = Some(actual.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        if id.as_deref() == Some(session_id) {
+            if let Some(session) = parse_session(&file, None)? {
+                if session.id == session_id {
+                    matches.push(session);
+                }
+            }
+        }
     }
     match matches.as_slice() {
         [session] => Ok((*session).clone()),
@@ -284,6 +352,7 @@ pub fn validate_main_transcript(
 }
 
 fn parse_session(path: &Path, cancel: Option<&AtomicBool>) -> AppResult<Option<SessionSummary>> {
+    crate::operation_metrics::record(|c| c.parsed_files += 1);
     let is_subagent = is_agent_session(path);
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -307,6 +376,10 @@ fn parse_session(path: &Path, cancel: Option<&AtomicBool>) -> AppResult<Option<S
     for line in reader.lines() {
         ensure_not_cancelled(cancel)?;
         let line = line?;
+        crate::operation_metrics::record(|c| {
+            c.read_bytes += line.len() as u64;
+            c.parsed_lines += 1;
+        });
         if line.trim().is_empty() {
             continue;
         }
@@ -1354,6 +1427,103 @@ mod tests {
         assert_eq!(first.len(), 200);
         assert_eq!(second.len(), 26);
         assert_eq!(second.last().map(|event| event.index), Some(225));
+        Ok(())
+    }
+
+    #[test]
+    fn performance_exact_resolution_does_not_parse_unrelated_sessions() -> AppResult<()> {
+        let root = temp_dir("claude-exact-resolution");
+        let target = write_sample_session(&root)?;
+        write_session_values(
+            &root,
+            "unrelated.jsonl",
+            vec![serde_json::json!({
+                "sessionId": "unrelated", "type": "user", "message": {"role": "user", "content": "other"}
+            })],
+        )?;
+        let (result, counters) = crate::operation_metrics::measured(|| {
+            resolve_session_summary(&root, "claude-1", Some(target.to_string_lossy().as_ref()))
+        });
+        assert_eq!(result?.id, "claude-1");
+        assert!(resolve_session_summary(
+            &root,
+            "wrong-id",
+            Some(target.to_string_lossy().as_ref())
+        )
+        .is_err());
+        let companion = target.with_extension("json");
+        fs::copy(&target, &companion)?;
+        assert!(
+            resolve_session_summary(
+                &root,
+                "claude-1",
+                Some(companion.to_string_lossy().as_ref())
+            )
+            .is_err(),
+            "a companion JSON must not become a transcript target"
+        );
+        let outside = root.join("outside.jsonl");
+        fs::copy(&target, &outside)?;
+        assert!(resolve_session_summary(
+            &root,
+            "claude-1",
+            Some(outside.to_string_lossy().as_ref())
+        )
+        .is_err());
+        fs::remove_dir_all(root)?;
+        assert_eq!(counters.parsed_files, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn performance_unchanged_claude_refresh_reuses_summaries() -> AppResult<()> {
+        let root = temp_dir("claude-summary-cache");
+        let file = write_sample_session(&root)?;
+        let first = scan_sessions(&root)?;
+        let (second, counters) = crate::operation_metrics::measured(|| scan_sessions(&root));
+        assert_eq!(second?[0].title, first[0].title);
+        let mut append = fs::OpenOptions::new().append(true).open(&file)?;
+        writeln!(
+            append,
+            "{}",
+            serde_json::json!({"type":"custom-title", "customTitle":"New title"})
+        )?;
+        drop(append);
+        assert_eq!(scan_sessions(&root)?[0].title, "New title");
+        fs::remove_dir_all(root)?;
+        assert_eq!(counters.parsed_files, 0);
+        assert_eq!(counters.cache_hits, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn summary_cache_detects_replacement_with_same_length_and_mtime() -> AppResult<()> {
+        let root = temp_dir("claude-cache-replacement");
+        let file = write_session_values(
+            &root,
+            "same.jsonl",
+            vec![serde_json::json!({
+                "sessionId":"same", "type":"custom-title", "customTitle":"Title A"
+            })],
+        )?;
+        assert_eq!(scan_sessions(&root)?[0].title, "Title A");
+        let modified = fs::metadata(&file)?.modified()?;
+        let replacement = file.with_extension("replacement");
+        fs::write(
+            &replacement,
+            fs::read_to_string(&file)?.replace("Title A", "Title B"),
+        )?;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&replacement)?
+            .set_modified(modified)?;
+        fs::rename(&replacement, &file)?;
+        assert_eq!(scan_sessions(&root)?[0].title, "Title B");
+        assert_eq!(
+            resolve_session_summary(&root, "same", Some(file.to_string_lossy().as_ref()))?.title,
+            "Title B"
+        );
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 

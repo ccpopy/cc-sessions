@@ -461,13 +461,7 @@ fn file_uri_to_path(uri: &str) -> Option<String> {
 pub fn preview_range(locator: &str, offset: usize, limit: usize) -> AppResult<Vec<PreviewEvent>> {
     let decoded = decode_locator(locator)?;
     if decoded.is_agent() {
-        return Ok(
-            crate::cursor_agent_store::load_preview_events(Path::new(&decoded.path))?
-                .into_iter()
-                .skip(offset)
-                .take(limit)
-                .collect(),
-        );
+        return crate::cursor_agent_store::preview_range(Path::new(&decoded.path), offset, limit);
     }
     // 大会话可以有上万条气泡，逐页全量展开代价太高：只读到本页末尾就停。
     let db = Path::new(&decoded.path);

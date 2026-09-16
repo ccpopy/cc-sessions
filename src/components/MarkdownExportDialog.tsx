@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Clock, Copy, Download, FileText, Loader2, RotateCcw } from "lucide-react";
 import { toast } from "sonner";
 
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
@@ -15,18 +15,16 @@ import { DatePicker } from "@/components/ui/date-picker";
 import {
   api,
   type MarkdownExportOptions,
-  type MarkdownExportReport,
+  type MarkdownPreviewPage,
   type SessionSummary,
 } from "@/lib/api";
-import { extractConversationMessages, type ConversationMessage } from "@/lib/markdown";
 import { parseLocalDate } from "@/lib/exportDateRange";
 import {
   EMPTY_LOCAL_DATE_TIME,
-  defaultMessageTimeRange,
+  eventEpochSeconds,
   isWithinRange,
   messageTimeLabel,
   messageTimeRange,
-  sameLocalDateTime,
   spansMultipleDays,
   type LocalDateTime,
   type MessageTimeRange,
@@ -42,7 +40,7 @@ type Props = {
   session: SessionSummary | null;
 };
 
-const EVENT_LIMIT = 100_000;
+type ConversationMessage = MarkdownPreviewPage["messages"][number] & { ts: number | null };
 
 export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
   const [includeFrontMatter, setIncludeFrontMatter] = useState(true);
@@ -57,12 +55,20 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
   const [rangeFrom, setRangeFrom] = useState<LocalDateTime>(EMPTY_LOCAL_DATE_TIME);
   const [rangeTo, setRangeTo] = useState<LocalDateTime>(EMPTY_LOCAL_DATE_TIME);
   const [loadingMessages, setLoadingMessages] = useState(false);
+  const [nextOffset, setNextOffset] = useState(0);
+  const [hasMoreMessages, setHasMoreMessages] = useState(true);
+  const [messageError, setMessageError] = useState<string | null>(null);
+  const [loadedSelection, setLoadedSelection] = useState(false);
+  const messageGeneration = useRef(0);
   // Shift + 点击的锚点：上一次点击的消息 index
   const lastClickedRef = useRef<number | null>(null);
 
-  const [report, setReport] = useState<MarkdownExportReport | null>(null);
+  const [report, setReport] = useState<MarkdownPreviewPage | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [copying, setCopying] = useState(false);
+  const [previewRetry, setPreviewRetry] = useState(0);
 
   const provider = session?.provider ?? "codex";
   const rolloutPath = session?.rollout_path ?? "";
@@ -83,9 +89,10 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
     };
   }, [session]);
 
-  // 打开时载入会话事件，构建可选择的对话列表；时间范围默认覆盖首尾消息
+  // 打开只重置状态；片段索引由用户启用选择后按页读取。
   useEffect(() => {
-    if (!open || !rolloutPath) return;
+    messageGeneration.current += 1;
+    if (!open) return;
     setIncludeFrontMatter(true);
     setIncludeReasoning(false);
     setIncludeTools(false);
@@ -96,46 +103,22 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
     setRangeFrom(EMPTY_LOCAL_DATE_TIME);
     setRangeTo(EMPTY_LOCAL_DATE_TIME);
     lastClickedRef.current = null;
-    setLoadingMessages(true);
-    let cancelled = false;
-    void (async () => {
-      try {
-        const events = await api.previewRange(provider, rolloutPath, 0, EVENT_LIMIT);
-        if (cancelled) return;
-        const msgs = extractConversationMessages(events);
-        setMessages(msgs);
-        setChecked(new Set(msgs.map((m) => m.index)));
-        const defaults = defaultMessageTimeRange(msgs.map((m) => m.ts));
-        setRangeFrom(defaults?.from ?? EMPTY_LOCAL_DATE_TIME);
-        setRangeTo(defaults?.to ?? EMPTY_LOCAL_DATE_TIME);
-      } catch (e: any) {
-        if (!cancelled) toast.error("读取会话失败：" + String(e?.message ?? e));
-      } finally {
-        if (!cancelled) setLoadingMessages(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
+    setMessages([]);
+    setChecked(new Set());
+    setNextOffset(0);
+    setHasMoreMessages(true);
+    setLoadedSelection(false);
+    setMessageError(null);
+    setLoadingMessages(false);
+    return () => { messageGeneration.current += 1; };
   }, [open, rolloutPath, provider]);
 
   const stamps = useMemo(() => messages.map((m) => m.ts), [messages]);
-  const defaultRange = useMemo(() => defaultMessageTimeRange(stamps), [stamps]);
   const multiDay = useMemo(() => spansMultipleDays(stamps), [stamps]);
-  const sessionFirstDay = useMemo(
-    () => (defaultRange ? parseLocalDate(defaultRange.from.date) : undefined),
-    [defaultRange],
-  );
-  const sessionLastDay = useMemo(
-    () => (defaultRange ? parseLocalDate(defaultRange.to.date) : undefined),
-    [defaultRange],
-  );
-  const rangeIsDefault =
-    !defaultRange ||
-    (sameLocalDateTime(rangeFrom, defaultRange.from) && sameLocalDateTime(rangeTo, defaultRange.to));
+  const rangeIsDefault = !rangeFrom.date && !rangeTo.date && !rangeFrom.time && !rangeTo.time;
   const range = useMemo<MessageTimeRange>(
-    () => (selectionMode && defaultRange ? messageTimeRange(rangeFrom, rangeTo) : {}),
-    [selectionMode, defaultRange, rangeFrom, rangeTo],
+    () => (selectionMode ? messageTimeRange(rangeFrom, rangeTo) : {}),
+    [selectionMode, rangeFrom, rangeTo],
   );
 
   // 列表只展示时间范围内的消息；勾选状态按消息保留，范围放宽后之前的取舍仍在
@@ -151,9 +134,11 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
   const selectedCount = selectionMode ? selectedIndices.length : messages.length;
   const exportBlockReason = !selectionMode
     ? null
-    : range.error
+    : loadingMessages || !loadedSelection
+      ? messageError ?? "正在加载消息摘要"
+      : range.error
       ? range.error
-      : messages.length > 0 && selectedIndices.length === 0
+      : selectedIndices.length === 0
         ? "尚未勾选任何消息，无法导出"
         : null;
 
@@ -164,13 +149,12 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
       include_reasoning: includeReasoning,
       include_tools: includeTools,
       ai_handoff_preamble: handoff,
-      selected_indices: selectionMode && messages.length > 0 ? selectedIndices : null,
+      selected_indices: selectionMode ? selectedIndices : null,
       time_from: timeFilter ? (range.from ?? null) : null,
       time_to: timeFilter ? (range.to ?? null) : null,
     };
   }, [
     selectionMode,
-    messages.length,
     selectedIndices,
     rangeIsDefault,
     range,
@@ -180,24 +164,54 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
     handoff,
   ]);
 
-  // 防抖地生成预览（out_path=null，仅取返回文本）
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const requestKey = JSON.stringify([open, provider, rolloutPath, header, buildOptions()]);
+  const latestRequestKey = useRef(requestKey);
+  latestRequestKey.current = requestKey;
+
+  const loadMoreMessages = async () => {
+    if (!header || loadingMessages || !hasMoreMessages) return;
+    const generation = messageGeneration.current;
+    setLoadingMessages(true);
+    setMessageError(null);
+    try {
+      const page = await api.previewSessionMarkdown({
+        provider, rollout_path: rolloutPath, header, offset: nextOffset,
+        options: { include_front_matter: false, include_reasoning: false, include_tools: false, ai_handoff_preamble: false },
+      });
+      if (generation !== messageGeneration.current) return;
+      const msgs = page.messages.map((m) => ({ ...m, ts: eventEpochSeconds(m.timestamp) }));
+      setMessages((previous) => [...previous, ...msgs]);
+      setChecked((previous) => new Set([...previous, ...msgs.map((m) => m.index)]));
+      setNextOffset(page.next_offset);
+      setHasMoreMessages(page.has_more);
+      setLoadedSelection(true);
+    } catch (e: any) {
+      if (generation === messageGeneration.current) setMessageError("读取消息失败：" + String(e?.message ?? e));
+    } finally {
+      if (generation === messageGeneration.current) setLoadingMessages(false);
+    }
+  };
+
+  // 每次只请求受限预览；已发出的旧请求也不能更新预览或 loading 状态。
   useEffect(() => {
-    if (!open || !header || !rolloutPath || loadingMessages) return;
-    if (selectionMode && range.error) return;
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => {
-      setGenerating(true);
+    setReport(null);
+    setPreviewError(null);
+    setGenerating(false);
+    if (!open || !header || !rolloutPath || exportBlockReason) return;
+    let cancelled = false;
+    setGenerating(true);
+    const timer = setTimeout(() => {
       void api
-        .exportSessionMarkdown({ provider, rollout_path: rolloutPath, header, options: buildOptions() })
-        .then((r) => setReport(r))
-        .catch((e: any) => toast.error("生成预览失败：" + String(e?.message ?? e)))
-        .finally(() => setGenerating(false));
+        .previewSessionMarkdown({ provider, rollout_path: rolloutPath, header, options: buildOptions(), offset: 0 })
+        .then((r) => { if (!cancelled && latestRequestKey.current === requestKey) setReport(r); })
+        .catch((e: any) => { if (!cancelled && latestRequestKey.current === requestKey) setPreviewError("生成预览失败：" + String(e?.message ?? e)); })
+        .finally(() => { if (!cancelled && latestRequestKey.current === requestKey) setGenerating(false); });
     }, 250);
     return () => {
-      if (debounceRef.current) clearTimeout(debounceRef.current);
+      cancelled = true;
+      clearTimeout(timer);
     };
-  }, [open, header, rolloutPath, provider, loadingMessages, buildOptions, selectionMode, range.error]);
+  }, [open, header, rolloutPath, provider, buildOptions, exportBlockReason, requestKey, previewRetry]);
 
   // 批量操作只作用于当前范围内可见的消息，范围外的勾选状态原样保留
   const applyToVisible = (decide: (m: ConversationMessage, prev: Set<number>) => boolean) =>
@@ -250,37 +264,43 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
   };
 
   const resetRange = () => {
-    if (!defaultRange) return;
-    setRangeFrom(defaultRange.from);
-    setRangeTo(defaultRange.to);
+    setRangeFrom(EMPTY_LOCAL_DATE_TIME);
+    setRangeTo(EMPTY_LOCAL_DATE_TIME);
   };
 
   const onCopy = async () => {
-    if (!report || exportBlockReason) return;
+    if (!header || !rolloutPath || exportBlockReason || copying) return;
+    const key = requestKey;
+    setCopying(true);
     try {
-      await copyText(report.markdown);
-      toast.success(`已复制 Markdown（${report.message_count} 条对话）`);
+      const full = await api.exportSessionMarkdown({ provider, rollout_path: rolloutPath, header, options: buildOptions() });
+      if (latestRequestKey.current !== key) return;
+      await copyText(full.markdown);
+      toast.success(`已复制 Markdown（${full.message_count} 条对话）`);
     } catch (e: any) {
       toast.error("复制失败：" + String(e?.message ?? e));
+    } finally {
+      setCopying(false);
     }
   };
 
   const onExportFile = async () => {
-    if (!header || !rolloutPath || exportBlockReason) return;
-    const path = await saveFilePath({
+    if (!header || !rolloutPath || exportBlockReason || saving) return;
+    const options = buildOptions();
+    setSaving(true);
+    try {
+      const path = await saveFilePath({
       title: "导出会话为 Markdown",
       defaultPath: `${slugify(header.title)}-${shortId(header.session_id)}.md`,
       filters: [{ name: "Markdown", extensions: ["md"] }],
     });
-    if (!path) return;
-    setSaving(true);
-    try {
+      if (!path) return;
       const r = await api.exportSessionMarkdown({
         provider,
         rollout_path: rolloutPath,
         out_path: path,
         header,
-        options: buildOptions(),
+        options,
       });
       toast.success("已导出 Markdown", {
         description: `${r.message_count} 条对话 · ${humanBytes(r.bytes)} · ${r.out_path}`,
@@ -300,6 +320,7 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
             <FileText className="h-[18px] w-[18px] text-muted-foreground" />
             导出为 Markdown
           </DialogTitle>
+          <DialogDescription className="sr-only">设置导出内容，查看受限预览，保存全部对话或按页选择消息片段。</DialogDescription>
           {session && (
             <p className="mt-1 truncate text-xs text-muted-foreground" title={session.title || "(无标题)"}>{session.title || "(无标题)"}</p>
           )}
@@ -351,12 +372,15 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
                   <SwitchRow
                     id="md-selection"
                     label="选择消息片段"
-                    hint="只导出勾选的对话；可按时间范围、角色或轮次批量选择"
+                    hint="按页加载短摘要，只导出已加载且勾选的对话"
                     checked={selectionMode}
-                    onChange={setSelectionMode}
+                    onChange={(value) => {
+                      setSelectionMode(value);
+                      if (value && !loadedSelection) void loadMoreMessages();
+                    }}
                   />
 
-                  {selectionMode && defaultRange && (
+                  {selectionMode && (
                     <div className="space-y-2">
                       <div className="flex items-center justify-between">
                         <span className="text-xs font-medium">时间范围</span>
@@ -377,22 +401,20 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
                         idPrefix="md-range-from"
                         value={rangeFrom}
                         onChange={setRangeFrom}
-                        minDate={sessionFirstDay}
-                        maxDate={parseLocalDate(rangeTo.date) ?? sessionLastDay}
+                        maxDate={parseLocalDate(rangeTo.date)}
                       />
                       <DateTimeField
                         label="结束"
                         idPrefix="md-range-to"
                         value={rangeTo}
                         onChange={setRangeTo}
-                        minDate={parseLocalDate(rangeFrom.date) ?? sessionFirstDay}
-                        maxDate={sessionLastDay}
+                        minDate={parseLocalDate(rangeFrom.date)}
                       />
                       {range.error ? (
                         <p className="text-[11px] text-destructive">{range.error}</p>
                       ) : (
                         <p className="text-[11px] leading-snug text-muted-foreground">
-                          默认覆盖首尾消息，精确到分钟；范围内 {visible.length}/{messages.length} 条
+                          留空不限时间；筛选已加载摘要，范围内 {visible.length}/{messages.length} 条
                         </p>
                       )}
                     </div>
@@ -402,7 +424,7 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
                     <div className="space-y-2">
                       <div className="flex flex-wrap items-center gap-1.5 text-xs">
                         <Button variant="outline" size="sm" className="h-7 px-2" onClick={checkAll}>
-                          全选
+                          全选已加载
                         </Button>
                         <Button variant="outline" size="sm" className="h-7 px-2" onClick={checkNone}>
                           清空
@@ -436,7 +458,7 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
                           onCheckedChange={(v) => setTurnMode(v === true)}
                           className="h-3.5 w-3.5"
                         />
-                        按轮次勾选：点提问时连同其回答一起
+                        按轮次勾选已加载的提问与回答
                       </label>
                       <p className="text-[11px] leading-snug text-muted-foreground">
                         Shift + 点击可批量勾选或取消一段连续消息。
@@ -504,6 +526,17 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
                     )}
                   </div>
                 )}
+                {selectionMode && (
+                  <div className="space-y-2">
+                    {messageError && <p role="alert" className="text-xs text-destructive">{messageError}</p>}
+                    <p className="text-[11px] text-muted-foreground">
+                      已加载 {messages.length} 条对话摘要。{hasMoreMessages ? "还有更多消息；未加载消息不会进入片段导出。" : "已到会话末尾。"}
+                    </p>
+                    {hasMoreMessages && <Button variant="outline" size="sm" disabled={loadingMessages} onClick={() => void loadMoreMessages()}>
+                      {loadingMessages ? "正在加载…" : messageError ? "重试加载" : "加载下一页摘要"}
+                    </Button>}
+                  </div>
+                )}
               </div>
             </ScrollArea>
           </div>
@@ -511,17 +544,16 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
           {/* 右侧：预览 */}
           <div className="flex min-h-0 flex-col bg-muted/20">
             <div className="flex items-center gap-2 border-b border-border/60 px-4 py-2 text-xs text-muted-foreground">
-              <span>预览</span>
+              <span>受限预览 · 开头最多 20 条对话 / 64 KiB</span>
               {generating && <Loader2 className="h-3 w-3 animate-spin" />}
               <span className="ml-auto flex items-center gap-2">
                 <Badge variant="outline" className="h-5 px-1.5 font-normal tabular-nums">
-                  {selectionMode ? `${selectedCount}/${messages.length}` : selectedCount} 条对话
+                  {selectionMode ? `已选 ${selectedCount} 条` : "导出全部对话"}
                 </Badge>
-                {report && (
-                  <span className="tabular-nums text-muted-foreground/70">{humanBytes(report.bytes)}</span>
-                )}
               </span>
             </div>
+            {(report?.truncated || selectionMode) && <p className="px-4 pt-3 text-xs text-muted-foreground">预览仅展示会话开头的部分内容，可能截断；保存和复制会按当前选项处理全部内容。</p>}
+            {previewError && <div className="space-y-2 px-4 pt-3"><p role="alert" className="text-xs text-destructive">{previewError}</p><Button variant="outline" size="sm" onClick={() => setPreviewRetry((value) => value + 1)}>重试预览</Button></div>}
             <ScrollArea className="min-h-0 flex-1" viewportClassName="[&>div]:!block">
               <pre className="whitespace-pre-wrap wrap-anywhere px-4 py-3 font-mono text-xs leading-relaxed text-foreground/90">
                 {report?.markdown ?? ""}
@@ -530,20 +562,20 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
           </div>
         </div>
 
-        <div className="flex items-center gap-2 border-t border-border/60 px-6 py-3">
-          <p className={cn("text-xs", exportBlockReason ? "text-destructive" : "text-muted-foreground")}>
+        <div className="flex flex-col items-stretch gap-2 border-t border-border/60 px-6 py-3 sm:flex-row sm:items-center">
+          <p className={cn("text-xs leading-relaxed", exportBlockReason ? "text-destructive" : "text-muted-foreground")}>
             {exportBlockReason ?? "默认仅导出对话；工具调用与推理需手动开启。"}
           </p>
-          <div className="ml-auto flex items-center gap-2">
+          <div className="ml-auto flex items-center justify-end gap-2">
             <Button
               variant="outline"
               size="sm"
               onClick={onCopy}
-              disabled={!report || generating || Boolean(exportBlockReason)}
+              disabled={!header || copying || Boolean(exportBlockReason)}
               className="gap-1.5"
             >
-              <Copy className="h-3.5 w-3.5" />
-              复制 Markdown
+              {copying ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Copy className="h-3.5 w-3.5" />}
+              生成并复制全文
             </Button>
             <Button
               size="sm"

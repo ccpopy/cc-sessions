@@ -1,7 +1,8 @@
 """Compare real Web UI fork output with the pinned official SDK, using synthetic data.
 
 Build dist/ and the CLI first. Pass the unmodified session_mutations.py downloaded
-from the commit linked in docs/claude-session-copy.md. No Claude/model call is made.
+from anthropics/claude-agent-sdk-python commit f101a76aed20655fde8e2c67cd1002bd7e700c3a.
+No Claude/model call is made.
 """
 
 from __future__ import annotations

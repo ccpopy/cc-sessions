@@ -345,9 +345,13 @@ fn list_sessions_impl(
     dirs: ProviderDirs,
     cancel: Option<&AtomicBool>,
 ) -> AppResult<Vec<SessionSummary>> {
+    let _measurement = crate::operation_metrics::Measurement::for_source(
+        "session_list",
+        provider.as_deref().unwrap_or("codex"),
+    );
     ensure_not_cancelled(cancel)?;
     let codex = dirs.codex_path();
-    match provider_or_codex(provider).as_str() {
+    let result = match provider_or_codex(provider).as_str() {
         "codex" => {
             let mut list = query_summaries(&codex, "", &[], cancel)?;
             ensure_not_cancelled(cancel)?;
@@ -387,7 +391,11 @@ fn list_sessions_impl(
             Ok(list)
         }
         other => Err(AppError::Other(format!("不支持的 provider: {other}"))),
+    };
+    if let Ok(sessions) = &result {
+        _measurement.response(sessions);
     }
+    result
 }
 
 /// 扫描 archived_sessions/ 下 threads 表没有覆盖的 rollout，合成归档态摘要。

@@ -129,7 +129,7 @@ Codex 用户还可以处理切换模型服务配置后留下的旧会话，或�
 
 在会话卡片上点击「复制会话」可创建完整副本；打开预览后，点击消息上的「复制到此处」可复制从开头到该消息的记录，包含所选消息。副本标题添加 ` (fork)`，保存在同一项目下，可从副本卡片复制继续对话的命令。原会话保留，副本不继承文件撤销历史或子代理状态。
 
-实现依据为 Anthropic Agent SDK 的离线 `fork_session`，详见[格式依据与验证](docs/claude-session-copy.md)。
+实现依据为 [Anthropic Agent SDK 的离线 `fork_session`](https://github.com/anthropics/claude-agent-sdk-python/blob/f101a76aed20655fde8e2c67cd1002bd7e700c3a/src/claude_agent_sdk/_internal/session_mutations.py#L240)。
 
 ### OpenCode 会话复制
 
@@ -137,7 +137,7 @@ Codex 用户还可以处理切换模型服务配置后留下的旧会话，或�
 
 原会话保留，副本不继承待办、分享、撤销、归档或子会话状态。当前支持 `opencode.db` 的 `message` / `part` 格式；使用新版 `session_message` 格式的会话会明确报错，不会生成不完整的副本。
 
-实现依据为 OpenCode 1.18.30 的官方 fork 和 SQLite 写入规则，已使用官方程序对照验证，详见[格式依据与验证](docs/opencode-session-copy.md)。
+实现依据为 [OpenCode 1.18.30 的官方 fork](https://github.com/anomalyco/opencode/blob/5cd8e68fdd72b27818d26d168b9c7a06b359567e/packages/opencode/src/session/session.ts) 和 SQLite 写入规则，已使用官方程序对照验证。
 
 ### 会话转换
 
@@ -501,7 +501,7 @@ git push origin vX.Y.Z
 
 [![CC Sessions Star 历史](img/star-history.svg)](https://github.com/ccpopy/cc-sessions/stargazers)
 
-图表根据 GitHub 公开的 Star 时间生成，点击可以查看当前 Star 用户列表。
+图表保留本项目样式，每天自动更新 GitHub Star 历史数据；点击可以查看当前 Star 用户列表。也可在 Actions 的「Update Star history」中手动刷新。
 
 ## License
 

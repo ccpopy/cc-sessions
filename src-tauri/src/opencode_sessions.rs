@@ -127,10 +127,12 @@ pub fn list_sessions(data_dir: &Path) -> AppResult<Vec<SessionSummary>> {
 }
 
 pub fn preview_range(locator: &str, offset: usize, limit: usize) -> AppResult<Vec<PreviewEvent>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let locator = decode_locator(locator)?;
     let connection = open_readonly(Path::new(&locator.db))?;
-    let events = load_preview_events(&connection, &locator.session)?;
-    Ok(events.into_iter().skip(offset).take(limit).collect())
+    load_preview_page(&connection, &locator.session, offset, limit)
 }
 
 pub(crate) fn load_preview_events_from_locator(locator: &str) -> AppResult<Vec<PreviewEvent>> {
@@ -296,8 +298,7 @@ pub fn delete_session(data_dir: &Path, id: &str) -> AppResult<DeleteResult> {
 }
 
 fn load_session_details(connection: &Connection) -> AppResult<HashMap<String, SessionDetails>> {
-    let messages = load_messages(connection, None)?;
-    let mut message_map = HashMap::new();
+    let messages = load_messages(connection)?;
     let mut details: HashMap<String, SessionDetails> = HashMap::new();
     for message in messages {
         let detail = details.entry(message.session_id.clone()).or_default();
@@ -306,36 +307,49 @@ fn load_session_details(connection: &Connection) -> AppResult<HashMap<String, Se
         detail.bytes = detail
             .bytes
             .saturating_add(message.id.len() as u64 + message.role.len() as u64);
-        message_map.insert(message.id.clone(), message);
     }
-    let mut statement = connection.prepare(
-        "SELECT message_id, session_id, data FROM part ORDER BY time_created ASC, id ASC",
-    )?;
+    let mut statement = connection
+        .prepare("SELECT session_id, SUM(octet_length(data)) FROM part GROUP BY session_id")?;
     let rows = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
+        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
     })?;
     for row in rows {
-        let (message_id, session_id, data) = row?;
+        let (session_id, bytes) = row?;
+        crate::operation_metrics::record(|c| c.sql_rows += 1);
         let detail = details.entry(session_id).or_default();
-        detail.bytes = detail.bytes.saturating_add(data.len() as u64);
-        if detail.first_user_message.is_empty()
-            && message_map
-                .get(&message_id)
-                .is_some_and(|message| message.role == "user")
-        {
-            if let Ok(value) = serde_json::from_str::<Value>(&data) {
-                if value.get("type").and_then(Value::as_str) == Some("text") {
-                    detail.first_user_message = value
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                }
+        detail.bytes = detail.bytes.saturating_add(bytes);
+    }
+    // Only the first useful user text crosses the SQLite boundary. Tool payloads are never
+    // materialized in Rust just to calculate their byte length.
+    let mut first_prompt = connection.prepare(
+        "SELECT p.id FROM part p JOIN message m ON m.id = p.message_id
+         WHERE p.session_id = ?1
+           AND CASE WHEN json_valid(m.data) THEN json_extract(m.data, '$.role') END = 'user'
+         ORDER BY p.time_created, p.id",
+    )?;
+    let mut part_data = connection.prepare("SELECT data FROM part WHERE id = ?1")?;
+    for (id, detail) in &mut details {
+        let candidates = first_prompt.query_map([id], |row| row.get::<_, String>(0))?;
+        for candidate in candidates {
+            let data = part_data.query_row([candidate?], |row| row.get::<_, String>(0))?;
+            crate::operation_metrics::record(|c| {
+                c.sql_rows += 2;
+                c.read_bytes += data.len() as u64;
+            });
+            let Ok(value) = serde_json::from_str::<Value>(&data) else {
+                continue;
+            };
+            if value.get("type").and_then(Value::as_str) != Some("text") {
+                continue;
+            }
+            let text = value
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if !text.is_empty() {
+                detail.first_user_message = text.to_string();
+                break;
             }
         }
     }
@@ -346,86 +360,110 @@ pub(crate) fn load_preview_events(
     connection: &Connection,
     session_id: &str,
 ) -> AppResult<Vec<PreviewEvent>> {
-    let messages = load_messages(connection, Some(session_id))?;
-    let message_map = messages
-        .into_iter()
-        .map(|message| (message.id.clone(), message))
-        .collect::<HashMap<_, _>>();
+    load_preview_page(connection, session_id, 0, usize::MAX)
+}
+
+fn load_preview_page(
+    connection: &Connection,
+    session_id: &str,
+    offset: usize,
+    limit: usize,
+) -> AppResult<Vec<PreviewEvent>> {
+    // Today each valid native part with a message emits exactly one display event (including
+    // metadata parts). Filter invalid/orphan records BEFORE applying display-event offsets.
+    // Materialize only the ordered keys so sorting never retains all part payloads.
     let mut statement = connection.prepare(
-        "SELECT id, message_id, time_created, data FROM part
-         WHERE session_id = ?1 ORDER BY time_created ASC, id ASC",
+        "WITH page AS MATERIALIZED (
+            SELECT p.id, p.time_created FROM part p
+            WHERE p.session_id = ?1 AND json_valid(p.data)
+              AND EXISTS (SELECT 1 FROM message m WHERE m.id = p.message_id AND m.session_id = ?1)
+            ORDER BY p.time_created, p.id LIMIT ?2 OFFSET ?3
+         )
+         SELECT p.id, p.message_id, p.time_created, p.data, m.session_id, m.time_created, m.data
+         FROM page JOIN part p ON p.id = page.id JOIN message m ON m.id = p.message_id
+         ORDER BY page.time_created, page.id",
     )?;
-    let rows = statement.query_map([session_id], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?;
+    let rows = statement.query_map(
+        params![
+            session_id,
+            i64::try_from(limit).unwrap_or(i64::MAX),
+            i64::try_from(offset).unwrap_or(i64::MAX)
+        ],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        },
+    )?;
     let mut events = Vec::new();
     for row in rows {
-        let (part_id, message_id, created, data) = row?;
-        let Some(message) = message_map.get(&message_id) else {
-            continue;
-        };
+        let (part_id, message_id, created, data, source_session, message_created, message_data) =
+            row?;
+        crate::operation_metrics::record(|c| {
+            c.sql_rows += 1;
+            c.read_bytes += (data.len() + message_data.len()) as u64;
+        });
+        let message = parse_message(message_id, source_session, message_created, &message_data);
         let Ok(part) = serde_json::from_str::<Value>(&data) else {
             continue;
         };
-        let raw = opencode_part_to_preview_raw(message, &part_id, created, part);
-        if let Some(event) = crate::claude_sessions::classify_preview(events.len(), raw) {
+        let raw = opencode_part_to_preview_raw(&message, &part_id, created, part);
+        if let Some(event) = crate::claude_sessions::classify_preview(offset + events.len(), raw) {
             events.push(event);
         }
     }
     Ok(events)
 }
 
-fn load_messages(connection: &Connection, session_id: Option<&str>) -> AppResult<Vec<MessageRow>> {
-    let (sql, parameter): (&str, Option<&str>) = match session_id {
-        Some(id) => (
-            "SELECT id, session_id, time_created, data FROM message WHERE session_id = ?1 ORDER BY time_created ASC, id ASC",
-            Some(id),
-        ),
-        None => (
-            "SELECT id, session_id, time_created, data FROM message ORDER BY time_created ASC, id ASC",
-            None,
-        ),
-    };
-    let mut statement = connection.prepare(sql)?;
-    let mut rows = match parameter {
-        Some(value) => statement.query([value])?,
-        None => statement.query([])?,
-    };
+fn load_messages(connection: &Connection) -> AppResult<Vec<MessageRow>> {
+    let mut statement = connection.prepare(
+        "SELECT id, session_id, time_created, data FROM message ORDER BY time_created ASC, id ASC",
+    )?;
+    let mut rows = statement.query([])?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
         let data: String = row.get(3)?;
-        let value = serde_json::from_str::<Value>(&data).unwrap_or(Value::Null);
-        out.push(MessageRow {
-            id: row.get(0)?,
-            session_id: row.get(1)?,
-            role: value
-                .get("role")
-                .and_then(Value::as_str)
-                .unwrap_or("other")
-                .to_string(),
-            parent_id: value
-                .get("parentID")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            finish: value
-                .get("finish")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            model: value
-                .get("modelID")
-                .or_else(|| value.get("model").and_then(|model| model.get("modelID")))
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            tokens: message_tokens(&value),
-            created_at_ms: row.get(2)?,
+        crate::operation_metrics::record(|c| {
+            c.sql_rows += 1;
+            c.read_bytes += data.len() as u64;
         });
+        out.push(parse_message(row.get(0)?, row.get(1)?, row.get(2)?, &data));
     }
     Ok(out)
+}
+
+fn parse_message(id: String, session_id: String, created_at_ms: i64, data: &str) -> MessageRow {
+    let value = serde_json::from_str::<Value>(data).unwrap_or(Value::Null);
+    MessageRow {
+        id,
+        session_id,
+        role: value
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("other")
+            .to_string(),
+        parent_id: value
+            .get("parentID")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        finish: value
+            .get("finish")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        model: value
+            .get("modelID")
+            .or_else(|| value.get("model").and_then(|model| model.get("modelID")))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        tokens: message_tokens(&value),
+        created_at_ms,
+    }
 }
 
 fn opencode_part_to_preview_raw(
@@ -671,6 +709,69 @@ mod tests {
         assert!(deleted.ok && deleted.rollout_deleted);
         assert!(list_sessions(&root)?.is_empty());
         fs::remove_dir_all(root).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn performance_opencode_preview_reads_only_page_payloads() -> AppResult<()> {
+        let root = fixture()?;
+        let connection = Connection::open(database_path(&root))?;
+        for index in 0..100 {
+            connection.execute(
+                "INSERT INTO part VALUES (?1, 'msg_assistant', 'ses_test', ?2, ?2, ?3)",
+                params![
+                    format!("more-{index}"),
+                    3000 + index,
+                    json!({"type":"text","text":"x".repeat(1000)}).to_string()
+                ],
+            )?;
+        }
+        // Invalid native records do not consume a display-event offset.
+        connection.execute(
+            "INSERT INTO part VALUES ('bad', 'msg_user', 'ses_test', 500, 500, 'broken')",
+            [],
+        )?;
+        let locator = encode_locator(&database_path(&root), "ses_test")?;
+        let full = load_preview_events(&connection, "ses_test")?;
+        let (page, counters) =
+            crate::operation_metrics::measured(|| preview_range(&locator, 80, 3));
+        let page = page?;
+        assert_eq!(
+            serde_json::to_value(&page)?,
+            serde_json::to_value(&full[80..83])?
+        );
+        assert!(preview_range(&locator, 0, 0)?.is_empty());
+        drop(connection);
+        fs::remove_dir_all(root)?;
+        assert!(counters.sql_rows <= 6, "read {} rows", counters.sql_rows);
+        assert!(
+            counters.read_bytes < 5000,
+            "read {} bytes",
+            counters.read_bytes
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn performance_opencode_list_does_not_transfer_tool_payloads() -> AppResult<()> {
+        let root = fixture()?;
+        let connection = Connection::open(database_path(&root))?;
+        connection.execute(
+            "INSERT INTO part VALUES ('large-tool', 'msg_assistant', 'ses_test', 3000, 3000, ?1)",
+            [json!({"type":"tool","state":{"output":"x".repeat(1_000_000)}}).to_string()],
+        )?;
+        let (sessions, counters) = crate::operation_metrics::measured(|| list_sessions(&root));
+        let sessions = sessions?;
+        assert_eq!(sessions[0].first_user_message, "你好");
+        assert_eq!(sessions[0].tokens_used, 12);
+        assert!(sessions[0].rollout_bytes > 1_000_000);
+        drop(connection);
+        fs::remove_dir_all(root)?;
+        assert!(
+            counters.read_bytes < 10_000,
+            "transferred {} bytes",
+            counters.read_bytes
+        );
         Ok(())
     }
 

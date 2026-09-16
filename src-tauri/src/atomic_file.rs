@@ -66,6 +66,15 @@ pub fn replace_with_writer_if_unchanged(
     expected: &FileFingerprint,
     writer: impl FnOnce(&mut AtomicWriter) -> AppResult<()>,
 ) -> AppResult<()> {
+    replace_with_writer_receipt(path, expected, writer).map(|_| ())
+}
+
+/// Return the fingerprint produced by the sequential writer only after the commit succeeds.
+pub(crate) fn replace_with_writer_receipt(
+    path: &Path,
+    expected: &FileFingerprint,
+    writer: impl FnOnce(&mut AtomicWriter) -> AppResult<()>,
+) -> AppResult<FileFingerprint> {
     replace_with_writer(path, Some(expected), writer)
 }
 
@@ -73,7 +82,7 @@ pub fn create_with_writer_if_absent(
     path: &Path,
     writer: impl FnOnce(&mut AtomicWriter) -> AppResult<()>,
 ) -> AppResult<()> {
-    replace_with_writer(path, None, writer)
+    replace_with_writer(path, None, writer).map(|_| ())
 }
 
 /// Atomically create-or-overwrite `path` with the writer's content.
@@ -86,7 +95,7 @@ pub fn overwrite_with_writer(
     writer: impl FnOnce(&mut AtomicWriter) -> AppResult<()>,
 ) -> AppResult<()> {
     if let Some(expected) = receipt::baseline(path)? {
-        return replace_with_writer(path, expected.as_ref(), writer);
+        return replace_with_writer(path, expected.as_ref(), writer).map(|_| ());
     }
     write_and_commit(path, writer, |temp_path| {
         replace_file_atomically(temp_path, path, true).map_err(|error| {
@@ -96,6 +105,7 @@ pub fn overwrite_with_writer(
             ))
         })
     })
+    .map(|_| ())
 }
 
 /// Move an existing file without ever replacing an existing destination entry.
@@ -319,7 +329,7 @@ fn replace_with_writer(
     path: &Path,
     expected: Option<&FileFingerprint>,
     writer: impl FnOnce(&mut AtomicWriter) -> AppResult<()>,
-) -> AppResult<()> {
+) -> AppResult<FileFingerprint> {
     if let Some(baseline) = receipt::baseline(path)? {
         if baseline.as_ref() != expected {
             return Err(changed_during_operation(path));
@@ -369,7 +379,7 @@ impl AtomicWriter {
     }
 
     pub(crate) fn sync_all(&self) -> std::io::Result<()> {
-        self.file.sync_all()
+        crate::operation_metrics::sync_file(&self.file)
     }
 }
 
@@ -378,7 +388,10 @@ impl Write for AtomicWriter {
         let written = self.file.write(bytes)?;
         self.hasher.update(&bytes[..written]);
         self.len += written as u64;
-        crate::operation_metrics::record(|c| c.hash_bytes += written as u64);
+        crate::operation_metrics::record(|c| {
+            c.hash_bytes += written as u64;
+            c.write_bytes += written as u64;
+        });
         Ok(written)
     }
 
@@ -391,7 +404,7 @@ fn write_and_commit(
     path: &Path,
     writer: impl FnOnce(&mut AtomicWriter) -> AppResult<()>,
     commit: impl FnOnce(&Path) -> AppResult<()>,
-) -> AppResult<()> {
+) -> AppResult<FileFingerprint> {
     let receipt_key = receipt::key(path)?;
     let (temp_path, temp_file) = create_unique_temp(path)?;
     let mut output = AtomicWriter::new(temp_file);
@@ -414,7 +427,7 @@ fn write_and_commit(
     let committed = commit(&temp_path);
     if committed.is_ok() || matches!(committed, Err(AppError::AtomicWriteCommitted(_))) {
         if let Some(key) = receipt_key {
-            receipt::publish(&key, written);
+            receipt::publish(&key, written.clone());
         }
     }
     if let Err(error) = committed {
@@ -426,7 +439,7 @@ fn write_and_commit(
             path.to_string_lossy()
         ))
     })?;
-    Ok(())
+    Ok(written)
 }
 
 fn create_file_atomically(temp_path: &Path, final_path: &Path) -> AppResult<()> {
@@ -740,7 +753,7 @@ fn replace_file_atomically(
 fn sync_parent(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     if let Some(parent) = path.parent() {
-        File::open(parent)?.sync_all()?;
+        crate::operation_metrics::sync_file(&File::open(parent)?)?;
     }
     #[cfg(not(unix))]
     let _ = path;

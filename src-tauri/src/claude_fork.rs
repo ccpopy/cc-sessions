@@ -1,5 +1,5 @@
 //! Offline Claude forks, following the Agent SDK's session_mutations.py transform.
-//! See docs/claude-session-copy.md for the pinned upstream source and scope.
+//! Upstream: https://github.com/anthropics/claude-agent-sdk-python/blob/f101a76aed20655fde8e2c67cd1002bd7e700c3a/src/claude_agent_sdk/_internal/session_mutations.py
 
 use std::collections::{HashMap, HashSet};
 use std::fs;

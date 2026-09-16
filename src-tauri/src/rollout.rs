@@ -435,7 +435,16 @@ pub fn preview_session_range(
     offset: usize,
     limit: usize,
 ) -> AppResult<Vec<PreviewEvent>> {
-    preview_range_by_provider(provider, &rollout_path, offset, limit)
+    let _measurement = crate::operation_metrics::Measurement::for_session(
+        "session_preview",
+        provider.as_deref().unwrap_or("codex"),
+        &rollout_path,
+    );
+    let result = preview_range_by_provider(provider, &rollout_path, offset, limit);
+    if let Ok(events) = &result {
+        _measurement.response(events);
+    }
+    result
 }
 
 fn preview_range_by_provider(
@@ -456,12 +465,19 @@ fn preview_range_by_provider(
 }
 
 fn preview_range_impl(path: &str, offset: usize, limit: usize) -> AppResult<Vec<PreviewEvent>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let f = File::open(PathBuf::from(path))?;
     let reader = BufReader::new(f);
     let mut out = Vec::with_capacity(preview_capacity_hint(limit));
     let mut event_index = 0usize;
     for (i, line) in reader.lines().enumerate() {
         let line = line?;
+        crate::operation_metrics::record(|c| {
+            c.read_bytes += line.len() as u64;
+            c.parsed_lines += 1;
+        });
         if line.trim().is_empty() {
             continue;
         }

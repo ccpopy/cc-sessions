@@ -1,4 +1,5 @@
-//! Offline OpenCode V1 forks. See docs/opencode-session-copy.md for upstream evidence.
+//! Offline OpenCode V1 forks, following OpenCode v1.18.30:
+//! https://github.com/anomalyco/opencode/blob/5cd8e68fdd72b27818d26d168b9c7a06b359567e/packages/opencode/src/session/session.ts
 //! Only new rows are written, in one transaction; no database migration is performed.
 
 use std::collections::{BTreeMap, HashMap};

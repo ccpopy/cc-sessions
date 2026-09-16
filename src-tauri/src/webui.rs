@@ -418,6 +418,13 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "sessionId")?,
             string_arg(&args, "backupDir")?,
         )),
+        "preview_session_markdown" => to_result_value(markdown_export::preview_session_markdown(
+            opt_string_arg(&args, "provider")?,
+            string_arg(&args, "rolloutPath")?,
+            arg(&args, "header")?,
+            arg(&args, "options")?,
+            arg(&args, "offset")?,
+        )),
         "export_session_markdown" => to_result_value(markdown_export::export_session_markdown(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "rolloutPath")?,

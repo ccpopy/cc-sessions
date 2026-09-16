@@ -12,11 +12,10 @@
 //!
 //! 子 blob 本身是纯 JSON 的 AI-SDK 消息，不需要再解 protobuf。
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::{json, Value};
 
 use crate::error::{AppError, AppResult};
@@ -193,35 +192,65 @@ pub(crate) fn preview_meta(session_dir: &Path) -> AppResult<SessionMetaBrief> {
 
 /// 按 root blob 记录的顺序还原整段对话。
 pub(crate) fn load_preview_events(session_dir: &Path) -> AppResult<Vec<PreviewEvent>> {
+    preview_range(session_dir, 0, usize::MAX)
+}
+
+pub(crate) fn preview_range(
+    session_dir: &Path,
+    offset: usize,
+    limit: usize,
+) -> AppResult<Vec<PreviewEvent>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let store = store_path(session_dir);
     let connection = open_readonly(&store)?;
-    let header = read_store_header(&store)?;
+    connection.execute_batch("BEGIN DEFERRED")?;
+    let header = read_store_header_from_connection(&connection)?;
     let Some(root) = header.get("latestRootBlobId").and_then(Value::as_str) else {
         return Ok(Vec::new());
     };
 
-    let mut blobs: HashMap<String, Vec<u8>> = HashMap::new();
-    let mut statement = connection.prepare("SELECT id, data FROM blobs")?;
-    let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-    })?;
-    for row in rows {
-        let (id, data) = row?;
-        blobs.insert(id, data);
-    }
-
-    let Some(root_blob) = blobs.get(root) else {
+    let mut statement = connection.prepare("SELECT data FROM blobs WHERE id = ?1")?;
+    let Some(root_blob) = statement
+        .query_row([root], |row| row.get::<_, Vec<u8>>(0))
+        .optional()?
+    else {
         return Ok(Vec::new());
     };
+    crate::operation_metrics::record(|c| {
+        c.sql_rows += 1;
+        c.read_bytes += root_blob.len() as u64;
+    });
     let mut events = Vec::new();
-    for id in child_blob_ids(root_blob) {
-        let Some(data) = blobs.get(&id) else {
+    let mut event_index = 0;
+    for id in child_blob_ids(&root_blob) {
+        let Some(data) = statement
+            .query_row([&id], |row| row.get::<_, Vec<u8>>(0))
+            .optional()?
+        else {
             continue;
         };
-        let Ok(message) = serde_json::from_slice::<Value>(data) else {
+        crate::operation_metrics::record(|c| {
+            c.sql_rows += 1;
+            c.read_bytes += data.len() as u64;
+        });
+        let Ok(message) = serde_json::from_slice::<Value>(&data) else {
             continue;
         };
-        push_message_events(&mut events, &id, &message);
+        let mut expanded = Vec::new();
+        push_message_events(&mut expanded, &id, &message);
+        for mut event in expanded {
+            event.index = event_index;
+            event_index += 1;
+            if event.index < offset {
+                continue;
+            }
+            events.push(event);
+            if events.len() == limit {
+                return Ok(events);
+            }
+        }
     }
     Ok(events)
 }
@@ -469,6 +498,10 @@ fn read_first_prompt(session_dir: &Path) -> String {
 /// `store.db` 的 `meta` 表把会话头存成 hex 编码的 JSON。
 fn read_store_header(store: &Path) -> AppResult<Value> {
     let connection = open_readonly(store)?;
+    read_store_header_from_connection(&connection)
+}
+
+fn read_store_header_from_connection(connection: &Connection) -> AppResult<Value> {
     let mut statement = connection.prepare("SELECT value FROM meta ORDER BY key ASC")?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
     for row in rows {
@@ -642,6 +675,26 @@ mod tests {
         assert_eq!(events[2].text_summary, "查一下日志");
         assert_eq!(events[3].text_summary, "好的");
         fs::remove_dir_all(dir.parent().unwrap())?;
+        Ok(())
+    }
+
+    #[test]
+    fn performance_cursor_agent_preview_stops_after_requested_events() -> AppResult<()> {
+        let root = temp_root("bounded-preview");
+        let dir = root.join("session");
+        let messages = (0..100).map(|index| json!({"role":"assistant","content":[
+            {"type":"text","text":format!("message {index}")},
+            {"type":"tool-call","toolCallId":format!("call-{index}"),"toolName":"read","args":{}}
+        ]})).collect::<Vec<_>>();
+        write_store(&dir, &messages)?;
+        let all = load_preview_events(&dir)?;
+        let (page, counters) = crate::operation_metrics::measured(|| preview_range(&dir, 1, 2));
+        assert_eq!(
+            serde_json::to_value(page?)?,
+            serde_json::to_value(&all[1..3])?
+        );
+        fs::remove_dir_all(root)?;
+        assert!(counters.sql_rows <= 4, "read {} blobs", counters.sql_rows);
         Ok(())
     }
 

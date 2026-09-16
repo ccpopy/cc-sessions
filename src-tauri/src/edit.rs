@@ -86,6 +86,7 @@ struct LoadedFile {
 }
 
 fn sha_hex(bytes: &[u8]) -> String {
+    crate::operation_metrics::record(|c| c.hash_bytes += bytes.len() as u64);
     let mut h = Sha256::new();
     h.update(bytes);
     hex::encode(h.finalize())
@@ -93,6 +94,7 @@ fn sha_hex(bytes: &[u8]) -> String {
 
 fn load_file(path: &Path) -> AppResult<LoadedFile> {
     let raw = fs::read(path)?;
+    crate::operation_metrics::record(|c| c.read_bytes += raw.len() as u64);
     let hash = sha_hex(&raw);
     let text = String::from_utf8(raw)
         .map_err(|_| AppError::Other("会话文件不是有效的 UTF-8，拒绝编辑".into()))?;
@@ -126,7 +128,9 @@ fn write_lines(
     trailing_newline: bool,
     expected_hash: &str,
 ) -> AppResult<String> {
+    crate::claude_sessions::invalidate_summary(path);
     let current = fs::read(path)?;
+    crate::operation_metrics::record(|c| c.read_bytes += current.len() as u64);
     let expected = atomic_file::fingerprint_bytes(&current);
     if expected.sha256_hex() != expected_hash {
         return Err(AppError::Other(format!(
@@ -140,15 +144,19 @@ fn write_lines(
             hook();
         }
     });
-    let mut body = lines.join("\n");
-    if trailing_newline && !lines.is_empty() {
-        body.push('\n');
-    }
-    atomic_file::replace_with_writer_if_unchanged(path, &expected, |file| {
-        file.write_all(body.as_bytes())?;
+    drop(current);
+    let written = atomic_file::replace_with_writer_receipt(path, &expected, |file| {
+        let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
+        for (index, line) in lines.iter().enumerate() {
+            writer.write_all(line.as_bytes())?;
+            if index + 1 < lines.len() || trailing_newline {
+                writer.write_all(b"\n")?;
+            }
+        }
+        writer.flush()?;
         Ok(())
     })?;
-    Ok(sha_hex(body.as_bytes()))
+    Ok(written.sha256_hex())
 }
 
 #[cfg(test)]
@@ -192,8 +200,10 @@ fn append_journal(dir: &Path, entry: &JournalEntry) -> AppResult<()> {
         .create(true)
         .append(true)
         .open(journal_path(dir))?;
-    writeln!(f, "{}", serde_json::to_string(entry)?)?;
-    f.sync_all()?;
+    let line = serde_json::to_string(entry)?;
+    writeln!(f, "{line}")?;
+    crate::operation_metrics::record(|c| c.write_bytes += line.len() as u64 + 1);
+    crate::operation_metrics::sync_file(&f)?;
     Ok(())
 }
 
@@ -211,7 +221,12 @@ fn ensure_snapshot(
     }
     fs::create_dir_all(dir)?;
     let name = format!("original-{}.jsonl", chrono::Utc::now().timestamp_millis());
-    fs::copy(rollout, dir.join(&name))?;
+    let bytes = fs::copy(rollout, dir.join(&name))?;
+    crate::operation_metrics::record(|c| {
+        c.read_bytes += bytes;
+        c.write_bytes += bytes;
+        c.snapshot_bytes += bytes;
+    });
     Ok(Some(name))
 }
 
@@ -1425,6 +1440,7 @@ pub fn edit_session_event_text_with_lock(
     lock: &crate::family::FamilyLock,
 ) -> AppResult<EditApplyReport> {
     let roots = mutation_roots(&provider, &rollout_path, &backup_dir, &session_id)?;
+    let _measurement = crate::operation_metrics::Measurement::for_source("edit_text", &provider);
     crate::family::with_roots(lock, &roots, |_g| {
         if provider == "opencode" {
             return crate::opencode_edit::apply_edit_text(
@@ -1534,6 +1550,27 @@ pub fn session_edit_history(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn performance_edit_hashes_output_once() -> AppResult<()> {
+        let root = temp_dir("edit-output-hash");
+        fs::create_dir_all(&root)?;
+        let path = root.join("session.jsonl");
+        let old = b"old\n";
+        fs::write(&path, old)?;
+        let expected = sha_hex(old);
+        let body = "new".repeat(1000);
+        let (result, counters) = crate::operation_metrics::measured(|| {
+            write_lines(&path, &[body.clone()], true, &expected)
+        });
+        assert_eq!(result?, sha_hex(format!("{body}\n").as_bytes()));
+        fs::remove_dir_all(root)?;
+        assert_eq!(
+            counters.hash_bytes,
+            2 * old.len() as u64 + body.len() as u64 + 1
+        );
+        Ok(())
+    }
+
     #[test]
     fn review_edit_rejects_changes_after_validation() {
         for changed in [b"old\nappended\n".as_slice(), b"new\n".as_slice()] {

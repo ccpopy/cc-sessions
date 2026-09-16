@@ -27,6 +27,9 @@ use crate::models::{
 };
 use crate::rollout::preview_session_range;
 
+mod preview;
+pub use preview::{preview_session_markdown, MarkdownPreviewPage};
+
 /// 工具调用 / 返回摘要的最大字符数（单行）。
 const TOOL_DETAIL_MAX_CHARS: usize = 120;
 const TOOL_BLOCK_MAX_LINES: usize = 200;
@@ -107,6 +110,11 @@ pub fn export_session_markdown(
     header: MarkdownExportHeader,
     options: MarkdownExportOptions,
 ) -> AppResult<MarkdownExportReport> {
+    let _measurement = crate::operation_metrics::Measurement::for_session(
+        "markdown_export",
+        provider.as_deref().unwrap_or("codex"),
+        &rollout_path,
+    );
     let source = match provider.as_deref().unwrap_or("codex") {
         "opencode" => crate::opencode_sessions::resolve_locator(&rollout_path)?.0,
         "cursor" => PathBuf::from(crate::cursor_sessions::decode_locator(&rollout_path)?.path),
@@ -138,7 +146,7 @@ pub fn export_session_markdown(
             && !options.include_reasoning
             && matches!(provider.as_deref().unwrap_or("codex"), "codex" | "claude")
         {
-            return stream_conversation_export(
+            let result = stream_conversation_export(
                 provider.as_deref().unwrap_or("codex"),
                 &source,
                 output,
@@ -146,6 +154,10 @@ pub fn export_session_markdown(
                 &header,
                 &options,
             );
+            if let Ok(report) = &result {
+                _measurement.response(report);
+            }
+            return result;
         }
     }
     let events = preview_session_range(provider, rollout_path, 0, usize::MAX)?;
@@ -175,7 +187,7 @@ pub fn export_session_markdown(
         None => None,
     };
 
-    Ok(MarkdownExportReport {
+    let report = MarkdownExportReport {
         ok: true,
         out_path: written,
         markdown: if output.is_some() {
@@ -186,7 +198,9 @@ pub fn export_session_markdown(
         message_count: rendered.message_count,
         total_message_count: rendered.total_message_count,
         bytes,
-    })
+    };
+    _measurement.response(&report);
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -280,6 +294,10 @@ fn stream_conversation_export(
                 .by_ref()
                 .take(MAX_EVENT_BYTES + 1)
                 .read_until(b'\n', &mut line)?;
+            crate::operation_metrics::record(|c| {
+                c.read_bytes += count as u64;
+                c.parsed_lines += u64::from(count > 0);
+            });
             if count == 0 {
                 break;
             }
@@ -323,6 +341,10 @@ fn stream_conversation_export(
             writer.write_all(chunk.as_bytes())?;
             writer.write_all(b"\n\n")?;
             written += chunk.len() as u64 + 2;
+            crate::operation_metrics::record(|c| {
+                c.write_bytes += chunk.len() as u64 + 2;
+                c.spool_bytes += chunk.len() as u64 + 2;
+            });
         }
         writer.flush()?;
         drop(writer);
@@ -342,7 +364,8 @@ fn stream_conversation_export(
         validate_markdown_destination(source, output)?;
         let publish = |file: &mut crate::atomic_file::AtomicWriter| -> AppResult<()> {
             file.write_all(prefix.as_bytes())?;
-            std::io::copy(&mut fs::File::open(&spool_path)?.take(body_end), file)?;
+            let copied = std::io::copy(&mut fs::File::open(&spool_path)?.take(body_end), file)?;
+            crate::operation_metrics::record(|c| c.read_bytes += copied);
             file.write_all(b"\n")?;
             Ok(())
         };
@@ -2224,7 +2247,7 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
 
-    fn temp_file(name: &str) -> PathBuf {
+    pub(super) fn temp_file(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "{name}-{}-{}.jsonl",
             std::process::id(),
@@ -2255,7 +2278,7 @@ mod tests {
             .timestamp()
     }
 
-    fn user(text: &str) -> Value {
+    pub(super) fn user(text: &str) -> Value {
         json!({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}})
     }
 
@@ -2271,7 +2294,7 @@ mod tests {
         json!({"type": "response_item", "payload": {"type": "function_call", "name": "shell", "arguments": json!({"cmd": command}).to_string()}})
     }
 
-    fn default_options() -> MarkdownExportOptions {
+    pub(super) fn default_options() -> MarkdownExportOptions {
         MarkdownExportOptions {
             include_front_matter: false,
             include_reasoning: false,
@@ -2283,7 +2306,7 @@ mod tests {
         }
     }
 
-    fn header() -> MarkdownExportHeader {
+    pub(super) fn header() -> MarkdownExportHeader {
         MarkdownExportHeader {
             title: "t".into(),
             session_id: "id".into(),

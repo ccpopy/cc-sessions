@@ -124,6 +124,7 @@ pub fn run() {
             commands::restore_session_edit_snapshot,
             commands::session_edit_history,
             commands::export_session_markdown,
+            commands::preview_session_markdown,
             commands::create_backup,
             commands::list_backups,
             commands::open_backup,

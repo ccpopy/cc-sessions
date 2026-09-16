@@ -476,6 +476,26 @@ pub async fn read_preview_image(path: String) -> AppResult<PreviewImage> {
 }
 
 #[tauri::command]
+pub async fn preview_session_markdown(
+    provider: Option<String>,
+    rollout_path: String,
+    header: MarkdownExportHeader,
+    options: MarkdownExportOptions,
+    offset: usize,
+) -> AppResult<crate::markdown_export::MarkdownPreviewPage> {
+    run_blocking(move || {
+        crate::markdown_export::preview_session_markdown(
+            provider,
+            rollout_path,
+            header,
+            options,
+            offset,
+        )
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn export_session_markdown(
     provider: Option<String>,
     rollout_path: String,

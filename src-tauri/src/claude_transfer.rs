@@ -27,6 +27,7 @@ pub fn rename_session(
     rollout_path: Option<&str>,
     title: &str,
 ) -> AppResult<u32> {
+    let _measurement = crate::operation_metrics::Measurement::for_source("claude_rename", "claude");
     let title = title.trim();
     if title.is_empty() {
         return Err(AppError::Other("会话名称不能为空".into()));
@@ -35,6 +36,7 @@ pub fn rename_session(
         return Err(AppError::Other("会话名称过长（最多 120 个字符）".into()));
     }
     let session = claude_sessions::resolve_session_summary(claude_dir, session_id, rollout_path)?;
+    claude_sessions::invalidate_summary(Path::new(&session.rollout_path));
     crate::repair::append_custom_title(Path::new(&session.rollout_path), session_id, title)?;
     Ok(1)
 }
@@ -56,8 +58,10 @@ pub fn move_session_cwd_with_options(
     preserve_path_case: bool,
 ) -> AppResult<MoveSessionCwdReport> {
     let target_cwd = normalize_target_cwd(target_cwd, preserve_path_case)?;
+    let _measurement = crate::operation_metrics::Measurement::for_source("claude_move", "claude");
     let session = claude_sessions::resolve_session_summary(claude_dir, session_id, rollout_path)?;
     let source_transcript = PathBuf::from(&session.rollout_path);
+    claude_sessions::invalidate_summary(&source_transcript);
     claude_sessions::validate_main_transcript(claude_dir, &source_transcript, session_id)?;
     let destination_project = claude_sessions::project_dir_for_cwd(claude_dir, &target_cwd);
     let destination_transcript = destination_project.join(format!("{session_id}.jsonl"));

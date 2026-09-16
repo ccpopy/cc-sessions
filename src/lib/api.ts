@@ -930,6 +930,14 @@ export type MarkdownExportReport = {
   bytes: number;
 };
 
+export type MarkdownPreviewPage = {
+  markdown: string;
+  messages: Array<{ index: number; role: "user" | "assistant"; timestamp: string; text: string }>;
+  next_offset: number;
+  has_more: boolean;
+  truncated: boolean;
+};
+
 export type PreviewImageData = {
   data_url: string;
   mime: string;
@@ -1164,6 +1172,21 @@ export const api = {
     }),
   readPreviewImage: (path: string) =>
     invokeCommand<PreviewImageData>("read_preview_image", { path }),
+
+  previewSessionMarkdown: (p: {
+    provider: SessionProvider;
+    rollout_path: string;
+    header: MarkdownExportHeader;
+    options: MarkdownExportOptions;
+    offset: number;
+  }) =>
+    invokeCommand<MarkdownPreviewPage>("preview_session_markdown", {
+      provider: p.provider,
+      rolloutPath: p.rollout_path,
+      header: p.header,
+      options: p.options,
+      offset: p.offset,
+    }),
 
   exportSessionMarkdown: (p: {
     provider: SessionProvider;
