@@ -501,7 +501,7 @@ git push origin vX.Y.Z
 
 [![CC Sessions Star 历史](img/star-history.svg)](https://github.com/ccpopy/cc-sessions/stargazers)
 
-图表保留本项目样式，每天自动更新 GitHub Star 历史数据；点击可以查看当前 Star 用户列表。也可在 Actions 的「Update Star history」中手动刷新。
+图表保留本项目样式，每周一北京时间 09:17 自动更新 GitHub Star 历史数据；点击可以查看当前 Star 用户列表。也可在 Actions 的「Update Star history」中手动刷新。
 
 ## License
 
