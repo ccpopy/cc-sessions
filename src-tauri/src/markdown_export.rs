@@ -16,11 +16,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::models::{
     MarkdownExportHeader, MarkdownExportOptions, MarkdownExportReport, PreviewEvent,
 };
@@ -106,6 +107,47 @@ pub fn export_session_markdown(
     header: MarkdownExportHeader,
     options: MarkdownExportOptions,
 ) -> AppResult<MarkdownExportReport> {
+    let source = match provider.as_deref().unwrap_or("codex") {
+        "opencode" => crate::opencode_sessions::resolve_locator(&rollout_path)?.0,
+        "cursor" => PathBuf::from(crate::cursor_sessions::decode_locator(&rollout_path)?.path),
+        _ => PathBuf::from(crate::paths::strip_verbatim(&rollout_path)),
+    };
+    let output = out_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(Path::new);
+    let expected_output = if let Some(output) = output {
+        validate_markdown_destination(&source, output)?;
+        match crate::atomic_file::fingerprint(output) {
+            Ok(fingerprint) => Some(fingerprint),
+            Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    if let Some(output) = output {
+        #[cfg(test)]
+        EXPORT_PREPARED.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().take() {
+                hook();
+            }
+        });
+        if !options.include_tools
+            && !options.include_reasoning
+            && matches!(provider.as_deref().unwrap_or("codex"), "codex" | "claude")
+        {
+            return stream_conversation_export(
+                provider.as_deref().unwrap_or("codex"),
+                &source,
+                output,
+                expected_output.as_ref(),
+                &header,
+                &options,
+            );
+        }
+    }
     let events = preview_session_range(provider, rollout_path, 0, usize::MAX)?;
     let rendered = render_markdown(&events, &header, &options);
 
@@ -118,7 +160,16 @@ pub fn export_session_markdown(
                     fs::create_dir_all(parent)?;
                 }
             }
-            fs::write(path, rendered.markdown.as_bytes())?;
+            validate_markdown_destination(&source, path)?;
+            let writer = |file: &mut crate::atomic_file::AtomicWriter| -> AppResult<()> {
+                file.write_all(rendered.markdown.as_bytes())?;
+                Ok(())
+            };
+            if let Some(expected) = expected_output.as_ref() {
+                crate::atomic_file::replace_with_writer_if_unchanged(path, expected, writer)?;
+            } else {
+                crate::atomic_file::create_with_writer_if_absent(path, writer)?;
+            }
             Some(out.to_string())
         }
         None => None,
@@ -127,11 +178,215 @@ pub fn export_session_markdown(
     Ok(MarkdownExportReport {
         ok: true,
         out_path: written,
-        markdown: rendered.markdown,
+        markdown: if output.is_some() {
+            String::new()
+        } else {
+            rendered.markdown
+        },
         message_count: rendered.message_count,
         total_message_count: rendered.total_message_count,
         bytes,
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    static EXPORT_PREPARED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn validate_markdown_destination(source: &Path, output: &Path) -> AppResult<()> {
+    let extension = output
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    if !extension.eq_ignore_ascii_case("md") && !extension.eq_ignore_ascii_case("markdown") {
+        return Err(AppError::Path(
+            "Markdown 导出目标必须使用 .md 或 .markdown 扩展名，不能覆盖会话或索引数据".into(),
+        ));
+    }
+    if output.exists() {
+        if same_file::is_same_file(source, output)? {
+            return Err(AppError::Path(
+                "Markdown 导出目标与来源是同一文件，已拒绝覆盖".into(),
+            ));
+        }
+        let metadata = fs::symlink_metadata(output)?;
+        if !metadata.is_file() || crate::path_safety::metadata_is_link_or_reparse(&metadata) {
+            return Err(AppError::Path("Markdown 导出目标必须是普通文件".into()));
+        }
+        // Existing exports can be overwritten, but aliases to the source's control files cannot.
+        for parent in source.ancestors() {
+            for name in [
+                "state_5.sqlite",
+                "session_index.jsonl",
+                "session_family.json",
+                "journal.jsonl",
+                "opencode.db",
+                "state.vscdb",
+                "store.db",
+            ] {
+                let protected = parent.join(name);
+                if protected.is_file() && same_file::is_same_file(&protected, output)? {
+                    return Err(AppError::Path(
+                        "Markdown 导出目标指向会话数据库、索引或恢复记录".into(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The default JSONL file export keeps only the current event in memory. The body is spooled
+/// privately so its final counts can precede it without reading the source a second time.
+fn stream_conversation_export(
+    provider: &str,
+    source: &Path,
+    output: &Path,
+    expected_output: Option<&crate::atomic_file::FileFingerprint>,
+    header: &MarkdownExportHeader,
+    options: &MarkdownExportOptions,
+) -> AppResult<MarkdownExportReport> {
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let (spool_path, spool) = crate::atomic_file::create_unique_temp(output)?;
+    let result = (|| {
+        let mut writer = BufWriter::with_capacity(64 * 1024, spool);
+        let mut reader = BufReader::new(fs::File::open(source)?);
+        let before = reader.get_ref().metadata()?;
+        let selected: Option<HashSet<usize>> = options
+            .selected_indices
+            .as_ref()
+            .map(|indices| indices.iter().copied().collect());
+        let mut excerpt = ExcerptInfo {
+            message_count: 0,
+            total_message_count: 0,
+            time_from: options.time_from,
+            time_to: options.time_to,
+        };
+        let mut first_user = None;
+        let mut line = Vec::new();
+        let mut index = 0;
+        let mut written = 0u64;
+        let mut body_end = 0u64;
+        loop {
+            line.clear();
+            const MAX_EVENT_BYTES: u64 = 64 * 1024 * 1024;
+            let count = reader
+                .by_ref()
+                .take(MAX_EVENT_BYTES + 1)
+                .read_until(b'\n', &mut line)?;
+            if count == 0 {
+                break;
+            }
+            if count as u64 > MAX_EVENT_BYTES {
+                return Err(AppError::Other(
+                    "单条会话记录超过 64 MiB，已停止导出，来源和旧导出文件保持不变".into(),
+                ));
+            }
+            let position = index;
+            index += 1;
+            let text = std::str::from_utf8(&line)
+                .map_err(|error| AppError::Other(format!("会话不是有效 UTF-8: {error}")))?;
+            let Ok(raw) = serde_json::from_str::<Value>(text) else {
+                continue;
+            };
+            let event = if provider == "claude" {
+                crate::claude_sessions::classify_preview(position, raw)
+            } else {
+                Some(crate::rollout::classify_preview(position, raw))
+            };
+            let Some(event) = event else {
+                continue;
+            };
+            let Segment::Message { role, text, .. } = segment(&event) else {
+                continue;
+            };
+            excerpt.total_message_count += 1;
+            if selected
+                .as_ref()
+                .is_some_and(|indices| !indices.contains(&event.index))
+                || !within_time_range(&event.timestamp, options)
+            {
+                continue;
+            }
+            excerpt.message_count += 1;
+            if role == "user" && first_user.is_none() {
+                first_user = Some(text.clone());
+            }
+            let chunk = render_message_chunk(role, text, &event.timestamp);
+            body_end = written + chunk.trim_end().len() as u64;
+            writer.write_all(chunk.as_bytes())?;
+            writer.write_all(b"\n\n")?;
+            written += chunk.len() as u64 + 2;
+        }
+        writer.flush()?;
+        drop(writer);
+        let after = reader.get_ref().metadata()?;
+        if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+            return Err(AppError::Other("会话在导出期间发生变化，请重试".into()));
+        }
+        let mut prefix = String::new();
+        if options.include_front_matter {
+            prefix.push_str(&render_front_matter(header, &excerpt));
+            prefix.push('\n');
+        }
+        if options.ai_handoff_preamble {
+            prefix.push_str(&render_preamble(header, first_user.as_deref(), &excerpt));
+            prefix.push('\n');
+        }
+        validate_markdown_destination(source, output)?;
+        let publish = |file: &mut crate::atomic_file::AtomicWriter| -> AppResult<()> {
+            file.write_all(prefix.as_bytes())?;
+            std::io::copy(&mut fs::File::open(&spool_path)?.take(body_end), file)?;
+            file.write_all(b"\n")?;
+            Ok(())
+        };
+        if let Some(expected) = expected_output {
+            crate::atomic_file::replace_with_writer_if_unchanged(output, expected, publish)?;
+        } else {
+            crate::atomic_file::create_with_writer_if_absent(output, publish)?;
+        }
+        Ok(MarkdownExportReport {
+            ok: true,
+            out_path: Some(output.to_string_lossy().into_owned()),
+            markdown: String::new(),
+            message_count: excerpt.message_count,
+            total_message_count: excerpt.total_message_count,
+            bytes: prefix.len() as u64 + body_end + 1,
+        })
+    })();
+    match (result, fs::remove_file(&spool_path)) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(AppError::AtomicWriteCommitted(format!(
+            "Markdown 已导出，但清理正文暂存文件失败: {error}"
+        ))),
+    }
+}
+
+fn render_message_chunk(role: &str, text: String, timestamp: &str) -> String {
+    let label = if role == "user" {
+        "👤 User"
+    } else {
+        "🤖 Assistant"
+    };
+    let time = format_event_time(timestamp);
+    let heading = if time.is_empty() {
+        format!("## {label}")
+    } else {
+        format!("## {label} · {time}")
+    };
+    let body = if text.trim().is_empty() {
+        "_(空消息)_".to_string()
+    } else {
+        text
+    };
+    format!("{heading}\n\n{body}")
 }
 
 fn render_markdown(
@@ -161,23 +416,7 @@ fn render_markdown(
                 if role == "user" && first_user_message.is_none() {
                     first_user_message = Some(text.clone());
                 }
-                let label = if role == "user" {
-                    "👤 User"
-                } else {
-                    "🤖 Assistant"
-                };
-                let time = format_event_time(&e.timestamp);
-                let heading = if time.is_empty() {
-                    format!("## {label}")
-                } else {
-                    format!("## {label} · {time}")
-                };
-                let body_text = if text.trim().is_empty() {
-                    "_(空消息)_".to_string()
-                } else {
-                    text
-                };
-                let mut chunk = format!("{heading}\n\n{body_text}");
+                let mut chunk = render_message_chunk(role, text, &e.timestamp);
                 if let Some(tools) = tool_chunks[position].take() {
                     chunk.push_str("\n\n");
                     chunk.push_str(&tools);
@@ -1838,6 +2077,146 @@ fn format_event_time(ts: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn review_export_rejects_destination_changed_during_rendering() -> AppResult<()> {
+        for streaming in [false, true] {
+            for existed in [false, true] {
+                let source = temp_file("export-destination-race");
+                let destination = source.with_extension("md");
+                fs::write(&source, format!("{}\n", user("export content")))?;
+                if existed {
+                    fs::write(&destination, b"original export")?;
+                }
+                let changed = destination.clone();
+                EXPORT_PREPARED.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move || {
+                        fs::write(changed, b"external change").unwrap();
+                    }));
+                });
+                let mut options = default_options();
+                options.include_tools = !streaming;
+                let result = export_session_markdown(
+                    Some("codex".into()),
+                    source.to_string_lossy().into_owned(),
+                    Some(destination.to_string_lossy().into_owned()),
+                    header(),
+                    options,
+                );
+                assert!(
+                    result.is_err(),
+                    "an export must not overwrite a concurrent change"
+                );
+                assert_eq!(fs::read(&destination)?, b"external change");
+                fs::remove_file(destination)?;
+                fs::remove_file(source)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn review_streamed_export_matches_rendering_with_filters() -> AppResult<()> {
+        for provider in ["codex", "claude"] {
+            let source = temp_file("streaming-parity");
+            let destination = source.with_extension("md");
+            let values = if provider == "codex" {
+                vec![
+                    user("你好  \n"),
+                    assistant("first\n"),
+                    user("second"),
+                    assistant("last   "),
+                ]
+            } else {
+                vec![
+                    json!({"message":{"role":"user","content":"你好  \n"}}),
+                    json!({"message":{"role":"assistant","content":[{"type":"text","text":"first\n"}]}}),
+                    json!({"message":{"role":"user","content":"second"}}),
+                    json!({"message":{"role":"assistant","content":"last   "}}),
+                ]
+            };
+            fs::write(
+                &source,
+                format!(
+                    "\r\n{}\r\nbroken\r\n{}\r\n{}\r\n{}",
+                    values[0], values[1], values[2], values[3]
+                ),
+            )?;
+            for selected in [None, Some(vec![1, 4]), Some(vec![])] {
+                let mut options = default_options();
+                options.selected_indices = selected;
+                options.ai_handoff_preamble = true;
+                let memory = export_session_markdown(
+                    Some(provider.into()),
+                    source.to_string_lossy().into_owned(),
+                    None,
+                    header(),
+                    options.clone(),
+                )?;
+                let disk = export_session_markdown(
+                    Some(provider.into()),
+                    source.to_string_lossy().into_owned(),
+                    Some(destination.to_string_lossy().into_owned()),
+                    header(),
+                    options,
+                )?;
+                assert_eq!(
+                    fs::read_to_string(&destination)?,
+                    memory.markdown,
+                    "{provider}"
+                );
+                assert_eq!(disk.message_count, memory.message_count);
+                assert_eq!(disk.total_message_count, memory.total_message_count);
+                assert_eq!(disk.bytes, memory.bytes);
+            }
+            fs::remove_file(destination)?;
+            fs::remove_file(source)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn review_export_rejects_source_and_hard_link() -> AppResult<()> {
+        let source = temp_file("export-source-protection");
+        let alias = source.with_extension("md");
+        let bytes = format!("{}\n", user("keep original"));
+        fs::write(&source, &bytes)?;
+        fs::hard_link(&source, &alias)?;
+        for destination in [&source, &alias] {
+            let result = export_session_markdown(
+                Some("codex".into()),
+                source.to_string_lossy().into_owned(),
+                Some(destination.to_string_lossy().into_owned()),
+                header(),
+                default_options(),
+            );
+            assert!(result.is_err(), "export must not overwrite its input");
+            assert_eq!(fs::read_to_string(&source)?, bytes);
+        }
+        fs::remove_file(alias)?;
+        fs::remove_file(source)?;
+        Ok(())
+    }
+
+    #[test]
+    fn review_file_export_does_not_return_full_markdown() -> AppResult<()> {
+        let source = temp_file("export-file-report");
+        let destination = source.with_extension("md");
+        fs::write(&source, format!("{}\n", user("exported content")))?;
+        let report = export_session_markdown(
+            Some("codex".into()),
+            source.to_string_lossy().into_owned(),
+            Some(destination.to_string_lossy().into_owned()),
+            header(),
+            default_options(),
+        )?;
+        assert!(report.markdown.is_empty());
+        assert!(fs::read_to_string(&destination)?.contains("exported content"));
+        assert_eq!(report.bytes, fs::metadata(&destination)?.len());
+        fs::remove_file(destination)?;
+        fs::remove_file(source)?;
+        Ok(())
+    }
+
     use super::*;
     use crate::models::PreviewEvent;
     use serde_json::json;

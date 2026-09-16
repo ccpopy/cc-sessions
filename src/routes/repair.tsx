@@ -93,6 +93,7 @@ function CodexRepairRoute() {
   const [integrity, setIntegrity] = useState<FamilyIntegrityReport | null>(null);
   const [familyPrunePreview, setFamilyPrunePreview] = useState<OrphanPruneReport | null>(null);
   const [backfillPreview, setBackfillPreview] = useState<ArchiveOriginBackfillReport | null>(null);
+  const [checkedAt, setCheckedAt] = useState<Partial<Record<"project" | "integrity" | "origins", string>>>({});
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [strategy, setStrategy] = useState<SwitchStrategy>("scatter");
@@ -106,7 +107,8 @@ function CodexRepairRoute() {
   const [refreshingAfterRepair, setRefreshingAfterRepair] = useState(false);
   const [providerSyncProgress, setProviderSyncProgress] = useState<ProviderSyncStatus | null>(null);
   const [dryRun, setDryRun] = useState(false);
-  const refreshFlight = useRef<{ codexDir: string; promise: Promise<void> } | null>(null);
+  const refreshFlight = useRef<{ codexDir: string; generation: number; promise: Promise<void> } | null>(null);
+  const refreshGeneration = useRef(0);
   const refreshMounted = useRef(false);
   const refreshDir = useRef(codexDir);
   refreshDir.current = codexDir;
@@ -124,7 +126,7 @@ function CodexRepairRoute() {
   const activityStatus = indexBusyLabel ?? threadsBusyLabel ?? (
     loading
       ? "正在诊断会话索引与数据库…"
-      : refreshing ? "总览诊断已完成，正在检查项目配置与归档…" : null
+      : refreshing ? "正在刷新总览与服务商信息…" : null
   );
   const expectedThreadsCount =
     diag == null ? null : diag.rollout_count + diag.archived_rollout_count;
@@ -148,7 +150,8 @@ function CodexRepairRoute() {
       return Promise.resolve();
     }
     const active = refreshFlight.current;
-    if (active?.codexDir === codexDir) {
+    const generation = refreshGeneration.current;
+    if (active?.codexDir === codexDir && active.generation === generation) {
       return force
         ? active.promise.catch(() => undefined).then(() => refresh(true))
         : active.promise;
@@ -159,6 +162,7 @@ function CodexRepairRoute() {
     let promise!: Promise<void>;
     const isCurrent = () =>
       refreshMounted.current &&
+      refreshGeneration.current === generation &&
       refreshDir.current === codexDir &&
       refreshFlight.current?.promise === promise;
     promise = (async () => {
@@ -178,29 +182,6 @@ function CodexRepairRoute() {
             (result) => isCurrent() && setProvider(result),
             (error) => showAuxiliaryError("服务商信息", error),
           ),
-          api.diagnoseProjectConfigs(codexDir).then(
-            (result) => isCurrent() && setProjectConfig(result),
-            (error) => showAuxiliaryError("项目配置", error),
-          ),
-          api.verifyFamilyIntegrity(codexDir).then(
-            (result) => isCurrent() && setIntegrity(result),
-            (error) => showAuxiliaryError("会话完整性", error),
-          ),
-          api.pruneOrphanEntries({
-            codex_dir: codexDir,
-            prune_index: false,
-            prune_threads: false,
-            prune_family: true,
-            prune_subagents: false,
-            dry_run: true,
-          }).then(
-            (result) => isCurrent() && setFamilyPrunePreview(result),
-            (error) => showAuxiliaryError("family 残留", error),
-          ),
-          api.backfillArchiveOrigins(codexDir, true).then(
-            (result) => isCurrent() && setBackfillPreview(result),
-            (error) => showAuxiliaryError("归档来源标记", error),
-          ),
         ]);
       } catch (e) {
         if (isCurrent()) {
@@ -214,25 +195,30 @@ function CodexRepairRoute() {
         if (refreshFlight.current?.promise === promise) refreshFlight.current = null;
       }
     })();
-    refreshFlight.current = { codexDir, promise };
+    refreshFlight.current = { codexDir, generation, promise };
     return promise;
   }, [codexDir]);
 
   useEffect(() => {
+    refreshGeneration.current += 1;
     refreshMounted.current = true;
+    setRunning(null);
     setDiag(null);
     setProvider(null);
     setProjectConfig(null);
     setIntegrity(null);
     setFamilyPrunePreview(null);
     setBackfillPreview(null);
+    setCheckedAt({});
     void refresh();
     return () => {
+      refreshGeneration.current += 1;
       refreshMounted.current = false;
     };
   }, [refresh]);
 
   const run = async (key: string, fn: () => Promise<void>) => {
+    const generation = refreshGeneration.current;
     setRunning(key);
     setRefreshingAfterRepair(false);
     try {
@@ -240,11 +226,68 @@ function CodexRepairRoute() {
     } catch (e) {
       toast.error(String((e as Error)?.message ?? e));
     } finally {
+      if (refreshGeneration.current !== generation) return;
+      if (!dryRun && refreshMounted.current && refreshDir.current === codexDir) {
+        if (["project_config_repair", "clone", "clone_do"].includes(key)) {
+          setProjectConfig(null);
+          setCheckedAt((previous) => ({ ...previous, project: undefined }));
+        }
+        if (["clone", "clone_do", "prune_family", "prune_subagents"].includes(key)) {
+          setIntegrity(null);
+          setFamilyPrunePreview(null);
+          setBackfillPreview(null);
+          setCheckedAt((previous) => ({ ...previous, integrity: undefined, origins: undefined }));
+        }
+        if (key === "backfill_origins") {
+          setBackfillPreview(null);
+          setCheckedAt((previous) => ({ ...previous, origins: undefined }));
+        }
+      }
       setProviderSyncProgress(null);
       setRefreshingAfterRepair(false);
       setRunning(null);
     }
   };
+
+  const check = (kind: "project" | "integrity" | "origins") => run(`check_${kind}`, async () => {
+    const generation = refreshGeneration.current;
+    const isCurrent = () => refreshMounted.current && refreshDir.current === codexDir && refreshGeneration.current === generation;
+    setCheckedAt((previous) => ({ ...previous, [kind]: undefined }));
+    if (kind === "project") {
+      setProjectConfig(null);
+      const result = await api.diagnoseProjectConfigs(codexDir);
+      if (!isCurrent()) return;
+      setProjectConfig(result);
+    } else if (kind === "integrity") {
+      setIntegrity(null);
+      setFamilyPrunePreview(null);
+      const result = await api.verifyFamilyIntegrity(codexDir);
+      if (!isCurrent()) return;
+      setIntegrity(result);
+      const preview = await api.pruneOrphanEntries({
+        codex_dir: codexDir, prune_index: false, prune_threads: false,
+        prune_family: true, prune_subagents: false, dry_run: true,
+      });
+      if (!isCurrent()) return;
+      setFamilyPrunePreview(preview);
+    } else {
+      setBackfillPreview(null);
+      const result = await api.backfillArchiveOrigins(codexDir, true);
+      if (!isCurrent()) return;
+      setBackfillPreview(result);
+    }
+    setCheckedAt((previous) => ({ ...previous, [kind]: new Date().toLocaleString() }));
+  });
+
+  const checkControls = (kind: "project" | "integrity" | "origins", label: string) => (
+    <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+      <Button size="sm" variant="outline" disabled={!!running} onClick={() => void check(kind)}>
+        {running === `check_${kind}` && <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />}
+        {label}
+      </Button>
+      <span role="status">{checkedAt[kind] ? `上次检查：${checkedAt[kind]}（普通刷新不重复检查）` : "尚未检查或结果已失效，请按需检查"}</span>
+    </div>
+  );
 
   const showFamilyPruneResult = (report: OrphanPruneReport, preview: boolean) => {
     const action = preview ? "预览：将移除" : "已移除";
@@ -648,6 +691,7 @@ function CodexRepairRoute() {
                     />
                   </div>
 
+                  {checkControls("project", "检查项目配置")}
                   {projectConfig == null ? (
                     <div className="text-xs text-muted-foreground">—</div>
                   ) : projectConfig.issues.length === 0 ? (
@@ -917,6 +961,7 @@ function CodexRepairRoute() {
                   </CardTitle>
                 </CardHeader>
                 <CardContent className="min-w-0 space-y-2">
+                  {checkControls("integrity", "执行深度校验")}
                   {integrity == null || familyPrunePreview == null ? (
                     <div className="text-xs text-muted-foreground">—</div>
                   ) : (
@@ -929,7 +974,7 @@ function CodexRepairRoute() {
                         ) : integrity.all_ok ? (
                           <>
                             <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
-                            <span>全部 {integrity.items.length} 条校验通过</span>
+                            <span>上次校验：全部 {integrity.items.length} 条通过</span>
                           </>
                         ) : (
                           <>
@@ -1091,6 +1136,7 @@ function CodexRepairRoute() {
                   </CardTitle>
                 </CardHeader>
                 <CardContent className="min-w-0 space-y-2">
+                  {checkControls("origins", "扫描归档来源")}
                   {backfillPreview == null ? (
                     <div className="text-xs text-muted-foreground">—</div>
                   ) : (

@@ -585,7 +585,7 @@ pub async fn set_archive_origin(
 ) -> AppResult<SetArchiveOriginReport> {
     let lock = lock.inner().clone();
     run_blocking(move || {
-        crate::family::with_lock(&lock, |_g| {
+        crate::family::with_lock(&lock, &PathBuf::from(&codex_dir), |_g| {
             crate::archive_ledger::set_archive_origin(
                 &PathBuf::from(&codex_dir),
                 &session_id,

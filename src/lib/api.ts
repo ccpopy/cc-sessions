@@ -46,27 +46,6 @@ async function invokeCommandRaw<T>(command: string, args?: Record<string, unknow
   return data as T;
 }
 
-function resumeCommandText(provider: SessionProvider, sessionId: string, cwd?: string) {
-  switch (provider) {
-    case "codex":
-      return `codex resume ${sessionId}`;
-    case "claude": {
-      const projectDir = cwd?.trim();
-      if (projectDir) {
-        const quoted = projectDir.replaceAll("'", "''");
-        return `Set-Location -LiteralPath '${quoted}'; claude --resume ${sessionId}`;
-      }
-      return `claude --resume ${sessionId}`;
-    }
-    case "opencode":
-      return `opencode --session ${sessionId}`;
-    // Cursor 的 IDE 会话只能在 Cursor 里打开；cursor-agent 会话可以续聊，
-    // 但从 (provider, id) 分辨不出是哪一种，命令由后端逐会话给在 resume_command 上。
-    case "cursor":
-      return "";
-  }
-}
-
 export type CoreSessionProvider = "codex" | "claude";
 export type SessionProvider = CoreSessionProvider | "opencode" | "cursor";
 export type StatsProvider = "all" | SessionProvider;
@@ -1326,7 +1305,7 @@ export const api = {
       return explicit;
     }
     if (isWebRuntime()) {
-      const text = resumeCommandText(provider, sessionId, cwd);
+      const text = await invokeCommand<string>("copy_resume_command", { provider, sessionId, cwd });
       if (!text) throw new Error("该会话没有可续聊的命令行入口");
       await copyText(text);
       return text;

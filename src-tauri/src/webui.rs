@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -50,6 +51,7 @@ struct WebuiState {
 }
 
 pub fn run(config: WebuiConfig) -> AppResult<()> {
+    validate_host(&config.host)?;
     let dist_dir = resolve_dist_dir()?;
     let settings_file = resolve_settings_file()?;
     let settings_exists = settings_file.exists();
@@ -90,7 +92,11 @@ pub fn run(config: WebuiConfig) -> AppResult<()> {
             .unwrap_or_else(|| "codex".to_string()),
     });
 
-    let addr = format!("{}:{}", config.host, config.port);
+    let addr = if config.host.contains(':') {
+        format!("[{}]:{}", config.host, config.port)
+    } else {
+        format!("{}:{}", config.host, config.port)
+    };
     let server =
         Server::http(&addr).map_err(|err| AppError::Other(format!("启动 Web UI 失败: {err}")))?;
     let listen_addr = server.server_addr().to_string();
@@ -114,16 +120,65 @@ pub fn run(config: WebuiConfig) -> AppResult<()> {
     }
     println!("按 Ctrl+C 停止服务。");
 
-    for request in server.incoming_requests() {
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<Request>(8);
+    let receiver = Arc::new(Mutex::new(receiver));
+    for _ in 0..4 {
+        let receiver = Arc::clone(&receiver);
         let state = Arc::clone(&state);
-        if let Err(err) = handle_request(request, state) {
-            eprintln!("webui request failed: {err}");
+        std::thread::spawn(move || loop {
+            let request = receiver
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .recv();
+            let Ok(request) = request else {
+                break;
+            };
+            if let Err(err) = handle_request(request, Arc::clone(&state)) {
+                eprintln!("webui request failed: {err}");
+            }
+        });
+    }
+    for request in server.incoming_requests() {
+        // Keep existing job polling/cancellation available even when all I/O workers are busy.
+        if matches!(
+            request.url(),
+            "/api/invoke/provider_sync_status"
+                | "/api/invoke/active_provider_sync"
+                | "/api/invoke/content_search_status"
+                | "/api/invoke/active_content_search"
+                | "/api/invoke/cancel_content_search"
+                | "/api/invoke/app_version"
+        ) {
+            if let Err(err) = handle_request(request, Arc::clone(&state)) {
+                eprintln!("webui control request failed: {err}");
+            }
+        } else if let Err(error) = sender.try_send(request) {
+            let request = match error {
+                std::sync::mpsc::TrySendError::Full(request)
+                | std::sync::mpsc::TrySendError::Disconnected(request) => request,
+            };
+            let _ = request.respond(json_error_response(
+                StatusCode(503),
+                "任务队列已满，请稍后重试",
+            ));
         }
     }
     Ok(())
 }
 
 fn handle_request(mut request: Request, state: Arc<WebuiState>) -> AppResult<()> {
+    if !local_request_allowed(
+        header_value(&request, "Host"),
+        header_value(&request, "Origin"),
+        header_value(&request, "Sec-Fetch-Site"),
+    ) {
+        return request
+            .respond(json_error_response(
+                StatusCode(403),
+                "只允许同源的本地 Web UI 请求",
+            ))
+            .map_err(AppError::Io);
+    }
     let method = request.method().clone();
     let url = request_url(&request)?;
     let path = url.path().to_string();
@@ -138,7 +193,14 @@ fn handle_request(mut request: Request, state: Arc<WebuiState>) -> AppResult<()>
                     ))
                     .map_err(AppError::Io);
             }
-            let args = read_json_body(&mut request)?;
+            let args = match read_json_body(&mut request) {
+                Ok(args) => args,
+                Err(error) => {
+                    return request
+                        .respond(json_error_response(StatusCode(400), &error.to_string()))
+                        .map_err(AppError::Io)
+                }
+            };
             respond_result_json(request, dispatch_invoke(&state, command, args))
         } else {
             request.respond(text_response(
@@ -168,8 +230,8 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
         }
         "save_settings" => {
             let next: Settings = arg(&args, "settings")?;
-            settings::write_settings_file(&state.settings_file, &next)?;
             let mut settings = state.settings.lock().unwrap_or_else(|err| err.into_inner());
+            settings::write_settings_file(&state.settings_file, &next)?;
             *settings = next;
             to_value(())
         }
@@ -693,6 +755,14 @@ fn serve_static(
             "not found",
         ));
     };
+    let final_path = final_path.canonicalize()?;
+    if !final_path.starts_with(dist_dir.canonicalize()?) {
+        return request.respond(text_response(
+            StatusCode(403),
+            "text/plain; charset=utf-8",
+            "asset outside trusted root",
+        ));
+    }
     let content_type = content_type(&final_path);
     let body = if head_only {
         Vec::new()
@@ -701,7 +771,11 @@ fn serve_static(
     } else {
         fs::read(&final_path)?
     };
-    request.respond(binary_response(StatusCode(200), content_type, body))
+    let csp = format!("default-src 'self'; script-src 'self' 'nonce-{}'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'", state.api_token);
+    request.respond(
+        binary_response(StatusCode(200), content_type, body)
+            .with_header(Header::from_bytes("Content-Security-Policy", csp).unwrap()),
+    )
 }
 
 fn should_fallback_to_spa(request_path: &str) -> bool {
@@ -725,13 +799,20 @@ fn static_path(dist_dir: &Path, request_path: &str) -> Option<PathBuf> {
 }
 
 fn inject_runtime_config(mut html: String, state: &WebuiState) -> std::io::Result<String> {
+    html = html.replace(
+        "<script>",
+        &format!("<script nonce=\"{}\">", state.api_token),
+    );
     let config = json!({
         "apiToken": &state.api_token,
         "defaultProvider": &state.default_provider,
     });
     let script = format!(
-        "<script>window.__CC_SESSIONS_WEBUI__ = {};</script>\n",
-        serde_json::to_string(&config).expect("runtime config is serializable")
+        "<script nonce=\"{}\">window.__CC_SESSIONS_WEBUI__ = {};</script>\n",
+        state.api_token,
+        serde_json::to_string(&config)
+            .expect("runtime config is serializable")
+            .replace('<', "\\u003c")
     );
     let Some(pos) = html.find("</head>") else {
         return Err(std::io::Error::new(
@@ -753,12 +834,14 @@ fn resolve_dist_dir() -> AppResult<PathBuf> {
     let mut candidates = Vec::new();
     if let Ok(raw) = env::var("CC_SESSIONS_WEBUI_DIST") {
         if !raw.trim().is_empty() {
-            candidates.push(PathBuf::from(raw));
+            let candidate = PathBuf::from(raw);
+            if !candidate.join("index.html").is_file() {
+                return Err(AppError::Path(
+                    "显式设置的 CC_SESSIONS_WEBUI_DIST 不包含 index.html".into(),
+                ));
+            }
+            return Ok(candidate.canonicalize()?);
         }
-    }
-    if let Ok(cwd) = env::current_dir() {
-        candidates.push(cwd.join("dist"));
-        candidates.push(cwd.join("webui"));
     }
     if let Ok(exe) = env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -766,15 +849,17 @@ fn resolve_dist_dir() -> AppResult<PathBuf> {
             candidates.push(dir.join("webui"));
         }
     }
+    #[cfg(debug_assertions)]
+    candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../dist"));
 
     for candidate in candidates {
         if candidate.join("index.html").is_file() {
-            return Ok(candidate);
+            return Ok(candidate.canonicalize()?);
         }
     }
 
     Err(AppError::Other(
-        "找不到 Web UI 前端构建产物。请先在项目根目录运行 npm run build，或把 dist 目录放在 cc-sessions 可执行文件旁。".into(),
+        "找不到 Web UI 前端构建产物。请把 dist 放在 cc-sessions 可执行文件旁；开发时可用 CC_SESSIONS_WEBUI_DIST 显式指定受信任的构建目录。".into(),
     ))
 }
 
@@ -833,8 +918,21 @@ fn request_url(request: &Request) -> AppResult<Url> {
 }
 
 fn read_json_body(request: &mut Request) -> AppResult<Value> {
+    const MAX_BODY: u64 = 8 * 1024 * 1024;
+    if request
+        .body_length()
+        .is_some_and(|length| length as u64 > MAX_BODY)
+    {
+        return Err(AppError::Other("Web UI 请求体不能超过 8 MiB".into()));
+    }
     let mut body = String::new();
-    request.as_reader().read_to_string(&mut body)?;
+    request
+        .as_reader()
+        .take(MAX_BODY + 1)
+        .read_to_string(&mut body)?;
+    if body.len() as u64 > MAX_BODY {
+        return Err(AppError::Other("Web UI 请求体不能超过 8 MiB".into()));
+    }
     if body.trim().is_empty() {
         return Ok(json!({}));
     }
@@ -940,7 +1038,7 @@ fn webui_set_archive_origin(state: &WebuiState, args: &Value) -> AppResult<SetAr
     let codex_dir = string_arg(args, "codexDir")?;
     let session_id = string_arg(args, "sessionId")?;
     let origin = enum_arg::<ArchiveOrigin>(args, "origin")?;
-    family::with_lock(&state.family_lock, |_g| {
+    family::with_lock(&state.family_lock, Path::new(&codex_dir), |_g| {
         crate::archive_ledger::set_archive_origin(
             Path::new(&codex_dir),
             &session_id,
@@ -1002,6 +1100,9 @@ fn binary_response(
         .with_status_code(status)
         .with_header(content_type)
         .with_header(cache)
+        .with_header(Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap())
+        .with_header(Header::from_bytes("X-Frame-Options", "DENY").unwrap())
+        .with_header(Header::from_bytes("Referrer-Policy", "no-referrer").unwrap())
 }
 
 fn content_type(path: &Path) -> &'static str {
@@ -1024,13 +1125,120 @@ pub fn validate_host(host: &str) -> AppResult<()> {
     if host.eq_ignore_ascii_case("localhost") {
         return Ok(());
     }
-    host.parse::<IpAddr>()
-        .map(|_| ())
-        .map_err(|_| AppError::Other(format!("无效 host: {host}")))
+    match host.parse::<IpAddr>() {
+        Ok(address) if address.is_loopback() => Ok(()),
+        _ => Err(AppError::Other(
+            "Web UI 仅支持回环地址（127.0.0.1、::1 或 localhost）；远程访问请使用 SSH 隧道".into(),
+        )),
+    }
+}
+
+fn local_request_allowed(
+    host: Option<&str>,
+    origin: Option<&str>,
+    fetch_site: Option<&str>,
+) -> bool {
+    if fetch_site.is_some_and(|site| site == "cross-site") {
+        return false;
+    }
+    let Some(host) = host else {
+        return false;
+    };
+    let Ok(base) = Url::parse(&format!("http://{host}")) else {
+        return false;
+    };
+    if base
+        .host_str()
+        .is_none_or(|host| validate_host(host.trim_matches(['[', ']'])).is_err())
+        || !base.username().is_empty()
+        || base.password().is_some()
+        || base.path() != "/"
+        || base.query().is_some()
+        || base.fragment().is_some()
+    {
+        return false;
+    }
+    origin.is_none_or(|origin| Url::parse(origin).is_ok_and(|url| url.origin() == base.origin()))
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn review_webui_checks_host_origin_and_runtime_nonce() -> AppResult<()> {
+        assert!(local_request_allowed(
+            Some("127.0.0.1:17888"),
+            Some("http://127.0.0.1:17888"),
+            Some("same-origin")
+        ));
+        assert!(local_request_allowed(Some("localhost:18000"), None, None)); // SSH forwarding port
+        assert!(local_request_allowed(
+            Some("[::1]:17888"),
+            Some("http://[::1]:17888"),
+            None
+        ));
+        for (host, origin, site) in [
+            ("attacker.example", None, None),
+            ("localhost:17888", Some("https://attacker.example"), None),
+            ("localhost:17888", Some("http://localhost:9000"), None),
+            ("localhost:17888", Some("null"), None),
+            ("localhost:17888", None, Some("cross-site")),
+        ] {
+            assert!(!local_request_allowed(Some(host), origin, site));
+        }
+        let state = test_state(Path::new("."));
+        let html = inject_runtime_config("<head><script>theme()</script></head>".into(), &state)?;
+        assert_eq!(html.matches("nonce=\"test-token\"").count(), 2);
+        assert!(!html.contains("<script>"));
+        Ok(())
+    }
+
+    #[test]
+    fn review_webui_http_rejects_untrusted_host_and_large_body() -> AppResult<()> {
+        use std::io::{Read, Write};
+        let root = temp_codex_dir("webui-http-boundaries");
+        fs::create_dir_all(root.join("dist"))?;
+        fs::write(
+            root.join("dist/index.html"),
+            "<html><head></head><body>trusted</body></html>",
+        )?;
+        let state = Arc::new(test_state(&root));
+        for (headers, status) in [
+            ("GET / HTTP/1.1\r\nHost: attacker.example\r\nConnection: close\r\n\r\n", "403"),
+            ("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", "200"),
+            ("POST /api/invoke/app_version HTTP/1.1\r\nHost: localhost\r\nX-CC-Sessions-Webui-Token: test-token\r\nContent-Length: 9000000\r\nConnection: close\r\n\r\n", "400"),
+        ] {
+            let server = Server::http("127.0.0.1:0").unwrap();
+            let address = server.server_addr().to_ip().unwrap();
+            let state = state.clone();
+            let worker = std::thread::spawn(move || handle_request(server.recv().unwrap(), state));
+            let mut client = std::net::TcpStream::connect(address)?;
+            client.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+            client.write_all(headers.as_bytes())?;
+            if status == "400" { client.write_all(&vec![b' '; 9_000_000])?; }
+            let mut response = String::new();
+            client.read_to_string(&mut response)?;
+            worker.join().unwrap()?;
+            assert!(response.starts_with(&format!("HTTP/1.1 {status}")), "{response}");
+            if status != "200" { assert!(!response.contains("apiToken")); }
+            else { assert!(response.contains("Content-Security-Policy:")); }
+        }
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn review_webui_refuses_non_loopback_listeners() {
+        for host in ["0.0.0.0", "::", "192.168.1.10", "8.8.8.8"] {
+            assert!(
+                validate_host(host).is_err(),
+                "{host} must not expose management APIs"
+            );
+        }
+        for host in ["localhost", "127.0.0.1", "::1"] {
+            assert!(validate_host(host).is_ok());
+        }
+    }
+
     use super::*;
 
     fn temp_codex_dir(name: &str) -> PathBuf {

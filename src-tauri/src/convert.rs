@@ -179,7 +179,18 @@ pub fn convert_session_with_target(
 ) -> AppResult<ConvertReport> {
     let codex_dir = dirs.codex_dir.clone();
     let claude_dir = dirs.claude_path().to_string_lossy().into_owned();
-    family::with_lock(lock, |_g| match source_provider.as_str() {
+    let mut roots = vec![dirs.codex_path()]; // provenance is stored here for both directions
+    match source_provider.as_str() {
+        "claude" | "codex" => roots.push(dirs.claude_path()),
+        "cursor" => {
+            roots.extend([dirs.cursor_path(), dirs.cursor_agent_path()]);
+            if target_provider.as_deref() == Some("claude") {
+                roots.push(dirs.claude_path());
+            }
+        }
+        _ => {}
+    }
+    family::with_roots(lock, &roots, |_g| match source_provider.as_str() {
         "claude" => convert_claude_to_codex(
             &codex_dir,
             &rollout_path,

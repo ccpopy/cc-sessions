@@ -12,81 +12,151 @@ use crate::atomic_file;
 use crate::error::{AppError, AppResult};
 
 #[derive(Debug)]
+struct DiskSnapshot {
+    path: PathBuf,
+    fingerprint: atomic_file::FileFingerprint,
+    permissions: fs::Permissions,
+    retain: bool,
+}
+
+impl DiskSnapshot {
+    fn cleanup(&mut self) -> AppResult<()> {
+        self.retain = true;
+        match atomic_file::remove_staged_file_if_unchanged(
+            &self.path,
+            &self.fingerprint,
+            "补偿快照",
+        ) {
+            Ok(()) => Ok(()),
+            Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl Drop for DiskSnapshot {
+    fn drop(&mut self) {
+        if !self.retain && !std::thread::panicking() {
+            if let Err(error) = fs::remove_file(&self.path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("清理补偿快照失败 {}: {error}", self.path.display());
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 struct FileMutationSnapshot {
     path: PathBuf,
-    contents: Option<Vec<u8>>,
-    fingerprint: Option<atomic_file::FileFingerprint>,
+    contents: Option<DiskSnapshot>,
 }
 
 impl FileMutationSnapshot {
-    fn capture(path: &Path) -> AppResult<Self> {
-        match fs::symlink_metadata(path) {
-            Ok(metadata)
-                if metadata.is_file()
-                    && !crate::path_safety::metadata_is_link_or_reparse(&metadata) =>
-            {
-                let before = atomic_file::fingerprint(path)?;
-                let contents = fs::read(path)?;
-                let contents_fingerprint = atomic_file::fingerprint_bytes(&contents);
-                let after = atomic_file::fingerprint(path)?;
-                if before != after || before != contents_fingerprint {
-                    return Err(AppError::AtomicWriteConflict(format!(
-                        "文件在创建补偿快照期间发生变化，已拒绝修改: {}",
-                        path.to_string_lossy()
-                    )));
-                }
-                Ok(Self {
-                    path: path.to_path_buf(),
-                    contents: Some(contents),
-                    fingerprint: Some(before),
-                })
-            }
-            Ok(_) => Err(AppError::Path(format!(
-                "待修改路径不是普通文件: {}",
-                path.to_string_lossy()
-            ))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self {
-                path: path.to_path_buf(),
-                contents: None,
-                fingerprint: None,
-            }),
-            Err(error) => Err(error.into()),
-        }
+    fn fingerprint(&self) -> Option<atomic_file::FileFingerprint> {
+        self.contents
+            .as_ref()
+            .map(|snapshot| snapshot.fingerprint.clone())
     }
 
-    fn into_compensation(self) -> AppResult<Option<MutationCompensation>> {
-        match fs::symlink_metadata(&self.path) {
+    fn capture(path: &Path) -> AppResult<Self> {
+        let _measurement = crate::operation_metrics::Measurement::start("compensation_snapshot");
+        let metadata = match fs::symlink_metadata(path) {
             Ok(metadata)
                 if metadata.is_file()
                     && !crate::path_safety::metadata_is_link_or_reparse(&metadata) =>
             {
-                let current = atomic_file::fingerprint(&self.path)?;
-                if self.fingerprint.as_ref() == Some(&current) {
-                    Ok(None)
-                } else {
-                    Ok(Some(MutationCompensation::RestoreFile {
-                        path: self.path,
-                        contents: self.contents,
-                        expected_current: current,
-                    }))
-                }
+                metadata
             }
-            Ok(_) => Err(AppError::Path(format!(
-                "修改后的路径不是普通文件: {}",
-                self.path.to_string_lossy()
-            ))),
+            Ok(_) => {
+                return Err(AppError::Path(format!(
+                    "待修改路径不是普通文件: {}",
+                    path.display()
+                )))
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if self.contents.is_none() {
-                    Ok(None)
-                } else {
-                    Err(AppError::Other(format!(
-                        "修改后的文件意外消失，无法登记补偿: {}",
-                        self.path.to_string_lossy()
-                    )))
-                }
+                return Ok(Self {
+                    path: path.to_path_buf(),
+                    contents: None,
+                });
             }
-            Err(error) => Err(error.into()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut name = path
+            .file_name()
+            .ok_or_else(|| AppError::Path("快照目标缺少文件名".into()))?
+            .to_os_string();
+        name.push(".ccsm-compensation");
+        let (snapshot_path, file) = atomic_file::create_unique_temp(&path.with_file_name(name))?;
+        let mut writer = atomic_file::AtomicWriter::new(file);
+        let mut snapshot = DiskSnapshot {
+            path: snapshot_path,
+            fingerprint: writer.fingerprint(),
+            permissions: metadata.permissions(),
+            retain: false,
+        };
+        let length = std::io::copy(&mut fs::File::open(path)?, &mut writer)?;
+        writer.flush()?;
+        writer.sync_all()?;
+        crate::operation_metrics::record(|c| {
+            c.read_bytes += length;
+            c.snapshot_bytes += length;
+        });
+        snapshot.fingerprint = writer.fingerprint();
+        drop(writer);
+        if atomic_file::fingerprint(path)? != snapshot.fingerprint {
+            return Err(AppError::AtomicWriteConflict(format!(
+                "文件在创建补偿快照期间发生变化，已拒绝修改: {}",
+                path.display()
+            )));
         }
+        Ok(Self {
+            path: path.to_path_buf(),
+            contents: Some(snapshot),
+        })
+    }
+
+    fn into_compensation(
+        mut self,
+        written: Option<atomic_file::FileFingerprint>,
+    ) -> AppResult<Option<MutationCompensation>> {
+        if let Some(expected_current) = written {
+            return Ok(Some(MutationCompensation::RestoreFile {
+                path: self.path,
+                contents: self.contents,
+                expected_current,
+            }));
+        }
+        let current = match fs::symlink_metadata(&self.path) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && !crate::path_safety::metadata_is_link_or_reparse(&metadata) =>
+            {
+                atomic_file::fingerprint(&self.path).map(Some)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Ok(_) => Err(AppError::Path("修改后的路径不是普通文件".into())),
+            Err(error) => Err(error.into()),
+        };
+        if matches!(&current, Ok(current) if current == &self.fingerprint()) {
+            return Ok(None);
+        }
+        let recovery = self
+            .contents
+            .as_mut()
+            .map(|snapshot| {
+                snapshot.retain = true;
+                format!("；原文件补偿快照保留在 {}", snapshot.path.display())
+            })
+            .unwrap_or_default();
+        Err(AppError::Other(format!(
+            "文件缺少本次写入凭据，拒绝猜测补偿状态: {}{recovery}{}",
+            self.path.display(),
+            current
+                .err()
+                .map(|error| format!("；{error}"))
+                .unwrap_or_default()
+        )))
     }
 }
 
@@ -100,7 +170,7 @@ enum MutationCompensation {
     },
     RestoreFile {
         path: PathBuf,
-        contents: Option<Vec<u8>>,
+        contents: Option<DiskSnapshot>,
         expected_current: atomic_file::FileFingerprint,
     },
     UndoMove {
@@ -138,41 +208,63 @@ impl MutationCompensation {
             }
             Self::RestoreFile {
                 path,
-                contents,
+                mut contents,
                 expected_current,
             } => {
-                let metadata = fs::symlink_metadata(&path)?;
-                if !metadata.is_file() || crate::path_safety::metadata_is_link_or_reparse(&metadata)
-                {
-                    return Err(AppError::Path(format!(
-                        "补偿目标不是普通文件或属于链接/junction: {}",
-                        path.to_string_lossy()
-                    )));
-                }
-                let current = atomic_file::fingerprint(&path)?;
-                if current != expected_current {
-                    return Err(AppError::Other(format!(
-                        "补偿前文件已再次变化，拒绝覆盖: {}",
-                        path.to_string_lossy()
-                    )));
-                }
-                if let Some(contents) = contents {
-                    atomic_file::replace_with_writer_if_unchanged(
-                        &path,
-                        &expected_current,
-                        |file| {
-                            file.write_all(&contents)?;
-                            Ok(())
-                        },
-                    )?;
-                } else {
-                    atomic_file::remove_file_if_unchanged(
-                        &path,
-                        &expected_current,
-                        "补偿新建文件",
-                    )?;
-                }
-                Ok(())
+                let result = (|| {
+                    let metadata = fs::symlink_metadata(&path)?;
+                    if !metadata.is_file()
+                        || crate::path_safety::metadata_is_link_or_reparse(&metadata)
+                    {
+                        return Err(AppError::Path(format!(
+                            "补偿目标不是普通文件或属于链接/junction: {}",
+                            path.display()
+                        )));
+                    }
+                    if let Some(snapshot) = &contents {
+                        atomic_file::replace_with_writer_if_unchanged(
+                            &path,
+                            &expected_current,
+                            |file| {
+                                let metadata = fs::symlink_metadata(&snapshot.path)?;
+                                if !metadata.is_file()
+                                    || crate::path_safety::metadata_is_link_or_reparse(&metadata)
+                                {
+                                    return Err(AppError::Path("补偿快照不是普通文件".into()));
+                                }
+                                std::io::copy(&mut fs::File::open(&snapshot.path)?, file)?;
+                                if file.fingerprint() != snapshot.fingerprint {
+                                    return Err(AppError::Other(
+                                        "补偿快照已发生变化，拒绝恢复".into(),
+                                    ));
+                                }
+                                file.set_permissions(snapshot.permissions.clone())?;
+                                Ok(())
+                            },
+                        )?;
+                    } else {
+                        atomic_file::remove_file_if_unchanged(
+                            &path,
+                            &expected_current,
+                            "补偿新建文件",
+                        )?;
+                    }
+                    if let Some(snapshot) = &mut contents {
+                        snapshot.cleanup()?;
+                    }
+                    Ok(())
+                })();
+                result.map_err(|error: AppError| {
+                    if let Some(snapshot) = &mut contents {
+                        snapshot.retain = true;
+                        AppError::Other(format!(
+                            "{error}; 补偿快照保留在 {}",
+                            snapshot.path.display()
+                        ))
+                    } else {
+                        error
+                    }
+                })
             }
             Self::UndoMove {
                 original,
@@ -225,40 +317,29 @@ impl MutationJournal {
         mutation: impl FnOnce() -> AppResult<T>,
     ) -> AppResult<T> {
         let snapshot = FileMutationSnapshot::capture(path)?;
+        let receipt = atomic_file::ReceiptScope::begin(path, snapshot.fingerprint())?;
         let mutation_result = mutation();
-        let compensation_result = snapshot.into_compensation();
-        match (mutation_result, compensation_result) {
-            (Ok(value), Ok(Some(compensation))) => {
+        let written = receipt.written();
+        drop(receipt);
+        // Even if the final write failed, earlier successful writes in this callback still need
+        // compensation. Only an actual writer receipt establishes ownership of those bytes.
+        if written.is_none()
+            && mutation_result
+                .as_ref()
+                .is_err_and(|error| error.atomic_write_not_committed())
+        {
+            return mutation_result;
+        }
+        match snapshot.into_compensation(written) {
+            Ok(Some(compensation)) => {
                 self.compensations.push(compensation);
-                Ok(value)
+                mutation_result
             }
-            (Ok(value), Ok(None)) => Ok(value),
-            (Ok(_), Err(snapshot_error)) => Err(AppError::Other(format!(
-                "文件修改已返回成功，但登记补偿状态失败，最终状态不确定: {snapshot_error}"
-            ))),
-            (Err(mutation_error), Ok(Some(compensation)))
-                if !mutation_error.atomic_write_not_committed() =>
-            {
-                // Some atomic writers can commit the target and then fail while syncing or
-                // cleaning a backup. That change still belongs to this workflow and must remain
-                // compensatable when a later step rolls back the surrounding operation.
-                self.compensations.push(compensation);
-                Err(mutation_error)
-            }
-            (Err(mutation_error), Ok(_)) => {
-                // A compare-and-swap/create conflict means the observed bytes may belong to
-                // another process. Never register those bytes as this workflow's write.
-                Err(mutation_error)
-            }
-            (Err(mutation_error), Err(snapshot_error)) => {
-                if mutation_error.atomic_write_not_committed() {
-                    Err(mutation_error)
-                } else {
-                    Err(AppError::Other(format!(
-                        "{mutation_error}; 登记文件补偿失败，最终状态不确定: {snapshot_error}"
-                    )))
-                }
-            }
+            Ok(None) => mutation_result,
+            Err(error) => match mutation_result {
+                Ok(_) => Err(error),
+                Err(primary) => Err(AppError::Other(format!("{primary}; {error}"))),
+            },
         }
     }
 
@@ -315,6 +396,17 @@ impl MutationJournal {
     /// Permanently remove files staged by `remove_file` after the surrounding SQLite commit.
     pub(crate) fn finalize(mut self) -> AppResult<()> {
         let mut errors = Vec::new();
+        for compensation in &mut self.compensations {
+            if let MutationCompensation::RestoreFile {
+                contents: Some(snapshot),
+                ..
+            } = compensation
+            {
+                if let Err(error) = snapshot.cleanup() {
+                    errors.push(error.to_string());
+                }
+            }
+        }
         for (staged, expected) in self.staged_deletions.drain(..) {
             let cleanup =
                 atomic_file::remove_staged_file_if_unchanged(&staged, &expected, "删除暂存文件");
@@ -328,7 +420,7 @@ impl MutationJournal {
             Ok(())
         } else {
             Err(AppError::Other(format!(
-                "操作已提交，但清理删除暂存文件失败: {}",
+                "操作已提交，但清理补偿暂存文件失败: {}",
                 errors.join(" | ")
             )))
         }
@@ -339,25 +431,20 @@ impl MutationJournal {
     }
 
     pub(crate) fn move_file(&mut self, original: &Path, current: &Path) -> AppResult<()> {
+        let expected_current = atomic_file::fingerprint(original)?;
         atomic_file::move_file_if_absent(original, current)?;
-        match atomic_file::fingerprint(current) {
-            Ok(expected_current) => {
-                self.compensations.push(MutationCompensation::UndoMove {
-                    original: original.to_path_buf(),
-                    current: current.to_path_buf(),
-                    expected_current,
-                });
-                Ok(())
-            }
-            Err(error) => match atomic_file::move_file_if_absent(current, original) {
-                Ok(()) => Err(error),
-                Err(restore_error) => Err(AppError::Other(format!(
-                    "移动后读取文件指纹失败: {error}; 立即移回原位置也失败 {} -> {}: {restore_error}",
-                    current.to_string_lossy(),
-                    original.to_string_lossy()
-                ))),
-            },
+        self.compensations.push(MutationCompensation::UndoMove {
+            original: original.to_path_buf(),
+            current: current.to_path_buf(),
+            expected_current: expected_current.clone(),
+        });
+        if atomic_file::fingerprint(current)? != expected_current {
+            return Err(AppError::AtomicWriteConflict(format!(
+                "文件在移动期间发生变化: {}",
+                current.display()
+            )));
         }
+        Ok(())
     }
 
     fn compensate(self, primary_error: AppError) -> AppError {
@@ -447,6 +534,248 @@ pub(crate) fn commit_transaction_with_compensation(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn round2_receipt_registration_never_rereads_new_output() -> AppResult<()> {
+        let (root, path) = temp_file("receipt-read-count")?;
+        fs::remove_file(&path)?;
+        let mut journal = MutationJournal::default();
+        let (result, counters) = crate::operation_metrics::measured(|| {
+            journal.mutate_file(&path, || {
+                atomic_file::create_with_writer_if_absent(&path, |file| {
+                    let chunk = [b'x'; 8192];
+                    for _ in 0..128 {
+                        file.write_all(&chunk)?;
+                    }
+                    Ok(())
+                })
+            })
+        });
+        result?;
+        assert_eq!(counters.read_bytes, 0);
+        assert_eq!(counters.hash_bytes, 1024 * 1024);
+        assert_eq!(fs::metadata(&path)?.len(), 1024 * 1024);
+        journal.finalize()?;
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn round2_disk_snapshot_starts_private_and_restores_permissions() -> AppResult<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, path) = temp_file("snapshot-permissions")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640))?;
+        let mut journal = MutationJournal::default();
+        journal.mutate_file(&path, || {
+            atomic_file::overwrite_with_writer(&path, |file| {
+                file.write_all(b"ours\n")?;
+                Ok(())
+            })
+        })?;
+        if let MutationCompensation::RestoreFile {
+            contents: Some(snapshot),
+            ..
+        } = &journal.compensations[0]
+        {
+            assert_eq!(
+                fs::metadata(&snapshot.path)?.permissions().mode() & 0o777,
+                0o600
+            );
+        } else {
+            panic!("disk snapshot expected");
+        }
+        journal.compensate_without_transaction(AppError::Other("later".into()));
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o640);
+        assert_eq!(fs::read(&path)?, b"before\n");
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn round2_refreshed_writer_baseline_cannot_include_external_bytes() -> AppResult<()> {
+        let (root, path) = temp_file("refreshed-baseline")?;
+        let mut journal = MutationJournal::default();
+        let error = journal
+            .mutate_file(&path, || {
+                fs::write(&path, b"external\n")?;
+                atomic_file::replace_with_writer_if_unchanged(
+                    &path,
+                    &atomic_file::fingerprint(&path)?,
+                    |file| {
+                        file.write_all(b"ours\n")?;
+                        Ok(())
+                    },
+                )
+            })
+            .unwrap_err();
+        assert!(error.atomic_write_not_committed());
+        journal.compensate_without_transaction(error);
+        assert_eq!(fs::read(&path)?, b"external\n");
+        assert_eq!(fs::read_dir(&root)?.count(), 1);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn round2_receipts_cover_multiple_writes_and_late_conflicts() -> AppResult<()> {
+        for external in [false, true] {
+            let (root, path) = temp_file("multi-write-receipts")?;
+            let mut journal = MutationJournal::default();
+            let result = journal.mutate_file(&path, || {
+                atomic_file::overwrite_with_writer(&path, |file| {
+                    file.write_all(b"first\n")?;
+                    Ok(())
+                })?;
+                if external {
+                    fs::write(&path, b"external\n")?;
+                }
+                atomic_file::overwrite_with_writer(&path, |file| {
+                    file.write_all(b"second\n")?;
+                    Ok(())
+                })
+            });
+            assert_eq!(result.is_err(), external);
+            let error = journal.compensate_without_transaction(AppError::Other("later".into()));
+            assert_eq!(
+                fs::read(&path)?,
+                if external {
+                    b"external\n".as_slice()
+                } else {
+                    b"before\n".as_slice()
+                }
+            );
+            assert_eq!(error.to_string().contains("补偿快照保留在"), external);
+            assert_eq!(fs::read_dir(&root)?.count(), if external { 2 } else { 1 });
+            fs::remove_dir_all(root)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn round2_disk_snapshot_lifecycle_and_corruption() -> AppResult<()> {
+        for corrupt in [false, true] {
+            let (root, path) = temp_file("disk-snapshot")?;
+            let mut journal = MutationJournal::default();
+            journal.mutate_file(&path, || {
+                atomic_file::overwrite_with_writer(&path, |file| {
+                    file.write_all(b"ours\n")?;
+                    Ok(())
+                })
+            })?;
+            let snapshot = match &journal.compensations[0] {
+                MutationCompensation::RestoreFile {
+                    contents: Some(snapshot),
+                    ..
+                } => snapshot.path.clone(),
+                _ => panic!("disk snapshot expected"),
+            };
+            assert_eq!(fs::read(&snapshot)?, b"before\n");
+            if corrupt {
+                fs::write(&snapshot, b"corrupt\n")?;
+                let error = journal.compensate_without_transaction(AppError::Other("later".into()));
+                assert!(error.to_string().contains("快照已发生变化"));
+                assert!(snapshot.exists());
+            } else {
+                journal.finalize()?;
+                assert!(!snapshot.exists());
+            }
+            assert_eq!(fs::read(&path)?, b"ours\n");
+            fs::remove_dir_all(root)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn round2_finalize_preserves_a_replaced_snapshot() -> AppResult<()> {
+        let (root, path) = temp_file("snapshot-finalize-conflict")?;
+        let mut journal = MutationJournal::default();
+        journal.mutate_file(&path, || {
+            atomic_file::overwrite_with_writer(&path, |file| {
+                file.write_all(b"ours\n")?;
+                Ok(())
+            })
+        })?;
+        let snapshot_path = match &journal.compensations[0] {
+            MutationCompensation::RestoreFile {
+                contents: Some(snapshot),
+                ..
+            } => snapshot.path.clone(),
+            _ => panic!("snapshot expected"),
+        };
+        fs::write(&snapshot_path, b"external recovery data\n")?;
+        assert!(journal.finalize().is_err());
+        assert_eq!(fs::read(&snapshot_path)?, b"external recovery data\n");
+        assert_eq!(fs::read(&path)?, b"ours\n");
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn round2_unreceipted_write_retains_recovery_material() -> AppResult<()> {
+        let (root, path) = temp_file("unreceipted")?;
+        let mut journal = MutationJournal::default();
+        let error = journal
+            .mutate_file(&path, || {
+                fs::write(&path, b"unknown\n")?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("缺少本次写入凭据"));
+        assert!(error.to_string().contains("补偿快照保留在"));
+        journal.compensate_without_transaction(error);
+        assert_eq!(fs::read(&path)?, b"unknown\n");
+        assert_eq!(fs::read_dir(&root)?.count(), 2);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn round2_receipt_never_claims_an_external_post_write_update() -> AppResult<()> {
+        let (root, path) = temp_file("receipt-post-write-race")?;
+        let mut journal = MutationJournal::default();
+        journal.mutate_file(&path, || {
+            atomic_file::replace_with_writer_if_unchanged(
+                &path,
+                &atomic_file::fingerprint(&path)?,
+                |file| {
+                    file.write_all(b"ours\n")?;
+                    Ok(())
+                },
+            )?;
+            fs::write(&path, b"external\n")?;
+            Ok(())
+        })?;
+        let error = journal.compensate_without_transaction(AppError::Other("later failure".into()));
+        assert_eq!(
+            fs::read(&path)?,
+            b"external\n",
+            "the writer receipt must describe our bytes, not a later reader's bytes"
+        );
+        assert!(error.to_string().contains("补偿失败"));
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn review_snapshot_reads_and_hashes_two_copies() -> AppResult<()> {
+        let path = std::env::temp_dir().join(format!(
+            "cc-snapshot-counts-{}",
+            crate::repair::new_session_id()
+        ));
+        fs::write(&path, vec![b'x'; 1024 * 1024])?;
+        let (snapshot, counters) =
+            crate::operation_metrics::measured(|| FileMutationSnapshot::capture(&path));
+        let snapshot = snapshot?;
+        assert_eq!(
+            fs::metadata(&snapshot.contents.as_ref().unwrap().path)?.len(),
+            1024 * 1024
+        );
+        assert_eq!(counters.snapshot_bytes, 1024 * 1024);
+        assert_eq!(counters.read_bytes, 2 * 1024 * 1024);
+        assert_eq!(counters.hash_bytes, 2 * 1024 * 1024);
+        fs::remove_file(path)?;
+        Ok(())
+    }
     use super::*;
 
     fn temp_file(label: &str) -> AppResult<(PathBuf, PathBuf)> {
@@ -490,7 +819,10 @@ mod tests {
 
         let error = journal
             .mutate_file(&path, || {
-                fs::write(&path, b"committed\n")?;
+                atomic_file::overwrite_with_writer(&path, |file| {
+                    file.write_all(b"committed\n")?;
+                    Ok(())
+                })?;
                 Err::<(), _>(AppError::Other("cleanup failed after commit".to_string()))
             })
             .expect_err("post-commit failure must be reported");
@@ -510,7 +842,10 @@ mod tests {
 
         journal
             .mutate_file(&path, || {
-                fs::write(&path, b"committed\n")?;
+                atomic_file::overwrite_with_writer(&path, |file| {
+                    file.write_all(b"committed\n")?;
+                    Ok(())
+                })?;
                 Err::<(), _>(AppError::Other(
                     "业务校验失败：文件在操作期间发生变化（仅为引用文本）".to_string(),
                 ))

@@ -119,7 +119,7 @@ pub fn list_sessions(data_dir: &Path) -> AppResult<Vec<SessionSummary>> {
                 .unwrap_or(database_bytes),
             logs_count: 0,
             has_backup: false,
-            resume_command: format!("opencode --session {id}"),
+            resume_command: crate::fs_ops::session_resume_command("opencode", &id),
         });
         let _ = (project_id, version);
     }

@@ -20,7 +20,7 @@ pub fn duplicate_session_with_lock(
     rollout_path: String,
     lock: &FamilyLock,
 ) -> AppResult<DuplicateSessionReport> {
-    family::with_lock(lock, |_| {
+    family::with_lock(lock, &PathBuf::from(&claude_dir), |_| {
         let (output, destination) = copy_session(&claude_dir, &session_id, &rollout_path, None)?;
         Ok(DuplicateSessionReport {
             source_id: session_id,
@@ -40,7 +40,7 @@ pub fn fork_session_at_event_with_lock(
     message_uuid: String,
     lock: &FamilyLock,
 ) -> AppResult<ForkSessionReport> {
-    family::with_lock(lock, |_| {
+    family::with_lock(lock, &PathBuf::from(&claude_dir), |_| {
         let (output, destination) = copy_session(
             &claude_dir,
             &session_id,

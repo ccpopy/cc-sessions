@@ -7,6 +7,9 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{AppError, AppResult};
 
+mod receipt;
+pub(crate) use receipt::ReceiptScope;
+
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
@@ -20,12 +23,19 @@ pub struct FileFingerprint {
     sha256: [u8; 32],
 }
 
+impl FileFingerprint {
+    pub(crate) fn sha256_hex(&self) -> String {
+        hex::encode(self.sha256)
+    }
+}
+
 pub fn fingerprint(path: &Path) -> AppResult<FileFingerprint> {
     let mut file = File::open(path)?;
     fingerprint_open_file(&mut file)
 }
 
 pub(crate) fn fingerprint_bytes(bytes: &[u8]) -> FileFingerprint {
+    crate::operation_metrics::record(|c| c.hash_bytes += bytes.len() as u64);
     FileFingerprint {
         len: bytes.len() as u64,
         sha256: Sha256::digest(bytes).into(),
@@ -33,8 +43,16 @@ pub(crate) fn fingerprint_bytes(bytes: &[u8]) -> FileFingerprint {
 }
 
 fn fingerprint_open_file(file: &mut File) -> AppResult<FileFingerprint> {
+    fingerprint_reader(file)
+}
+
+pub(crate) fn fingerprint_reader(file: &mut impl std::io::Read) -> AppResult<FileFingerprint> {
     let mut hasher = Sha256::new();
     let len = std::io::copy(file, &mut hasher)?;
+    crate::operation_metrics::record(|c| {
+        c.read_bytes += len;
+        c.hash_bytes += len;
+    });
     Ok(FileFingerprint {
         len,
         sha256: hasher.finalize().into(),
@@ -46,14 +64,14 @@ fn fingerprint_open_file(file: &mut File) -> AppResult<FileFingerprint> {
 pub fn replace_with_writer_if_unchanged(
     path: &Path,
     expected: &FileFingerprint,
-    writer: impl FnOnce(&mut File) -> AppResult<()>,
+    writer: impl FnOnce(&mut AtomicWriter) -> AppResult<()>,
 ) -> AppResult<()> {
     replace_with_writer(path, Some(expected), writer)
 }
 
 pub fn create_with_writer_if_absent(
     path: &Path,
-    writer: impl FnOnce(&mut File) -> AppResult<()>,
+    writer: impl FnOnce(&mut AtomicWriter) -> AppResult<()>,
 ) -> AppResult<()> {
     replace_with_writer(path, None, writer)
 }
@@ -65,37 +83,19 @@ pub fn create_with_writer_if_absent(
 /// the target is a CC Sessions-owned JSON store that Codex/Claude never write.
 pub fn overwrite_with_writer(
     path: &Path,
-    writer: impl FnOnce(&mut File) -> AppResult<()>,
+    writer: impl FnOnce(&mut AtomicWriter) -> AppResult<()>,
 ) -> AppResult<()> {
-    let (temp_path, mut temp_file) = create_unique_temp(path)?;
-    let write_result = writer(&mut temp_file).and_then(|()| {
-        temp_file.flush()?;
-        temp_file.sync_all()?;
-        Ok(())
-    });
-    drop(temp_file);
-    if let Err(error) = write_result {
-        return Err(cleanup_after_error(
-            &temp_path,
-            atomic_write_not_committed(error),
-        ));
+    if let Some(expected) = receipt::baseline(path)? {
+        return replace_with_writer(path, expected.as_ref(), writer);
     }
-    if let Err(error) = replace_file_atomically(&temp_path, path, true) {
-        return Err(cleanup_after_error(
-            &temp_path,
+    write_and_commit(path, writer, |temp_path| {
+        replace_file_atomically(temp_path, path, true).map_err(|error| {
             AppError::AtomicWriteNotCommitted(format!(
                 "原子替换目标文件失败 {}: {error}",
                 path.to_string_lossy()
-            )),
-        ));
-    }
-    sync_parent(path).map_err(|error| {
-        AppError::AtomicWriteCommitted(format!(
-            "文件已写入，但同步父目录失败 {}: {error}",
-            path.to_string_lossy()
-        ))
-    })?;
-    Ok(())
+            ))
+        })
+    })
 }
 
 /// Move an existing file without ever replacing an existing destination entry.
@@ -318,52 +318,107 @@ fn rename_file_no_replace(source: &Path, destination: &Path) -> std::io::Result<
 fn replace_with_writer(
     path: &Path,
     expected: Option<&FileFingerprint>,
-    writer: impl FnOnce(&mut File) -> AppResult<()>,
+    writer: impl FnOnce(&mut AtomicWriter) -> AppResult<()>,
 ) -> AppResult<()> {
-    let (temp_path, mut temp_file) = create_unique_temp(path)?;
-    let write_result = writer(&mut temp_file).and_then(|()| {
-        temp_file.flush()?;
-        temp_file.sync_all()?;
+    if let Some(baseline) = receipt::baseline(path)? {
+        if baseline.as_ref() != expected {
+            return Err(changed_during_operation(path));
+        }
+    }
+    write_and_commit(path, writer, |temp_path| match expected {
+        Some(expected) => commit_existing_if_unchanged(temp_path, path, expected),
+        None => create_file_atomically(temp_path, path),
+    })
+}
+
+/// Sequential writer that hashes exactly the bytes accepted by the staging file. No raw file
+/// access or seeking is exposed, so the receipt cannot omit overwritten/bypassed writes.
+pub struct AtomicWriter {
+    file: File,
+    hasher: Sha256,
+    len: u64,
+    permissions_set: bool,
+}
+
+impl AtomicWriter {
+    pub(crate) fn new(file: File) -> Self {
+        Self {
+            file,
+            hasher: Sha256::new(),
+            len: 0,
+            permissions_set: false,
+        }
+    }
+
+    pub(crate) fn fingerprint(&self) -> FileFingerprint {
+        FileFingerprint {
+            len: self.len,
+            sha256: self.hasher.clone().finalize().into(),
+        }
+    }
+
+    pub fn set_permissions(&mut self, permissions: fs::Permissions) -> std::io::Result<()> {
+        self.file.set_permissions(permissions)?;
+        self.permissions_set = true;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn metadata(&self) -> std::io::Result<fs::Metadata> {
+        self.file.metadata()
+    }
+
+    pub(crate) fn sync_all(&self) -> std::io::Result<()> {
+        self.file.sync_all()
+    }
+}
+
+impl Write for AtomicWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.file.write(bytes)?;
+        self.hasher.update(&bytes[..written]);
+        self.len += written as u64;
+        crate::operation_metrics::record(|c| c.hash_bytes += written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+fn write_and_commit(
+    path: &Path,
+    writer: impl FnOnce(&mut AtomicWriter) -> AppResult<()>,
+    commit: impl FnOnce(&Path) -> AppResult<()>,
+) -> AppResult<()> {
+    let receipt_key = receipt::key(path)?;
+    let (temp_path, temp_file) = create_unique_temp(path)?;
+    let mut output = AtomicWriter::new(temp_file);
+    let write_result = writer(&mut output).and_then(|()| {
+        if !output.permissions_set {
+            preserve_permissions(path, &output.file)?;
+        }
+        output.flush()?;
+        output.sync_all()?;
         Ok(())
     });
-    drop(temp_file);
+    let written = output.fingerprint();
+    drop(output);
     if let Err(error) = write_result {
         return Err(cleanup_after_error(
             &temp_path,
             atomic_write_not_committed(error),
         ));
     }
-
-    match expected {
-        Some(expected) => {
-            if let Err(error) = commit_existing_if_unchanged(&temp_path, path, expected) {
-                return Err(cleanup_after_error(&temp_path, error));
-            }
+    let committed = commit(&temp_path);
+    if committed.is_ok() || matches!(committed, Err(AppError::AtomicWriteCommitted(_))) {
+        if let Some(key) = receipt_key {
+            receipt::publish(&key, written);
         }
-        None => match path.try_exists() {
-            Ok(false) => {}
-            Ok(true) => {
-                return Err(cleanup_after_error(
-                    &temp_path,
-                    AppError::AtomicWriteConflict(format!(
-                        "文件在创建期间已由其他进程生成，已拒绝覆盖: {}",
-                        path.to_string_lossy()
-                    )),
-                ))
-            }
-            Err(error) => {
-                return Err(cleanup_after_error(
-                    &temp_path,
-                    AppError::AtomicWriteNotCommitted(error.to_string()),
-                ))
-            }
-        },
     }
-
-    if expected.is_none() {
-        if let Err(error) = create_file_atomically(&temp_path, path) {
-            return Err(cleanup_after_error(&temp_path, error));
-        }
+    if let Err(error) = committed {
+        return Err(cleanup_after_error(&temp_path, error));
     }
     sync_parent(path).map_err(|error| {
         AppError::AtomicWriteCommitted(format!(
@@ -550,7 +605,7 @@ fn commit_existing_if_unchanged(
     Ok(())
 }
 
-fn create_unique_temp(path: &Path) -> AppResult<(PathBuf, File)> {
+pub(crate) fn create_unique_temp(path: &Path) -> AppResult<(PathBuf, File)> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -563,16 +618,31 @@ fn create_unique_temp(path: &Path) -> AppResult<(PathBuf, File)> {
         let mut temp_name = file_name.to_os_string();
         temp_name.push(format!(".{}.{}.rewrite.tmp", std::process::id(), sequence));
         let temp_path = parent.join(temp_name);
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temp_path) {
             Ok(file) => return Ok((temp_path, file)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
         }
     }
+}
+
+fn preserve_permissions(path: &Path, temp: &File) -> std::io::Result<()> {
+    #[cfg(unix)]
+    match fs::metadata(path) {
+        Ok(metadata) => temp.set_permissions(metadata.permissions())?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    #[cfg(not(unix))]
+    let _ = (path, temp);
+    Ok(())
 }
 
 fn cleanup_after_error(temp_path: &Path, original: AppError) -> AppError {
@@ -679,6 +749,63 @@ fn sync_parent(path: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn round2_committed_cleanup_failure_keeps_the_write_receipt() -> AppResult<()> {
+        let root = std::env::temp_dir().join(format!(
+            "cc-receipt-commit-{}",
+            crate::repair::new_session_id()
+        ));
+        fs::create_dir_all(&root)?;
+        let path = root.join("state.jsonl");
+        fs::write(&path, b"before\n")?;
+        let expected = fingerprint(&path)?;
+        let mut journal = crate::mutation_journal::MutationJournal::default();
+        let result = journal.mutate_file(&path, || {
+            write_and_commit(
+                &path,
+                |file| {
+                    file.write_all(b"ours\n")?;
+                    Ok(())
+                },
+                |temp| {
+                    commit_existing_if_unchanged(temp, &path, &expected)?;
+                    Err(AppError::AtomicWriteCommitted(
+                        "injected cleanup failure".into(),
+                    ))
+                },
+            )
+        });
+        assert!(matches!(result, Err(AppError::AtomicWriteCommitted(_))));
+        assert_eq!(fs::read(&path)?, b"ours\n");
+        journal.compensate_without_transaction(AppError::Other("later".into()));
+        assert_eq!(fs::read(&path)?, b"before\n");
+        assert_eq!(fs::read_dir(&root)?.count(), 1);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_atomic_write_preserves_private_permissions() -> AppResult<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "cc-permissions-{}",
+            crate::repair::new_session_id()
+        ));
+        fs::create_dir_all(&root)?;
+        let path = root.join("private.jsonl");
+        fs::write(&path, b"before")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+        replace_with_writer_if_unchanged(&path, &fingerprint(&path)?, |file| {
+            assert_eq!(file.metadata()?.permissions().mode() & 0o777, 0o600);
+            file.write_all(b"after")?;
+            Ok(())
+        })?;
+        assert_eq!(fs::metadata(&path)?.permissions().mode() & 0o777, 0o600);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     use super::*;
 
     #[test]

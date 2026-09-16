@@ -259,7 +259,9 @@ cc-sessions webui --host 127.0.0.1 --port 17888
 
 服务默认只接受本机连接。它会为当前页面生成一次性访问令牌，并保存你在页面中设置的数据路径。
 
-WSL2 通常可以通过 `http://localhost:17888` 访问。如果必须绑定 `0.0.0.0`，请确认当前网络可信。Web UI 没有账号登录，不建议直接暴露到公网。
+WSL2 通常可以通过 `http://localhost:17888` 访问。Web UI 仅允许回环监听（`127.0.0.1`、`::1` 或 `localhost`）；远程访问请使用 SSH 隧道，不支持直接绑定 `0.0.0.0` 或局域网地址。API token 用于跨站防护，不是网络用户认证。
+
+正式 CLI 包只从可执行文件旁的 `dist/` 或 `webui/` 加载界面，不会自动使用当前项目目录中的网页。开发时可用 `CC_SESSIONS_WEBUI_DIST` 显式指定受信任的构建目录；启动时会显示实际资源路径。
 
 官方 CLI 包含 `cc-sessions.portable` 标记，设置保存在程序旁的 `cc-sessions-webui-settings.json`。自行构建且没有该标记时，设置会保存在当前系统的用户配置目录。环境变量 `CC_SESSIONS_WEBUI_SETTINGS` 可以指定其他设置文件。
 

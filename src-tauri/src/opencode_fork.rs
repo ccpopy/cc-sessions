@@ -22,7 +22,7 @@ pub fn copy_session_with_lock(
     cutoff: Option<OpenCodeForkPoint>,
     lock: &FamilyLock,
 ) -> AppResult<OpenCodeCopyReport> {
-    family::with_lock(lock, |_| {
+    family::with_lock(lock, &PathBuf::from(&opencode_dir), |_| {
         let root = PathBuf::from(paths::strip_verbatim(&opencode_dir));
         let (located_db, located_id) = opencode_sessions::resolve_locator(&rollout_path)?;
         let db = opencode_sessions::database_path(&root);

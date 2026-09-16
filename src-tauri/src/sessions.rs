@@ -195,7 +195,7 @@ fn query_summaries(
         let cwd = paths::host_path_string_from_codex_record(codex_dir, &cwd_raw);
         let cwd_display = paths::basename_display(&cwd);
         let rollout_bytes = fs::metadata(&rollout_path).map(|m| m.len()).unwrap_or(0);
-        let resume_command = format!("codex resume {}", id);
+        let resume_command = crate::fs_ops::session_resume_command("codex", &id);
         let title = select_codex_title(
             index_titles.get(&id).map(String::as_str),
             &database_name,
@@ -432,7 +432,7 @@ fn supplement_archived_summaries(
         let title: String = brief.first_user_message.chars().take(80).collect();
         out.push(SessionSummary {
             provider: "codex".into(),
-            resume_command: format!("codex resume {}", brief.id),
+            resume_command: crate::fs_ops::session_resume_command("codex", &brief.id),
             id: brief.id.clone(),
             rollout_path: p.to_string_lossy().into_owned(),
             cwd,
@@ -620,15 +620,19 @@ pub fn set_archived_with_dirs(
     v: bool,
     lock: &family::FamilyLock,
 ) -> AppResult<()> {
-    match provider_or_codex(provider).as_str() {
-        "codex" => family::with_lock(lock, |_guard| {
-            set_archived_codex_locked(dirs.codex_dir, id, v)
-        }),
+    let provider = provider_or_codex(provider);
+    let roots = if provider == "cursor" {
+        vec![dirs.cursor_path(), dirs.cursor_agent_path()]
+    } else {
+        vec![dirs.provider_path(&provider)?]
+    };
+    family::with_roots(lock, &roots, |_| match provider.as_str() {
+        "codex" => set_archived_codex_locked(dirs.codex_dir, id, v),
         "opencode" => crate::opencode_sessions::set_archived(&dirs.opencode_path(), &id, v),
         "cursor" => crate::cursor_mutate::set_archived(&dirs, &id, v),
         "claude" => Err(AppError::Other("Claude 会话不支持归档".into())),
         other => Err(AppError::Other(format!("不支持的 provider: {other}"))),
-    }
+    })
 }
 
 /// 重命名会话：新版写 threads.name，同时兼容更新旧版 threads.title。
@@ -663,18 +667,20 @@ pub fn rename_session_with_dirs(
     let provider = provider_or_codex(provider);
     let codex_dir = dirs.codex_dir.clone();
     if provider == "opencode" {
-        return family::with_lock(lock, |_guard| {
+        return family::with_lock(lock, &dirs.opencode_path(), |_guard| {
             crate::opencode_sessions::rename_session(&dirs.opencode_path(), &id, &title)
         });
     }
     if provider == "cursor" {
-        return family::with_lock(lock, |_guard| {
-            crate::cursor_mutate::rename_session(&dirs, &id, &title)
-        });
+        return family::with_roots(
+            lock,
+            &[dirs.cursor_path(), dirs.cursor_agent_path()],
+            |_guard| crate::cursor_mutate::rename_session(&dirs, &id, &title),
+        );
     }
     if provider == "claude" {
         let claude = dirs.claude_path();
-        return family::with_lock(lock, |_guard| {
+        return family::with_lock(lock, &claude, |_guard| {
             crate::claude_transfer::rename_session(&claude, &id, rollout_path.as_deref(), &title)
         });
     }
@@ -688,7 +694,9 @@ pub fn rename_session_with_dirs(
     if title.chars().count() > 120 {
         return Err(AppError::Other("会话名称过长（最多 120 个字符）".into()));
     }
-    family::with_lock(lock, |_guard| rename_session_locked(codex_dir, id, title))
+    family::with_lock(lock, &PathBuf::from(&codex_dir), |_guard| {
+        rename_session_locked(codex_dir, id, title)
+    })
 }
 
 fn rename_session_locked(codex_dir: String, id: String, title: String) -> AppResult<u32> {
@@ -1098,7 +1106,7 @@ pub fn move_session_cwd_with_provider_dirs_and_options(
         ));
     }
     match provider_or_codex(provider).as_str() {
-        "codex" => family::with_lock(lock, |_guard| {
+        "codex" => family::with_lock(lock, &PathBuf::from(&codex_dir), |_guard| {
             move_session_cwd_locked(codex_dir, id, target_cwd)
         }),
         "claude" => {
@@ -1106,7 +1114,7 @@ pub fn move_session_cwd_with_provider_dirs_and_options(
                 claude_dir
                     .unwrap_or_else(|| paths::default_claude_dir().to_string_lossy().into_owned()),
             );
-            family::with_lock(lock, |_guard| {
+            family::with_lock(lock, &claude, |_guard| {
                 crate::claude_transfer::move_session_cwd_with_options(
                     &claude,
                     &id,
@@ -1121,7 +1129,7 @@ pub fn move_session_cwd_with_provider_dirs_and_options(
                 PathBuf::from(opencode_dir.unwrap_or_else(|| {
                     paths::default_opencode_dir().to_string_lossy().into_owned()
                 }));
-            family::with_lock(lock, |_guard| {
+            family::with_lock(lock, &data_dir, |_guard| {
                 crate::opencode_transfer::move_session_cwd(&data_dir, &id, &target_cwd)
             })
         }
@@ -1549,19 +1557,23 @@ pub fn delete_session_with_dirs(
             rollout_path: None,
         },
     };
-    match provider_or_codex(provider).as_str() {
-        "codex" => family::with_lock(lock, |_guard| {
-            delete_codex_targets_locked(&dirs.codex_path(), vec![target])?
-                .pop()
-                .ok_or_else(|| AppError::Other("Codex 删除未返回结果".to_string()))
-        }),
+    let provider = provider_or_codex(provider);
+    let roots = if provider == "cursor" {
+        vec![dirs.cursor_path(), dirs.cursor_agent_path()]
+    } else {
+        vec![dirs.provider_path(&provider)?]
+    };
+    family::with_roots(lock, &roots, |_| match provider.as_str() {
+        "codex" => delete_codex_targets_locked(&dirs.codex_path(), vec![target])?
+            .pop()
+            .ok_or_else(|| AppError::Other("Codex 删除未返回结果".to_string())),
         "claude" => delete_claude_targets(&dirs.claude_path(), vec![target])?
             .pop()
             .ok_or_else(|| AppError::Other("Claude 删除未返回结果".to_string())),
         "opencode" => crate::opencode_sessions::delete_session(&dirs.opencode_path(), &target.id),
         "cursor" => crate::cursor_mutate::delete_session(&dirs, &target.id),
         other => Err(AppError::Other(format!("不支持的 provider: {other}"))),
-    }
+    })
 }
 
 pub fn delete_sessions_with_lock(
@@ -1615,10 +1627,14 @@ pub fn delete_sessions_with_dirs(
             })
             .collect(),
     };
-    match provider_or_codex(provider).as_str() {
-        "codex" => family::with_lock(lock, |_guard| {
-            delete_codex_targets_locked(&dirs.codex_path(), targets)
-        }),
+    let provider = provider_or_codex(provider);
+    let roots = if provider == "cursor" {
+        vec![dirs.cursor_path(), dirs.cursor_agent_path()]
+    } else {
+        vec![dirs.provider_path(&provider)?]
+    };
+    family::with_roots(lock, &roots, |_| match provider.as_str() {
+        "codex" => delete_codex_targets_locked(&dirs.codex_path(), targets),
         "claude" => delete_claude_targets(&dirs.claude_path(), targets),
         "opencode" => {
             let dir = dirs.opencode_path();
@@ -1641,7 +1657,7 @@ pub fn delete_sessions_with_dirs(
                 .collect())
         }
         other => Err(AppError::Other(format!("不支持的 provider: {other}"))),
-    }
+    })
 }
 
 fn empty_delete_result(target: &DeleteTarget) -> DeleteResult {

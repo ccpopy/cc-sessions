@@ -94,6 +94,21 @@ impl ProviderDirs {
         }
     }
 
+    pub(crate) fn provider_path(
+        &self,
+        provider: &str,
+    ) -> crate::error::AppResult<std::path::PathBuf> {
+        match provider {
+            "codex" => Ok(self.codex_path()),
+            "claude" => Ok(self.claude_path()),
+            "opencode" => Ok(self.opencode_path()),
+            "cursor" => Ok(self.cursor_path()),
+            other => Err(crate::error::AppError::Other(format!(
+                "不支持的 provider: {other}"
+            ))),
+        }
+    }
+
     pub fn codex_path(&self) -> std::path::PathBuf {
         std::path::PathBuf::from(&self.codex_dir)
     }

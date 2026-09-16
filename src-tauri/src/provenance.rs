@@ -62,7 +62,7 @@ fn save(codex_dir: &Path, store: &ProvenanceStore) -> AppResult<()> {
     fs::create_dir_all(codex_dir)?;
     let path = paths::session_provenance_path(codex_dir);
     let data = serde_json::to_vec_pretty(store)?;
-    let writer = |file: &mut fs::File| -> AppResult<()> {
+    let writer = |file: &mut crate::atomic_file::AtomicWriter| -> AppResult<()> {
         file.write_all(&data)?;
         file.write_all(b"\n")?;
         Ok(())

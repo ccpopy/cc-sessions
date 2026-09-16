@@ -81,7 +81,7 @@ pub fn write_lines(path: &Path, lines: &[String]) -> AppResult<u32> {
     let expected = existed
         .then(|| atomic_file::fingerprint(path))
         .transpose()?;
-    let writer = |file: &mut File| -> AppResult<()> {
+    let writer = |file: &mut crate::atomic_file::AtomicWriter| -> AppResult<()> {
         for line in lines {
             writeln!(file, "{}", line)?;
         }
@@ -132,7 +132,7 @@ pub fn append_lines(history_path: &Path, id: &str, lines: &[String]) -> AppResul
     if added == 0 {
         return Ok(0);
     }
-    let writer = |file: &mut File| -> AppResult<()> {
+    let writer = |file: &mut crate::atomic_file::AtomicWriter| -> AppResult<()> {
         for line in &output {
             writeln!(file, "{line}")?;
         }

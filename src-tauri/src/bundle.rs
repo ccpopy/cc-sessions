@@ -1732,6 +1732,30 @@ pub fn import_session_bundles_with_dirs(
     project_mappings: Vec<ProjectPathMapping>,
     bundle_dirs: Option<Vec<String>>,
 ) -> AppResult<Vec<ImportReport>> {
+    import_session_bundles_with_dirs_scoped(
+        provider,
+        src_dir,
+        dirs,
+        mode,
+        make_visible,
+        strict,
+        project_mappings,
+        bundle_dirs,
+        None,
+    )
+}
+
+fn import_session_bundles_with_dirs_scoped(
+    provider: Option<String>,
+    src_dir: String,
+    dirs: ProviderDirs,
+    mode: ImportMode,
+    make_visible: bool,
+    strict: bool,
+    project_mappings: Vec<ProjectPathMapping>,
+    bundle_dirs: Option<Vec<String>>,
+    lock: Option<&crate::family::FamilyLock>,
+) -> AppResult<Vec<ImportReport>> {
     let codex_dir = dirs.codex_dir.clone();
     let claude_dir = Some(dirs.claude_path().to_string_lossy().into_owned());
     let opencode_dir = Some(dirs.opencode_path().to_string_lossy().into_owned());
@@ -1757,36 +1781,38 @@ pub fn import_session_bundles_with_dirs(
         let item_provider = provider
             .as_deref()
             .unwrap_or_else(|| bundle_provider(&it.manifest));
-        reports.push(
-            (match item_provider {
-                PROVIDER_CLAUDE => {
-                    import_one_claude(&claude, &it, &mode, strict, &project_mappings)
-                }
-                PROVIDER_OPENCODE => {
-                    import_one_opencode(&opencode, &it, &mode, strict, &project_mappings)
-                }
-                PROVIDER_CURSOR => import_one_cursor(&cursor, &it, &mode, strict),
-                _ => import_one(&codex, &it, &mode, make_visible, strict, &project_mappings),
-            })
-            .unwrap_or_else(|e| ImportReport {
-                desktop_restart_required: false,
-                session_id: it.manifest.session_id.clone(),
-                ok: false,
-                rollout_written: false,
-                history_appended: 0,
-                threads_upserted: false,
-                index_appended: false,
-                skipped_reason: None,
-                error: Some(e.to_string()),
-                verified: false,
-                sha_mismatch: false,
-            }),
-        );
+        let import = || match item_provider {
+            PROVIDER_CLAUDE => import_one_claude(&claude, &it, &mode, strict, &project_mappings),
+            PROVIDER_OPENCODE => {
+                import_one_opencode(&opencode, &it, &mode, strict, &project_mappings)
+            }
+            PROVIDER_CURSOR => import_one_cursor(&cursor, &it, &mode, strict),
+            _ => import_one(&codex, &it, &mode, make_visible, strict, &project_mappings),
+        };
+        let result = match lock {
+            Some(lock) => {
+                crate::family::with_lock(lock, &dirs.provider_path(item_provider)?, |_| import())
+            }
+            None => import(),
+        };
+        reports.push(result.unwrap_or_else(|e| ImportReport {
+            desktop_restart_required: false,
+            session_id: it.manifest.session_id.clone(),
+            ok: false,
+            rollout_written: false,
+            history_appended: 0,
+            threads_upserted: false,
+            index_appended: false,
+            skipped_reason: None,
+            error: Some(e.to_string()),
+            verified: false,
+            sha_mismatch: false,
+        }));
     }
     Ok(reports)
 }
 
-/// 产品入口必须持有共享 FamilyLock，覆盖完整 import，避免归档来源账本并发丢写。
+/// 每条导入按实际目标的数据目录持锁，避免归档来源账本并发丢写。
 pub fn import_session_bundles_with_lock(
     provider: Option<String>,
     src_dir: String,
@@ -1798,18 +1824,17 @@ pub fn import_session_bundles_with_lock(
     bundle_dirs: Option<Vec<String>>,
     lock: &crate::family::FamilyLock,
 ) -> AppResult<Vec<ImportReport>> {
-    crate::family::with_lock(lock, |_guard| {
-        import_session_bundles_with_dirs(
-            provider,
-            src_dir,
-            dirs,
-            mode,
-            make_visible,
-            strict,
-            project_mappings,
-            bundle_dirs,
-        )
-    })
+    import_session_bundles_with_dirs_scoped(
+        provider,
+        src_dir,
+        dirs,
+        mode,
+        make_visible,
+        strict,
+        project_mappings,
+        bundle_dirs,
+        Some(lock),
+    )
 }
 
 fn build_project_mapping(items: Vec<ProjectPathMapping>) -> AppResult<HashMap<String, String>> {
@@ -3854,7 +3879,7 @@ fn upsert_bundle_index_line(codex: &Path, manifest: &BundleManifest) -> AppResul
     if !existed {
         output.push(entry);
     }
-    let write = |file: &mut File| -> AppResult<()> {
+    let write = |file: &mut crate::atomic_file::AtomicWriter| -> AppResult<()> {
         for line in &output {
             writeln!(file, "{line}")?;
         }
@@ -3870,7 +3895,7 @@ fn upsert_bundle_index_line(codex: &Path, manifest: &BundleManifest) -> AppResul
 
 fn replace_import_destination(
     dest: &Path,
-    writer: impl FnOnce(&mut File) -> AppResult<()>,
+    writer: impl FnOnce(&mut crate::atomic_file::AtomicWriter) -> AppResult<()>,
 ) -> AppResult<()> {
     if dest.exists() && !dest.is_file() {
         return Err(AppError::Path(format!(
@@ -4185,9 +4210,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn import_product_entrypoint_waits_for_family_lock() {
+    fn import_invalid_input_does_not_wait_for_a_write_lock() {
         let lock = std::sync::Arc::new(crate::family::FamilyLock::default());
-        let guard = lock.0.lock().unwrap();
+        let mutex = crate::family::test_mutex(Path::new("missing-codex"));
+        let guard = mutex.lock().unwrap();
         let worker_lock = std::sync::Arc::clone(&lock);
         let (sender, receiver) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
@@ -4205,14 +4231,10 @@ mod tests {
             sender.send(result.map(|_| ())).unwrap();
         });
 
-        assert!(matches!(
-            receiver.recv_timeout(std::time::Duration::from_millis(100)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        ));
-        drop(guard);
         let _ = receiver
             .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("import should continue after releasing FamilyLock");
+            .unwrap();
+        drop(guard);
         worker.join().unwrap();
     }
 

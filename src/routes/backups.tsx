@@ -32,12 +32,12 @@ export default function BackupsRoute({ provider = "codex" }: { provider?: Sessio
         stats={backups.length > 0 ? `${backups.length} 份 · ${humanBytes(totalSize)}` : undefined}
         onRefresh={refresh}
       />
-      <ScrollArea className="flex-1">
+      <ScrollArea className="flex-1" viewportClassName="[&>div]:!block">
       <div className="space-y-4 p-6">
-        <div className="flex items-center gap-2 text-sm text-muted-foreground">
-          <Archive className="h-4 w-4" />
-          备份目录：
-          <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">
+        <div className="flex min-w-0 items-start gap-2 text-sm text-muted-foreground">
+          <Archive className="mt-0.5 h-4 w-4 shrink-0" />
+          <span className="shrink-0">备份目录：</span>
+          <code className="min-w-0 break-all rounded bg-muted px-1.5 py-0.5 font-mono text-xs">
             {settings?.backup_dir}
           </code>
         </div>
@@ -83,9 +83,9 @@ export default function BackupsRoute({ provider = "codex" }: { provider?: Sessio
                       </Badge>
                     </div>
                     <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                      <span>{safeFormat(b.created_at)}</span>
-                      <span>·</span>
-                      <span className="truncate font-mono">{b.path}</span>
+                      <span className="shrink-0">{safeFormat(b.created_at)}</span>
+                      <span className="shrink-0">·</span>
+                      <span className="truncate font-mono" title={b.path}>{b.path}</span>
                     </div>
                     {b.note && (
                       <div className="line-clamp-1 text-xs text-muted-foreground">

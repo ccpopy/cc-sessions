@@ -28,6 +28,33 @@ pub(crate) struct SessionActivityGuard {
     samples: Vec<Sample>,
 }
 impl SessionActivityGuard {
+    /// Sample every target before sharing one quiet window. Each token only watches its own
+    /// target, so earlier successful writes in a batch cannot invalidate later targets.
+    pub(crate) fn observe_batch(
+        codex: &Path,
+        targets: Vec<(String, Vec<PathBuf>)>,
+    ) -> AppResult<Vec<AppResult<Self>>> {
+        let samples = sample_each(codex, &targets)?;
+        if samples
+            .iter()
+            .filter_map(|sample| sample.as_ref().ok())
+            .any(|s| s.row.is_some() || s.files.iter().any(|(_, f)| f.is_some()))
+        {
+            observation_window();
+        }
+        Ok(targets
+            .into_iter()
+            .zip(samples)
+            .map(|(target, sample)| {
+                sample.map(|sample| Self {
+                    codex: codex.to_path_buf(),
+                    targets: vec![target],
+                    samples: vec![sample],
+                })
+            })
+            .collect())
+    }
+
     pub(crate) fn observe(codex: &Path, targets: Vec<(String, Vec<PathBuf>)>) -> AppResult<Self> {
         let samples = sample(codex, &targets)?;
         let guard = Self {
@@ -62,6 +89,13 @@ impl SessionActivityGuard {
 }
 
 fn sample(codex: &Path, targets: &[(String, Vec<PathBuf>)]) -> AppResult<Vec<Sample>> {
+    sample_each(codex, targets)?.into_iter().collect()
+}
+
+fn sample_each(
+    codex: &Path,
+    targets: &[(String, Vec<PathBuf>)],
+) -> AppResult<Vec<AppResult<Sample>>> {
     if targets.is_empty() {
         return Ok(Vec::new());
     }
@@ -84,7 +118,7 @@ fn sample(codex: &Path, targets: &[(String, Vec<PathBuf>)]) -> AppResult<Vec<Sam
         )?,
         None => false,
     };
-    targets
+    Ok(targets
         .iter()
         .map(|(id, explicit_paths)| {
             let mut files: BTreeSet<PathBuf> = explicit_paths
@@ -126,7 +160,7 @@ fn sample(codex: &Path, targets: &[(String, Vec<PathBuf>)]) -> AppResult<Vec<Sam
                 .collect::<AppResult<_>>()?;
             Ok(Sample { row, files })
         })
-        .collect()
+        .collect())
 }
 
 fn file_sample(path: &Path) -> AppResult<Option<FileSample>> {
@@ -150,6 +184,7 @@ fn file_sample(path: &Path) -> AppResult<Option<FileSample>> {
 
 #[cfg(not(test))]
 fn observation_window() {
+    crate::operation_metrics::record(|c| c.observation_windows += 1);
     std::thread::sleep(std::time::Duration::from_millis(350));
 }
 #[cfg(test)]
@@ -158,6 +193,7 @@ thread_local! {
 }
 #[cfg(test)]
 fn observation_window() {
+    crate::operation_metrics::record(|c| c.observation_windows += 1);
     if let Some(hook) = OBSERVATION_HOOK.with(|slot| slot.borrow_mut().take()) {
         hook();
     }
@@ -171,6 +207,62 @@ pub(crate) fn during_observation(hook: impl FnOnce() + 'static) {
 mod tests {
     use super::*;
     use std::io::Write;
+    #[test]
+    fn review_batch_sample_failure_does_not_abort_other_targets() -> AppResult<()> {
+        let root = std::env::temp_dir().join(format!(
+            "cc-batch-sample-{}",
+            crate::repair::new_session_id()
+        ));
+        fs::create_dir_all(&root)?;
+        let good = root.join("good.jsonl");
+        fs::write(&good, b"good")?;
+        let observed = SessionActivityGuard::observe_batch(
+            &root,
+            vec![
+                ("bad".into(), vec![root.clone()]),
+                ("good".into(), vec![good]),
+            ],
+        );
+        assert!(
+            observed.is_ok(),
+            "one unreadable target must not abort the whole batch"
+        );
+        let mut observed = observed?.into_iter();
+        assert!(observed.next().unwrap().is_err());
+        observed.next().unwrap()?.ensure_unchanged()?;
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn review_batch_observation_is_shared_but_tokens_are_independent() -> AppResult<()> {
+        let root = std::env::temp_dir().join(format!(
+            "cc-batch-activity-{}",
+            crate::repair::new_session_id()
+        ));
+        fs::create_dir_all(&root)?;
+        let a = root.join("a.jsonl");
+        let b = root.join("b.jsonl");
+        fs::write(&a, b"a")?;
+        fs::write(&b, b"b")?;
+        let observed = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = observed.clone();
+        during_observation(move || count.set(count.get() + 1));
+        let guards = SessionActivityGuard::observe_batch(
+            &root,
+            vec![("a".into(), vec![a.clone()]), ("b".into(), vec![b.clone()])],
+        )?
+        .into_iter()
+        .collect::<AppResult<Vec<_>>>()?;
+        assert_eq!(observed.get(), 1);
+        fs::write(&a, b"a changed by the batch")?;
+        assert!(guards[0].ensure_unchanged().is_err());
+        guards[1].ensure_unchanged()?;
+        fs::write(&b, b"external append")?;
+        assert!(guards[1].ensure_unchanged().is_err());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
     #[test]
     fn detects_target_append_and_thread_repoint_but_ignores_other_sessions() -> AppResult<()> {
         let root = std::env::temp_dir().join(format!(

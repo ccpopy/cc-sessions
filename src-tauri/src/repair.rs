@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
@@ -60,10 +60,12 @@ fn rewrite_lines_atomically(path: &Path, lines: &[String]) -> AppResult<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    let writer = |file: &mut fs::File| -> AppResult<()> {
+    let writer = |file: &mut crate::atomic_file::AtomicWriter| -> AppResult<()> {
+        let mut file = BufWriter::with_capacity(64 * 1024, file);
         for line in lines {
             writeln!(file, "{line}")?;
         }
+        file.flush()?;
         Ok(())
     };
     if let Some(expected) = expected.as_ref() {
@@ -651,6 +653,7 @@ struct RolloutIdentity {
     id: String,
     model_provider: String,
     source: Option<String>,
+    is_paginated: bool,
 }
 
 /// 读取 provider / 本地索引诊断所需的最小 rollout 身份信息。
@@ -691,6 +694,7 @@ fn read_rollout_identity(path: &Path) -> AppResult<Option<RolloutIdentity>> {
             id: id.to_string(),
             model_provider,
             source: metadata_string_field(payload, "source"),
+            is_paginated: payload.get("history_mode").and_then(Value::as_str) == Some("paginated"),
         }));
     }
     Ok(None)
@@ -1070,6 +1074,20 @@ fn find_orphan_subagent_ids(
     state: &rusqlite::Connection,
     rollout_ids: &BTreeSet<String>,
 ) -> AppResult<Vec<String>> {
+    find_orphan_subagent_ids_from_threads(state, rollout_ids, || {
+        let mut stmt = state.prepare("SELECT id FROM threads")?;
+        let ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ids)
+    })
+}
+
+fn find_orphan_subagent_ids_from_threads(
+    state: &rusqlite::Connection,
+    rollout_ids: &BTreeSet<String>,
+    thread_ids: impl FnOnce() -> AppResult<Vec<String>>,
+) -> AppResult<Vec<String>> {
     let has_edges: bool = state.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='thread_spawn_edges')",
         [],
@@ -1082,9 +1100,7 @@ fn find_orphan_subagent_ids(
     // rollout 与 threads 都能证明父会话仍存在。threads 可由 rollout 重建，不能把
     // 暂缺 threads 行的真实父会话整棵子代理树误判为孤儿。
     let mut existing_parent_ids = rollout_ids.clone();
-    let mut thread_stmt = state.prepare("SELECT id FROM threads")?;
-    let thread_rows = thread_stmt.query_map([], |row| row.get::<_, String>(0))?;
-    existing_parent_ids.extend(thread_rows.collect::<Result<Vec<_>, _>>()?);
+    existing_parent_ids.extend(thread_ids()?);
 
     let mut edge_stmt =
         state.prepare("SELECT parent_thread_id, child_thread_id FROM thread_spawn_edges")?;
@@ -1117,6 +1133,7 @@ fn find_orphan_subagent_ids(
 }
 
 pub fn diagnose_codex_state(codex_dir: String) -> AppResult<DiagnosticReport> {
+    let _measurement = crate::operation_metrics::Measurement::start("repair_overview");
     let codex = PathBuf::from(&codex_dir);
 
     // 1) 扫 sessions/。这里的 rollout_count 只统计 active 会话，和官方 thread/list
@@ -1148,50 +1165,28 @@ pub fn diagnose_codex_state(codex_dir: String) -> AppResult<DiagnosticReport> {
         .cloned()
         .collect::<BTreeSet<_>>();
 
-    // 3) session_index.jsonl
-    let index_path = paths::session_index_path(&codex);
-    let mut index_ids: Vec<String> = Vec::new();
-    if index_path.is_file() {
-        let f = fs::File::open(&index_path)?;
-        for line in BufReader::new(f).lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
-                    index_ids.push(id.to_string());
-                }
-            }
+    // One request-local snapshot feeds both set differences and provider planning. Never reuse
+    // this snapshot to authorize writes; mutation entry points reread the affected records.
+    let scan = RepairScanContext::read(&codex)?;
+    let index_ids: Vec<_> = scan.index_ids.iter().cloned().collect();
+    let mut threads_ids: Vec<_> = scan.thread_states.keys().cloned().collect();
+    let mut threads_active_ids = Vec::new();
+    let mut threads_archived_ids = Vec::new();
+    for (id, state) in &scan.thread_states {
+        if state.archived {
+            threads_archived_ids.push(id.clone());
+        } else {
+            threads_active_ids.push(id.clone());
         }
     }
-    index_ids.sort();
-    index_ids.dedup();
-
-    // 4) threads 表
-    let mut threads_ids: Vec<String> = Vec::new();
-    let mut threads_active_ids: Vec<String> = Vec::new();
-    let mut threads_archived_ids: Vec<String> = Vec::new();
-    // 孤儿子代理：thread_spawn_edges 中父会话已不在 threads 表的 child。
-    // 父在 threads 表（含 archived=1 的本工具归档）说明父会话仍存在，不算孤儿。
-    let mut orphan_subagent_ids: Vec<String> = Vec::new();
-    if paths::state_db_path(&codex).is_file() {
+    let mut orphan_subagent_ids = if paths::state_db_path(&codex).is_file() {
         let conn = state_db::open_ro(&codex)?;
-        let mut stmt = conn.prepare("SELECT id, COALESCE(archived,0) FROM threads")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0))
-        })?;
-        for r in rows.flatten() {
-            let (id, archived) = r;
-            if archived {
-                threads_archived_ids.push(id.clone());
-            } else {
-                threads_active_ids.push(id.clone());
-            }
-            threads_ids.push(id);
-        }
-        orphan_subagent_ids = find_orphan_subagent_ids(&conn, &all_rollout_ids)?;
-    }
+        find_orphan_subagent_ids_from_threads(&conn, &all_rollout_ids, || {
+            Ok(scan.thread_states.keys().cloned().collect())
+        })?
+    } else {
+        Vec::new()
+    };
     threads_ids.sort();
     threads_ids.dedup();
     threads_active_ids.sort();
@@ -1216,8 +1211,9 @@ pub fn diagnose_codex_state(codex_dir: String) -> AppResult<DiagnosticReport> {
     // 6) provider mismatch —— 与 batch_clone 共用实现。
     // config.toml 没显式写 model_provider 时 Codex 默认 "openai"，这里也按默认值比较。
     let cur_provider = effective_current_provider(&codex)?;
-    let mismatch = list_mismatched_sessions_from_rollouts(&codex, &cur_provider, active_rollouts)?
-        .len() as u32;
+    let mismatch =
+        list_mismatched_sessions_from_scan(&codex, &cur_provider, active_rollouts, &scan)?.len()
+            as u32;
 
     Ok(DiagnosticReport {
         rollout_count,
@@ -1243,6 +1239,14 @@ pub fn diagnose_codex_state(codex_dir: String) -> AppResult<DiagnosticReport> {
 // ========================= 重建 session_index.jsonl =========================
 
 pub fn repair_session_index(codex_dir: String, dry_run: bool) -> AppResult<IndexRepairReport> {
+    family::with_lock(
+        &family::FamilyLock::default(),
+        &PathBuf::from(&codex_dir),
+        |_| repair_session_index_locked(codex_dir, dry_run),
+    )
+}
+
+fn repair_session_index_locked(codex_dir: String, dry_run: bool) -> AppResult<IndexRepairReport> {
     let codex = PathBuf::from(&codex_dir);
     let rollouts = family::scan_rollouts(&codex)?;
     // 分页会话的存根与延续文件共用同一 id；索引必须指向延续文件且不得重复。
@@ -1362,7 +1366,7 @@ pub fn prune_orphan_entries_with_lock(
     dry_run: bool,
     lock: &family::FamilyLock,
 ) -> AppResult<OrphanPruneReport> {
-    family::with_lock(lock, |_g| {
+    family::with_lock(lock, &PathBuf::from(&codex_dir), |_g| {
         prune_orphan_entries_locked(
             codex_dir,
             prune_index,
@@ -1865,7 +1869,7 @@ pub fn backfill_archive_origins_with_lock(
     dry_run: bool,
     lock: &family::FamilyLock,
 ) -> AppResult<ArchiveOriginBackfillReport> {
-    family::with_lock(lock, |_g| {
+    family::with_lock(lock, &PathBuf::from(&codex_dir), |_g| {
         backfill_archive_origins_locked(codex_dir, dry_run)
     })
 }
@@ -2013,6 +2017,17 @@ pub fn diagnose_claude_history_orphans(claude_dir: String) -> AppResult<HistoryO
 }
 
 pub fn prune_claude_history_orphans(
+    claude_dir: String,
+    dry_run: bool,
+) -> AppResult<HistoryPruneReport> {
+    family::with_lock(
+        &family::FamilyLock::default(),
+        &PathBuf::from(&claude_dir),
+        |_| prune_claude_history_orphans_locked(claude_dir, dry_run),
+    )
+}
+
+fn prune_claude_history_orphans_locked(
     claude_dir: String,
     dry_run: bool,
 ) -> AppResult<HistoryPruneReport> {
@@ -2427,6 +2442,18 @@ pub fn repair_claude_gui_visibility(
     dry_run: bool,
     session_ids: Option<Vec<String>>,
 ) -> AppResult<GuiVisibilityFixReport> {
+    family::with_lock(
+        &family::FamilyLock::default(),
+        &PathBuf::from(&claude_dir),
+        |_| repair_claude_gui_visibility_locked(claude_dir, dry_run, session_ids),
+    )
+}
+
+fn repair_claude_gui_visibility_locked(
+    claude_dir: String,
+    dry_run: bool,
+    session_ids: Option<Vec<String>>,
+) -> AppResult<GuiVisibilityFixReport> {
     let report = diagnose_claude_gui_visibility(claude_dir)?;
     let filter: Option<BTreeSet<String>> = session_ids.map(|ids| ids.into_iter().collect());
 
@@ -2599,6 +2626,17 @@ fn effective_threads_cols(state: &rusqlite::Connection) -> AppResult<Vec<&'stati
 }
 
 pub fn rebuild_threads_table(codex_dir: String, dry_run: bool) -> AppResult<ThreadsRebuildReport> {
+    family::with_lock(
+        &family::FamilyLock::default(),
+        &PathBuf::from(&codex_dir),
+        |_| rebuild_threads_table_locked(codex_dir, dry_run),
+    )
+}
+
+fn rebuild_threads_table_locked(
+    codex_dir: String,
+    dry_run: bool,
+) -> AppResult<ThreadsRebuildReport> {
     let codex = PathBuf::from(&codex_dir);
     let active_rollouts = family::scan_rollouts(&codex)?;
     let archived_rollouts = family::scan_archived_rollouts(&codex)?;
@@ -3033,7 +3071,52 @@ struct ThreadRepairState {
     archived: bool,
 }
 
+struct RepairScanContext {
+    thread_states: BTreeMap<String, ThreadRepairState>,
+    index_ids: BTreeSet<String>,
+}
+
+impl RepairScanContext {
+    fn read(codex: &Path) -> AppResult<Self> {
+        Ok(Self {
+            thread_states: read_thread_state_map(codex)?,
+            index_ids: read_session_index_ids(codex)?,
+        })
+    }
+}
+
+fn read_thread_states_for_ids<'a>(
+    codex: &Path,
+    ids: impl IntoIterator<Item = &'a str>,
+) -> AppResult<BTreeMap<String, ThreadRepairState>> {
+    use rusqlite::OptionalExtension;
+    let mut states = BTreeMap::new();
+    if !paths::state_db_path(codex).is_file() {
+        return Ok(states);
+    }
+    let conn = state_db::open_ro(codex)?;
+    let mut stmt = conn.prepare("SELECT rollout_path, model_provider, source, COALESCE(archived,0) FROM threads WHERE id=?1")?;
+    for id in ids {
+        crate::operation_metrics::record(|c| c.local_thread_queries += 1);
+        if let Some(state) = stmt
+            .query_row([id], |row| {
+                Ok(ThreadRepairState {
+                    rollout_path: row.get(0)?,
+                    model_provider: row.get(1)?,
+                    source: row.get(2)?,
+                    archived: row.get::<_, i64>(3)? != 0,
+                })
+            })
+            .optional()?
+        {
+            states.insert(id.to_owned(), state);
+        }
+    }
+    Ok(states)
+}
+
 fn read_thread_state_map(codex: &Path) -> AppResult<BTreeMap<String, ThreadRepairState>> {
+    crate::operation_metrics::record(|c| c.thread_table_scans += 1);
     let mut out = BTreeMap::new();
     if !paths::state_db_path(codex).is_file() {
         return Ok(out);
@@ -3061,6 +3144,7 @@ fn read_thread_state_map(codex: &Path) -> AppResult<BTreeMap<String, ThreadRepai
 }
 
 pub(crate) fn read_session_index_ids(codex: &Path) -> AppResult<BTreeSet<String>> {
+    crate::operation_metrics::record(|c| c.index_scans += 1);
     let path = paths::session_index_path(codex);
     let mut ids = BTreeSet::new();
     if !path.is_file() {
@@ -3418,7 +3502,7 @@ fn create_rollout_from_source_snapshot(
     src_abs: &Path,
     dest_abs: &Path,
     source_fingerprint: &atomic_file::FileFingerprint,
-    writer: impl FnOnce(&mut fs::File) -> AppResult<()>,
+    writer: impl FnOnce(&mut crate::atomic_file::AtomicWriter) -> AppResult<()>,
 ) -> AppResult<()> {
     if let Some(parent) = dest_abs.parent() {
         fs::create_dir_all(parent)?;
@@ -3637,7 +3721,7 @@ fn build_independent_duplicate_meta(
 }
 
 fn write_interrupted_duplicate_boundary(
-    out: &mut fs::File,
+    out: &mut impl Write,
     turn_id: Option<&str>,
 ) -> AppResult<()> {
     const GUIDANCE: &str = "The user interrupted the previous turn on purpose. Any running unified exec processes may still be running in the background. If any tools/commands were aborted, they may have partially executed.";
@@ -4121,7 +4205,7 @@ pub fn fork_session_at_event_with_lock(
     event_index: usize,
     lock: &family::FamilyLock,
 ) -> AppResult<ForkSessionReport> {
-    family::with_lock(lock, |_g| {
+    family::with_lock(lock, &PathBuf::from(&codex_dir), |_g| {
         fork_session_at_event_locked(codex_dir, session_id, rollout_path, event_index)
     })
 }
@@ -4405,7 +4489,7 @@ pub fn duplicate_session_with_lock(
     rollout_path: String,
     lock: &family::FamilyLock,
 ) -> AppResult<DuplicateSessionReport> {
-    family::with_lock(lock, |_g| {
+    family::with_lock(lock, &PathBuf::from(&codex_dir), |_g| {
         duplicate_session_locked(codex_dir, session_id, rollout_path)
     })
 }
@@ -4613,7 +4697,7 @@ pub fn clone_session_for_provider_with_lock(
     dry_run: bool,
     lock: &family::FamilyLock,
 ) -> AppResult<CloneReport> {
-    family::with_lock(lock, |_g| {
+    family::with_lock(lock, &PathBuf::from(&codex_dir), |_g| {
         clone_session_for_provider_locked(codex_dir, session_id, target_provider, strategy, dry_run)
     })
 }
@@ -4716,6 +4800,33 @@ fn clone_session_for_provider_locked_with_hint(
     source_rollout_hint: Option<&Path>,
     provider_forker: &mut dyn ProviderThreadForker,
 ) -> AppResult<CloneReport> {
+    clone_session_for_provider_with_activity(
+        codex_dir,
+        session_id,
+        target_provider,
+        strategy,
+        dry_run,
+        source_rollout_hint,
+        provider_forker,
+        None,
+    )
+}
+
+enum ProviderSyncActivity {
+    Observed(crate::codex_activity::SessionActivityGuard),
+    Paginated,
+}
+
+fn clone_session_for_provider_with_activity(
+    codex_dir: String,
+    session_id: String,
+    target_provider: Option<String>,
+    strategy: SwitchStrategy,
+    dry_run: bool,
+    source_rollout_hint: Option<&Path>,
+    provider_forker: &mut dyn ProviderThreadForker,
+    observed_activity: Option<ProviderSyncActivity>,
+) -> AppResult<CloneReport> {
     let codex = PathBuf::from(&codex_dir);
     let defer_desktop_state =
         !dry_run && crate::codex_projects::should_defer_desktop_state_mutation();
@@ -4782,10 +4893,21 @@ fn clone_session_for_provider_locked_with_hint(
     };
 
     let activity = if !dry_run && src_brief.history_mode != "paginated" {
-        Some(crate::codex_activity::SessionActivityGuard::observe(
-            &codex,
-            vec![(session_id.clone(), vec![src_brief.path.clone()])],
-        )?)
+        Some(match observed_activity {
+            Some(ProviderSyncActivity::Observed(guard)) => {
+                guard.ensure_unchanged()?;
+                guard
+            }
+            Some(ProviderSyncActivity::Paginated) => {
+                // The batch omitted local observation only for a paginated source. A format
+                // change requires a new plan, not a fresh wait while holding the write lock.
+                return Err(AppError::SessionBusy(session_id));
+            }
+            None => crate::codex_activity::SessionActivityGuard::observe(
+                &codex,
+                vec![(session_id.clone(), vec![src_brief.path.clone()])],
+            )?,
+        })
     } else {
         None
     };
@@ -4844,14 +4966,14 @@ fn clone_session_for_provider_locked_with_hint(
                     rusqlite::TransactionBehavior::Immediate,
                 )?;
                 let mut journal = MutationJournal::default();
-                let operation = (|| -> AppResult<()> {
+                let operation = (|| -> AppResult<IndexEntryLocation> {
                     if let Some(activity) = &activity {
                         activity.ensure_unchanged()?;
                     }
                     sync_thread_from_rollout(&codex, &transaction, &src_brief.path)?;
                     let index_path = paths::session_index_path(&codex);
-                    journal.mutate_file(&index_path, || {
-                        append_index_line(
+                    let index_entry = journal.mutate_file(&index_path, || {
+                        append_index_line_with_location(
                             &codex,
                             &src_brief.id,
                             &src_brief.first_user_message,
@@ -4873,19 +4995,25 @@ fn clone_session_for_provider_locked_with_hint(
                         journal.mutate_file(&family_path, || family::save(&codex, &store))?;
                     }
                     inject_repair_fault("provider_visibility_after_family_save")?;
-                    Ok(())
+                    Ok(index_entry)
                 })();
-                if let Err(error) = operation {
-                    return Err(rollback_transaction_with_compensation(
-                        transaction,
-                        journal,
-                        error,
-                    ));
-                }
+                let index_entry = match operation {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        return Err(rollback_transaction_with_compensation(
+                            transaction,
+                            journal,
+                            error,
+                        ))
+                    }
+                };
                 commit_transaction_with_compensation(transaction, journal)?;
-
-                let states = read_thread_state_map(&codex)?;
-                let index_ids = read_session_index_ids(&codex)?;
+                let states = read_thread_states_for_ids(&codex, [src_brief.id.as_str()])?;
+                let index_ids = if index_entry.is_current(&codex)? {
+                    BTreeSet::from([src_brief.id.clone()])
+                } else {
+                    BTreeSet::new()
+                };
                 if !rollout_is_usable_provider_session(
                     &codex,
                     &states,
@@ -4914,7 +5042,14 @@ fn clone_session_for_provider_locked_with_hint(
             .iter()
             .any(|branch| branch.provider == provider)
         {
-            let thread_states = read_thread_state_map(&codex)?;
+            let thread_states = read_thread_states_for_ids(
+                &codex,
+                family
+                    .chain
+                    .iter()
+                    .filter(|branch| branch.provider == provider)
+                    .map(|branch| branch.id.as_str()),
+            )?;
             let index_ids = read_session_index_ids(&codex)?;
             for branch in &family.chain {
                 if branch.provider != provider {
@@ -4983,6 +5118,7 @@ fn clone_session_for_provider_locked_with_hint(
             if let Err(error) = operation {
                 return Err(journal.compensate_without_transaction(error));
             }
+            journal.finalize()?;
         }
         report.desktop_restart_required = defer_desktop_state;
         return Ok(report);
@@ -5456,15 +5592,19 @@ fn clone_paginated_session_for_provider(
                 }
             }
             let index_path = paths::session_index_path(codex);
-            journal.mutate_file(&index_path, || {
-                append_index_line(codex, &new_id, &thread_name, &new_abs)
+            let index_entry = journal.mutate_file(&index_path, || {
+                append_index_line_with_location(codex, &new_id, &thread_name, &new_abs)
             })?;
             let family_path = paths::family_store_path(codex);
             journal.mutate_file(&family_path, || family::save(codex, store))?;
             inject_repair_fault("paginated_clone_after_family_save")?;
 
-            let states = read_thread_state_map(codex)?;
-            let index_ids = read_session_index_ids(codex)?;
+            let states = read_thread_states_for_ids(codex, [new_id.as_str()])?;
+            let index_ids = if index_entry.is_current(codex)? {
+                BTreeSet::from([new_id.clone()])
+            } else {
+                BTreeSet::new()
+            };
             if !rollout_is_usable_provider_session(
                 codex, &states, &index_ids, &new_id, provider, &new_abs,
             )? {
@@ -5562,6 +5702,31 @@ pub(crate) fn append_index_line(
     thread_name: &str,
     _rollout_abs: &Path,
 ) -> AppResult<()> {
+    append_index_line_with_location(codex, id, thread_name, _rollout_abs).map(|_| ())
+}
+
+struct IndexEntryLocation {
+    offset: u64,
+    len: u64,
+    fingerprint: atomic_file::FileFingerprint,
+}
+
+impl IndexEntryLocation {
+    fn is_current(&self, codex: &Path) -> AppResult<bool> {
+        use std::io::{Seek, SeekFrom};
+        crate::operation_metrics::record(|c| c.local_index_checks += 1);
+        let mut file = fs::File::open(paths::session_index_path(codex))?;
+        file.seek(SeekFrom::Start(self.offset))?;
+        Ok(atomic_file::fingerprint_reader(&mut file.take(self.len))? == self.fingerprint)
+    }
+}
+
+fn append_index_line_with_location(
+    codex: &Path,
+    id: &str,
+    thread_name: &str,
+    _rollout_abs: &Path,
+) -> AppResult<IndexEntryLocation> {
     let index_path = paths::session_index_path(codex);
     // 与 codex 原生 SessionIndexEntry 对齐：{ id, thread_name, updated_at: RFC3339 }
     // 不再写 rollout_path（codex 不识别），不再用毫秒数字（codex 期望 String）。
@@ -5601,10 +5766,20 @@ pub(crate) fn append_index_line(
         }
     }
     if !replaced {
-        lines.push(entry_line);
+        lines.push(entry_line.clone());
     }
 
-    let write_index = |file: &mut fs::File| -> AppResult<()> {
+    let entry_bytes = format!("{entry_line}\n");
+    let location = IndexEntryLocation {
+        offset: lines
+            .iter()
+            .take_while(|line| *line != &entry_line)
+            .map(|line| line.len() as u64 + 1)
+            .sum(),
+        len: entry_bytes.len() as u64,
+        fingerprint: atomic_file::fingerprint_bytes(entry_bytes.as_bytes()),
+    };
+    let write_index = |file: &mut crate::atomic_file::AtomicWriter| -> AppResult<()> {
         for line in &lines {
             writeln!(file, "{line}")?;
         }
@@ -5615,7 +5790,7 @@ pub(crate) fn append_index_line(
     } else {
         atomic_file::create_with_writer_if_absent(&index_path, write_index)?;
     }
-    Ok(())
+    Ok(location)
 }
 
 /// 列出"active 分支 provider ≠ target_provider"的 session id（去重，稳定顺序）。
@@ -5627,6 +5802,7 @@ pub(crate) fn append_index_line(
 struct ProviderSyncTarget {
     session_id: String,
     rollout_path: PathBuf,
+    is_paginated: bool,
 }
 
 fn list_mismatched_sessions(
@@ -5645,12 +5821,22 @@ fn list_mismatched_sessions_from_rollouts(
     target_provider: &str,
     active_rollouts: Vec<(PathBuf, RolloutIdentity)>,
 ) -> AppResult<Vec<ProviderSyncTarget>> {
+    let scan = RepairScanContext::read(codex)?;
+    list_mismatched_sessions_from_scan(codex, target_provider, active_rollouts, &scan)
+}
+
+fn list_mismatched_sessions_from_scan(
+    codex: &Path,
+    target_provider: &str,
+    active_rollouts: Vec<(PathBuf, RolloutIdentity)>,
+    scan: &RepairScanContext,
+) -> AppResult<Vec<ProviderSyncTarget>> {
     use std::collections::BTreeSet;
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut family_managed_ids: BTreeSet<String> = BTreeSet::new();
     let mut out: Vec<ProviderSyncTarget> = Vec::new();
-    let thread_states = read_thread_state_map(codex)?;
-    let index_ids = read_session_index_ids(codex)?;
+    let thread_states = &scan.thread_states;
+    let index_ids = &scan.index_ids;
     // 同一逻辑会话只检查一次。优先采用 threads 中仍存在且身份匹配的路径；
     // 无记录时按续写文件及文件名选择，诊断无需为此读取完整对话。
     let mut selected_rollouts: BTreeMap<String, (PathBuf, RolloutIdentity)> = BTreeMap::new();
@@ -5690,6 +5876,11 @@ fn list_mismatched_sessions_from_rollouts(
         }
     }
     let active_rollouts: Vec<_> = selected_rollouts.into_values().collect();
+    let paginated_ids: BTreeSet<_> = active_rollouts
+        .iter()
+        .filter(|(_, identity)| identity.is_paginated)
+        .map(|(_, identity)| identity.id.as_str())
+        .collect();
     let active_rollout_paths = active_rollouts
         .iter()
         .map(|(path, identity)| (identity.id.as_str(), path))
@@ -5749,6 +5940,7 @@ fn list_mismatched_sessions_from_rollouts(
                 out.push(ProviderSyncTarget {
                     session_id: active.id.clone(),
                     rollout_path: (*active_rollout_path).clone(),
+                    is_paginated: paginated_ids.contains(active.id.as_str()),
                 });
             }
         }
@@ -5774,6 +5966,7 @@ fn list_mismatched_sessions_from_rollouts(
             out.push(ProviderSyncTarget {
                 session_id: identity.id,
                 rollout_path: p,
+                is_paginated: identity.is_paginated,
             });
         }
     }
@@ -5795,7 +5988,7 @@ pub fn get_provider_sync_plan_with_lock(
     codex_dir: String,
     lock: &family::FamilyLock,
 ) -> AppResult<Vec<String>> {
-    family::with_lock(lock, |_g| {
+    family::with_lock(lock, &PathBuf::from(&codex_dir), |_g| {
         let codex = PathBuf::from(codex_dir);
         let current_provider = effective_current_provider(&codex)?;
         list_mismatched_session_ids(&codex, &current_provider)
@@ -5828,45 +6021,72 @@ pub fn batch_clone_for_current_provider_with_progress<F>(
 where
     F: FnMut(usize, usize, Option<String>, Option<CloneReport>),
 {
-    family::with_lock(lock, |_g| {
-        let codex = PathBuf::from(&codex_dir);
-        let cur = effective_current_provider(&codex)?;
+    let _measurement = crate::operation_metrics::Measurement::start("batch_provider_sync");
+    let codex = PathBuf::from(&codex_dir);
+    let cur = effective_current_provider(&codex)?;
 
-        let targets = list_mismatched_sessions(&codex, &cur)?;
-        let total = targets.len();
-        on_progress(0, total, None, None);
+    let targets = list_mismatched_sessions(&codex, &cur)?;
+    let total = targets.len();
+    on_progress(0, total, None, None);
+    let mut activity = if dry_run {
+        Vec::new()
+    } else {
+        crate::codex_activity::SessionActivityGuard::observe_batch(
+            &codex,
+            targets
+                .iter()
+                .filter(|target| !target.is_paginated)
+                .map(|target| (target.session_id.clone(), vec![target.rollout_path.clone()]))
+                .collect(),
+        )?
+    }
+    .into_iter();
 
-        let mut out: Vec<CloneReport> = Vec::new();
-        let mut provider_forker = OfficialProviderThreadForker::new(codex.clone());
-        for target in targets {
-            let id = target.session_id;
-            on_progress(out.len(), total, Some(id.clone()), None);
-            let report = match clone_session_for_provider_locked_with_hint(
-                codex_dir.clone(),
-                id.clone(),
-                Some(cur.clone()),
-                strategy.clone(),
-                dry_run,
-                Some(&target.rollout_path),
-                &mut provider_forker,
-            ) {
-                Ok(report) => report,
-                Err(e) => CloneReport {
-                    source_id: id,
-                    new_id: None,
-                    new_rollout_path: None,
-                    new_provider: cur.clone(),
-                    desktop_restart_required: false,
-                    ok: false,
-                    skipped_reason: None,
-                    error: Some(e.to_string()),
-                },
-            };
-            out.push(report.clone());
-            on_progress(out.len(), total, None, Some(report));
-        }
-        Ok(out)
-    })
+    let mut out: Vec<CloneReport> = Vec::new();
+    let mut provider_forker = OfficialProviderThreadForker::new(codex.clone());
+    for target in targets {
+        let id = target.session_id;
+        on_progress(out.len(), total, Some(id.clone()), None);
+        let observed = if dry_run {
+            Ok(None)
+        } else if target.is_paginated {
+            Ok(Some(ProviderSyncActivity::Paginated))
+        } else {
+            activity
+                .next()
+                .expect("one observation per legacy target")
+                .map(|guard| Some(ProviderSyncActivity::Observed(guard)))
+        };
+        let report = match observed.and_then(|observed| {
+            family::with_lock(lock, &PathBuf::from(&codex_dir), |_g| {
+                clone_session_for_provider_with_activity(
+                    codex_dir.clone(),
+                    id.clone(),
+                    Some(cur.clone()),
+                    strategy.clone(),
+                    dry_run,
+                    Some(&target.rollout_path),
+                    &mut provider_forker,
+                    observed,
+                )
+            })
+        }) {
+            Ok(report) => report,
+            Err(e) => CloneReport {
+                source_id: id,
+                new_id: None,
+                new_rollout_path: None,
+                new_provider: cur.clone(),
+                desktop_restart_required: false,
+                ok: false,
+                skipped_reason: None,
+                error: Some(e.to_string()),
+            },
+        };
+        out.push(report.clone());
+        on_progress(out.len(), total, None, Some(report));
+    }
+    Ok(out)
 }
 
 /// 回滚：把家族的 active 切回某个历史分支（把当前 active 归档，目标分支从归档恢复）。
@@ -5876,7 +6096,7 @@ pub fn rollback_family_active_with_lock(
     target_branch_id: String,
     lock: &family::FamilyLock,
 ) -> AppResult<()> {
-    family::with_lock(lock, |_g| {
+    family::with_lock(lock, &PathBuf::from(&codex_dir), |_g| {
         rollback_family_active_locked(codex_dir, family_id, target_branch_id)
     })
 }
@@ -6101,7 +6321,7 @@ pub fn delete_family_branch_with_lock(
     branch_id: String,
     lock: &family::FamilyLock,
 ) -> AppResult<crate::models::DeleteResult> {
-    family::with_lock(lock, |_g| {
+    family::with_lock(lock, &PathBuf::from(&codex_dir), |_g| {
         delete_family_branch_locked(codex_dir, family_id, branch_id)
     })
 }
@@ -6146,7 +6366,7 @@ pub fn get_family_branch_sync_states_with_lock(
     family_id: String,
     lock: &family::FamilyLock,
 ) -> AppResult<Vec<BranchSyncState>> {
-    family::with_lock(lock, |_g| {
+    family::with_lock(lock, &PathBuf::from(&codex_dir), |_g| {
         get_family_branch_sync_states_locked(codex_dir, family_id)
     })
 }
@@ -6240,7 +6460,7 @@ pub fn sync_branch_into_active_with_lock(
     source_branch_id: String,
     lock: &family::FamilyLock,
 ) -> AppResult<SyncBranchReport> {
-    family::with_lock(lock, |_g| {
+    family::with_lock(lock, &PathBuf::from(&codex_dir), |_g| {
         sync_branch_into_active_locked(codex_dir, family_id, source_branch_id)
     })
 }
@@ -6272,7 +6492,7 @@ pub fn sync_active_into_branch_with_lock(
     target_branch_id: String,
     lock: &family::FamilyLock,
 ) -> AppResult<BranchSyncReport> {
-    family::with_lock(lock, |_g| {
+    family::with_lock(lock, &PathBuf::from(&codex_dir), |_g| {
         let active_id = active_branch_id(&codex_dir, &family_id)?;
         if active_id == target_branch_id {
             return Err(AppError::Other("目标分支即为当前 active，无需同步".into()));
@@ -6577,6 +6797,100 @@ mod tests {
     use super::*;
     use crate::models::{BranchStatus, Family, FamilyBranch, FamilyStore};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn round2_diagnosis_reuses_one_index_and_thread_scan() -> AppResult<()> {
+        let codex = temp_codex_dir("round2-diagnosis-scans");
+        let state = create_full_state(&codex)?;
+        write_rollout(&codex, "scan-a", DEFAULT_PROVIDER)?;
+        let (report, counters) = crate::operation_metrics::measured(|| {
+            diagnose_codex_state(codex.to_string_lossy().into_owned())
+        });
+        assert_eq!(report?.rollout_count, 1);
+        assert_eq!(counters.thread_table_scans, 1);
+        assert_eq!(counters.index_scans, 1);
+        drop(state);
+        fs::remove_dir_all(codex)?;
+        Ok(())
+    }
+
+    #[test]
+    fn round2_batch_verification_only_reads_affected_records() -> AppResult<()> {
+        let codex = temp_codex_dir("round2-batch-scans");
+        let state = create_full_state(&codex)?;
+        for id in ["scan-a", "scan-b", "scan-c"] {
+            write_rollout(&codex, id, DEFAULT_PROVIDER)?;
+        }
+        let (reports, counters) = crate::operation_metrics::measured(|| {
+            batch_clone_for_current_provider_with_lock(
+                codex.to_string_lossy().into_owned(),
+                SwitchStrategy::Scatter,
+                false,
+                &family::FamilyLock::default(),
+            )
+        });
+        assert!(reports?.iter().all(|report| report.ok));
+        assert_eq!(counters.thread_table_scans, 1);
+        assert_eq!(counters.index_scans, 1);
+        assert_eq!(counters.local_thread_queries, 3);
+        assert_eq!(counters.local_index_checks, 3);
+        drop(state);
+        fs::remove_dir_all(codex)?;
+        Ok(())
+    }
+
+    #[test]
+    fn round2_local_verification_rejects_changed_records() -> AppResult<()> {
+        let codex = temp_codex_dir("round2-local-checks");
+        let state = create_full_state(&codex)?;
+        write_rollout(&codex, "local-a", DEFAULT_PROVIDER)?;
+        let rollout = family::scan_rollouts(&codex)?.remove(0);
+        let entry = append_index_line_with_location(&codex, "local-a", "old name", &rollout)?;
+        assert!(entry.is_current(&codex)?);
+        fs::write(paths::session_index_path(&codex), "{\"id\":\"other\"}\n")?;
+        assert!(!entry.is_current(&codex)?);
+        sync_thread_from_rollout(&codex, &state, &rollout)?;
+        state.execute(
+            "UPDATE threads SET model_provider='external' WHERE id='local-a'",
+            [],
+        )?;
+        let current = read_thread_states_for_ids(&codex, ["local-a"])?;
+        assert_eq!(
+            current["local-a"].model_provider.as_deref(),
+            Some("external")
+        );
+        drop(state);
+        fs::remove_dir_all(codex)?;
+        Ok(())
+    }
+
+    #[test]
+    fn round2_core_repairs_share_the_source_write_lock() -> AppResult<()> {
+        let codex = temp_codex_dir("round2-core-lock");
+        fs::create_dir_all(&codex)?;
+        let mutex = family::test_mutex(&codex);
+        let guard = mutex.lock().unwrap();
+        let source = codex.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(repair_session_index(
+                source.to_string_lossy().into_owned(),
+                false,
+            ))
+            .unwrap()
+        });
+        let before_release = rx.recv_timeout(std::time::Duration::from_millis(100));
+        drop(guard);
+        assert!(
+            before_release.is_err(),
+            "core repair must wait for a same-source mutation"
+        );
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()?;
+        worker.join().unwrap();
+        fs::remove_dir_all(codex)?;
+        Ok(())
+    }
 
     #[test]
     fn opencode_parent_sources_are_subagent_sessions() {
@@ -9820,6 +10134,7 @@ mod tests {
                 id: id.to_string(),
                 model_provider: provider.to_string(),
                 source: Some(DEFAULT_THREAD_SOURCE.to_string()),
+                is_paginated: false,
             }
         );
         assert!(rollout_record_is_usable_provider(
@@ -9916,6 +10231,7 @@ mod tests {
                             } else {
                                 newest.clone()
                             },
+                            is_paginated: true,
                         }]
                     );
                 }
@@ -10194,6 +10510,84 @@ mod tests {
     }
 
     #[test]
+    fn review_provider_batch_shares_window_without_holding_lock() -> AppResult<()> {
+        let codex = temp_codex_dir("provider-batch-observation");
+        let state = create_full_state(&codex)?;
+        fs::write(
+            paths::config_toml_path(&codex),
+            "model_provider = \"openai\"\n",
+        )?;
+        for id in ["batch-a", "batch-b", "batch-c"] {
+            write_rollout(&codex, id, DEFAULT_PROVIDER)?;
+        }
+        let lock = std::sync::Arc::new(family::FamilyLock::default());
+        let observed_lock = family::test_mutex(&codex);
+        let changed = codex.join("sessions/2026/04/22/rollout-batch-b.jsonl");
+        crate::codex_activity::during_observation(move || {
+            assert!(
+                observed_lock.try_lock().is_ok(),
+                "quiet window must not hold the family lock"
+            );
+            writeln!(
+                fs::OpenOptions::new().append(true).open(&changed).unwrap(),
+                "{{\"type\":\"external-append\"}}"
+            )
+            .unwrap();
+        });
+        let (reports, counters) = crate::operation_metrics::measured(|| {
+            batch_clone_for_current_provider_with_lock(
+                codex.to_string_lossy().into_owned(),
+                SwitchStrategy::Scatter,
+                false,
+                &lock,
+            )
+        });
+        let reports = reports?;
+        assert_eq!(counters.observation_windows, 1);
+        assert_eq!(reports.len(), 3);
+        assert!(reports[0].ok, "{:?}", reports[0]);
+        assert!(reports[1]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("SESSION_BUSY")));
+        assert!(
+            reports[2].ok,
+            "an earlier batch write must not invalidate another target: {:?}",
+            reports[2]
+        );
+        assert_eq!(
+            read_session_index_ids(&codex)?,
+            BTreeSet::from(["batch-a".into(), "batch-c".into()])
+        );
+        drop(state);
+        fs::remove_dir_all(codex)?;
+        Ok(())
+    }
+
+    #[test]
+    fn review_paginated_batch_has_no_local_observation_window() -> AppResult<()> {
+        let codex = temp_codex_dir("provider-batch-paginated-window");
+        fs::create_dir_all(&codex)?;
+        fs::write(
+            paths::config_toml_path(&codex),
+            "model_provider = \"openai\"\n",
+        )?;
+        write_rollout_with_events(&codex, "paginated-window", &[])?;
+        let (reports, counters) = crate::operation_metrics::measured(|| {
+            batch_clone_for_current_provider_with_lock(
+                codex.to_string_lossy().into_owned(),
+                SwitchStrategy::Scatter,
+                false,
+                &family::FamilyLock::default(),
+            )
+        });
+        assert!(reports?.iter().all(|report| report.ok));
+        assert_eq!(counters.observation_windows, 0);
+        fs::remove_dir_all(codex)?;
+        Ok(())
+    }
+
+    #[test]
     fn provider_sync_targets_keep_the_planned_rollout_path() -> AppResult<()> {
         let codex = temp_codex_dir("cc-session-manager-provider-sync-target-test");
         fs::create_dir_all(&codex)?;
@@ -10214,6 +10608,7 @@ mod tests {
             vec![ProviderSyncTarget {
                 session_id: id.to_string(),
                 rollout_path: expected,
+                is_paginated: false,
             }]
         );
         Ok(())

@@ -127,13 +127,19 @@ fn write_lines(
     expected_hash: &str,
 ) -> AppResult<String> {
     let current = fs::read(path)?;
-    if sha_hex(&current) != expected_hash {
+    let expected = atomic_file::fingerprint_bytes(&current);
+    if expected.sha256_hex() != expected_hash {
         return Err(AppError::Other(format!(
             "会话文件在编辑期间发生变化，已拒绝覆盖: {}",
             path.to_string_lossy()
         )));
     }
-    let expected = atomic_file::fingerprint(path)?;
+    #[cfg(test)]
+    AFTER_EDIT_VALIDATION.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
     let mut body = lines.join("\n");
     if trailing_newline && !lines.is_empty() {
         body.push('\n');
@@ -143,6 +149,11 @@ fn write_lines(
         Ok(())
     })?;
     Ok(sha_hex(body.as_bytes()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_EDIT_VALIDATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 // ========================= 编辑目录 / journal / 快照 =========================
@@ -1084,7 +1095,7 @@ pub fn apply_edit_text(
     } else {
         String::new()
     };
-    let description = format!("改写第 {line_no} 行文本{mirror_note}");
+    let description = format!("改写第 {} 行文本{mirror_note}", line_no + 1);
     commit_op(
         &mut ctx,
         provider,
@@ -1373,6 +1384,37 @@ pub fn plan_session_event_deletion(
     plan_delete(&provider, &rollout_path, &line_nos)
 }
 
+fn mutation_roots(
+    provider: &str,
+    rollout: &str,
+    backup: &str,
+    id: &str,
+) -> AppResult<Vec<PathBuf>> {
+    let path = if provider == "opencode" {
+        crate::opencode_sessions::resolve_locator(rollout)?.0
+    } else {
+        PathBuf::from(rollout)
+    };
+    let root = match provider {
+        "codex" | "claude" => path
+            .ancestors()
+            .find(|ancestor| {
+                let name = ancestor.file_name().and_then(|name| name.to_str());
+                if provider == "codex" {
+                    matches!(name, Some("sessions" | "archived_sessions"))
+                } else {
+                    name == Some("projects")
+                }
+            })
+            .and_then(Path::parent),
+        "opencode" => path.parent(),
+        _ => None,
+    }
+    .or_else(|| path.parent())
+    .unwrap_or_else(|| Path::new("."));
+    Ok(vec![root.to_path_buf(), edit_dir(backup, provider, id)])
+}
+
 pub fn edit_session_event_text_with_lock(
     provider: String,
     rollout_path: String,
@@ -1382,7 +1424,8 @@ pub fn edit_session_event_text_with_lock(
     new_text: String,
     lock: &crate::family::FamilyLock,
 ) -> AppResult<EditApplyReport> {
-    crate::family::with_lock(lock, |_g| {
+    let roots = mutation_roots(&provider, &rollout_path, &backup_dir, &session_id)?;
+    crate::family::with_roots(lock, &roots, |_g| {
         if provider == "opencode" {
             return crate::opencode_edit::apply_edit_text(
                 &rollout_path,
@@ -1411,7 +1454,8 @@ pub fn delete_session_events_with_lock(
     line_nos: Vec<usize>,
     lock: &crate::family::FamilyLock,
 ) -> AppResult<EditApplyReport> {
-    crate::family::with_lock(lock, |_g| {
+    let roots = mutation_roots(&provider, &rollout_path, &backup_dir, &session_id)?;
+    crate::family::with_roots(lock, &roots, |_g| {
         if provider == "opencode" {
             return crate::opencode_edit::apply_delete(
                 &rollout_path,
@@ -1437,7 +1481,8 @@ pub fn undo_last_session_edit_with_lock(
     backup_dir: String,
     lock: &crate::family::FamilyLock,
 ) -> AppResult<EditApplyReport> {
-    crate::family::with_lock(lock, |_g| {
+    let roots = mutation_roots(&provider, &rollout_path, &backup_dir, &session_id)?;
+    crate::family::with_roots(lock, &roots, |_g| {
         if provider == "opencode" {
             return crate::opencode_edit::undo_last(&rollout_path, &session_id, &backup_dir);
         }
@@ -1453,7 +1498,8 @@ pub fn restore_session_edit_snapshot_with_lock(
     snapshot_name: String,
     lock: &crate::family::FamilyLock,
 ) -> AppResult<EditApplyReport> {
-    crate::family::with_lock(lock, |_g| {
+    let roots = mutation_roots(&provider, &rollout_path, &backup_dir, &session_id)?;
+    crate::family::with_roots(lock, &roots, |_g| {
         if provider == "opencode" {
             return crate::opencode_edit::restore_snapshot(
                 &rollout_path,
@@ -1488,6 +1534,28 @@ pub fn session_edit_history(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn review_edit_rejects_changes_after_validation() {
+        for changed in [b"old\nappended\n".as_slice(), b"new\n".as_slice()] {
+            let root = temp_dir("edit-baseline-race");
+            fs::create_dir_all(&root).unwrap();
+            let path = root.join("session.jsonl");
+            fs::write(&path, b"old\n").unwrap();
+            let external_path = path.clone();
+            let changed = changed.to_vec();
+            let external_bytes = changed.clone();
+            AFTER_EDIT_VALIDATION.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    fs::write(external_path, external_bytes).unwrap();
+                }));
+            });
+            let result = write_lines(&path, &["edited".into()], true, &sha_hex(b"old\n"));
+            assert!(result.is_err(), "must reject a plan based on old bytes");
+            assert_eq!(fs::read(&path).unwrap(), changed);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     use super::*;
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1570,6 +1638,19 @@ mod tests {
         .unwrap();
         assert_eq!(report.changed_lines, 2, "应同步镜像行");
         assert!(report.snapshot_created.is_some(), "首次编辑应建快照");
+        let latest_description = || {
+            history(
+                "codex",
+                rollout.to_str().unwrap(),
+                "sess-1",
+                backup.to_str().unwrap(),
+            )
+            .unwrap()
+            .entries[0]
+                .description
+                .clone()
+        };
+        assert_eq!(latest_description(), "改写第 11 行文本（含镜像行 1 处）");
 
         let loaded = load_file(&rollout).unwrap();
         let v10 = loaded.parsed[10].as_ref().unwrap();
@@ -1592,6 +1673,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_bytes(&rollout), original, "撤销后应与原文件逐字节一致");
+        assert_eq!(
+            latest_description(),
+            "撤销：改写第 11 行文本（含镜像行 1 处）"
+        );
 
         // 再撤销一次 = 重做
         undo_last(
@@ -1602,6 +1687,10 @@ mod tests {
         )
         .unwrap();
         let redone = load_file(&rollout).unwrap();
+        assert_eq!(
+            latest_description(),
+            "重做：改写第 11 行文本（含镜像行 1 处）"
+        );
         assert_eq!(
             codex_flat_text(redone.parsed[10].as_ref().unwrap()),
             "edited answer"
@@ -1711,6 +1800,14 @@ mod tests {
             "I'll verify instead",
         )
         .unwrap();
+        let edit_history = history(
+            "claude",
+            rollout.to_str().unwrap(),
+            "s",
+            backup.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(edit_history.entries[0].description, "改写第 3 行文本");
 
         let loaded = load_file(&rollout).unwrap();
         let content = claude_content(loaded.parsed[2].as_ref().unwrap()).unwrap();

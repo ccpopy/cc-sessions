@@ -102,7 +102,14 @@ fn create_unique_zip_pack_stage(parent: &Path, output: &Path) -> AppResult<(Path
             sequence
         ));
         let stage = parent.join(stage_name);
-        match OpenOptions::new().write(true).create_new(true).open(&stage) {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&stage) {
             Ok(file) => return Ok((stage, file)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
@@ -167,15 +174,6 @@ fn write_store_zip(src: &Path, file: File) -> AppResult<(u32, u64)> {
                 entry.path().to_string_lossy()
             ))
         })?;
-        let mut data: Vec<u8> = Vec::new();
-        File::open(entry.path())?.read_to_end(&mut data)?;
-        if data.len() as u64 != metadata.len() {
-            return Err(AppError::Other(format!(
-                "ZIP 打包源在读取期间发生变化: {}",
-                entry.path().to_string_lossy()
-            )));
-        }
-        let crc = crc32(&data);
         total_bytes = total_bytes
             .checked_add(size as u64)
             .ok_or_else(|| AppError::Other("ZIP 总字节数溢出".into()))?;
@@ -192,13 +190,40 @@ fn write_store_zip(src: &Path, file: File) -> AppResult<(u32, u64)> {
         writer.write_all(&0u16.to_le_bytes())?; // method STORE
         writer.write_all(&0u16.to_le_bytes())?; // mod time
         writer.write_all(&0u16.to_le_bytes())?; // mod date
-        writer.write_all(&crc.to_le_bytes())?;
+        writer.write_all(&0u32.to_le_bytes())?; // CRC is filled after the streaming copy.
         writer.write_all(&size.to_le_bytes())?; // compressed size
         writer.write_all(&size.to_le_bytes())?; // uncompressed size
         writer.write_all(&name_len.to_le_bytes())?;
         writer.write_all(&0u16.to_le_bytes())?; // extra len
         writer.write_all(rel_str.as_bytes())?;
-        writer.write_all(&data)?;
+        let mut source = File::open(entry.path())?.take(u64::from(size) + 1);
+        let mut buffer = [0u8; 64 * 1024];
+        let mut hasher = Crc32Hasher::new();
+        let mut copied = 0u64;
+        loop {
+            let count = source.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            copied += count as u64;
+            hasher.update(&buffer[..count]);
+            writer.write_all(&buffer[..count])?;
+        }
+        let after = source.get_ref().metadata()?;
+        if copied != u64::from(size)
+            || after.len() != metadata.len()
+            || after.modified().ok() != metadata.modified().ok()
+        {
+            return Err(AppError::Other(format!(
+                "ZIP 打包源在读取期间发生变化: {}",
+                entry.path().display()
+            )));
+        }
+        let crc = hasher.finish();
+        let end = writer.stream_position()?;
+        writer.seek(SeekFrom::Start(u64::from(offset) + 14))?;
+        writer.write_all(&crc.to_le_bytes())?;
+        writer.seek(SeekFrom::Start(end))?;
 
         let local_header_size = 30u32
             .checked_add(rel_str.len() as u32)
@@ -264,7 +289,7 @@ fn write_store_zip(src: &Path, file: File) -> AppResult<(u32, u64)> {
 
 fn publish_packed_zip(stage: &Path, output: &Path) -> AppResult<()> {
     let stage_fingerprint = atomic_file::fingerprint(stage)?;
-    let copy_stage = |file: &mut File| -> AppResult<()> {
+    let copy_stage = |file: &mut crate::atomic_file::AtomicWriter| -> AppResult<()> {
         let mut source = File::open(stage)?;
         std::io::copy(&mut source, file)?;
         if atomic_file::fingerprint(stage)? != stage_fingerprint {
@@ -341,6 +366,7 @@ impl Crc32Hasher {
     }
 }
 
+#[cfg(test)]
 pub(super) fn crc32(data: &[u8]) -> u32 {
     let mut hasher = Crc32Hasher::new();
     hasher.update(data);

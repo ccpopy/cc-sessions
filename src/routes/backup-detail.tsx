@@ -519,7 +519,7 @@ function toSessionSummary(m: ManifestSession, backupPath: string, provider: Sess
     rollout_bytes: m.bytes_rollout,
     logs_count: m.logs_count,
     has_backup: true,
-    resume_command: provider === "claude"
+    resume_command: !/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(m.id) ? "" : provider === "claude"
       ? `claude --resume ${m.id}`
       : provider === "opencode"
         ? `opencode --session ${m.id}`

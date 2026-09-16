@@ -106,7 +106,7 @@ fn summary_from_meta(session_dir: &Path, meta: AgentSessionMeta) -> AppResult<Se
         rollout_bytes: meta.bytes,
         logs_count: 0,
         has_backup: false,
-        resume_command: format!("cursor-agent --resume {}", meta.id),
+        resume_command: crate::fs_ops::session_resume_command("cursor-agent", &meta.id),
     })
 }
 

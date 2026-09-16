@@ -8,10 +8,9 @@
 //! - 每次归档时固化 sha256 + line_count，支持后续完整性校验。
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::AtomicBool;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -24,94 +23,12 @@ use crate::models::{
 use crate::paths;
 use crate::state_db;
 
-static FAMILY_SAVE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-/// 进程内并发保护：所有 family store 的 load → mutate → save 都需要持有这把锁。
-/// Tauri 的 command 各自跑在独立线程池里，不加锁会出现"读A→读B→写A→写B"覆盖丢数据。
-#[derive(Default)]
-pub struct FamilyLock(pub Mutex<()>);
-
-#[cfg(windows)]
-struct CrossProcessFamilyGuard {
-    handle: *mut std::ffi::c_void,
-}
-
-#[cfg(windows)]
-impl Drop for CrossProcessFamilyGuard {
-    fn drop(&mut self) {
-        #[link(name = "kernel32")]
-        extern "system" {
-            fn ReleaseMutex(handle: *mut std::ffi::c_void) -> i32;
-            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
-        }
-        // The handle is created and acquired by `acquire_cross_process_family_lock` and remains
-        // owned by this guard until drop.
-        unsafe {
-            let _ = ReleaseMutex(self.handle);
-            let _ = CloseHandle(self.handle);
-        }
-    }
-}
-
-#[cfg(windows)]
-fn acquire_cross_process_family_lock() -> AppResult<CrossProcessFamilyGuard> {
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn CreateMutexW(
-            attributes: *const std::ffi::c_void,
-            initial_owner: i32,
-            name: *const u16,
-        ) -> *mut std::ffi::c_void;
-        fn WaitForSingleObject(handle: *mut std::ffi::c_void, milliseconds: u32) -> u32;
-        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
-    }
-    const INFINITE: u32 = 0xffff_ffff;
-    const WAIT_OBJECT_0: u32 = 0;
-    const WAIT_ABANDONED: u32 = 0x80;
-    let name = "Local\\cc-session-manager-family-store-v1"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    // The UTF-16 name is NUL terminated and remains alive for the call. A non-null handle is
-    // closed either on an acquisition error or by the returned guard.
-    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
-    if handle.is_null() {
-        return Err(AppError::Other(format!(
-            "创建 family 跨进程锁失败: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
-    if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
-        let error = std::io::Error::last_os_error();
-        unsafe {
-            let _ = CloseHandle(handle);
-        }
-        return Err(AppError::Other(format!(
-            "获取 family 跨进程锁失败: {error}"
-        )));
-    }
-    Ok(CrossProcessFamilyGuard { handle })
-}
-
-#[cfg(not(windows))]
-struct CrossProcessFamilyGuard;
-
-#[cfg(not(windows))]
-fn acquire_cross_process_family_lock() -> AppResult<CrossProcessFamilyGuard> {
-    Ok(CrossProcessFamilyGuard)
-}
-
-/// 封装：持锁执行回调。调用方闭包里做 load / mutate / save。
-/// 只有 Tauri command 需要持锁；内部辅助函数（已持锁的调用链下层）直接调 load/save 即可。
-pub fn with_lock<R>(
-    lock: &FamilyLock,
-    f: impl FnOnce(MutexGuard<'_, ()>) -> AppResult<R>,
-) -> AppResult<R> {
-    let g = lock.0.lock().unwrap_or_else(PoisonError::into_inner);
-    let _cross_process = acquire_cross_process_family_lock()?;
-    f(g)
-}
+mod locking;
+#[cfg(all(test, unix))]
+use locking::acquire_family_file_lock;
+#[cfg(test)]
+pub(crate) use locking::test_mutex;
+pub use locking::{with_lock, with_roots, FamilyLock};
 
 pub fn load(codex_dir: &Path) -> AppResult<FamilyStore> {
     let p = paths::family_store_path(codex_dir);
@@ -140,122 +57,12 @@ pub fn load(codex_dir: &Path) -> AppResult<FamilyStore> {
 }
 
 pub fn save(codex_dir: &Path, store: &FamilyStore) -> AppResult<()> {
-    let final_path = paths::family_store_path(codex_dir);
-    let data = serde_json::to_vec_pretty(store)?;
-    let (temp_path, mut temp_file) = create_unique_family_temp(&final_path)?;
-
-    if let Err(error) = write_and_sync_family_temp(&mut temp_file, &data) {
-        drop(temp_file);
-        return Err(cleanup_family_temp_after_error(
-            &temp_path,
-            AppError::Other(format!(
-                "写入并同步 family 临时文件失败 {}: {error}",
-                temp_path.display()
-            )),
-        ));
-    }
-    drop(temp_file);
-
-    if let Err(error) = replace_file_atomically(&temp_path, &final_path) {
-        return Err(cleanup_family_temp_after_error(
-            &temp_path,
-            AppError::Other(format!(
-                "原子替换 family store 失败 {} -> {}: {error}",
-                temp_path.display(),
-                final_path.display()
-            )),
-        ));
-    }
-    Ok(())
-}
-
-fn create_unique_family_temp(final_path: &Path) -> AppResult<(PathBuf, fs::File)> {
-    let parent = final_path.parent().ok_or_else(|| {
-        AppError::Path(format!("family store 缺少父目录: {}", final_path.display()))
-    })?;
-    let file_name = final_path.file_name().ok_or_else(|| {
-        AppError::Path(format!("family store 缺少文件名: {}", final_path.display()))
-    })?;
-
-    loop {
-        let sequence = FAMILY_SAVE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let mut temp_name = file_name.to_os_string();
-        temp_name.push(format!(".{}.{}.tmp", std::process::id(), sequence));
-        let temp_path = parent.join(temp_name);
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-        {
-            Ok(file) => return Ok((temp_path, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(AppError::Other(format!(
-                    "创建 family 临时文件失败 {}: {error}",
-                    temp_path.display()
-                )))
-            }
-        }
-    }
-}
-
-fn write_and_sync_family_temp(file: &mut fs::File, data: &[u8]) -> std::io::Result<()> {
-    file.write_all(data)?;
-    file.flush()?;
-    file.sync_all()
-}
-
-fn cleanup_family_temp_after_error(temp_path: &Path, original_error: AppError) -> AppError {
-    match fs::remove_file(temp_path) {
-        Ok(()) => original_error,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => original_error,
-        Err(cleanup_error) => AppError::Other(format!(
-            "{original_error}; 清理 family 临时文件失败 {}: {cleanup_error}",
-            temp_path.display()
-        )),
-    }
-}
-
-#[cfg(not(windows))]
-fn replace_file_atomically(temp_path: &Path, final_path: &Path) -> std::io::Result<()> {
-    fs::rename(temp_path, final_path)
-}
-
-#[cfg(windows)]
-fn replace_file_atomically(temp_path: &Path, final_path: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
-    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
-
-    #[link(name = "Kernel32")]
-    extern "system" {
-        fn MoveFileExW(
-            existing_file_name: *const u16,
-            new_file_name: *const u16,
-            flags: u32,
-        ) -> i32;
-    }
-
-    let existing: Vec<u16> = temp_path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let new: Vec<u16> = final_path
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
-    // 两个缓冲区在调用期间保持存活且以 NUL 结尾，参数满足 MoveFileExW 的约定。
-    let replaced = unsafe {
-        MoveFileExW(
-            existing.as_ptr(),
-            new.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if replaced == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
+    crate::atomic_file::overwrite_with_writer(&paths::family_store_path(codex_dir), |file| {
+        let mut file = BufWriter::with_capacity(64 * 1024, file);
+        serde_json::to_writer_pretty(&mut file, store)?;
+        file.flush()?;
         Ok(())
-    }
+    })
 }
 
 /// 计算 rollout 文件的字节级 sha256 + 总行数（与 bundle 导出 sha256_file 语义一致）。
@@ -277,6 +84,10 @@ fn compute_integrity_from_reader(reader: &mut impl BufRead) -> AppResult<(String
             break;
         }
         hasher.update(line.as_bytes());
+        crate::operation_metrics::record(|c| {
+            c.read_bytes += line.len() as u64;
+            c.hash_bytes += line.len() as u64;
+        });
         let content = line
             .strip_suffix('\n')
             .map(|text| text.strip_suffix('\r').unwrap_or(text))
@@ -769,7 +580,18 @@ pub fn set_archive_origin_for_session(
 /// 扫描 family store，对每个已固化的分支比对 rollout 文件。
 pub fn verify_integrity(codex_dir: &Path) -> AppResult<FamilyIntegrityReport> {
     let store = load(codex_dir)?;
+    verify_integrity_snapshot(codex_dir, &store)
+}
+
+fn verify_integrity_snapshot(
+    codex_dir: &Path,
+    store: &FamilyStore,
+) -> AppResult<FamilyIntegrityReport> {
     let mut items: Vec<FamilyIntegrityItem> = Vec::new();
+    let mut verified: std::collections::HashMap<
+        PathBuf,
+        ((String, u64), fs::Metadata, same_file::Handle),
+    > = std::collections::HashMap::new();
     let mut all_ok = true;
     for (fid, family) in store.families.iter() {
         for b in family.chain.iter() {
@@ -801,8 +623,37 @@ pub fn verify_integrity(codex_dir: &Path) -> AppResult<FamilyIntegrityReport> {
             if unsealed {
                 continue; // 未固化 sha256 的分支（当前可写分支、迁移前的旧数据）只检查是否存在，不做 sha256/行数校验
             }
-            match compute_integrity(&candidate) {
+            let observed = fs::metadata(&candidate)?;
+            let identity = same_file::Handle::from_path(&candidate)?;
+            let result = match verified.get(&candidate) {
+                Some((result, previous, previous_identity))
+                    if previous.len() == observed.len()
+                        && previous.modified().ok() == observed.modified().ok()
+                        && *previous_identity == identity =>
+                {
+                    Ok(result.clone())
+                }
+                Some(_) => {
+                    return Err(AppError::Other(format!(
+                        "文件在校验期间发生变化，请重新检查: {}",
+                        candidate.display()
+                    )))
+                }
+                None => compute_integrity(&candidate),
+            };
+            let current = fs::metadata(&candidate)?;
+            if observed.len() != current.len()
+                || observed.modified().ok() != current.modified().ok()
+                || identity != same_file::Handle::from_path(&candidate)?
+            {
+                return Err(AppError::Other(format!(
+                    "文件在校验期间发生变化，请重新检查: {}",
+                    candidate.display()
+                )));
+            }
+            match result {
                 Ok((sha, lines)) => {
+                    verified.insert(candidate, ((sha.clone(), lines), observed, identity));
                     let sha_ok = expected_sha.as_deref() == Some(sha.as_str());
                     let lines_ok = expected_lines.map(|l| l == lines).unwrap_or(true);
                     let ok = sha_ok && lines_ok;
@@ -820,18 +671,11 @@ pub fn verify_integrity(codex_dir: &Path) -> AppResult<FamilyIntegrityReport> {
                         missing: false,
                     });
                 }
-                Err(_) => {
-                    all_ok = false;
-                    items.push(FamilyIntegrityItem {
-                        family_id: fid.clone(),
-                        branch_id: b.id.clone(),
-                        ok: false,
-                        expected_sha,
-                        actual_sha: None,
-                        expected_lines,
-                        actual_lines: None,
-                        missing: false,
-                    });
+                Err(error) => {
+                    return Err(AppError::Other(format!(
+                        "读取校验文件失败 {}: {error}",
+                        candidate.display()
+                    )));
                 }
             }
         }
@@ -907,7 +751,7 @@ pub(crate) fn scan_archived_rollouts_cancellable(
 }
 
 pub fn get_family_store_with_lock(codex_dir: String, lock: &FamilyLock) -> AppResult<FamilyStore> {
-    with_lock(lock, |_g| {
+    with_lock(lock, &PathBuf::from(&codex_dir), |_g| {
         let p = PathBuf::from(&codex_dir);
         load(&p)
     })
@@ -917,10 +761,30 @@ pub fn verify_family_integrity_with_lock(
     codex_dir: String,
     lock: &FamilyLock,
 ) -> AppResult<FamilyIntegrityReport> {
-    with_lock(lock, |_g| {
-        let p = PathBuf::from(&codex_dir);
-        verify_integrity(&p)
+    let _measurement = crate::operation_metrics::Measurement::start("family_integrity");
+    let p = PathBuf::from(&codex_dir);
+    let store = with_lock(lock, &PathBuf::from(&codex_dir), |_g| load(&p))?;
+    let version = serde_json::to_vec(&store)?;
+    #[cfg(test)]
+    INTEGRITY_SCAN_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+    let report = verify_integrity_snapshot(&p, &store)?;
+    with_lock(lock, &PathBuf::from(&codex_dir), |_g| {
+        if serde_json::to_vec(&load(&p)?)? != version {
+            return Err(AppError::Other(
+                "family 在校验期间已更新，本次结果已过期，请重新检查".into(),
+            ));
+        }
+        Ok(report)
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    static INTEGRITY_SCAN_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// 把 threads 表 + family store + current provider 聚合成 per-session 覆盖信息，
@@ -930,9 +794,10 @@ pub fn get_session_family_overlay_with_lock(
     lock: &FamilyLock,
 ) -> AppResult<Vec<FamilyOverlay>> {
     let codex = PathBuf::from(&codex_dir);
-    let _g = lock.0.lock().unwrap_or_else(PoisonError::into_inner);
-    let _cross_process = acquire_cross_process_family_lock()?;
+    with_lock(lock, &codex, |_| get_session_family_overlay_locked(&codex))
+}
 
+fn get_session_family_overlay_locked(codex: &Path) -> AppResult<Vec<FamilyOverlay>> {
     // 1) 读 threads 表（id, model_provider, source, archived）
     let mut thread_state_of: std::collections::BTreeMap<
         String,
@@ -1122,6 +987,105 @@ fn compute_clone_state(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn round2_independent_sources_do_not_share_a_write_lock() -> AppResult<()> {
+        let root = temp_codex_dir("independent-source-locks");
+        let a = root.join("a");
+        let b = root.join("b");
+        fs::create_dir_all(&a)?;
+        fs::create_dir_all(&b)?;
+        let lock = std::sync::Arc::new(FamilyLock::default());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_lock = lock.clone();
+        let first = std::thread::spawn(move || {
+            with_lock(&first_lock, &a, |_| {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                Ok(())
+            })
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let result = get_family_store_with_lock(b.to_string_lossy().into_owned(), &lock);
+            done_tx.send(result.is_ok()).unwrap();
+        });
+        let independent = done_rx.recv_timeout(std::time::Duration::from_millis(300));
+        release_tx.send(()).unwrap();
+        first.join().unwrap()?;
+        second.join().unwrap();
+        fs::remove_dir_all(root)?;
+        assert_eq!(
+            independent.ok(),
+            Some(true),
+            "another source must remain accessible"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_family_file_lock_child() -> AppResult<()> {
+        let Some(path) = std::env::var_os("CC_REVIEW_FAMILY_LOCK_PATH") else {
+            return Ok(());
+        };
+        let result =
+            acquire_family_file_lock(Path::new(&path), std::time::Duration::from_millis(50));
+        if std::env::var_os("CC_REVIEW_EXPECT_LOCK_TIMEOUT").is_some() {
+            assert!(
+                matches!(result, Err(AppError::Other(ref message)) if message.contains("写锁超时"))
+            );
+        } else {
+            let _guard = result?;
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_family_file_lock_coordinates_processes() -> AppResult<()> {
+        let root = temp_codex_dir("family-cross-process-lock");
+        fs::create_dir_all(&root)?;
+        let path = root.join("family.lock");
+        let guard = acquire_family_file_lock(&path, std::time::Duration::from_secs(1))?;
+        assert_eq!(
+            fs::read_to_string(&path)?.trim(),
+            std::process::id().to_string()
+        );
+        let child = |blocked: bool| -> AppResult<()> {
+            let mut command = std::process::Command::new(std::env::current_exe()?);
+            command
+                .args([
+                    "--exact",
+                    "family::tests::review_family_file_lock_child",
+                    "--nocapture",
+                ])
+                .env("CC_REVIEW_FAMILY_LOCK_PATH", &path)
+                .env_remove("CC_REVIEW_EXPECT_LOCK_TIMEOUT");
+            if blocked {
+                command.env("CC_REVIEW_EXPECT_LOCK_TIMEOUT", "1");
+            }
+            let output = command.output()?;
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(())
+        };
+        child(true)?;
+        drop(guard);
+        child(false)?;
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     use super::*;
     use crate::models::{BranchStatus, Family, FamilyBranch, FamilyStore};
     use rusqlite::params;
@@ -1465,6 +1429,45 @@ mod tests {
         assert_eq!(report.items[0].branch_id, "missing-active");
         assert!(report.items[0].missing);
         fs::remove_dir_all(codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn review_integrity_scan_releases_write_lock() -> AppResult<()> {
+        let codex = temp_codex_dir("integrity-unlocked");
+        fs::create_dir_all(&codex)?;
+        let lock = std::sync::Arc::new(FamilyLock::default());
+        let observed = test_mutex(&codex);
+        INTEGRITY_SCAN_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                assert!(
+                    observed.try_lock().is_ok(),
+                    "deep I/O must not hold the write lock"
+                );
+            }));
+        });
+        verify_family_integrity_with_lock(codex.to_string_lossy().into_owned(), &lock)?;
+        fs::remove_dir_all(codex)?;
+        Ok(())
+    }
+
+    #[test]
+    fn review_integrity_rejects_changed_store() -> AppResult<()> {
+        let codex = temp_codex_dir("integrity-stale-store");
+        fs::create_dir_all(&codex)?;
+        let changed = codex.clone();
+        INTEGRITY_SCAN_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                save(&changed, &two_branch_store()).unwrap();
+            }));
+        });
+        let error = verify_family_integrity_with_lock(
+            codex.to_string_lossy().into_owned(),
+            &FamilyLock::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("已过期"));
+        fs::remove_dir_all(codex)?;
         Ok(())
     }
 

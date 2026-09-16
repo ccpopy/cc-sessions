@@ -34,6 +34,7 @@ pub mod opencode_edit;
 pub mod opencode_fork;
 pub mod opencode_sessions;
 pub mod opencode_transfer;
+pub(crate) mod operation_metrics;
 pub mod path_safety;
 pub mod paths;
 pub mod provenance;

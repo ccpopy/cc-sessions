@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -43,13 +44,24 @@ pub fn read_preview_image(path: String) -> AppResult<PreviewImage> {
         )));
     }
 
-    let bytes = fs::read(&path)?;
+    const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
+    if metadata.len() > MAX_IMAGE_BYTES {
+        return Err(AppError::Other("预览图片不能超过 20 MiB".into()));
+    }
+    let mut file = fs::File::open(&path)?;
+    let mut bytes = Vec::new();
+    file.by_ref().take(12).read_to_end(&mut bytes)?;
     let mime = preview_image_mime(&bytes).ok_or_else(|| {
         AppError::Other(format!(
             "不支持的图片格式: {}（仅支持 PNG、JPEG、GIF、WebP）",
             path.display()
         ))
     })?;
+    file.take(MAX_IMAGE_BYTES + 1 - bytes.len() as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return Err(AppError::Other("预览图片不能超过 20 MiB".into()));
+    }
     let encoded = BASE64_STANDARD.encode(bytes);
     Ok(PreviewImage {
         data_url: format!("data:{mime};base64,{encoded}"),
@@ -168,6 +180,9 @@ fn open_external(url: &str) -> AppResult<()> {
 }
 
 pub fn claude_resume_command(session_id: &str, cwd: Option<&str>) -> String {
+    if validate_resume_arguments(session_id, cwd).is_err() {
+        return String::new();
+    }
     let cwd = cwd
         .map(paths::strip_verbatim)
         .filter(|value| !value.trim().is_empty());
@@ -192,6 +207,7 @@ pub fn resume_command_text(
     session_id: String,
     cwd: Option<String>,
 ) -> AppResult<String> {
+    validate_resume_arguments(&session_id, cwd.as_deref())?;
     let text = match provider.as_deref().unwrap_or("codex") {
         "codex" => format!("codex resume {}", session_id),
         "claude" => claude_resume_command(&session_id, cwd.as_deref()),
@@ -202,6 +218,34 @@ pub fn resume_command_text(
         other => return Err(AppError::Other(format!("不支持的 provider: {other}"))),
     };
     Ok(text)
+}
+
+fn validate_resume_arguments(session_id: &str, cwd: Option<&str>) -> AppResult<()> {
+    if !session_id
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphanumeric)
+        || !session_id
+            .bytes()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'-' | b'_'))
+        || cwd.is_some_and(|value| value.chars().any(char::is_control))
+    {
+        return Err(AppError::Other(
+            "续聊参数无效：会话 ID 只能包含字母、数字、短横线和下划线，目录不能包含控制字符".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn session_resume_command(provider: &str, session_id: &str) -> String {
+    if provider == "cursor-agent" {
+        return if validate_resume_arguments(session_id, None).is_ok() {
+            format!("cursor-agent --resume {session_id}")
+        } else {
+            String::new()
+        };
+    }
+    resume_command_text(Some(provider.into()), session_id.into(), None).unwrap_or_default()
 }
 
 #[cfg(feature = "desktop")]
@@ -221,6 +265,45 @@ pub fn copy_resume_command(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn review_preview_image_rejects_oversized_file() {
+        let root = TestDir::new();
+        let path = root.path().join("oversized.png");
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(20 * 1024 * 1024 + 1)
+            .unwrap();
+        assert!(read_preview_image(path.to_string_lossy().into_owned())
+            .unwrap_err()
+            .to_string()
+            .contains("20 MiB"));
+    }
+    #[test]
+    fn review_resume_rejects_shell_syntax_and_controls() {
+        for provider in ["codex", "claude", "opencode"] {
+            for id in [
+                "",
+                "--help",
+                "id; echo injected",
+                "$(whoami)",
+                "id\nnext",
+                "a'b",
+                "a\"b",
+            ] {
+                assert!(
+                    resume_command_text(Some(provider.into()), id.into(), None).is_err(),
+                    "{provider}: {id:?}"
+                );
+            }
+        }
+        assert!(resume_command_text(
+            Some("claude".into()),
+            "valid-id".into(),
+            Some("project\nnext".into())
+        )
+        .is_err());
+    }
+
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};

@@ -191,3 +191,35 @@ pub fn remove_path(root: &Path, path: &Path, expected: EntryKind, label: &str) -
     }
     Ok(true)
 }
+/// Stable identity for coordination, including paths whose final components do not exist yet.
+/// Resolve existing ancestors so aliases share a key; never create directories while locking.
+pub(crate) fn coordination_path(
+    path: &std::path::Path,
+) -> crate::error::AppResult<std::path::PathBuf> {
+    use std::path::{Component, PathBuf};
+    let absolute = std::path::absolute(path)?;
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => continue,
+            // A Windows verbatim prefix (\\?\C:) is not an openable path until its root
+            // component has been appended. Canonicalize only complete path components.
+            Component::Prefix(_) | Component::RootDir => resolved.push(component.as_os_str()),
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            _ => {
+                resolved.push(component.as_os_str());
+                match resolved.canonicalize() {
+                    Ok(canonical) => resolved = canonical,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    let resolved =
+        PathBuf::from(crate::paths::strip_verbatim(&resolved.to_string_lossy()).to_lowercase());
+    Ok(resolved)
+}

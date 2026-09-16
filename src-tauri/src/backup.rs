@@ -365,7 +365,7 @@ fn copy_restore_file_atomically(
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
-    let copy = |target: &mut File| -> AppResult<()> {
+    let copy = |target: &mut crate::atomic_file::AtomicWriter| -> AppResult<()> {
         let mut source_file = File::open(source)?;
         let mut hasher = Sha256::new();
         let mut buffer = [0u8; 64 * 1024];
@@ -2593,6 +2593,28 @@ pub fn restore_session_with_dirs(
     backup_rollout_relpath: Option<String>,
     overwrite: bool,
 ) -> AppResult<RestoreResult> {
+    restore_session_with_dirs_scoped(
+        provider,
+        backup_dir,
+        backup_path,
+        dirs,
+        id,
+        backup_rollout_relpath,
+        overwrite,
+        None,
+    )
+}
+
+fn restore_session_with_dirs_scoped(
+    provider: Option<String>,
+    backup_dir: String,
+    backup_path: String,
+    dirs: ProviderDirs,
+    id: String,
+    backup_rollout_relpath: Option<String>,
+    overwrite: bool,
+    lock: Option<&crate::family::FamilyLock>,
+) -> AppResult<RestoreResult> {
     let backup = validated_backup_path(Path::new(&backup_dir), Path::new(&backup_path))?;
     let codex = dirs.codex_path();
     let claude = dirs.claude_path();
@@ -2641,15 +2663,19 @@ pub fn restore_session_with_dirs(
         }
     }
     let provider = provider.as_deref().unwrap_or(manifest_provider);
-    match provider {
+    let restore = || match provider {
         PROVIDER_CLAUDE => restore_one_claude(&backup, &claude, target, overwrite),
         PROVIDER_OPENCODE => restore_one_opencode(&backup, &opencode, target, overwrite),
         PROVIDER_CURSOR => restore_one_cursor(&backup, &cursor, target, overwrite),
         _ => restore_one(&backup, &codex, target, overwrite),
+    };
+    match lock {
+        Some(lock) => crate::family::with_lock(lock, &dirs.provider_path(provider)?, |_| restore()),
+        None => restore(),
     }
 }
 
-/// 产品入口必须持有共享 FamilyLock，覆盖完整 restore，避免归档来源账本并发丢写。
+/// 产品入口按实际目标的数据目录持锁，覆盖单条 restore，避免归档来源账本并发丢写。
 pub fn restore_session_with_lock(
     provider: Option<String>,
     backup_dir: String,
@@ -2660,17 +2686,16 @@ pub fn restore_session_with_lock(
     overwrite: bool,
     lock: &crate::family::FamilyLock,
 ) -> AppResult<RestoreResult> {
-    crate::family::with_lock(lock, |_guard| {
-        restore_session_with_dirs(
-            provider,
-            backup_dir,
-            backup_path,
-            dirs,
-            id,
-            backup_rollout_relpath,
-            overwrite,
-        )
-    })
+    restore_session_with_dirs_scoped(
+        provider,
+        backup_dir,
+        backup_path,
+        dirs,
+        id,
+        backup_rollout_relpath,
+        overwrite,
+        Some(lock),
+    )
 }
 
 pub fn restore_all(
@@ -2733,6 +2758,26 @@ pub fn restore_selected_with_dirs(
     targets: Option<Vec<BackupRestoreTarget>>,
     overwrite: bool,
 ) -> AppResult<Vec<RestoreResult>> {
+    restore_selected_with_dirs_scoped(
+        provider,
+        backup_dir,
+        backup_path,
+        dirs,
+        targets,
+        overwrite,
+        None,
+    )
+}
+
+fn restore_selected_with_dirs_scoped(
+    provider: Option<String>,
+    backup_dir: String,
+    backup_path: String,
+    dirs: ProviderDirs,
+    targets: Option<Vec<BackupRestoreTarget>>,
+    overwrite: bool,
+    lock: Option<&crate::family::FamilyLock>,
+) -> AppResult<Vec<RestoreResult>> {
     let backup = validated_backup_path(Path::new(&backup_dir), Path::new(&backup_path))?;
     let codex = dirs.codex_path();
     let claude = dirs.claude_path();
@@ -2757,30 +2802,36 @@ pub fn restore_selected_with_dirs(
         let session_provider = provider
             .as_deref()
             .unwrap_or_else(|| manifest_session_provider(&manifest, s));
-        out.push(
-            (match session_provider {
-                PROVIDER_CLAUDE => restore_one_claude(&backup, &claude, s, overwrite),
-                PROVIDER_OPENCODE => restore_one_opencode(&backup, &opencode, s, overwrite),
-                PROVIDER_CURSOR => restore_one_cursor(&backup, &cursor, s, overwrite),
-                _ => restore_one(&backup, &codex, s, overwrite),
-            })
-            .unwrap_or_else(|e| RestoreResult {
-                desktop_restart_required: false,
-                id: s.id.clone(),
-                ok: false,
-                threads_inserted: false,
-                logs_inserted: 0,
-                history_appended: 0,
-                rollout_copied: false,
-                conflict: false,
-                error: Some(e.to_string()),
-            }),
-        );
+        let restore = || match session_provider {
+            PROVIDER_CLAUDE => restore_one_claude(&backup, &claude, s, overwrite),
+            PROVIDER_OPENCODE => restore_one_opencode(&backup, &opencode, s, overwrite),
+            PROVIDER_CURSOR => restore_one_cursor(&backup, &cursor, s, overwrite),
+            _ => restore_one(&backup, &codex, s, overwrite),
+        };
+        let result = match lock {
+            Some(lock) => {
+                crate::family::with_lock(lock, &dirs.provider_path(session_provider)?, |_| {
+                    restore()
+                })
+            }
+            None => restore(),
+        };
+        out.push(result.unwrap_or_else(|e| RestoreResult {
+            desktop_restart_required: false,
+            id: s.id.clone(),
+            ok: false,
+            threads_inserted: false,
+            logs_inserted: 0,
+            history_appended: 0,
+            rollout_copied: false,
+            conflict: false,
+            error: Some(e.to_string()),
+        }));
     }
     Ok(out)
 }
 
-/// 产品入口必须持有共享 FamilyLock，覆盖完整 restore-all，避免归档来源账本并发丢写。
+/// 每条还原按实际目标的数据目录持锁，保留批量操作逐条返回的语义。
 pub fn restore_all_with_lock(
     provider: Option<String>,
     backup_dir: String,
@@ -2809,9 +2860,15 @@ pub fn restore_selected_with_lock(
     overwrite: bool,
     lock: &crate::family::FamilyLock,
 ) -> AppResult<Vec<RestoreResult>> {
-    crate::family::with_lock(lock, |_guard| {
-        restore_selected_with_dirs(provider, backup_dir, backup_path, dirs, targets, overwrite)
-    })
+    restore_selected_with_dirs_scoped(
+        provider,
+        backup_dir,
+        backup_path,
+        dirs,
+        targets,
+        overwrite,
+        Some(lock),
+    )
 }
 
 fn backup_provider(provider: &Option<String>) -> &str {
@@ -4009,32 +4066,29 @@ mod tests {
         Ok(())
     }
 
-    fn assert_waits_for_family_lock<T: Send + 'static>(
+    fn assert_invalid_backup_does_not_wait_for_family_lock<T: Send + 'static>(
         run: impl FnOnce(std::sync::Arc<crate::family::FamilyLock>) -> AppResult<T> + Send + 'static,
     ) {
         let lock = std::sync::Arc::new(crate::family::FamilyLock::default());
-        let guard = lock.0.lock().unwrap();
+        let mutex = crate::family::test_mutex(Path::new("missing-codex"));
+        let guard = mutex.lock().unwrap();
         let worker_lock = std::sync::Arc::clone(&lock);
         let (sender, receiver) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             sender.send(run(worker_lock).map(|_| ())).unwrap();
         });
 
-        assert!(matches!(
-            receiver.recv_timeout(std::time::Duration::from_millis(100)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        ));
-        drop(guard);
         assert!(receiver
             .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("restore should continue after releasing FamilyLock")
+            .unwrap()
             .is_err());
+        drop(guard);
         worker.join().unwrap();
     }
 
     #[test]
-    fn restore_product_entrypoints_wait_for_family_lock() {
-        assert_waits_for_family_lock(|lock| {
+    fn restore_invalid_input_is_rejected_before_taking_a_write_lock() {
+        assert_invalid_backup_does_not_wait_for_family_lock(|lock| {
             restore_session_with_lock(
                 None,
                 "missing-backup-root".into(),
@@ -4046,7 +4100,7 @@ mod tests {
                 &lock,
             )
         });
-        assert_waits_for_family_lock(|lock| {
+        assert_invalid_backup_does_not_wait_for_family_lock(|lock| {
             restore_all_with_lock(
                 None,
                 "missing-backup-root".into(),
