@@ -211,3 +211,22 @@ test("children index sorts by creation time and ignores non-codex sources", () =
     [earlier.id, later.id],
   );
 });
+
+test("subagent source without agent_path still parses and groups", () => {
+  // 新版 Codex 的 thread_spawn 不再写 agent_path（实测为 null），
+  // 分组能力只依赖 parent_thread_id 与 depth。
+  const parent = rootSession(uuid("b1c2d3e4"), 600);
+  const child = subagentSession(uuid("c2d3e4f5"), parent.id, 1, 500);
+  const parsed = JSON.parse(child.source ?? "{}");
+  parsed.subagent.thread_spawn.agent_path = null;
+  child.source = JSON.stringify(parsed);
+
+  const groups = buildSubagentParentGroups([child], [parent, child]);
+
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0]?.key, parent.id);
+  assert.deepEqual(
+    groups[0]?.descendants.map((item) => item.session.id),
+    [child.id],
+  );
+});

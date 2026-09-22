@@ -1436,9 +1436,11 @@ function SubagentOverview({ items }: { items: RelatedSubagentSession[] }) {
                     L{item.depth}
                   </span>
                 </div>
-                <div className="mt-0.5 truncate font-mono text-[11px] text-foreground/70" title={item.agentPath}>
-                  {item.agentPath}
-                </div>
+                {item.agentPath && (
+                  <div className="mt-0.5 truncate font-mono text-[11px] text-foreground/70" title={item.agentPath}>
+                    {item.agentPath}
+                  </div>
+                )}
                 <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-muted-foreground">
                   <span>开始 {absoluteTime(item.createdAt)}</span>
                   <span>最后活动 {absoluteTime(item.updatedAt)}</span>

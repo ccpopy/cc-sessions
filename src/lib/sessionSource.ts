@@ -3,7 +3,8 @@ import type { FamilyOverlay, SessionSummary } from "@/lib/api";
 export type CodexThreadSpawnSource = {
   parentThreadId: string;
   depth: number;
-  agentPath: string;
+  /** 新版 Codex 不再写入 agent_path（实测为 null），路径信息改为可选。 */
+  agentPath: string | null;
   agentNickname: string | null;
   agentRole: string | null;
 };
@@ -13,7 +14,7 @@ export type RelatedSubagentSession = {
   parentThreadId: string;
   depth: number;
   relativeDepth: number;
-  agentPath: string;
+  agentPath: string | null;
   nickname: string | null;
   role: string | null;
   createdAt: number;
@@ -80,13 +81,10 @@ export function parseCodexThreadSpawnSource(
   if (!isRecord(threadSpawn)) return null;
 
   const parentThreadId = requiredText(threadSpawn.parent_thread_id);
-  const agentPath = requiredText(threadSpawn.agent_path);
   const depth = threadSpawn.depth;
   if (
     !parentThreadId ||
     !SESSION_ID_PATTERN.test(parentThreadId) ||
-    !agentPath ||
-    !agentPath.startsWith("/") ||
     typeof depth !== "number" ||
     !Number.isSafeInteger(depth) ||
     depth < 1
@@ -97,7 +95,7 @@ export function parseCodexThreadSpawnSource(
   return {
     parentThreadId,
     depth,
-    agentPath,
+    agentPath: optionalText(threadSpawn.agent_path),
     agentNickname: optionalText(threadSpawn.agent_nickname),
     agentRole: optionalText(threadSpawn.agent_role),
   };
