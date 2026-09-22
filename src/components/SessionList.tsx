@@ -4,6 +4,7 @@ import { ArchivedSessionView } from "@/components/ArchivedSessionView";
 import { ProjectSessionView } from "@/components/ProjectSessionView";
 import type { SessionCardHandlers } from "@/components/SelectableSessionCard";
 import { SizeSessionView } from "@/components/SizeSessionView";
+import { SubagentSessionView } from "@/components/SubagentSessionView";
 import { TimeSessionView } from "@/components/TimeSessionView";
 import type { SessionListViewProps } from "@/components/SessionListRowCard";
 import type { ArchiveOrigin, FamilyOverlay, SessionSummary } from "@/lib/api";
@@ -23,6 +24,7 @@ type Props = SessionCardHandlers & {
   syncingSessionIds?: ReadonlySet<string>;
   syncActionsDisabled?: boolean;
   duplicatingSessionIds?: ReadonlySet<string>;
+  subagentGrouping?: { allSessions: SessionSummary[] } | null;
   archivedGrouping?: {
     ledgerBySession: ReadonlyMap<string, ArchiveOrigin>;
     originFilter: ArchivedOriginGroupKey | "all";
@@ -38,6 +40,7 @@ export const SessionList = memo(function SessionList({
   syncingSessionIds,
   syncActionsDisabled,
   duplicatingSessionIds,
+  subagentGrouping,
   archivedGrouping,
   ...handlers
 }: Props) {
@@ -68,6 +71,18 @@ export const SessionList = memo(function SessionList({
     );
   }, [archivedGrouping, visibleSessions]);
 
+  // 父组头卡片取自全量 allSessions（不受搜索影响），需要与可见列表一样
+  // 用 backupIndex 补齐 has_backup，避免备份徽标失真。
+  const subagentAllSessions = useMemo(() => {
+    if (!subagentGrouping) return [];
+    return subagentGrouping.allSessions.map((session) => ({
+      ...session,
+      has_backup: backupIndex
+        ? Boolean(backupIndex[sessionIdentity(session)]?.length)
+        : session.has_backup,
+    }));
+  }, [backupIndex, subagentGrouping]);
+
   const viewProps: SessionListViewProps = {
     sessions: viewSessions,
     handlers,
@@ -88,6 +103,14 @@ export const SessionList = memo(function SessionList({
         {...viewProps}
         ledgerBySession={archivedGrouping.ledgerBySession}
         originFilter={archivedGrouping.originFilter}
+      />
+    );
+  }
+  if (subagentGrouping) {
+    return (
+      <SubagentSessionView
+        {...viewProps}
+        allSessions={subagentAllSessions}
       />
     );
   }

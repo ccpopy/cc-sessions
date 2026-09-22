@@ -866,6 +866,9 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             syncingSessionIds={providerSyncState.sessionIds}
             syncActionsDisabled={providerSyncState.batchActive}
             duplicatingSessionIds={duplicatingSessionIds}
+            subagentGrouping={
+              isCodex && showSubagentSessions ? { allSessions } : undefined
+            }
             archivedGrouping={
               isCodex && showArchivedSessions ? { ledgerBySession, originFilter } : undefined
             }
