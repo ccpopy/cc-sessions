@@ -90,6 +90,7 @@ import {
   previewProcessKey,
   survivingPreviewAnchor,
   editableTextBlocks,
+  contentMappingCounts,
   editableText,
   eventMessageLabel,
   extractPreviewEventText as extractText,
@@ -858,7 +859,7 @@ export function PreviewDialog({
 
   const recordMutationFailure = (title: string, error: unknown) => {
     const message = String((error as Error)?.message ?? error);
-    if (/EDIT_CONFLICT|EDIT_RECOVERY|EDIT_INCONSISTENT|EDIT_MAPPING_UNSUPPORTED/.test(message)) setMutationError(message);
+    if (/EDIT_CONFLICT|EDIT_RECOVERY|EDIT_INCONSISTENT/.test(message)) setMutationError(message);
     toast.error(title, { description: message });
   };
 
@@ -869,6 +870,12 @@ export function PreviewDialog({
 
   const requestEditAt = (event: PreviewEvent) => {
     if (!canMutateSession) return;
+    const target = paginatedTargets([event])[0];
+    const restricted = capability?.content_mappings.find((m) => target && m.thread_id === target.thread_id && m.turn_id === target.turn_id && m.item_id === target.item_id && !m.operations.edit_text.supported);
+    if (restricted) {
+      toast.warning("当前消息无法改写", { description: restricted.operations.edit_text.reason ?? "请查看会话信息中的操作详情" });
+      return;
+    }
     setEditText(editableText(event));
     setEditBlocks(editableTextBlocks(event));
     setEditTarget(event);
@@ -1317,7 +1324,7 @@ export function PreviewDialog({
               <div className="mt-1">{capability.blocked_reasons.join("；")}</div>
             </div>
           )}
-          {!!capability?.diagnostics?.length && <div role="alert" className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-xs">部分消息需要核对内容映射，未受影响的消息仍可编辑。<button className="ml-2 underline" onClick={() => setSessionInfoOpen(true)}>查看诊断</button></div>}
+          {!!capability?.diagnostics?.length && <div role="alert" className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-xs">部分消息正文不一致，受影响写入已拦截；其他消息仍可编辑。<button className="ml-2 underline" onClick={() => setSessionInfoOpen(true)}>查看诊断</button></div>}
           {(readError || mutationError) && <div role="alert" className="mt-2 rounded-md border border-destructive/40 p-2 text-xs text-destructive">{readError || mutationError}<div className="mt-1 flex gap-3"><button className="underline" disabled={mutating || loading} onClick={() => void reloadPreservingView()}>刷新并重新选择</button>{mutationError && !isSessionWideMutationFailure(mutationError) ? <button className="underline" onClick={() => setSessionInfoOpen(true)}>查看内容块映射</button> : <button className="underline" onClick={openEditHistory}>核对操作与恢复状态</button>}</div></div>}
           {lastReport?.status === "needs_recovery" && (
             <div role="alert" className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs">
@@ -1507,7 +1514,7 @@ export function PreviewDialog({
         <DialogHeader><DialogTitle>会话信息</DialogTitle><DialogDescription>数据来源、历史诊断与本地修改详情。</DialogDescription></DialogHeader>
         <dl className="space-y-2 break-all text-xs"><dt className="text-muted-foreground">来源</dt><dd>{sourceLabel}</dd><dt className="text-muted-foreground">会话 ID</dt><dd className="font-mono">{session?.id}</dd><dt className="text-muted-foreground">路径</dt><dd className="font-mono">{rolloutPath}</dd><dt className="text-muted-foreground">工作目录</dt><dd>{session?.cwd}</dd><dt className="text-muted-foreground">已加载 / 总底层记录</dt><dd>{events.length} / {totalEvents || "未知"}</dd></dl>
         {capability?.diagnostics?.map((reason, i) => <div key={i} className="break-all rounded-md border border-amber-500/40 p-3 text-xs">{reason}</div>)}
-        {!!capability?.content_mappings?.length && <details className="rounded-md border p-3 text-xs"><summary className="cursor-pointer">内容块映射依据（{capability.content_mappings.length}）</summary><p className="my-2 text-muted-foreground">索引与差异位置从 0 开始；正文差异偏移按 UTF-8 字节计。这里只展示结构，不包含正文或媒体数据。</p>{capability.content_mappings.map((mapping) => <details key={`${mapping.turn_id}:${mapping.item_id}:${mapping.context_ordinal}`} className="mt-2 border-t pt-2"><summary className="cursor-pointer break-all">消息 {mapping.item_id} · {mapping.status === "matched" ? "已对应" : mapping.status === "inconsistent" ? "正文不一致" : "映射尚未支持"}</summary><pre className="mt-2 whitespace-pre-wrap break-all">{JSON.stringify(mapping, null, 2)}</pre></details>)}</details>}
+        {!!capability?.content_mappings?.length && <details className="rounded-md border p-3 text-xs"><summary className="cursor-pointer">内容块映射依据 · 正常 {contentMappingCounts(capability.content_mappings).matched} / 不支持 {contentMappingCounts(capability.content_mappings).unsupported} / 不一致 {contentMappingCounts(capability.content_mappings).inconsistent}</summary><p className="my-2 text-muted-foreground">索引与差异位置从 0 开始；正文差异偏移按 UTF-8 字节计。这里只展示结构，不包含正文或媒体数据。</p>{capability.content_mappings.map((mapping) => <details key={`${mapping.turn_id}:${mapping.item_id}:${mapping.context_ordinal}`} className="mt-2 border-t pt-2"><summary className="cursor-pointer break-all">消息 {mapping.item_id} · {mapping.status === "matched" ? "已对应" : mapping.status === "inconsistent" ? "正文不一致" : "映射尚未支持"}</summary><div className="my-2 space-y-1">{([["edit_text", "改写文本块"], ["delete_message", "删除消息"], ["delete_turn", "删除整轮"]] as const).map(([key, label]) => <div key={key}>{label}：{mapping.operations[key].supported ? "映射允许，执行前仍检查依赖与冲突" : mapping.operations[key].reason}</div>)}</div><pre className="mt-2 whitespace-pre-wrap break-all">{JSON.stringify(mapping, null, 2)}</pre></details>)}</details>}
         {lastReport && <div className="space-y-2 rounded-md border p-3 text-xs"><strong>{lastReport.status === "needs_recovery" ? "需要处理" : "本地修改已保存"}</strong><div className="break-all">操作 {lastReport.op_id}</div><div>改写 {lastReport.changed_lines} · 删除 {lastReport.deleted_lines} · 恢复 {lastReport.restored_lines} 条底层记录</div><div>{lastReport.warning}</div><p>{lastReport.status === "needs_recovery" ? "提交尚未完成核对，请先查看操作记录与恢复状态。" : "已保存本地会话与相关投影。"}本次操作未自动执行原生读取或 Codex App 冷启动验证；测试样本的验证结果不代表当前会话已验收。</p><Button variant="outline" size="sm" onClick={() => { setSessionInfoOpen(false); openEditHistory(); }}>查看编辑历史与恢复</Button></div>}
       </DialogContent>
     </Dialog>

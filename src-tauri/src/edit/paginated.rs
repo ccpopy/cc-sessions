@@ -2,6 +2,7 @@
 use super::*;
 pub(super) mod content_mapping;
 pub(super) mod projection;
+mod tool_message;
 pub(super) use projection::{HistoryChange, HistoryImage};
 
 pub(super) fn from_lines(lines: &[String], trailing_newline: bool) -> LoadedFile {
@@ -220,6 +221,18 @@ fn model(loaded: &LoadedFile) -> AppResult<History> {
                         && v["payload"]["id"].as_str() == Some(&item.key.id)
                 })
                 .collect();
+            if item.kind == "AgentMessage" && item.contexts.is_empty() {
+                item.contexts = loaded
+                    .parsed
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, v)| {
+                        (turns[i].as_deref() == Some(&item.key.turn)
+                            && tool_message::is_call(v.as_ref().unwrap(), &item.key.id))
+                        .then_some(i)
+                    })
+                    .collect();
+            }
         }
     }
     Ok(History { items, turns })
@@ -236,12 +249,96 @@ pub(super) fn diagnostics(
 ) -> AppResult<Vec<crate::models::ContentMappingDetail>> {
     let h = model(loaded)?;
     let mut diagnostics = Vec::new();
+    let dependency = loaded.parsed.iter().enumerate().rev().find_map(|(i, v)| {
+        let v = v.as_ref()?;
+        (matches!(codex_outer(v), "compacted" | "retained_context")
+            || matches!(codex_ptype(v), "context_compacted" | "thread_rolled_back"))
+        .then_some(i)
+    });
+    let ended: BTreeSet<_> = loaded
+        .parsed
+        .iter()
+        .flatten()
+        .filter(|v| matches!(codex_ptype(v), "task_complete" | "turn_aborted"))
+        .filter_map(|v| v["payload"]["turn_id"].as_str())
+        .collect();
+    let mut turn_starts = BTreeMap::new();
+    for (i, turn) in h.turns.iter().enumerate() {
+        if let Some(turn) = turn {
+            turn_starts.entry(turn.as_str()).or_insert(i);
+        }
+    }
     for item in h
         .items
         .iter()
         .filter(|item| matches!(item.kind.as_str(), "UserMessage" | "AgentMessage"))
     {
-        diagnostics.extend(content_mapping::item_mappings(loaded, item));
+        let mut details = content_mapping::item_mappings(loaded, item);
+        let first = item
+            .records
+            .iter()
+            .chain(&item.contexts)
+            .min()
+            .copied()
+            .unwrap();
+        for detail in &mut details {
+            let restrict =
+                |cap: &mut crate::models::MessageOperationCapability, code: &str, reason: &str| {
+                    if cap.supported {
+                        *cap = crate::models::MessageOperationCapability {
+                            supported: false,
+                            reason_code: Some(code.into()),
+                            reason: Some(reason.into()),
+                        };
+                    }
+                };
+            if !ended.contains(item.key.turn.as_str()) {
+                for op in [
+                    &mut detail.operations.edit_text,
+                    &mut detail.operations.delete_message,
+                    &mut detail.operations.delete_turn,
+                ] {
+                    restrict(op, "TURN_NOT_ENDED", "该回合尚未结束；停止写入并刷新后重试");
+                }
+            }
+            if dependency.is_some_and(|i| i >= first) {
+                for op in [
+                    &mut detail.operations.edit_text,
+                    &mut detail.operations.delete_message,
+                ] {
+                    restrict(op,"CONTEXT_DEPENDENCY","该消息被后续压缩或保留上下文引用；需先重建相关摘要，摘要之后的独立消息仍可操作");
+                }
+            }
+            if dependency.is_some_and(|i| i >= turn_starts[item.key.turn.as_str()]) {
+                restrict(
+                    &mut detail.operations.delete_turn,
+                    "CONTEXT_DEPENDENCY",
+                    "该回合涉及压缩或保留上下文；不能连带删除仍被引用的历史",
+                );
+            }
+            if let Some(other) = h.items.iter().find(|other| {
+                other.key.turn == item.key.turn
+                    && !matches!(
+                        other.kind.as_str(),
+                        "UserMessage"
+                            | "AgentMessage"
+                            | "Reasoning"
+                            | "CommandExecution"
+                            | "McpToolCall"
+                            | "FileChange"
+                    )
+            }) {
+                restrict(
+                    &mut detail.operations.delete_turn,
+                    "TURN_ITEM_UNMAPPED",
+                    &format!(
+                        "该回合包含尚未适配的 {}；单条消息按自身关联处理",
+                        other.kind
+                    ),
+                );
+            }
+        }
+        diagnostics.extend(details);
     }
     Ok(diagnostics)
 }
@@ -298,10 +395,15 @@ pub(super) fn required_turns(
         .iter()
         .filter(|it| {
             selected_items.contains(&it.key)
-                && !matches!(
-                    it.kind.as_str(),
-                    "UserMessage" | "AgentMessage" | "Reasoning"
-                )
+                && if matches!(it.kind.as_str(), "UserMessage" | "AgentMessage") {
+                    let details = content_mapping::item_mappings(loaded, it);
+                    details
+                        .iter()
+                        .any(|d| !d.operations.delete_message.supported)
+                        && details.iter().all(|d| d.operations.delete_turn.supported)
+                } else {
+                    it.kind != "Reasoning"
+                }
                 && h.items.iter().any(|other| {
                     other.key.turn == it.key.turn && !selected_items.contains(&other.key)
                 })
@@ -344,7 +446,8 @@ fn check_scope(path: &Path, loaded: &LoadedFile, selected: &BTreeSet<usize>) -> 
             }
             let v = v.as_ref().unwrap();
             let known = match codex_outer(v) {
-                "session_meta" | "turn_context" | "token_usage_record" | "world_state" => true,
+                "session_meta" | "turn_context" | "token_usage_record" | "world_state"
+                | "compacted" | "retained_context" => true,
                 "response_item" => {
                     matches!(codex_ptype(v), "message" | "reasoning")
                         || CODEX_CALL_TYPES.contains(&codex_ptype(v))
@@ -372,6 +475,7 @@ fn check_scope(path: &Path, loaded: &LoadedFile, selected: &BTreeSet<usize>) -> 
                 )));
             }
             if codex_ptype(v) == "item_completed"
+                && selected.contains(&i)
                 && !matches!(
                     v["payload"]["item"]["type"].as_str(),
                     Some(
@@ -467,17 +571,38 @@ pub(super) fn delete_plan(
         selected_items.insert(item.key.clone());
         plan.insert(i, REASON_SELECTED.into());
     }
+    let full_turns: BTreeSet<_> = selected_items
+        .iter()
+        .filter(|key| {
+            h.items
+                .iter()
+                .filter(|it| it.key.turn == key.turn)
+                .all(|it| selected_items.contains(&it.key))
+        })
+        .map(|key| key.turn.as_str())
+        .collect();
     for item in &h.items {
         if !selected_items.contains(&item.key) {
             continue;
         }
         if matches!(item.kind.as_str(), "UserMessage" | "AgentMessage") {
-            content_mapping::require_supported(&content_mapping::item_mappings(loaded, item))?;
+            content_mapping::require_delete(
+                &content_mapping::item_mappings(loaded, item),
+                full_turns.contains(item.key.turn.as_str()),
+            )?;
         }
         for &i in &item.records {
             plan.entry(i).or_insert_with(|| "item_snapshot".into());
         }
-        if item.kind == "UserMessage" {
+        if full_turns.contains(item.key.turn.as_str()) {
+            for (i, turn) in h.turns.iter().enumerate() {
+                if turn.as_deref() == Some(&item.key.turn)
+                    && codex_outer(loaded.parsed[i].as_ref().unwrap()) == "response_item"
+                {
+                    plan.entry(i).or_insert_with(|| REASON_TOOL_PAIR.into());
+                }
+            }
+        } else if item.kind == "UserMessage" {
             if item.contexts.len() != 1
                 || h.items
                     .iter()
@@ -512,6 +637,18 @@ pub(super) fn delete_plan(
         }
         for &i in &item.contexts {
             plan.entry(i).or_insert_with(|| REASON_MIRROR.into());
+            if tool_message::is_call(loaded.parsed[i].as_ref().unwrap(), &item.key.id) {
+                for (j, row) in loaded.parsed.iter().enumerate() {
+                    let row = row.as_ref().unwrap();
+                    if h.turns[j].as_deref() == Some(&item.key.turn)
+                        && codex_outer(row) == "response_item"
+                        && codex_ptype(row) == "function_call_output"
+                        && row["payload"]["call_id"] == item.key.id
+                    {
+                        plan.entry(j).or_insert_with(|| REASON_TOOL_PAIR.into());
+                    }
+                }
+            }
         }
     }
     // Delete attached reasoning using its exact response item ID and canonical snapshots.
@@ -562,7 +699,7 @@ pub(super) fn edit_changes(
         return Err(unsupported("工具和推理内容不支持文本改写"));
     }
     let mappings = content_mapping::item_mappings(loaded, item);
-    content_mapping::require_supported(&mappings)?;
+    content_mapping::require_edit(&mappings)?;
     if item.contexts.is_empty()
         || (item.kind == "UserMessage"
             && (item.contexts.len() != 1
@@ -612,8 +749,22 @@ pub(super) fn edit_changes(
         .filter_map(|&i| updated[i]["text"].as_str())
         .collect::<String>();
     let mut changes = Vec::new();
+    let tool_source = mappings
+        .iter()
+        .all(|m| m.source == "tool.request_user_input_async");
     for i in indices {
         let mut raw = loaded.parsed[i].clone().unwrap();
+        if tool_source {
+            tool_message::rewrite(&mut raw, &final_text)?;
+            if raw != *loaded.parsed[i].as_ref().unwrap() {
+                changes.push(LineChange {
+                    line_no: i,
+                    before: Some(loaded.lines[i].clone()),
+                    after: Some(serde_json::to_string(&raw)?),
+                });
+            }
+            continue;
+        }
         let formal = codex_ptype(&raw) == "item_completed";
         let mapping = if formal {
             let content = &raw["payload"]["item"]["content"];
@@ -664,7 +815,7 @@ pub(super) fn edit_changes(
         });
     }
     // Native turn completion carries a copy of the last assistant text.
-    if final_agent(&h, loaded, &item.key.turn, &BTreeMap::new())
+    if final_agent(&h, loaded, &item.key.turn, &BTreeMap::new(), false)
         .is_some_and(|last| last.key == item.key)
     {
         for (i, v) in loaded.parsed.iter().enumerate() {
@@ -769,7 +920,13 @@ pub(super) fn deletion_updates(
         {
             continue;
         }
-        let last = final_agent(&h, loaded, v["payload"]["turn_id"].as_str().unwrap(), plan);
+        let last = final_agent(
+            &h,
+            loaded,
+            v["payload"]["turn_id"].as_str().unwrap(),
+            plan,
+            false,
+        );
         let text = last.map(|it| {
             loaded.parsed[*it.records.last().unwrap()].as_ref().unwrap()["payload"]["item"]
                 ["content"]
@@ -798,12 +955,20 @@ fn final_agent<'a>(
     loaded: &LoadedFile,
     turn: &str,
     excluded: &BTreeMap<usize, String>,
+    include_async: bool,
 ) -> Option<&'a Item> {
+    // Native thread_history selects final_answer items including async questions;
+    // task_complete.last_agent_message comes only from model response messages
+    // (core/session/turn.rs), not messages emitted directly by tool handlers.
     let find = |phase: &Value| {
         h.items.iter().rev().find(|it| {
             it.kind == "AgentMessage"
                 && it.key.turn == turn
                 && !it.records.iter().any(|i| excluded.contains_key(i))
+                && (include_async
+                    || loaded.parsed[*it.records.last().unwrap()].as_ref().unwrap()["payload"]
+                        ["item"]["delivery"]
+                        != "async")
                 && &loaded.parsed[*it.records.last().unwrap()].as_ref().unwrap()["payload"]["item"]
                     ["phase"]
                     == phase

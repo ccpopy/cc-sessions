@@ -1,0 +1,232 @@
+{
+  "provenance": {
+    "version": "codex-cli 0.155.0-alpha.9.2",
+    "sourceCommit": "4607249e430dac1c961df4dc615beae88e33cec8",
+    "threadId": "01a0cdba-2e74-78d3-aaa0-c7347b1130eb",
+    "rolloutSha256": "e0c17a9b4f5207b2ad00e836c8ad029118dad19b05b45a92c16a833540372c98",
+    "nativeGenerated": true,
+    "ccSessionsEdits": false
+  },
+  "cases": [
+    {
+      "name": "freeform",
+      "rows": [
+        {
+          "timestamp": "2026-09-23T10:05:27.187Z",
+          "ordinal": 8,
+          "type": "response_item",
+          "payload": {
+            "type": "function_call",
+            "id": "fc-native-0",
+            "name": "request_user_input_async",
+            "namespace": "functions",
+            "arguments": "{\"questions\": [{\"title\": \"SYNTHETIC QUESTION\"}]}",
+            "call_id": "call-native-0",
+            "internal_chat_message_metadata_passthrough": {
+              "turn_id": "01a0cdba-302c-7261-a2d5-88afad1c589a"
+            }
+          }
+        },
+        {
+          "timestamp": "2026-09-23T10:05:27.195Z",
+          "ordinal": 10,
+          "type": "event_msg",
+          "payload": {
+            "type": "item_completed",
+            "thread_id": "01a0cdba-2e74-78d3-aaa0-c7347b1130eb",
+            "turn_id": "01a0cdba-302c-7261-a2d5-88afad1c589a",
+            "item": {
+              "type": "AgentMessage",
+              "id": "call-native-0",
+              "content": [
+                {
+                  "type": "Text",
+                  "text": "SYNTHETIC QUESTION"
+                }
+              ],
+              "phase": "final_answer",
+              "delivery": "async",
+              "questions": [
+                {
+                  "title": "SYNTHETIC QUESTION",
+                  "options": null
+                }
+              ]
+            },
+            "started_at_ms": 1790157927195,
+            "completed_at_ms": 1790157927195
+          }
+        },
+        {
+          "timestamp": "2026-09-23T10:05:27.199Z",
+          "ordinal": 11,
+          "type": "response_item",
+          "payload": {
+            "type": "function_call_output",
+            "id": "fco_01a0cdba-331f-7b81-aa3f-554587ff9e4f",
+            "call_id": "call-native-0",
+            "output": "{\"accepted\":true}",
+            "internal_chat_message_metadata_passthrough": {
+              "turn_id": "01a0cdba-302c-7261-a2d5-88afad1c589a",
+              "create_time": 1790157927.1998212
+            }
+          },
+          "metadata": {
+            "client_authored": false,
+            "fallback_token_limit_override": 12000
+          }
+        }
+      ]
+    },
+    {
+      "name": "options",
+      "rows": [
+        {
+          "timestamp": "2026-09-23T10:05:27.713Z",
+          "ordinal": 22,
+          "type": "response_item",
+          "payload": {
+            "type": "function_call",
+            "id": "fc-native-1",
+            "name": "request_user_input_async",
+            "namespace": "functions",
+            "arguments": "{\"questions\": [{\"title\": \"SYNTHETIC CHOICE\", \"options\": [\"FIRST\", \"SECOND\"]}]}",
+            "call_id": "call-native-1",
+            "internal_chat_message_metadata_passthrough": {
+              "turn_id": "01a0cdba-3413-7c51-a309-b4b3c1c92bba"
+            }
+          }
+        },
+        {
+          "timestamp": "2026-09-23T10:05:27.717Z",
+          "ordinal": 24,
+          "type": "event_msg",
+          "payload": {
+            "type": "item_completed",
+            "thread_id": "01a0cdba-2e74-78d3-aaa0-c7347b1130eb",
+            "turn_id": "01a0cdba-3413-7c51-a309-b4b3c1c92bba",
+            "item": {
+              "type": "AgentMessage",
+              "id": "call-native-1",
+              "content": [
+                {
+                  "type": "Text",
+                  "text": "SYNTHETIC CHOICE\n- FIRST\n- SECOND"
+                }
+              ],
+              "phase": "final_answer",
+              "delivery": "async",
+              "questions": [
+                {
+                  "title": "SYNTHETIC CHOICE",
+                  "options": [
+                    "FIRST",
+                    "SECOND"
+                  ]
+                }
+              ]
+            },
+            "started_at_ms": 1790157927716,
+            "completed_at_ms": 1790157927717
+          }
+        },
+        {
+          "timestamp": "2026-09-23T10:05:27.720Z",
+          "ordinal": 25,
+          "type": "response_item",
+          "payload": {
+            "type": "function_call_output",
+            "id": "fco_01a0cdba-3528-7460-b091-eefffbb499cc",
+            "call_id": "call-native-1",
+            "output": "{\"accepted\":true}",
+            "internal_chat_message_metadata_passthrough": {
+              "turn_id": "01a0cdba-3413-7c51-a309-b4b3c1c92bba",
+              "create_time": 1790157927.7209606
+            }
+          },
+          "metadata": {
+            "client_authored": false,
+            "fallback_token_limit_override": 12000
+          }
+        }
+      ]
+    },
+    {
+      "name": "multi-question",
+      "rows": [
+        {
+          "timestamp": "2026-09-23T10:05:28.290Z",
+          "ordinal": 36,
+          "type": "response_item",
+          "payload": {
+            "type": "function_call",
+            "id": "fc-native-2",
+            "name": "request_user_input_async",
+            "namespace": "functions",
+            "arguments": "{\"questions\": [{\"title\": \"FIRST QUESTION\", \"options\": [\"ONE\", \"TWO\"]}, {\"title\": \"SECOND QUESTION\"}]}",
+            "call_id": "call-native-2",
+            "internal_chat_message_metadata_passthrough": {
+              "turn_id": "01a0cdba-3614-7100-a59f-6d5e0cd529e2"
+            }
+          }
+        },
+        {
+          "timestamp": "2026-09-23T10:05:28.294Z",
+          "ordinal": 38,
+          "type": "event_msg",
+          "payload": {
+            "type": "item_completed",
+            "thread_id": "01a0cdba-2e74-78d3-aaa0-c7347b1130eb",
+            "turn_id": "01a0cdba-3614-7100-a59f-6d5e0cd529e2",
+            "item": {
+              "type": "AgentMessage",
+              "id": "call-native-2",
+              "content": [
+                {
+                  "type": "Text",
+                  "text": "FIRST QUESTION\n- ONE\n- TWO\n\nSECOND QUESTION"
+                }
+              ],
+              "phase": "final_answer",
+              "delivery": "async",
+              "questions": [
+                {
+                  "title": "FIRST QUESTION",
+                  "options": [
+                    "ONE",
+                    "TWO"
+                  ]
+                },
+                {
+                  "title": "SECOND QUESTION",
+                  "options": null
+                }
+              ]
+            },
+            "started_at_ms": 1790157928294,
+            "completed_at_ms": 1790157928294
+          }
+        },
+        {
+          "timestamp": "2026-09-23T10:05:28.298Z",
+          "ordinal": 39,
+          "type": "response_item",
+          "payload": {
+            "type": "function_call_output",
+            "id": "fco_01a0cdba-376a-7bb1-bafe-0ce2b6618695",
+            "call_id": "call-native-2",
+            "output": "{\"accepted\":true}",
+            "internal_chat_message_metadata_passthrough": {
+              "turn_id": "01a0cdba-3614-7100-a59f-6d5e0cd529e2",
+              "create_time": 1790157928.2984078
+            }
+          },
+          "metadata": {
+            "client_authored": false,
+            "fallback_token_limit_override": 12000
+          }
+        }
+      ]
+    }
+  ]
+}

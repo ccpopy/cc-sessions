@@ -1,0 +1,649 @@
+{
+  "provenance": {
+    "version": "codex-cli 0.155.0-alpha.9.2",
+    "sourceCommit": "4607249e430dac1c961df4dc615beae88e33cec8",
+    "threadId": "01a0cdb6-cf84-7552-8002-4bb4b7c94d0b",
+    "rolloutSha256": "f8b5369df0e2df03aa1c8193602968024a24afba57148a9a6e3ac196636aeaa9",
+    "nativeGenerated": true,
+    "ccSessionsEdits": false
+  },
+  "cases": [
+    {
+      "name": "pure-image",
+      "cli_version": "0.155.0-alpha.9.2",
+      "canonical": {
+        "timestamp": "2026-09-23T10:01:45.765Z",
+        "ordinal": 7,
+        "type": "event_msg",
+        "payload": {
+          "type": "item_completed",
+          "thread_id": "01a0cdb6-cf84-7552-8002-4bb4b7c94d0b",
+          "turn_id": "01a0cdb6-d0b5-75b2-b8b2-0a71310ef4dd",
+          "item": {
+            "type": "UserMessage",
+            "id": "01a0cdb6-d225-7a91-b1b1-3d4769d0f5e8",
+            "content": [
+              {
+                "type": "local_image",
+                "path": "F:\\project\\sessions-management\\codex-session-manager\\output\\mapping-compatibility\\native-alpha9\\one.png"
+              }
+            ]
+          },
+          "started_at_ms": 1790157705765,
+          "completed_at_ms": 1790157705765
+        }
+      },
+      "context": {
+        "timestamp": "2026-09-23T10:01:45.764Z",
+        "ordinal": 6,
+        "type": "response_item",
+        "payload": {
+          "type": "message",
+          "id": "msg_01a0cdb6-d224-7a41-a8ce-a0a415143bfc",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "<image name=[Image #1] path=\"F:\\project\\sessions-management\\codex-session-manager\\output\\mapping-compatibility\\native-alpha9\\one.png\">"
+            },
+            {
+              "type": "input_image",
+              "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+              "detail": "high"
+            },
+            {
+              "type": "input_text",
+              "text": "</image>"
+            }
+          ],
+          "internal_chat_message_metadata_passthrough": {
+            "turn_id": "01a0cdb6-d0b5-75b2-b8b2-0a71310ef4dd",
+            "create_time": 1790157705.7643783,
+            "content_item_kinds": [
+              "user.text",
+              "user.image",
+              "user.text"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "text-image",
+      "cli_version": "0.155.0-alpha.9.2",
+      "canonical": {
+        "timestamp": "2026-09-23T10:01:46.114Z",
+        "ordinal": 16,
+        "type": "event_msg",
+        "payload": {
+          "type": "item_completed",
+          "thread_id": "01a0cdb6-cf84-7552-8002-4bb4b7c94d0b",
+          "turn_id": "01a0cdb6-d363-7a70-8d43-d26de41717d8",
+          "item": {
+            "type": "UserMessage",
+            "id": "01a0cdb6-d382-7c80-a3d3-05c42c264e63",
+            "content": [
+              {
+                "type": "text",
+                "text": "KEEP-A",
+                "text_elements": []
+              },
+              {
+                "type": "local_image",
+                "path": "F:\\project\\sessions-management\\codex-session-manager\\output\\mapping-compatibility\\native-alpha9\\one.png"
+              }
+            ]
+          },
+          "started_at_ms": 1790157706114,
+          "completed_at_ms": 1790157706114
+        }
+      },
+      "context": {
+        "timestamp": "2026-09-23T10:01:46.112Z",
+        "ordinal": 15,
+        "type": "response_item",
+        "payload": {
+          "type": "message",
+          "id": "msg_01a0cdb6-d37f-7212-b2a1-7d5c8a74158c",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "KEEP-A"
+            },
+            {
+              "type": "input_text",
+              "text": "<image name=[Image #1] path=\"F:\\project\\sessions-management\\codex-session-manager\\output\\mapping-compatibility\\native-alpha9\\one.png\">"
+            },
+            {
+              "type": "input_image",
+              "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+              "detail": "high"
+            },
+            {
+              "type": "input_text",
+              "text": "</image>"
+            }
+          ],
+          "internal_chat_message_metadata_passthrough": {
+            "turn_id": "01a0cdb6-d363-7a70-8d43-d26de41717d8",
+            "create_time": 1790157706.1119545,
+            "content_item_kinds": [
+              "user.text",
+              "user.text",
+              "user.image",
+              "user.text"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "multi-image",
+      "cli_version": "0.155.0-alpha.9.2",
+      "canonical": {
+        "timestamp": "2026-09-23T10:01:46.444Z",
+        "ordinal": 25,
+        "type": "event_msg",
+        "payload": {
+          "type": "item_completed",
+          "thread_id": "01a0cdb6-cf84-7552-8002-4bb4b7c94d0b",
+          "turn_id": "01a0cdb6-d4af-7ce1-88e6-1fff4e635e12",
+          "item": {
+            "type": "UserMessage",
+            "id": "01a0cdb6-d4cc-7130-a35f-d29ef4b77227",
+            "content": [
+              {
+                "type": "local_image",
+                "path": "F:\\project\\sessions-management\\codex-session-manager\\output\\mapping-compatibility\\native-alpha9\\one.png"
+              },
+              {
+                "type": "text",
+                "text": "BETWEEN",
+                "text_elements": []
+              },
+              {
+                "type": "local_image",
+                "path": "F:\\project\\sessions-management\\codex-session-manager\\output\\mapping-compatibility\\native-alpha9\\two.png"
+              },
+              {
+                "type": "text",
+                "text": "TAIL",
+                "text_elements": []
+              }
+            ]
+          },
+          "started_at_ms": 1790157706444,
+          "completed_at_ms": 1790157706444
+        }
+      },
+      "context": {
+        "timestamp": "2026-09-23T10:01:46.441Z",
+        "ordinal": 24,
+        "type": "response_item",
+        "payload": {
+          "type": "message",
+          "id": "msg_01a0cdb6-d4c9-75d2-a28b-e54c50f86c6f",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "<image name=[Image #1] path=\"F:\\project\\sessions-management\\codex-session-manager\\output\\mapping-compatibility\\native-alpha9\\one.png\">"
+            },
+            {
+              "type": "input_image",
+              "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+              "detail": "high"
+            },
+            {
+              "type": "input_text",
+              "text": "</image>"
+            },
+            {
+              "type": "input_text",
+              "text": "BETWEEN"
+            },
+            {
+              "type": "input_text",
+              "text": "<image name=[Image #2] path=\"F:\\project\\sessions-management\\codex-session-manager\\output\\mapping-compatibility\\native-alpha9\\two.png\">"
+            },
+            {
+              "type": "input_image",
+              "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+              "detail": "high"
+            },
+            {
+              "type": "input_text",
+              "text": "</image>"
+            },
+            {
+              "type": "input_text",
+              "text": "TAIL"
+            }
+          ],
+          "internal_chat_message_metadata_passthrough": {
+            "turn_id": "01a0cdb6-d4af-7ce1-88e6-1fff4e635e12",
+            "create_time": 1790157706.441696,
+            "content_item_kinds": [
+              "user.text",
+              "user.image",
+              "user.text",
+              "user.text",
+              "user.text",
+              "user.image",
+              "user.text",
+              "user.text"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "local-audio",
+      "cli_version": "0.155.0-alpha.9.2",
+      "canonical": {
+        "timestamp": "2026-09-23T10:01:46.722Z",
+        "ordinal": 34,
+        "type": "event_msg",
+        "payload": {
+          "type": "item_completed",
+          "thread_id": "01a0cdb6-cf84-7552-8002-4bb4b7c94d0b",
+          "turn_id": "01a0cdb6-d5c5-7ea2-bad1-2f5a28f0f19d",
+          "item": {
+            "type": "UserMessage",
+            "id": "01a0cdb6-d5e2-7951-bbff-bf5e85d73a14",
+            "content": [
+              {
+                "type": "text",
+                "text": "LISTEN",
+                "text_elements": []
+              },
+              {
+                "type": "local_audio",
+                "path": "F:\\project\\sessions-management\\codex-session-manager\\output\\mapping-compatibility\\native-alpha9\\tone.wav"
+              },
+              {
+                "type": "text",
+                "text": "AUDIO-TAIL",
+                "text_elements": []
+              }
+            ]
+          },
+          "started_at_ms": 1790157706722,
+          "completed_at_ms": 1790157706722
+        }
+      },
+      "context": {
+        "timestamp": "2026-09-23T10:01:46.719Z",
+        "ordinal": 33,
+        "type": "response_item",
+        "payload": {
+          "type": "message",
+          "id": "msg_01a0cdb6-d5de-7010-a3ba-202bfebfba22",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "LISTEN"
+            },
+            {
+              "type": "input_text",
+              "text": "<audio name=[Audio #1] path=\"F:\\project\\sessions-management\\codex-session-manager\\output\\mapping-compatibility\\native-alpha9\\tone.wav\">"
+            },
+            {
+              "type": "input_audio",
+              "audio_url": "data:audio/wav;base64,UklGRmQGAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUAGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            },
+            {
+              "type": "input_text",
+              "text": "</audio>"
+            },
+            {
+              "type": "input_text",
+              "text": "AUDIO-TAIL"
+            }
+          ],
+          "internal_chat_message_metadata_passthrough": {
+            "turn_id": "01a0cdb6-d5c5-7ea2-bad1-2f5a28f0f19d",
+            "create_time": 1790157706.7189736,
+            "content_item_kinds": [
+              "user.text",
+              "user.text",
+              "user.audio",
+              "user.text",
+              "user.text"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "mixed-blocks",
+      "cli_version": "0.155.0-alpha.9.2",
+      "canonical": {
+        "timestamp": "2026-09-23T10:01:46.986Z",
+        "ordinal": 43,
+        "type": "event_msg",
+        "payload": {
+          "type": "item_completed",
+          "thread_id": "01a0cdb6-cf84-7552-8002-4bb4b7c94d0b",
+          "turn_id": "01a0cdb6-d6ce-7ad0-acad-9f1db9ab9fd8",
+          "item": {
+            "type": "UserMessage",
+            "id": "01a0cdb6-d6ea-7422-aafb-76fb79197eca",
+            "content": [
+              {
+                "type": "text",
+                "text": "HEAD",
+                "text_elements": []
+              },
+              {
+                "type": "text",
+                "text": "SECOND",
+                "text_elements": []
+              },
+              {
+                "type": "local_image",
+                "path": "F:\\project\\sessions-management\\codex-session-manager\\output\\mapping-compatibility\\native-alpha9\\one.png"
+              },
+              {
+                "type": "text",
+                "text": "MIDDLE",
+                "text_elements": []
+              },
+              {
+                "type": "local_audio",
+                "path": "F:\\project\\sessions-management\\codex-session-manager\\output\\mapping-compatibility\\native-alpha9\\tone.wav"
+              },
+              {
+                "type": "text",
+                "text": "LAST",
+                "text_elements": []
+              }
+            ]
+          },
+          "started_at_ms": 1790157706986,
+          "completed_at_ms": 1790157706986
+        }
+      },
+      "context": {
+        "timestamp": "2026-09-23T10:01:46.985Z",
+        "ordinal": 42,
+        "type": "response_item",
+        "payload": {
+          "type": "message",
+          "id": "msg_01a0cdb6-d6e9-7393-be41-111a5e180c17",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "HEAD"
+            },
+            {
+              "type": "input_text",
+              "text": "SECOND"
+            },
+            {
+              "type": "input_text",
+              "text": "<image name=[Image #1] path=\"F:\\project\\sessions-management\\codex-session-manager\\output\\mapping-compatibility\\native-alpha9\\one.png\">"
+            },
+            {
+              "type": "input_image",
+              "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+              "detail": "high"
+            },
+            {
+              "type": "input_text",
+              "text": "</image>"
+            },
+            {
+              "type": "input_text",
+              "text": "MIDDLE"
+            },
+            {
+              "type": "input_text",
+              "text": "<audio name=[Audio #1] path=\"F:\\project\\sessions-management\\codex-session-manager\\output\\mapping-compatibility\\native-alpha9\\tone.wav\">"
+            },
+            {
+              "type": "input_audio",
+              "audio_url": "data:audio/wav;base64,UklGRmQGAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUAGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            },
+            {
+              "type": "input_text",
+              "text": "</audio>"
+            },
+            {
+              "type": "input_text",
+              "text": "LAST"
+            }
+          ],
+          "internal_chat_message_metadata_passthrough": {
+            "turn_id": "01a0cdb6-d6ce-7ad0-acad-9f1db9ab9fd8",
+            "create_time": 1790157706.9857209,
+            "content_item_kinds": [
+              "user.text",
+              "user.text",
+              "user.text",
+              "user.image",
+              "user.text",
+              "user.text",
+              "user.text",
+              "user.audio",
+              "user.text",
+              "user.text"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "inline-image",
+      "cli_version": "0.155.0-alpha.9.2",
+      "canonical": {
+        "timestamp": "2026-09-23T10:01:47.258Z",
+        "ordinal": 52,
+        "type": "event_msg",
+        "payload": {
+          "type": "item_completed",
+          "thread_id": "01a0cdb6-cf84-7552-8002-4bb4b7c94d0b",
+          "turn_id": "01a0cdb6-d7db-7570-b64b-40c806e779d9",
+          "item": {
+            "type": "UserMessage",
+            "id": "01a0cdb6-d7fa-7ea1-8e46-8abb066528ad",
+            "content": [
+              {
+                "type": "text",
+                "text": "INLINE",
+                "text_elements": []
+              },
+              {
+                "type": "image",
+                "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
+              },
+              {
+                "type": "text",
+                "text": "INLINE-TAIL",
+                "text_elements": []
+              }
+            ]
+          },
+          "started_at_ms": 1790157707258,
+          "completed_at_ms": 1790157707258
+        }
+      },
+      "context": {
+        "timestamp": "2026-09-23T10:01:47.256Z",
+        "ordinal": 51,
+        "type": "response_item",
+        "payload": {
+          "type": "message",
+          "id": "msg_01a0cdb6-d7f7-7e50-abb6-82daf7cd2ac4",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "INLINE"
+            },
+            {
+              "type": "input_image",
+              "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+              "detail": "high"
+            },
+            {
+              "type": "input_text",
+              "text": "INLINE-TAIL"
+            }
+          ],
+          "internal_chat_message_metadata_passthrough": {
+            "turn_id": "01a0cdb6-d7db-7570-b64b-40c806e779d9",
+            "create_time": 1790157707.255967,
+            "content_item_kinds": [
+              "user.text",
+              "user.image",
+              "user.text"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "inline-audio",
+      "cli_version": "0.155.0-alpha.9.2",
+      "canonical": {
+        "timestamp": "2026-09-23T10:01:47.544Z",
+        "ordinal": 61,
+        "type": "event_msg",
+        "payload": {
+          "type": "item_completed",
+          "thread_id": "01a0cdb6-cf84-7552-8002-4bb4b7c94d0b",
+          "turn_id": "01a0cdb6-d8fc-7e83-9bb1-a89ad8c33cc9",
+          "item": {
+            "type": "UserMessage",
+            "id": "01a0cdb6-d917-7a23-b555-f8eca4853d2a",
+            "content": [
+              {
+                "type": "text",
+                "text": "INLINE-AUDIO",
+                "text_elements": []
+              },
+              {
+                "type": "audio",
+                "audio_url": "data:audio/wav;base64,UklGRmQGAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUAGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+              },
+              {
+                "type": "text",
+                "text": "AUDIO-END",
+                "text_elements": []
+              }
+            ]
+          },
+          "started_at_ms": 1790157707543,
+          "completed_at_ms": 1790157707543
+        }
+      },
+      "context": {
+        "timestamp": "2026-09-23T10:01:47.542Z",
+        "ordinal": 60,
+        "type": "response_item",
+        "payload": {
+          "type": "message",
+          "id": "msg_01a0cdb6-d916-7110-b279-0c8a3cd80a16",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "INLINE-AUDIO"
+            },
+            {
+              "type": "input_audio",
+              "audio_url": "data:audio/wav;base64,UklGRmQGAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUAGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            },
+            {
+              "type": "input_text",
+              "text": "AUDIO-END"
+            }
+          ],
+          "internal_chat_message_metadata_passthrough": {
+            "turn_id": "01a0cdb6-d8fc-7e83-9bb1-a89ad8c33cc9",
+            "create_time": 1790157707.5428083,
+            "content_item_kinds": [
+              "user.text",
+              "user.audio",
+              "user.text"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "literal-tags",
+      "cli_version": "0.155.0-alpha.9.2",
+      "canonical": {
+        "timestamp": "2026-09-23T10:01:47.821Z",
+        "ordinal": 70,
+        "type": "event_msg",
+        "payload": {
+          "type": "item_completed",
+          "thread_id": "01a0cdb6-cf84-7552-8002-4bb4b7c94d0b",
+          "turn_id": "01a0cdb6-da05-7033-b8ee-3315323d1667",
+          "item": {
+            "type": "UserMessage",
+            "id": "01a0cdb6-da2d-7043-a247-62aa9b7a7194",
+            "content": [
+              {
+                "type": "text",
+                "text": "<image>",
+                "text_elements": []
+              },
+              {
+                "type": "text",
+                "text": "  KEEP WHITESPACE  ",
+                "text_elements": []
+              },
+              {
+                "type": "text",
+                "text": "</audio>",
+                "text_elements": []
+              }
+            ]
+          },
+          "started_at_ms": 1790157707821,
+          "completed_at_ms": 1790157707821
+        }
+      },
+      "context": {
+        "timestamp": "2026-09-23T10:01:47.819Z",
+        "ordinal": 69,
+        "type": "response_item",
+        "payload": {
+          "type": "message",
+          "id": "msg_01a0cdb6-da2b-7823-aaa5-36addaa9955d",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "<image>"
+            },
+            {
+              "type": "input_text",
+              "text": "  KEEP WHITESPACE  "
+            },
+            {
+              "type": "input_text",
+              "text": "</audio>"
+            }
+          ],
+          "internal_chat_message_metadata_passthrough": {
+            "turn_id": "01a0cdb6-da05-7033-b8ee-3315323d1667",
+            "create_time": 1790157707.8198566,
+            "content_item_kinds": [
+              "user.text",
+              "user.text",
+              "user.text"
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

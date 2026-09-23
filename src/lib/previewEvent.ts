@@ -1,4 +1,4 @@
-import type { OpenCodeForkPoint, PreviewEvent, PaginatedItemTarget, TextBlockEdit } from "./api.ts";
+import type { ContentMappingDetail, OpenCodeForkPoint, PreviewEvent, PaginatedItemTarget, TextBlockEdit } from "./api.ts";
 import {
   isAssistantTextToolUseEvent,
   isOpenCodeConversationEvent,
@@ -11,6 +11,19 @@ export type DiffCommentPrompt = {
 };
 
 const previewEventSearchTextCache = new WeakMap<PreviewEvent, string>();
+
+export function contentMappingCounts(mappings: Pick<ContentMappingDetail, "thread_id" | "turn_id" | "item_id" | "status">[]) {
+  const rank = { matched: 0, unsupported: 1, inconsistent: 2 };
+  const items = new Map<string, keyof typeof rank>();
+  for (const mapping of mappings) {
+    const key = JSON.stringify([mapping.thread_id, mapping.turn_id, mapping.item_id]);
+    const status = mapping.status in rank ? mapping.status as keyof typeof rank : "unsupported";
+    if (rank[status] >= rank[items.get(key) ?? "matched"]) items.set(key, status);
+  }
+  const counts = { matched: 0, unsupported: 0, inconsistent: 0 };
+  for (const status of items.values()) counts[status]++;
+  return counts;
+}
 
 export function isSessionWideMutationFailure(message: string | null): boolean {
   if (!message) return false;

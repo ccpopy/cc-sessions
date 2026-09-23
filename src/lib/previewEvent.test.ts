@@ -12,6 +12,7 @@ import {
   previewProcessKey,
   survivingPreviewAnchor,
   editableTextBlocks,
+  contentMappingCounts,
   editableText,
   extractPreviewEventText,
   isConversationMessage,
@@ -20,6 +21,18 @@ import {
   openCodeForkPoint,
   parseDiffCommentPrompt,
 } from "./previewEvent.ts";
+
+test("mapping counters count logical messages separately and merge duplicate contexts", () => {
+  const base = { thread_id: "thread", turn_id: "turn" };
+  assert.deepEqual(contentMappingCounts([
+    { ...base, item_id: "normal", status: "matched" },
+    { ...base, item_id: "normal", status: "matched" },
+    { ...base, item_id: "limited", status: "unsupported" },
+    { ...base, item_id: "different", status: "matched" },
+    { ...base, item_id: "different", status: "inconsistent" },
+  ]), { matched: 1, unsupported: 1, inconsistent: 1 });
+  assert.deepEqual(contentMappingCounts([]), { matched: 0, unsupported: 0, inconsistent: 0 });
+});
 
 test("content mapping failures keep unaffected messages available without weakening conflict protection", () => {
   for (const message of [null, "[EDIT_INCONSISTENT] body differs", "[EDIT_MAPPING_UNSUPPORTED] unknown block"]) {

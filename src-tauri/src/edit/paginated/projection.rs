@@ -248,6 +248,9 @@ pub(super) fn project(loaded: &LoadedFile, seed: &HistoryImage) -> AppResult<His
         } else if item.kind == "AgentMessage" {
             native["text"] = Value::String(text);
             native["phase"] = raw["phase"].clone();
+            if let Some(questions) = raw.get("questions") {
+                native["questions"] = questions.clone();
+            }
         }
         if native != original {
             row["item_json"] = Value::String(serde_json::to_string(&native)?);
@@ -296,7 +299,7 @@ pub(super) fn project(loaded: &LoadedFile, seed: &HistoryImage) -> AppResult<His
             .find(|r| r["turn_id"] == tid && r["item_type"] == "userMessage")
             .map(|r| r["item_id"].clone())
             .unwrap_or(Value::Null);
-        turn["final_agent_item_id"] = final_agent(&h, loaded, &tid, &BTreeMap::new())
+        turn["final_agent_item_id"] = final_agent(&h, loaded, &tid, &BTreeMap::new(), true)
             .filter(|item| {
                 turn["status"] != "inProgress"
                     || loaded.parsed[*item.records.last().unwrap()]

@@ -2,7 +2,7 @@
 
 The matching CLI writes every original record through thread/start and turn/start.
 Only a loopback Responses fixture is contacted; no credentials are copied and no
-real model or tool runs. The output directory must not already exist. Desktop GUI
+real model or external tool runs. The output directory must not already exist. Desktop GUI
 acceptance is separate from the native process restarts performed here.
 """
 import argparse
@@ -20,6 +20,11 @@ import wave
 
 REPO = Path(__file__).resolve().parents[1]
 SOURCE_COMMIT = '0e2f848bf4a4e8d41a02d848a851ba126c09d185'
+SOURCE_COMMITS = {
+    '0.153.4': '3d2ee51ca2d5db578f328aa75e20aa22c0197c9a',
+    '0.155.0-alpha.9.2': '4607249e430dac1c961df4dc615beae88e33cec8',
+    '0.155.0-alpha.16': SOURCE_COMMIT,
+}
 spec = importlib.util.spec_from_file_location('native_validator', REPO/'scripts/validate-paginated-native.py')
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
@@ -52,6 +57,7 @@ class NativeCapture(module.Native):
 
 class ResponseHandler(BaseHTTPRequestHandler):
     count = 0
+    async_questions = False
 
     def log_message(self, *args):
         pass
@@ -70,6 +76,15 @@ class ResponseHandler(BaseHTTPRequestHandler):
             {'type': 'response.completed', 'response': {'id': f'resp-{n}', 'usage':
              {'input_tokens':0,'input_tokens_details':None,'output_tokens':0,'output_tokens_details':None,'total_tokens':0}}},
         ]
+        if type(self).async_questions and n % 2 == 1:
+            case = (n - 1) // 2
+            questions = [
+                [{'title':'SYNTHETIC QUESTION'}],
+                [{'title':'SYNTHETIC CHOICE','options':['FIRST','SECOND']}],
+                [{'title':'FIRST QUESTION','options':['ONE','TWO']},{'title':'SECOND QUESTION'}],
+            ][case]
+            events[1]['item'] = {'type':'function_call','id':f'fc-native-{case}','call_id':f'call-native-{case}',
+                'namespace':'functions','name':'request_user_input_async','arguments':json.dumps({'questions':questions})}
         body = ''.join(f'event: {e["type"]}\ndata: {json.dumps(e)}\n\n' for e in events).encode()
         self.send_response(200)
         self.send_header('Content-Type', 'text/event-stream')
@@ -83,17 +98,23 @@ def main():
     parser.add_argument('--codex', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--capture-only', action='store_true', help='Keep an untouched native baseline without running CC Sessions')
+    parser.add_argument('--async-questions', action='store_true', help='Exercise native request_user_input_async messages and their call chains')
     args = parser.parse_args()
     version = subprocess.check_output([str(args.codex), '--version'], text=True).strip()
-    assert version == 'codex-cli 0.155.0-alpha.16', version
+    source_commit = SOURCE_COMMITS[version.removeprefix('codex-cli ')]
     home = args.output.resolve()
     home.mkdir(parents=True, exist_ok=False)
+    ResponseHandler.count = 0
+    ResponseHandler.async_questions = args.async_questions
     server = ThreadingHTTPServer(('127.0.0.1',0),ResponseHandler)
     threading.Thread(target=server.serve_forever,daemon=True).start()
-    catalog_bytes = urllib.request.urlopen(f'https://raw.githubusercontent.com/openai/codex/{SOURCE_COMMIT}/codex-rs/models-manager/models.json', timeout=30).read()
+    catalog_bytes = urllib.request.urlopen(f'https://raw.githubusercontent.com/openai/codex/{source_commit}/codex-rs/models-manager/models.json', timeout=30).read()
     catalog = json.loads(catalog_bytes)
     selected = next(m for m in catalog['models'] if m['slug']=='gpt-5.5')
     selected['input_modalities'] = ['text','image','audio']
+    if args.async_questions:
+        selected['tool_mode'] = 'code_mode_only'
+        selected['experimental_supported_tools'] = ['request_user_input_async']
     (home/'models.json').write_text(json.dumps({'models':[selected]}),encoding='utf-8')
     (home/'config.toml').write_text(
         'model = "gpt-5.5"\nmodel_provider = "fixture"\napproval_policy = "never"\n'
@@ -120,6 +141,8 @@ def main():
         ('inline-audio',[text('INLINE-AUDIO'),{'type':'audio','url':'data:audio/wav;base64,'+base64.b64encode((home/'tone.wav').read_bytes()).decode()},text('AUDIO-END')]),
         ('literal-tags',[text('<image>'),text('  KEEP WHITESPACE  '),text('</audio>')]),
     ]
+    if args.async_questions:
+        cases = [(name,[text('FIXTURE '+name)]) for name in ['freeform','options','multi-question']]
     native = NativeCapture(args.codex.resolve(),home)
     try:
         started=native.call('thread/start',{'cwd':str(home),'historyMode':'paginated','model':'gpt-5.5',
@@ -140,7 +163,7 @@ def main():
         server.shutdown()
     original=path.read_bytes()
     (home/'untouched-native.jsonl').write_bytes(original)
-    (home/'capture.json').write_text(json.dumps({'version':version,'sourceCommit':SOURCE_COMMIT,
+    (home/'capture.json').write_text(json.dumps({'version':version,'sourceCommit':source_commit,'caseSet':'async' if args.async_questions else 'media',
         'threadId':tid,'path':str(path),'cases':captured,'rolloutSha256':hashlib.sha256(original).hexdigest(),
         'nativeGenerated':True,'ccSessionsEdits':False,'modelService':'loopback fixture','requests':ResponseHandler.count,
         'catalogSha256':hashlib.sha256(catalog_bytes).hexdigest(),'fixtureModalities':['text','image','audio']},indent=2),encoding='utf-8')
@@ -150,6 +173,8 @@ def main():
 
 
 def verify(binary, home, tid, path, cases):
+    capture=json.loads((home/'capture.json').read_text(encoding='utf-8'))
+    async_questions=capture.get('caseSet')=='async'
     built = subprocess.run(['cargo','test','--manifest-path','src-tauri/Cargo.toml','--lib','--no-run','--message-format=json'],
         cwd=REPO,capture_output=True,text=True,encoding='utf-8',check=True)
     executables=[json.loads(line)['executable'] for line in built.stdout.splitlines()
@@ -159,10 +184,10 @@ def verify(binary, home, tid, path, cases):
     def save(name,value):
         (home/(name+'.json')).write_text(json.dumps(value,ensure_ascii=False,indent=2),encoding='utf-8')
 
-    def edit(action,item='',block=0,expect_error=None):
+    def edit(action,item='',block=0,expect_error=None,text='NATIVE-MEDIA-EDITED'):
         result=subprocess.run([executables[0],'edit::paginated::tests::paginated_native_media_fixture_command','--exact','--ignored','--nocapture'],
             cwd=REPO,env={**os.environ,'CC_NATIVE_MEDIA_HOME':str(home),'CC_NATIVE_MEDIA_ACTION':action,
-                         'CC_NATIVE_MEDIA_ITEM':item,'CC_NATIVE_MEDIA_BLOCK':str(block)},capture_output=True,text=True,encoding='utf-8',check=True)
+                         'CC_NATIVE_MEDIA_ITEM':item,'CC_NATIVE_MEDIA_BLOCK':str(block),'CC_NATIVE_MEDIA_TEXT':text},capture_output=True,text=True,encoding='utf-8',check=True)
         with (home/'rust-commands.log').open('a',encoding='utf-8') as log:
             log.write(action+' '+item+'\n'+result.stdout+result.stderr)
         response=json.loads((home/'last-operation.json').read_text(encoding='utf-8'))
@@ -210,19 +235,27 @@ def verify(binary, home, tid, path, cases):
     stages=[]
     rows=[json.loads(line) for line in original.decode().splitlines()]
     for case in cases:
-        raw=next(r for r in rows if r['payload'].get('turn_id')==case['turnId'] and r['payload'].get('item',{}).get('type')=='UserMessage')
+        raw=next(r for r in rows if r['payload'].get('turn_id')==case['turnId'] and (
+            r['payload'].get('item',{}).get('delivery')=='async' if async_questions else r['payload'].get('item',{}).get('type')=='UserMessage'))
         item_id=raw['payload']['item']['id']
-        positions=[i for i,b in enumerate(raw['payload']['item']['content']) if b['type']=='text']
+        positions=[i for i,b in enumerate(raw['payload']['item']['content']) if b['type'] in ['text','Text']]
         # Every text block is checked in unit tests; use the last block here to prove
         # the native integration does not move text to the first block.
         if positions:
             index=positions[-1]
-            report=edit('edit',item_id,index)
-            save(case['case']+'-edit-report',report)
             expected=json.loads(json.dumps(baseline))
             item=next(i for i in expected if i['id']==item_id)
-            item['content'][index]['text']='NATIVE-MEDIA-EDITED'
-            if 'text_elements' in item['content'][index]: item['content'][index]['text_elements']=[]
+            if async_questions:
+                item['questions'][0]['title']='NATIVE-ASYNC-EDITED '+item['questions'][0]['title']
+                if item['questions'][0].get('options'): item['questions'][0]['options'][-1]='UPDATED OPTION'
+                item['text']='\n\n'.join('\n'.join([q['title']]+['- '+o for o in q.get('options') or []]) for q in item['questions'])
+                new_text=item['text']
+            else:
+                new_text='NATIVE-MEDIA-EDITED'
+                item['content'][index]['text']=new_text
+                if 'text_elements' in item['content'][index]: item['content'][index]['text_elements']=[]
+            report=edit('edit',item_id,index,text=new_text)
+            save(case['case']+'-edit-report',report)
             read_stage(case['case']+'-edited',expected)
             save(case['case']+'-edit-undo-report',edit('undo'))
             assert path.read_bytes()==original,'edit undo did not restore original bytes'
@@ -231,20 +264,43 @@ def verify(binary, home, tid, path, cases):
         read_stage(case['case']+'-deleted',[i for i in baseline if i['id']!=item_id])
         after_rows=[json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
         assert not any(r['payload'].get('item',{}).get('id')==item_id for r in after_rows)
-        assert not any(r['type']=='response_item' and r['payload'].get('role')=='user' and r['payload'].get('internal_chat_message_metadata_passthrough',{}).get('turn_id')==case['turnId'] and any(k.startswith('user.') for k in r['payload'].get('internal_chat_message_metadata_passthrough',{}).get('content_item_kinds',[])) for r in after_rows)
+        if async_questions:
+            assert not any(r['payload'].get('call_id')==item_id for r in after_rows)
+        else:
+            assert not any(r['type']=='response_item' and r['payload'].get('role')=='user' and r['payload'].get('internal_chat_message_metadata_passthrough',{}).get('turn_id')==case['turnId'] and any(k.startswith('user.') for k in r['payload'].get('internal_chat_message_metadata_passthrough',{}).get('content_item_kinds',[])) for r in after_rows)
         save(case['case']+'-delete-undo-report',edit('undo'))
         assert path.read_bytes()==original,'delete undo did not restore original bytes'
         read_stage(case['case']+'-delete-undone',baseline)
+        if async_questions:
+            turn_items={r['payload']['item']['id'] for r in rows if r['payload'].get('type')=='item_completed' and r['payload'].get('turn_id')==case['turnId']}
+            save(case['case']+'-delete-turn-report',edit('delete-turn',item_id))
+            read_stage(case['case']+'-turn-deleted',[i for i in baseline if i['id'] not in turn_items])
+            save(case['case']+'-turn-undo-report',edit('undo'))
+            assert path.read_bytes()==original
+            read_stage(case['case']+'-turn-undone',baseline)
+            # A tool-emitted async question is a final_answer item in native
+            # history, but must not become task_complete.last_agent_message.
+            answer=next(r['payload']['item']['id'] for r in rows if r['payload'].get('type')=='item_completed'
+                        and r['payload'].get('turn_id')==case['turnId'] and r['payload']['item'].get('type')=='AgentMessage'
+                        and r['payload']['item'].get('delivery')!='async')
+            save(case['case']+'-answer-delete-report',edit('delete',answer))
+            read_stage(case['case']+'-answer-deleted',[i for i in baseline if i['id']!=answer])
+            remaining=[json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
+            complete=next(r for r in remaining if r['payload'].get('type')=='task_complete' and r['payload'].get('turn_id')==case['turnId'])
+            assert complete['payload'].get('last_agent_message') is None
+            save(case['case']+'-answer-undo-report',edit('undo'))
+            assert path.read_bytes()==original
+            read_stage(case['case']+'-answer-undone',baseline)
         stages.append({'case':case['case'],'turnId':case['turnId'],'itemId':item_id,'textEdit':bool(positions),'delete':True,'undo':True,'nativeReopen':True})
     # Introduce a same-byte-length body mismatch in this isolated sample only.
-    damaged=original.replace(b'"text":"MIDDLE"',b'"text":"MIDDLe"',1)
+    damaged=original.replace(b'SYNTHETIC QUESTION',b'SYNTHETIC QUESTIoN',1) if async_questions else original.replace(b'"text":"MIDDLE"',b'"text":"MIDDLe"',1)
     assert damaged!=original and len(damaged)==len(original)
     path.write_bytes(damaged)
     mismatch=edit('diagnose')
     save('intentional-mismatch',mismatch)
     assert not mismatch['capability']['blocked_reasons']
     assert len(mismatch['capability']['diagnostics'])==1 and 'EDIT_INCONSISTENT' in mismatch['capability']['diagnostics'][0]
-    target=next(s for s in stages if s['case']=='mixed-blocks')
+    target=stages[0] if async_questions else next(s for s in stages if s['case']=='mixed-blocks')
     save('mismatch-edit-rejected',edit('edit',target['itemId'],0,'EDIT_INCONSISTENT'))
     save('mismatch-delete-rejected',edit('delete',target['itemId'],0,'EDIT_INCONSISTENT'))
     assert path.read_bytes()==damaged
@@ -253,8 +309,9 @@ def verify(binary, home, tid, path, cases):
     read_stage('restored-after-injection',baseline)
     final=edit('diagnose')
     assert not final['capability']['diagnostics']
-    save('result',{'passed':True,'threadId':tid,'version':'codex-cli 0.155.0-alpha.16','sourceCommit':SOURCE_COMMIT,
+    save('result',{'passed':True,'threadId':tid,'version':capture['version'],'sourceCommit':capture['sourceCommit'],'caseSet':capture.get('caseSet','media'),
         'baselineNativeGenerated':True,'stages':stages,'bodyMismatchDetected':True,'originalBytesRestored':True,
+        'nativeReaderVersion':subprocess.check_output([str(binary),'--version'],text=True).strip(),
         'nativeColdReopen':True,'desktopGui':'NOT VERIFIED','realModelGeneration':False,'historicalToolReplay':False})
 
 

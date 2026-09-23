@@ -78,6 +78,7 @@ pub(super) fn inspect(
         result.diagnostics = result
             .content_mappings
             .iter()
+            .filter(|detail| detail.status == "inconsistent")
             .filter_map(paginated::content_mapping::issue)
             .collect();
         if let Err(error) = paginated::inspect(path, loaded) {

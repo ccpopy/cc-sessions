@@ -349,9 +349,13 @@ export type ContentMappingDetail = {
   item_id: string;
   context_ordinal: number | null;
   cli_version: string;
+  item_type: string;
+  source: string;
   mapping_basis: string;
   status: "matched" | "unsupported" | "inconsistent";
+  reason_code: string | null;
   reason: string | null;
+  operations: Record<"edit_text" | "delete_message" | "delete_turn", { supported: boolean; reason_code: string | null; reason: string | null }>;
   canonical_block_types: string[];
   context_block_types: string[];
   source_kinds: string[];

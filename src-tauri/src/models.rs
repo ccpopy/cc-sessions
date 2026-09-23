@@ -1332,15 +1332,33 @@ pub struct ContentMappingDifference {
 
 /// Structural evidence only: never include message text, media URLs/data or paths.
 #[derive(Debug, Clone, Serialize)]
+pub struct MessageOperationCapability {
+    pub supported: bool,
+    pub reason_code: Option<String>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MessageEditOperations {
+    pub edit_text: MessageOperationCapability,
+    pub delete_message: MessageOperationCapability,
+    pub delete_turn: MessageOperationCapability,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ContentMappingDetail {
     pub thread_id: String,
     pub turn_id: String,
     pub item_id: String,
     pub context_ordinal: Option<u64>,
     pub cli_version: String,
+    pub item_type: String,
+    pub source: String,
     pub mapping_basis: String,
     pub status: String,
+    pub reason_code: Option<String>,
     pub reason: Option<String>,
+    pub operations: MessageEditOperations,
     pub canonical_block_types: Vec<String>,
     pub context_block_types: Vec<String>,
     pub source_kinds: Vec<String>,

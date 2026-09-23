@@ -108,6 +108,7 @@ export function PreviewMutationDialogs({
           </DialogHeader>
           <div className="space-y-3">
             <p className="text-xs text-muted-foreground">修改原会话，保存前自动备份，可在编辑历史中撤销。{edit.blocks.length > 1 && "请分别编辑文本块，图片及其他内容保持原位。"}</p>
+            {(edit.target?.raw as any)?.payload?.item?.delivery === "async" && <p className="text-xs text-muted-foreground">请保留问题与选项的数量和分隔换行，可修改各项文字。</p>}
             <div className="max-h-[50vh] space-y-3 overflow-auto">
             {edit.target && edit.blocks.length > 0 ? ((edit.target.raw as any).payload.item.content as any[]).map((block, index) => {
               const editable = edit.blocks.find((b) => b.content_index === index);
