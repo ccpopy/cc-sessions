@@ -155,6 +155,7 @@ export function buildConversationPreviewRows(
     flushOpenCodeRun();
     if (event.role === "assistant") {
       assistantRun.push(event);
+      if (assistantMessagePhase(event) === "final_answer") flushAssistantRun();
       continue;
     }
     flushAssistantRun();
@@ -217,10 +218,10 @@ export function isVisibleConversationEvent(
 function assistantMessagePhase(event: PreviewEvent): string | null {
   if (event.role !== "assistant") return null;
   const raw = event.raw as {
-    payload?: { phase?: unknown };
+    payload?: { phase?: unknown; item?: { phase?: unknown } };
     message?: { phase?: unknown };
   } | null;
-  const phase = raw?.payload?.phase ?? raw?.message?.phase;
+  const phase = raw?.payload?.item?.phase ?? raw?.payload?.phase ?? raw?.message?.phase;
   return typeof phase === "string" ? phase : null;
 }
 

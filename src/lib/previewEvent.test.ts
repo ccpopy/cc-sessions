@@ -5,6 +5,7 @@ import {
   buildPreviewEventSearchText,
   canDeleteEvent,
   canEditEventText,
+  canonicalMessageImages,
   editableText,
   extractPreviewEventText,
   isConversationMessage,
@@ -23,6 +24,24 @@ function event(raw: unknown, role: PreviewEvent["role"] = "user"): PreviewEvent 
     raw,
   };
 }
+
+test("canonical paginated messages are readable but cannot use legacy mutation or fork actions", () => {
+  const user = event({ type: "event_msg", payload: { type: "item_completed", item: {
+    type: "UserMessage", id: "user-1", content: [{ type: "text", text: "继续" }, { type: "local_image", path: "C:/fixture/image.png" }],
+  } } });
+  const assistant = event({ type: "event_msg", payload: { type: "item_completed", item: {
+    type: "AgentMessage", id: "agent-1", phase: "final_answer", content: [{ type: "Text", text: "完成" }],
+  } } }, "assistant");
+  for (const message of [user, assistant]) {
+    assert.equal(isConversationMessage(message), true);
+    assert.equal(canDeleteEvent("codex", message), false);
+    assert.equal(canEditEventText("codex", message), false);
+    assert.equal(isStableForkNode(message, "codex"), false);
+  }
+  assert.equal(extractPreviewEventText(user), "继续");
+  assert.deepEqual(canonicalMessageImages(user), [{ name: "image.png", path: "C:/fixture/image.png" }]);
+  assert.equal(extractPreviewEventText(assistant), "完成");
+});
 
 test("Claude copy boundaries require an identified main-chain message", () => {
   const raw = { type: "user", uuid: "message-uuid", message: { role: "user", content: "hello" } };

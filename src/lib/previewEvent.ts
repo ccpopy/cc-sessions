@@ -65,6 +65,9 @@ export function extractPreviewEventText(event: PreviewEvent): string {
   }
   const payload = raw.payload;
   if (!payload) return event.text_summary ?? "";
+  if (payload.type === "item_completed" && Array.isArray(payload.item?.content)) {
+    return payload.item.content.map((item: any) => typeof item?.text === "string" ? item.text : "").filter(Boolean).join("\n\n");
+  }
   if (typeof payload.message === "string") return payload.message;
   if (typeof payload.content === "string") return payload.content;
   if (typeof payload.text === "string") return payload.text;
@@ -75,6 +78,14 @@ export function extractPreviewEventText(event: PreviewEvent): string {
       .join("\n\n");
   }
   return event.text_summary ?? "";
+}
+
+export function canonicalMessageImages(event: PreviewEvent): Array<{ name: string; path: string }> {
+  const raw = event.raw as { payload?: { type?: unknown; item?: { content?: unknown } } } | null;
+  const content = raw?.payload?.item?.content;
+  if (raw?.payload?.type !== "item_completed" || !Array.isArray(content)) return [];
+  return content.flatMap((item) => item?.type === "local_image" && typeof item.path === "string"
+    ? [{ name: item.path.split(/[\\/]/).pop() || "图片", path: item.path }] : []);
 }
 
 export function parseDiffCommentPrompt(text: string): DiffCommentPrompt | null {
@@ -172,6 +183,8 @@ function cleanDiffCommentText(text: string): string {
 export function isConversationMessage(event: PreviewEvent): boolean {
   if (event.role === "subagent") return false;
   if (isInternalCodexContextMessage(event)) return false;
+  if (payloadType(event) === "item_completed") return event.role === "user" || event.role === "assistant";
+  if (event.kind === "turn_error") return true;
   if (isAssistantTextToolUseEvent(event)) return true;
   const raw = event.raw as {
     message?: { role?: unknown };
@@ -221,6 +234,7 @@ export function isStableForkNode(event: PreviewEvent, provider = "codex"): boole
       && raw.isMeta !== true && raw.isSidechain !== true;
   }
   if (provider !== "codex") return false;
+  if (payloadType(event) === "item_completed" || event.kind === "turn_error") return false;
   return isConversationMessage(event) || isEventMessage(event);
 }
 
@@ -287,6 +301,7 @@ export function subagentEventTime(event: PreviewEvent, fallback: string): string
 }
 
 function isInternalCodexContextMessage(event: PreviewEvent): boolean {
+  if (payloadType(event) === "item_completed") return false;
   if (event.role !== "user") return false;
   const text = extractPreviewEventText(event).trim();
   if (!text) return false;

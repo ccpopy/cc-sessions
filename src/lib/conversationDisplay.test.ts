@@ -32,6 +32,11 @@ function event(
   };
 }
 
+test("consecutive explicit final answers remain visible after deleting a user message", () => {
+  const answers = [event(1, "assistant", "final_answer"), event(2, "assistant", "final_answer")];
+  assert.deepEqual(buildConversationPreviewRows(answers), answers.map((answer) => ({ type: "event", event: answer })));
+});
+
 function claudeToolEvent(index: number, text: string | null): PreviewEvent {
   return {
     index,

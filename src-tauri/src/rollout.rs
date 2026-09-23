@@ -45,6 +45,27 @@ fn classify(index: usize, raw: Value) -> PreviewEvent {
         .to_string();
 
     let (role, kind, text_summary) = match (outer_type.as_str(), payload_type.as_str()) {
+        ("event_msg", "item_completed") => {
+            let item = &raw["payload"]["item"];
+            let role = match item["type"].as_str() {
+                Some("UserMessage") => "user",
+                Some("AgentMessage") => "assistant",
+                _ => "other",
+            };
+            (
+                role.into(),
+                "item_completed".into(),
+                trim(&flatten_content(item.get("content")), 120),
+            )
+        }
+        ("event_msg", "task_complete") if raw["payload"]["error"]["message"].is_string() => (
+            "error".into(),
+            "turn_error".into(),
+            raw["payload"]["error"]["message"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        ),
         ("session_meta", _) => ("meta".into(), "session_meta".into(), "会话元数据".into()),
         ("event_msg", "task_started") => ("meta".into(), "task_started".into(), "任务开始".into()),
         ("event_msg", "token_count") => {
@@ -130,6 +151,14 @@ fn classify(index: usize, raw: Value) -> PreviewEvent {
 
 pub(crate) fn classify_preview(index: usize, raw: Value) -> PreviewEvent {
     classify(index, raw)
+}
+
+pub(crate) fn classify_history(index: usize, raw: Value, canonical: bool) -> PreviewEvent {
+    let mut event = classify(index, raw);
+    if canonical && raw_type(&event) == "response_item" && payload_type(&event) == "message" {
+        event.role = "context".into();
+    }
+    event
 }
 
 fn subagent_activity_summary(raw: &Value) -> String {
@@ -221,7 +250,8 @@ pub fn preview_event_is_conversation(event: &PreviewEvent) -> bool {
         return true;
     }
 
-    raw_type(event) == "response_item" && payload_type(event) == "message"
+    (raw_type(event) == "response_item" && payload_type(event) == "message")
+        || (raw_type(event) == "event_msg" && payload_type(event) == "item_completed")
 }
 
 pub(crate) fn preview_event_has_assistant_text_tool_use(event: &PreviewEvent) -> bool {
@@ -263,7 +293,11 @@ fn assistant_message_phase(event: &PreviewEvent) -> Option<&str> {
     event
         .raw
         .get("payload")
-        .and_then(|payload| payload.get("phase"))
+        .and_then(|payload| {
+            payload
+                .get("phase")
+                .or_else(|| payload.get("item").and_then(|item| item.get("phase")))
+        })
         .and_then(Value::as_str)
         .or_else(|| {
             event
@@ -290,7 +324,11 @@ impl ConversationDisplayReducer {
             self.flush_pending_turn(out);
             out.push(event);
         } else {
+            let is_final = assistant_message_phase(&event) == Some("final_answer");
             self.pending_turn.push(event);
+            if is_final {
+                self.flush_pending_turn(out);
+            }
         }
     }
 
@@ -326,6 +364,9 @@ impl ConversationDisplayReducer {
 }
 
 fn is_internal_codex_context_message(event: &PreviewEvent) -> bool {
+    if payload_type(event) == "item_completed" {
+        return false;
+    }
     if event.role != "user" {
         return false;
     }
@@ -361,6 +402,15 @@ fn payload_type(event: &PreviewEvent) -> &str {
 }
 
 pub fn preview_event_text(event: &PreviewEvent) -> String {
+    if payload_type(event) == "item_completed" {
+        return flatten_rich_content(
+            event
+                .raw
+                .get("payload")
+                .and_then(|p| p.get("item"))
+                .and_then(|item| item.get("content")),
+        );
+    }
     if let Some(message) = event.raw.get("message") {
         let content = message.get("content");
         let text = flatten_rich_content(content);
@@ -447,6 +497,41 @@ pub fn preview_session_range(
     result
 }
 
+/// Versioned preview for mutations. Keep the existing range API for read-only callers.
+pub fn preview_session_page(
+    provider: String,
+    rollout_path: String,
+    offset: usize,
+    limit: usize,
+    expected_revision: Option<String>,
+) -> AppResult<crate::models::PreviewPage> {
+    let capability = if matches!(provider.as_str(), "codex" | "claude") {
+        let capability = crate::edit::inspect_edit_capability(&provider, &rollout_path)?;
+        if expected_revision
+            .as_ref()
+            .is_some_and(|expected| expected != &capability.revision)
+        {
+            return Err(crate::error::AppError::Other(
+                "[EDIT_CONFLICT] 会话已更新，请刷新预览后重新选择".into(),
+            ));
+        }
+        Some(capability)
+    } else {
+        None
+    };
+    let events = preview_session_range(Some(provider), rollout_path.clone(), offset, limit)?;
+    if let Some(capability) = &capability {
+        if crate::atomic_file::fingerprint(Path::new(&rollout_path))?.sha256_hex()
+            != capability.file_sha256
+        {
+            return Err(crate::error::AppError::Other(
+                "[EDIT_CONFLICT] 会话在读取期间更新，请刷新预览".into(),
+            ));
+        }
+    }
+    Ok(crate::models::PreviewPage { events, capability })
+}
+
 fn preview_range_by_provider(
     provider: Option<String>,
     path: &str,
@@ -472,6 +557,7 @@ fn preview_range_impl(path: &str, offset: usize, limit: usize) -> AppResult<Vec<
     let reader = BufReader::new(f);
     let mut out = Vec::with_capacity(preview_capacity_hint(limit));
     let mut event_index = 0usize;
+    let mut canonical = false;
     for (i, line) in reader.lines().enumerate() {
         let line = line?;
         crate::operation_metrics::record(|c| {
@@ -483,11 +569,14 @@ fn preview_range_impl(path: &str, offset: usize, limit: usize) -> AppResult<Vec<
         }
         // 预览允许跳过损坏行，完整修复功能会负责诊断这类文件。
         if let Ok(raw) = serde_json::from_str::<Value>(&line) {
+            if raw["type"] == "session_meta" {
+                canonical = raw["payload"]["history_mode"] == "paginated";
+            }
             if event_index < offset {
                 event_index += 1;
                 continue;
             }
-            out.push(classify(i, raw));
+            out.push(classify_history(i, raw, canonical));
             event_index += 1;
             if out.len() >= limit {
                 break;
@@ -533,7 +622,8 @@ pub fn preview_session_user_prompts(
 }
 
 fn codex_event_is_agent_activity(event: &PreviewEvent) -> bool {
-    (raw_type(event) == "event_msg" && payload_type(event) == "agent_message")
+    event.kind == "turn_error"
+        || (raw_type(event) == "event_msg" && payload_type(event) == "agent_message")
         || (event.role == "assistant"
             && preview_event_is_conversation(event)
             && !preview_event_text(event).trim().is_empty())
@@ -556,6 +646,7 @@ fn user_prompts_impl(
     let f = File::open(PathBuf::from(path))?;
     let reader = BufReader::new(f);
     let mut events = Vec::new();
+    let mut canonical = false;
     for (i, line) in reader.lines().enumerate() {
         let line = line?;
         if line.trim().is_empty() {
@@ -564,9 +655,15 @@ fn user_prompts_impl(
         let Ok(raw) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        let Some(event) = classify_line(i, raw) else {
+        if raw["type"] == "session_meta" {
+            canonical = raw["payload"]["history_mode"] == "paginated";
+        }
+        let Some(mut event) = classify_line(i, raw) else {
             continue;
         };
+        if canonical && raw_type(&event) == "response_item" && payload_type(&event) == "message" {
+            event.role = "context".into();
+        }
         events.push(event);
     }
     Ok(user_prompts_from_events(events, event_is_agent_activity))
@@ -891,6 +988,61 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
+
+    #[test]
+    fn paginated_preview_uses_canonical_messages_and_keeps_failed_turns() -> AppResult<()> {
+        let path = temp_file("canonical-preview");
+        let mut file = File::create(&path)?;
+        for raw in [
+            serde_json::json!({"type":"session_meta","payload":{"id":"test","history_mode":"paginated"}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"context duplicate"}]}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","turn_id":"a","item":{"type":"UserMessage","id":"u1","content":[{"type":"text","text":"question"}]}}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","turn_id":"a","item":{"type":"AgentMessage","id":"a1","phase":"commentary","content":[{"type":"Text","text":"working"}]}}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","turn_id":"a","item":{"type":"AgentMessage","id":"a2","phase":"final_answer","content":[{"type":"Text","text":"answer"}]}}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","turn_id":"b","item":{"type":"UserMessage","id":"u2","content":[{"type":"text","text":"continue"}]}}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"b","error":{"message":"429 Too Many Requests"}}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","turn_id":"c","item":{"type":"UserMessage","id":"u3","content":[{"type":"text","text":"continue"}]}}}),
+        ] {
+            writeln!(file, "{raw}")?;
+        }
+        drop(file);
+        let page = preview_session_page("codex".into(), path.to_string_lossy().into(), 0, 3, None)?;
+        let capability = page.capability.unwrap();
+        assert_eq!(capability.format, "paginated");
+        assert!(!capability.blocked_reasons.is_empty());
+        assert!(!preview_event_is_conversation(&page.events[1]));
+        assert_eq!(preview_event_text(&page.events[2]), "question");
+        let next = preview_session_page(
+            "codex".into(),
+            path.to_string_lossy().into(),
+            3,
+            50,
+            Some(capability.revision.clone()),
+        )?;
+        assert_eq!(
+            assistant_message_phase(&next.events[1]),
+            Some("final_answer")
+        );
+        assert_eq!(next.events[3].kind, "turn_error");
+        let prompts =
+            preview_session_user_prompts(Some("codex".into()), path.to_string_lossy().into())?;
+        assert_eq!(prompts.prompts.len(), 3, "失败回合的重复提问也必须保留");
+        assert_eq!(prompts.prompts[0].response.as_ref().unwrap().text, "answer");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)?
+            .write_all(b"\n")?;
+        assert!(preview_session_page(
+            "codex".into(),
+            path.to_string_lossy().into(),
+            3,
+            50,
+            Some(capability.revision)
+        )
+        .is_err());
+        fs::remove_file(path)?;
+        Ok(())
+    }
 
     fn temp_file(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

@@ -33,6 +33,18 @@ use crate::models::{
 };
 use crate::paths;
 
+mod safety;
+mod transaction;
+
+pub fn inspect_edit_capability(
+    provider: &str,
+    path: &str,
+) -> AppResult<crate::models::EditCapability> {
+    let provider = provider_normalized(provider)?;
+    let path = PathBuf::from(paths::strip_verbatim(path));
+    safety::inspect(provider, &path, &load_file(&path)?)
+}
+
 const REASON_SELECTED: &str = "selected";
 const REASON_TOOL_PAIR: &str = "tool_pair";
 const REASON_MIRROR: &str = "mirror";
@@ -133,7 +145,7 @@ fn write_lines(
     crate::operation_metrics::record(|c| c.read_bytes += current.len() as u64);
     let expected = atomic_file::fingerprint_bytes(&current);
     if expected.sha256_hex() != expected_hash {
-        return Err(AppError::Other(format!(
+        return Err(AppError::AtomicWriteConflict(format!(
             "会话文件在编辑期间发生变化，已拒绝覆盖: {}",
             path.to_string_lossy()
         )));
@@ -196,21 +208,34 @@ fn read_journal(dir: &Path) -> AppResult<Vec<JournalEntry>> {
 
 fn append_journal(dir: &Path, entry: &JournalEntry) -> AppResult<()> {
     fs::create_dir_all(dir)?;
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(journal_path(dir))?;
-    let line = serde_json::to_string(entry)?;
-    writeln!(f, "{line}")?;
-    crate::operation_metrics::record(|c| c.write_bytes += line.len() as u64 + 1);
-    crate::operation_metrics::sync_file(&f)?;
-    Ok(())
+    let path = journal_path(dir);
+    let exists = path.try_exists()?;
+    let expected = if exists {
+        Some(atomic_file::fingerprint(&path)?)
+    } else {
+        None
+    };
+    let mut entries = read_journal(dir)?;
+    if entries.iter().any(|existing| existing.op_id == entry.op_id) {
+        return Ok(());
+    }
+    entries.push(entry.clone());
+    let write = |file: &mut atomic_file::AtomicWriter| -> AppResult<()> {
+        for entry in &entries {
+            writeln!(file, "{}", serde_json::to_string(entry)?)?;
+        }
+        Ok(())
+    };
+    match expected {
+        Some(expected) => atomic_file::replace_with_writer_if_unchanged(&path, &expected, write),
+        None => atomic_file::create_with_writer_if_absent(&path, write),
+    }
 }
 
 /// 与上一次编辑不连续（外部改动过 / 从未编辑）时，快照当前文件。
 fn ensure_snapshot(
     dir: &Path,
-    rollout: &Path,
+    loaded: &LoadedFile,
     current_hash: &str,
     journal: &[JournalEntry],
 ) -> AppResult<Option<String>> {
@@ -220,8 +245,13 @@ fn ensure_snapshot(
         }
     }
     fs::create_dir_all(dir)?;
-    let name = format!("original-{}.jsonl", chrono::Utc::now().timestamp_millis());
-    let bytes = fs::copy(rollout, dir.join(&name))?;
+    let name = format!("original-{}.jsonl", crate::repair::new_session_id());
+    transaction::snapshot(&dir.join(&name), loaded)?;
+    let bytes = loaded
+        .lines
+        .iter()
+        .map(|line| line.len() as u64 + 1)
+        .sum::<u64>();
     crate::operation_metrics::record(|c| {
         c.read_bytes += bytes;
         c.write_bytes += bytes;
@@ -418,52 +448,87 @@ fn summarize(text: &str) -> String {
     out
 }
 
-/// 在 parsed 里找与 line_no 最近的镜像行（Codex 消息双写）。
-fn find_codex_mirror(parsed: &[Option<Value>], line_no: usize, old_text: &str) -> Option<usize> {
-    let src = parsed.get(line_no)?.as_ref()?;
-    let (want_outer, want_ptype, want_role) = match (codex_outer(src), codex_ptype(src)) {
-        ("response_item", "message") => match codex_msg_role(src) {
-            "user" => ("event_msg", "user_message", ""),
-            "assistant" => ("event_msg", "agent_message", ""),
-            _ => return None,
-        },
+/// 在同回合、同角色内唯一配对镜像行，拒绝猜测重复文本的归属。
+fn find_codex_mirror(
+    parsed: &[Option<Value>],
+    line_no: usize,
+    old_text: &str,
+) -> AppResult<Option<usize>> {
+    let Some(source) = parsed.get(line_no).and_then(Option::as_ref) else {
+        return Ok(None);
+    };
+    let (want_outer, want_ptype, role) = match (codex_outer(source), codex_ptype(source)) {
+        ("response_item", "message") if codex_msg_role(source) == "user" => {
+            ("event_msg", "user_message", "user")
+        }
+        ("response_item", "message") if codex_msg_role(source) == "assistant" => {
+            ("event_msg", "agent_message", "assistant")
+        }
         ("event_msg", "user_message") => ("response_item", "message", "user"),
         ("event_msg", "agent_message") => ("response_item", "message", "assistant"),
-        _ => return None,
+        _ => return Ok(None),
     };
-    let matches_target = |v: &Value| -> bool {
-        if codex_outer(v) != want_outer || codex_ptype(v) != want_ptype {
-            return false;
-        }
-        if want_outer == "event_msg" {
+    let is_boundary = |v: &Value| {
+        (codex_outer(v) == "event_msg"
+            && matches!(
+                codex_ptype(v),
+                "task_started" | "task_complete" | "turn_aborted"
+            ))
+            || (role == "assistant"
+                && ((codex_outer(v) == "response_item" && codex_msg_role(v) == "user")
+                    || (codex_outer(v) == "event_msg" && codex_ptype(v) == "user_message")))
+    };
+    let start = (0..line_no)
+        .rev()
+        .find(|&i| parsed[i].as_ref().is_some_and(&is_boundary))
+        .map_or(0, |i| i + 1);
+    let end = ((line_no + 1)..parsed.len())
+        .find(|&i| parsed[i].as_ref().is_some_and(&is_boundary))
+        .unwrap_or(parsed.len());
+    let text_matches = |v: &Value| {
+        if codex_outer(v) == "event_msg" {
             codex_event_message_text(v) == Some(old_text)
         } else {
-            codex_msg_role(v) == want_role && codex_flat_text(v) == old_text
+            codex_msg_role(v) == role && codex_flat_text(v) == old_text
         }
     };
-    // 从近到远向两侧扫描，优先取距离最近者
-    for dist in 1..parsed.len() {
-        let before = line_no.checked_sub(dist);
-        if let Some(i) = before {
-            if let Some(Some(v)) = parsed.get(i) {
-                if matches_target(v) {
-                    return Some(i);
-                }
-            }
-        }
-        let after = line_no + dist;
-        if after < parsed.len() {
-            if let Some(Some(v)) = parsed.get(after) {
-                if matches_target(v) {
-                    return Some(after);
-                }
-            }
-        }
-        if before.is_none() && after >= parsed.len() {
-            break;
-        }
+    let candidates: Vec<usize> = (start..end)
+        .filter(|&i| {
+            parsed[i].as_ref().is_some_and(|v| {
+                codex_outer(v) == want_outer && codex_ptype(v) == want_ptype && text_matches(v)
+            })
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Ok(None);
     }
-    None
+    let same_side = (start..end)
+        .filter(|&i| {
+            parsed[i].as_ref().is_some_and(|v| {
+                codex_outer(v) == codex_outer(source)
+                    && codex_ptype(v) == codex_ptype(source)
+                    && text_matches(v)
+            })
+        })
+        .count();
+    let bounded = start > 0 || end < parsed.len();
+    let same_timestamp = candidates.len() == 1
+        && source
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .is_some_and(|time| {
+                parsed[candidates[0]]
+                    .as_ref()
+                    .and_then(|v| v.get("timestamp"))
+                    .and_then(Value::as_str)
+                    == Some(time)
+            });
+    if candidates.len() != 1 || same_side != 1 || (!bounded && !same_timestamp) {
+        return Err(AppError::Other(
+            "[EDIT_AMBIGUOUS] 同文消息无法在同一回合内唯一配对，已拒绝猜测镜像关系".into(),
+        ));
+    }
+    Ok(candidates.first().copied())
 }
 
 /// Codex 删除集合扩展：镜像行、call_id 配对、附着 reasoning。
@@ -534,7 +599,7 @@ fn codex_expand_delete(
         if old_text.is_empty() {
             continue;
         }
-        if let Some(m) = find_codex_mirror(parsed, i, &old_text) {
+        if let Some(m) = find_codex_mirror(parsed, i, &old_text)? {
             plan.entry(m).or_insert_with(|| REASON_MIRROR.into());
         }
     }
@@ -904,7 +969,7 @@ fn codex_edit_changes(
     }];
 
     // 镜像行同步
-    if let Some(m) = find_codex_mirror(parsed, line_no, &old_text) {
+    if let Some(m) = find_codex_mirror(parsed, line_no, &old_text)? {
         let mv = parsed[m].as_ref().unwrap();
         let mut nv = mv.clone();
         let synced = match codex_outer(mv) {
@@ -980,14 +1045,18 @@ pub fn plan_delete(
     provider: &str,
     rollout_path: &str,
     line_nos: &[usize],
+    expected_revision: Option<&str>,
 ) -> AppResult<DeletePlan> {
     let provider = provider_normalized(provider)?;
     let path = paths::strip_verbatim(rollout_path);
     let loaded = load_file(Path::new(&path))?;
-    let (plan, blocked) = match provider {
+    safety::check_revision(Path::new(&path), &loaded, expected_revision)?;
+    let capability = safety::inspect(provider, Path::new(&path), &loaded)?;
+    let (plan, mut blocked) = match provider {
         "codex" => codex_expand_delete(&loaded.parsed, line_nos)?,
         _ => claude_expand_delete(&loaded.parsed, line_nos)?,
     };
+    blocked.extend(capability.blocked_reasons);
     let lines = plan
         .iter()
         .map(|(&i, reason)| {
@@ -1008,6 +1077,7 @@ pub fn plan_delete(
         .collect();
     Ok(DeletePlan {
         rollout_path: path,
+        revision: Some(capability.revision),
         lines,
         blocked,
     })
@@ -1025,14 +1095,23 @@ fn open_op_context(
     rollout_path: &str,
     session_id: &str,
     backup_dir: &str,
+    expected_revision: Option<&str>,
 ) -> AppResult<OpContext> {
     let path = PathBuf::from(paths::strip_verbatim(rollout_path));
     if !path.is_file() {
         return Err(AppError::NotFound(path.to_string_lossy().into_owned()));
     }
     let dir = edit_dir(backup_dir, provider, session_id);
+    if dir.join("pending-operation.json").try_exists()? {
+        return Err(AppError::Other(
+            "[EDIT_RECOVERY_REQUIRED] 存在未完成操作，请打开编辑历史核对提交状态；不要重复删改。"
+                .into(),
+        ));
+    }
     let journal = read_journal(&dir)?;
     let loaded = load_file(&path)?;
+    safety::check_revision(&path, &loaded, expected_revision)?;
+    safety::ensure_writable(provider, &path, &loaded, session_id)?;
     Ok(OpContext {
         dir,
         journal,
@@ -1051,13 +1130,8 @@ fn commit_op(
     changes: Vec<LineChange>,
     new_lines: Vec<String>,
 ) -> AppResult<EditApplyReport> {
-    let snapshot = ensure_snapshot(&ctx.dir, &ctx.path, &ctx.loaded.hash, &ctx.journal)?;
-    let after_hash = write_lines(
-        &ctx.path,
-        &new_lines,
-        ctx.loaded.trailing_newline,
-        &ctx.loaded.hash,
-    )?;
+    let snapshot = ensure_snapshot(&ctx.dir, &ctx.loaded, &ctx.loaded.hash, &ctx.journal)?;
+    let after_hash = transaction::lines_hash(&new_lines, ctx.loaded.trailing_newline);
     let changed = changes
         .iter()
         .filter(|c| c.before.is_some() && c.after.is_some())
@@ -1078,8 +1152,15 @@ fn commit_op(
         after_hash,
         changes,
     };
-    append_journal(&ctx.dir, &entry)?;
+    let warning = transaction::commit(ctx, &entry, &new_lines, ctx.loaded.trailing_newline)?;
     Ok(EditApplyReport {
+        status: if warning.is_some() {
+            "needs_recovery"
+        } else {
+            "committed_unverified"
+        }
+        .into(),
+        warning,
         op_id: entry.op_id,
         kind: kind.into(),
         snapshot_created: snapshot,
@@ -1096,9 +1177,16 @@ pub fn apply_edit_text(
     backup_dir: &str,
     line_no: usize,
     new_text: &str,
+    expected_revision: Option<&str>,
 ) -> AppResult<EditApplyReport> {
     let provider = provider_normalized(provider)?;
-    let mut ctx = open_op_context(provider, rollout_path, session_id, backup_dir)?;
+    let mut ctx = open_op_context(
+        provider,
+        rollout_path,
+        session_id,
+        backup_dir,
+        expected_revision,
+    )?;
     let changes = match provider {
         "codex" => codex_edit_changes(&ctx.loaded.lines, &ctx.loaded.parsed, line_no, new_text)?,
         _ => claude_edit_changes(&ctx.loaded.lines, &ctx.loaded.parsed, line_no, new_text)?,
@@ -1129,12 +1217,19 @@ pub fn apply_delete(
     session_id: &str,
     backup_dir: &str,
     line_nos: &[usize],
+    expected_revision: Option<&str>,
 ) -> AppResult<EditApplyReport> {
     let provider = provider_normalized(provider)?;
     if line_nos.is_empty() {
         return Err(AppError::Other("未选择要删除的事件".into()));
     }
-    let mut ctx = open_op_context(provider, rollout_path, session_id, backup_dir)?;
+    let mut ctx = open_op_context(
+        provider,
+        rollout_path,
+        session_id,
+        backup_dir,
+        expected_revision,
+    )?;
     let (plan, blocked) = match provider {
         "codex" => codex_expand_delete(&ctx.loaded.parsed, line_nos)?,
         _ => claude_expand_delete(&ctx.loaded.parsed, line_nos)?,
@@ -1191,9 +1286,16 @@ pub fn undo_last(
     rollout_path: &str,
     session_id: &str,
     backup_dir: &str,
+    expected_revision: Option<&str>,
 ) -> AppResult<EditApplyReport> {
     let provider = provider_normalized(provider)?;
-    let mut ctx = open_op_context(provider, rollout_path, session_id, backup_dir)?;
+    let mut ctx = open_op_context(
+        provider,
+        rollout_path,
+        session_id,
+        backup_dir,
+        expected_revision,
+    )?;
     let last = ctx
         .journal
         .last()
@@ -1201,7 +1303,7 @@ pub fn undo_last(
         .ok_or_else(|| AppError::Other("该会话没有编辑记录".into()))?;
     if last.after_hash != ctx.loaded.hash {
         return Err(AppError::Other(
-            "会话文件在本工具之外被修改过，无法直接撤销；可从原始快照还原".into(),
+            "会话文件在本工具之外被修改过，无法直接撤销或覆盖快照；请在独立副本中核对".into(),
         ));
     }
     if last.changes.is_empty() {
@@ -1210,14 +1312,15 @@ pub fn undo_last(
         ));
     }
 
+    let expected = last.before_hash.clone();
     let mut new_lines = ctx.loaded.lines.clone();
-    let redo = last.kind == "undo";
-    if redo {
-        forward_apply(&mut new_lines, &last.changes)?;
-    } else {
+    let redo = last.kind == "undo"
+        && forward_apply(&mut new_lines, &last.changes).is_ok()
+        && transaction::lines_hash(&new_lines, ctx.loaded.trailing_newline) == expected;
+    if !redo {
+        new_lines = ctx.loaded.lines.clone();
         reverse_apply(&mut new_lines, &last.changes)?;
     }
-    let expected = last.before_hash.clone();
     let base = last
         .base_description
         .clone()
@@ -1227,6 +1330,11 @@ pub fn undo_last(
     } else {
         format!("撤销：{base}")
     };
+    if transaction::lines_hash(&new_lines, ctx.loaded.trailing_newline) != expected {
+        return Err(AppError::Other(
+            "[EDIT_CONFLICT] 撤销结果与记录不一致，未执行修改".into(),
+        ));
+    }
     let report = commit_op(
         &mut ctx,
         provider,
@@ -1237,13 +1345,6 @@ pub fn undo_last(
         last.changes.clone(),
         new_lines,
     )?;
-    // 校验逆放结果与记录一致（不一致仅提示，不回滚——journal 里已有完整字节可再撤销）
-    let now = load_file(&ctx.path)?;
-    if now.hash != expected {
-        return Err(AppError::Other(
-            "撤销已执行，但结果哈希与记录不一致，请从原始快照核对".into(),
-        ));
-    }
     // commit_op 按原操作语义统计；撤销一次删除实际是恢复行
     let mut report = report;
     if !redo {
@@ -1259,31 +1360,35 @@ pub fn restore_snapshot(
     session_id: &str,
     backup_dir: &str,
     snapshot_name: &str,
+    expected_revision: Option<&str>,
 ) -> AppResult<EditApplyReport> {
     let provider = provider_normalized(provider)?;
     if snapshot_name.contains('/') || snapshot_name.contains('\\') || snapshot_name.contains("..") {
         return Err(AppError::Other("快照名称不合法".into()));
     }
-    let mut ctx = open_op_context(provider, rollout_path, session_id, backup_dir)?;
+    let ctx = open_op_context(
+        provider,
+        rollout_path,
+        session_id,
+        backup_dir,
+        expected_revision,
+    )?;
+    if ctx
+        .journal
+        .last()
+        .is_none_or(|last| last.after_hash != ctx.loaded.hash)
+    {
+        return Err(AppError::Other("[EDIT_CONFLICT] 会话存在外部修改，已拒绝用旧快照覆盖新增内容；请保留当前文件后在独立副本中核对。".into()));
+    }
     let snap_path = ctx.dir.join(snapshot_name);
     if !snap_path.is_file() {
         return Err(AppError::NotFound(snap_path.to_string_lossy().into_owned()));
     }
-    // 还原前先把当前状态存为新快照，保证任何状态都可回退
-    let pre_name = format!(
-        "pre-restore-{}.jsonl",
-        chrono::Utc::now().timestamp_millis()
-    );
-    fs::create_dir_all(&ctx.dir)?;
-    fs::copy(&ctx.path, ctx.dir.join(&pre_name))?;
-
     let snap_loaded = load_file(&snap_path)?;
-    let after_hash = write_lines(
-        &ctx.path,
-        &snap_loaded.lines,
-        snap_loaded.trailing_newline,
-        &ctx.loaded.hash,
-    )?;
+    safety::ensure_writable(provider, &snap_path, &snap_loaded, session_id)?;
+    let pre_name = format!("pre-restore-{}.jsonl", crate::repair::new_session_id());
+    transaction::snapshot(&ctx.dir.join(&pre_name), &ctx.loaded)?;
+    let after_hash = snap_loaded.hash.clone();
     let description = format!("还原快照 {snapshot_name}（还原前状态已保存为 {pre_name}）");
     let entry = JournalEntry {
         op_id: new_op_id(ctx.journal.len()),
@@ -1294,14 +1399,25 @@ pub fn restore_snapshot(
         rollout_path: ctx.path.to_string_lossy().into_owned(),
         description: description.clone(),
         base_description: None,
-        base_snapshot: Some(snapshot_name.to_string()),
+        base_snapshot: Some(pre_name.clone()),
         before_hash: ctx.loaded.hash.clone(),
         after_hash,
         changes: Vec::new(),
     };
-    append_journal(&ctx.dir, &entry)?;
-    ctx.journal.push(entry.clone());
+    let warning = transaction::commit(
+        &ctx,
+        &entry,
+        &snap_loaded.lines,
+        snap_loaded.trailing_newline,
+    )?;
     Ok(EditApplyReport {
+        status: if warning.is_some() {
+            "needs_recovery"
+        } else {
+            "committed_unverified"
+        }
+        .into(),
+        warning,
         op_id: entry.op_id,
         kind: "restore_snapshot".into(),
         snapshot_created: Some(pre_name),
@@ -1346,26 +1462,42 @@ pub fn history(
     } else {
         None
     };
-    let (undo_available, undo_blocked_reason) = match (journal.last(), current_hash.as_deref()) {
-        (None, _) => (false, None),
-        (Some(_), None) => (false, Some("会话文件不存在".to_string())),
-        (Some(last), Some(hash)) => {
-            if last.after_hash != hash {
-                (
-                    false,
-                    Some("会话文件在本工具之外被修改过，只能从快照还原".to_string()),
-                )
-            } else if last.changes.is_empty() {
-                (
-                    false,
-                    Some("上一步是快照还原，请继续使用快照回退".to_string()),
-                )
-            } else {
-                (true, None)
+    let (mut undo_available, mut undo_blocked_reason) =
+        match (journal.last(), current_hash.as_deref()) {
+            (None, _) => (false, None),
+            (Some(_), None) => (false, Some("会话文件不存在".to_string())),
+            (Some(last), Some(hash)) => {
+                if last.after_hash != hash {
+                    (
+                        false,
+                        Some("会话文件在本工具之外被修改过，已阻止撤销与快照覆盖".to_string()),
+                    )
+                } else if last.changes.is_empty() {
+                    (
+                        false,
+                        Some("上一步是快照还原，请继续使用快照回退".to_string()),
+                    )
+                } else {
+                    (true, None)
+                }
             }
-        }
-    };
+        };
 
+    let pending_operation = transaction::pending_summary(&dir, &path)?;
+    let capability = if path.is_file() {
+        Some(inspect_edit_capability(provider, rollout_path)?)
+    } else {
+        None
+    };
+    if pending_operation.is_some() {
+        undo_available = false;
+        undo_blocked_reason = Some("存在未完成操作，请先核对提交状态，不要重复删除或恢复。".into());
+    } else if let Some(capability) = &capability {
+        if !capability.blocked_reasons.is_empty() {
+            undo_available = false;
+            undo_blocked_reason = Some(capability.blocked_reasons.join("；"));
+        }
+    }
     let entries = journal
         .iter()
         .rev()
@@ -1375,12 +1507,22 @@ pub fn history(
             kind: e.kind.clone(),
             description: e.description.clone(),
             changes: e.changes.len() as u32,
+            status: "committed_unverified".into(),
         })
         .collect();
 
     Ok(EditHistory {
         entries,
         snapshots,
+        restore_available: pending_operation.is_none()
+            && capability
+                .as_ref()
+                .is_some_and(|c| c.blocked_reasons.is_empty())
+            && journal
+                .last()
+                .is_some_and(|last| Some(&last.after_hash) == current_hash.as_ref()),
+        pending_operation,
+        revision: capability.map(|capability| capability.revision),
         undo_available,
         undo_blocked_reason,
     })
@@ -1392,11 +1534,17 @@ pub fn plan_session_event_deletion(
     provider: String,
     rollout_path: String,
     line_nos: Vec<usize>,
+    expected_revision: Option<String>,
 ) -> AppResult<DeletePlan> {
     if provider == "opencode" {
         return crate::opencode_edit::plan_delete(&rollout_path, &line_nos);
     }
-    plan_delete(&provider, &rollout_path, &line_nos)
+    plan_delete(
+        &provider,
+        &rollout_path,
+        &line_nos,
+        expected_revision.as_deref(),
+    )
 }
 
 fn mutation_roots(
@@ -1437,6 +1585,7 @@ pub fn edit_session_event_text_with_lock(
     backup_dir: String,
     line_no: usize,
     new_text: String,
+    expected_revision: Option<String>,
     lock: &crate::family::FamilyLock,
 ) -> AppResult<EditApplyReport> {
     let roots = mutation_roots(&provider, &rollout_path, &backup_dir, &session_id)?;
@@ -1458,6 +1607,7 @@ pub fn edit_session_event_text_with_lock(
             &backup_dir,
             line_no,
             &new_text,
+            expected_revision.as_deref(),
         )
     })
 }
@@ -1468,6 +1618,7 @@ pub fn delete_session_events_with_lock(
     session_id: String,
     backup_dir: String,
     line_nos: Vec<usize>,
+    expected_revision: Option<String>,
     lock: &crate::family::FamilyLock,
 ) -> AppResult<EditApplyReport> {
     let roots = mutation_roots(&provider, &rollout_path, &backup_dir, &session_id)?;
@@ -1486,6 +1637,7 @@ pub fn delete_session_events_with_lock(
             &session_id,
             &backup_dir,
             &line_nos,
+            expected_revision.as_deref(),
         )
     })
 }
@@ -1495,6 +1647,7 @@ pub fn undo_last_session_edit_with_lock(
     rollout_path: String,
     session_id: String,
     backup_dir: String,
+    expected_revision: Option<String>,
     lock: &crate::family::FamilyLock,
 ) -> AppResult<EditApplyReport> {
     let roots = mutation_roots(&provider, &rollout_path, &backup_dir, &session_id)?;
@@ -1502,7 +1655,13 @@ pub fn undo_last_session_edit_with_lock(
         if provider == "opencode" {
             return crate::opencode_edit::undo_last(&rollout_path, &session_id, &backup_dir);
         }
-        undo_last(&provider, &rollout_path, &session_id, &backup_dir)
+        undo_last(
+            &provider,
+            &rollout_path,
+            &session_id,
+            &backup_dir,
+            expected_revision.as_deref(),
+        )
     })
 }
 
@@ -1512,6 +1671,7 @@ pub fn restore_session_edit_snapshot_with_lock(
     session_id: String,
     backup_dir: String,
     snapshot_name: String,
+    expected_revision: Option<String>,
     lock: &crate::family::FamilyLock,
 ) -> AppResult<EditApplyReport> {
     let roots = mutation_roots(&provider, &rollout_path, &backup_dir, &session_id)?;
@@ -1530,6 +1690,7 @@ pub fn restore_session_edit_snapshot_with_lock(
             &session_id,
             &backup_dir,
             &snapshot_name,
+            expected_revision.as_deref(),
         )
     })
 }
@@ -1546,10 +1707,405 @@ pub fn session_edit_history(
     history(&provider, &rollout_path, &session_id, &backup_dir)
 }
 
+pub fn reconcile_session_edit_with_lock(
+    provider: String,
+    rollout_path: String,
+    session_id: String,
+    backup_dir: String,
+    expected_revision: Option<String>,
+    lock: &crate::family::FamilyLock,
+) -> AppResult<()> {
+    provider_normalized(&provider)?;
+    let roots = mutation_roots(&provider, &rollout_path, &backup_dir, &session_id)?;
+    crate::family::with_roots(lock, &roots, |_| {
+        transaction::reconcile(
+            &provider,
+            Path::new(&rollout_path),
+            &session_id,
+            &edit_dir(&backup_dir, &provider, &session_id),
+            expected_revision.as_deref(),
+        )
+    })
+}
+
 // ========================= 测试 =========================
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stale_preview_rejects_insert_delete_rewrite_and_missing_revision() {
+        for change in ["insert", "delete", "rewrite", "missing"] {
+            let root = temp_dir("stale-preview");
+            let path = root.join("rollout.jsonl");
+            let backup = root.join("backup");
+            let mut rows = codex_fixture();
+            write_jsonl(&path, &rows);
+            let revision = current_revision(path.to_str().unwrap());
+            match change {
+                "insert" => rows.insert(
+                    1,
+                    json!({"type":"event_msg","payload":{"type":"token_count"}}),
+                ),
+                "delete" => {
+                    rows.remove(1);
+                }
+                "rewrite" => rows[2]["payload"]["content"][0]["text"] = json!("external"),
+                _ => {}
+            }
+            write_jsonl(&path, &rows);
+            let before = read_bytes(&path);
+            let expected = if change == "missing" {
+                None
+            } else {
+                Some(revision.as_str())
+            };
+            assert!(super::apply_delete(
+                "codex",
+                path.to_str().unwrap(),
+                "sess-1",
+                backup.to_str().unwrap(),
+                &[2],
+                expected
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("EDIT_CONFLICT"));
+            assert!(super::apply_edit_text(
+                "codex",
+                path.to_str().unwrap(),
+                "sess-1",
+                backup.to_str().unwrap(),
+                2,
+                "bad",
+                expected
+            )
+            .is_err());
+            assert_eq!(read_bytes(&path), before);
+            assert!(!backup.exists());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn interrupted_commit_can_be_reconciled_once_without_replaying_the_edit() {
+        for external in [false, true] {
+            let root = temp_dir("pending-edit");
+            let path = root.join("rollout.jsonl");
+            let backup = root.join("backup");
+            write_jsonl(&path, &codex_fixture());
+            transaction::FAIL_AFTER_ROLLOUT.with(|flag| flag.set(true));
+            let report = apply_delete(
+                "codex",
+                path.to_str().unwrap(),
+                "sess-1",
+                backup.to_str().unwrap(),
+                &[2],
+            )
+            .unwrap();
+            assert_eq!(report.status, "needs_recovery");
+            assert!(report.warning.is_some());
+            if external {
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(b"\n")
+                    .unwrap();
+            }
+            let before = read_bytes(&path);
+            assert!(apply_delete(
+                "codex",
+                path.to_str().unwrap(),
+                "sess-1",
+                backup.to_str().unwrap(),
+                &[2]
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("EDIT_RECOVERY_REQUIRED"));
+            let dir = edit_dir(backup.to_str().unwrap(), "codex", "sess-1");
+            let summary = transaction::pending_summary(&dir, &path).unwrap().unwrap();
+            assert_eq!(summary.can_reconcile, !external);
+            let result = transaction::reconcile(
+                "codex",
+                &path,
+                "sess-1",
+                &dir,
+                Some(&current_revision(path.to_str().unwrap())),
+            );
+            assert_eq!(result.is_err(), external);
+            assert_eq!(read_bytes(&path), before);
+            if !external {
+                transaction::reconcile(
+                    "codex",
+                    &path,
+                    "sess-1",
+                    &dir,
+                    Some(&current_revision(path.to_str().unwrap())),
+                )
+                .unwrap();
+                assert_eq!(read_journal(&dir).unwrap().len(), 1);
+                assert_eq!(read_journal(&dir).unwrap()[0].op_id, report.op_id);
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn codex_capability_blocks_metadata_modes_projection_and_shared_children() {
+        for scenario in [
+            "paginated",
+            "future",
+            "shared",
+            "projected",
+            "unknown_schema",
+            "child",
+            "malformed",
+            "active",
+        ] {
+            let root = temp_dir("capability");
+            let path = root.join("sessions/rollout.jsonl");
+            let mut rows = codex_fixture();
+            match scenario {
+                "paginated" | "future" => rows[0]["payload"]["history_mode"] = json!(scenario),
+                "shared" => rows[0]["payload"]["history_base"] = json!({"thread_id":"parent"}),
+                "active" => rows.push(json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"active"}})),
+                _ => {},
+            }
+            write_jsonl(&path, &rows);
+            if matches!(scenario, "projected" | "unknown_schema") {
+                let db = rusqlite::Connection::open(root.join("thread_history_1.sqlite")).unwrap();
+                if scenario == "projected" {
+                    db.execute_batch("CREATE TABLE thread_items(thread_id TEXT); INSERT INTO thread_items VALUES('sess-1');").unwrap();
+                }
+            }
+            if scenario == "child" {
+                write_jsonl(
+                    &root.join("sessions/child.jsonl"),
+                    &[
+                        json!({"type":"session_meta","payload":{"id":"child","history_base":{"thread_id":"sess-1"}}}),
+                    ],
+                );
+            }
+            if scenario == "malformed" {
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(b"{bad\n")
+                    .unwrap();
+            }
+            let before = read_bytes(&path);
+            let result = inspect_edit_capability("codex", path.to_str().unwrap());
+            assert!(
+                result.is_err() || !result.unwrap().blocked_reasons.is_empty(),
+                "{scenario}"
+            );
+            assert!(
+                apply_delete(
+                    "codex",
+                    path.to_str().unwrap(),
+                    "sess-1",
+                    root.join("backup").to_str().unwrap(),
+                    &[2]
+                )
+                .is_err(),
+                "{scenario}"
+            );
+            assert_eq!(read_bytes(&path), before);
+            assert!(!root.join("backup").exists());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn snapshot_restore_without_external_changes_preserves_exact_original_bytes() {
+        let root = temp_dir("safe-restore");
+        let path = root.join("rollout.jsonl");
+        let backup = root.join("backup");
+        write_jsonl(&path, &codex_fixture());
+        let before = read_bytes(&path);
+        let report = apply_delete(
+            "codex",
+            path.to_str().unwrap(),
+            "sess-1",
+            backup.to_str().unwrap(),
+            &[2],
+        )
+        .unwrap();
+        restore_snapshot(
+            "codex",
+            path.to_str().unwrap(),
+            "sess-1",
+            backup.to_str().unwrap(),
+            report.snapshot_created.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read_bytes(&path), before);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn current_revision(path: &str) -> String {
+        safety::revision(Path::new(path), &load_file(Path::new(path)).unwrap().hash).unwrap()
+    }
+    fn plan_delete(provider: &str, path: &str, indices: &[usize]) -> AppResult<DeletePlan> {
+        super::plan_delete(provider, path, indices, Some(&current_revision(path)))
+    }
+    fn apply_edit_text(
+        provider: &str,
+        path: &str,
+        id: &str,
+        backup: &str,
+        index: usize,
+        text: &str,
+    ) -> AppResult<EditApplyReport> {
+        super::apply_edit_text(
+            provider,
+            path,
+            id,
+            backup,
+            index,
+            text,
+            Some(&current_revision(path)),
+        )
+    }
+    fn apply_delete(
+        provider: &str,
+        path: &str,
+        id: &str,
+        backup: &str,
+        indices: &[usize],
+    ) -> AppResult<EditApplyReport> {
+        super::apply_delete(
+            provider,
+            path,
+            id,
+            backup,
+            indices,
+            Some(&current_revision(path)),
+        )
+    }
+    fn undo_last(provider: &str, path: &str, id: &str, backup: &str) -> AppResult<EditApplyReport> {
+        super::undo_last(provider, path, id, backup, Some(&current_revision(path)))
+    }
+    fn restore_snapshot(
+        provider: &str,
+        path: &str,
+        id: &str,
+        backup: &str,
+        snapshot: &str,
+    ) -> AppResult<EditApplyReport> {
+        super::restore_snapshot(
+            provider,
+            path,
+            id,
+            backup,
+            snapshot,
+            Some(&current_revision(path)),
+        )
+    }
+
+    #[test]
+    fn unsupported_codex_history_blocks_every_message_write_without_changes() {
+        for marker in [
+            json!({"type":"event_msg","payload":{"type":"item_completed","turn_id":"t","item":{"type":"UserMessage","id":"i","content":[]}}}),
+            json!({"type":"compacted","payload":{"message":"retained context"}}),
+            json!({"type":"future_record","payload":{}}),
+        ] {
+            let root = temp_dir("unsupported-edit");
+            let path = root.join("rollout.jsonl");
+            let backup = root.join("backup");
+            write_jsonl(&path, &codex_fixture());
+            let report = apply_edit_text(
+                "codex",
+                path.to_str().unwrap(),
+                "sess-1",
+                backup.to_str().unwrap(),
+                10,
+                "changed",
+            )
+            .unwrap();
+            let mut rows = codex_fixture();
+            rows.push(marker);
+            write_jsonl(&path, &rows);
+            let before = read_bytes(&path);
+            let journal = read_bytes(
+                &edit_dir(backup.to_str().unwrap(), "codex", "sess-1").join("journal.jsonl"),
+            );
+            assert!(!plan_delete("codex", path.to_str().unwrap(), &[2])
+                .unwrap()
+                .blocked
+                .is_empty());
+            assert!(apply_edit_text(
+                "codex",
+                path.to_str().unwrap(),
+                "sess-1",
+                backup.to_str().unwrap(),
+                2,
+                "bad"
+            )
+            .is_err());
+            assert!(apply_delete(
+                "codex",
+                path.to_str().unwrap(),
+                "sess-1",
+                backup.to_str().unwrap(),
+                &[2]
+            )
+            .is_err());
+            assert!(undo_last(
+                "codex",
+                path.to_str().unwrap(),
+                "sess-1",
+                backup.to_str().unwrap()
+            )
+            .is_err());
+            assert!(restore_snapshot(
+                "codex",
+                path.to_str().unwrap(),
+                "sess-1",
+                backup.to_str().unwrap(),
+                report.snapshot_created.as_deref().unwrap()
+            )
+            .is_err());
+            assert_eq!(before, read_bytes(&path));
+            assert_eq!(
+                journal,
+                read_bytes(
+                    &edit_dir(backup.to_str().unwrap(), "codex", "sess-1").join("journal.jsonl")
+                )
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn repeated_messages_never_pair_across_turns() {
+        let root = temp_dir("repeated-turns");
+        let path = root.join("rollout.jsonl");
+        write_jsonl(
+            &path,
+            &[
+                json!({"type":"session_meta","payload":{"id":"s"}}),
+                json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"a"}}),
+                json!({"type":"event_msg","payload":{"type":"user_message","message":"继续"}}),
+                json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"a"}}),
+                json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"b"}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"继续"}]}}),
+                json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":"b"}}),
+            ],
+        );
+        let plan = plan_delete("codex", path.to_str().unwrap(), &[5]).unwrap();
+        assert_eq!(
+            plan.lines
+                .iter()
+                .map(|line| line.line_no)
+                .collect::<Vec<_>>(),
+            vec![5]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn performance_edit_hashes_output_once() -> AppResult<()> {
         let root = temp_dir("edit-output-hash");
@@ -1732,6 +2288,14 @@ mod tests {
             codex_flat_text(redone.parsed[10].as_ref().unwrap()),
             "edited answer"
         );
+        undo_last(
+            "codex",
+            rollout.to_str().unwrap(),
+            "sess-1",
+            backup.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read_bytes(&rollout), original, "重做后仍能再次撤销");
         fs::remove_dir_all(&root).ok();
     }
 
@@ -1945,12 +2509,11 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_restore_recovers_original_after_external_change() {
+    fn snapshot_restore_rejects_external_changes() {
         let root = temp_dir("snapshot-restore");
         let rollout = root.join("s.jsonl");
         let backup = root.join("backup");
         write_jsonl(&rollout, &claude_fixture());
-        let original = read_bytes(&rollout);
 
         let report = apply_edit_text(
             "claude",
@@ -1980,27 +2543,17 @@ mod tests {
         assert!(h.undo_blocked_reason.is_some());
         assert!(h.snapshots.iter().any(|s| s.name == snap));
 
-        restore_snapshot(
+        let before = read_bytes(&rollout);
+        let result = restore_snapshot(
             "claude",
             rollout.to_str().unwrap(),
             "s",
             backup.to_str().unwrap(),
             &snap,
-        )
-        .unwrap();
-        assert_eq!(read_bytes(&rollout), original, "还原快照应恢复原始字节");
-
-        let h2 = history(
-            "claude",
-            rollout.to_str().unwrap(),
-            "s",
-            backup.to_str().unwrap(),
-        )
-        .unwrap();
-        assert!(h2
-            .snapshots
-            .iter()
-            .any(|s| s.name.starts_with("pre-restore-")));
+        );
+        assert!(result.unwrap_err().to_string().contains("EDIT_CONFLICT"));
+        assert_eq!(read_bytes(&rollout), before, "不得覆盖外部新增消息");
+        assert!(!h.restore_available);
         fs::remove_dir_all(&root).ok();
     }
 

@@ -49,6 +49,8 @@ import { PreviewMutationDialogs } from "@/components/PreviewMutationDialogs";
 import {
   api,
   type DeletePlan,
+  type EditApplyReport,
+  type EditCapability,
   type EditHistory,
   type PreviewEvent,
   type SessionSummary,
@@ -78,6 +80,7 @@ import {
 import {
   canDeleteEvent,
   canEditEventText,
+  canonicalMessageImages,
   editableText,
   eventMessageLabel,
   extractPreviewEventText as extractText,
@@ -96,6 +99,7 @@ import {
 import { cn } from "@/lib/utils";
 import { useSettings } from "@/stores/settings";
 import { toast } from "sonner";
+import { isTauriRuntime } from "@/lib/runtime";
 
 type Props = {
   open: boolean;
@@ -167,18 +171,27 @@ export function PreviewDialog({
   const [editTarget, setEditTarget] = useState<PreviewEvent | null>(null);
   const [editText, setEditText] = useState("");
   const [mutating, setMutating] = useState(false);
+  const mutationInFlightRef = useRef(false);
   const [deleteTarget, setDeleteTarget] = useState<PreviewEvent | null>(null);
   const [isSelecting, setIsSelecting] = useState(false);
   const [selectionFirstIndex, setSelectionFirstIndex] = useState<number | null>(null);
   const [selectionSecondIndex, setSelectionSecondIndex] = useState<number | null>(null);
   const [deleteSelectedTarget, setDeleteSelectedTarget] = useState<{ start: number; end: number } | null>(null);
   const [deletePlan, setDeletePlan] = useState<DeletePlan | null>(null);
+  const deleteRequestRef = useRef(0);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [editHistory, setEditHistory] = useState<EditHistory | null>(null);
   const [prompts, setPrompts] = useState<UserPromptBrief[] | null>(null);
   const [totalEvents, setTotalEvents] = useState(0);
   const [activeTimelineIndex, setActiveTimelineIndex] = useState<number | null>(null);
   const [loadingAll, setLoadingAll] = useState(false);
+  const [capability, setCapability] = useState<EditCapability | null>(null);
+  const [readError, setReadError] = useState("");
+  const [lastReport, setLastReport] = useState<EditApplyReport | null>(null);
+  const revisionRef = useRef<string | null>(null);
+  const generationRef = useRef(0);
+  const cancelLoadAllRef = useRef(false);
+  const readErrorRef = useRef(false);
   const offsetRef = useRef(0);
   const loadingRef = useRef(false);
   const doneRef = useRef(false);
@@ -190,14 +203,17 @@ export function PreviewDialog({
   const claudeDir = appSettings?.claude_dir;
   const opencodeDir = appSettings?.opencode_dir;
   const canForkSession = !customRolloutPath && !!session && (
-    (provider === "codex" && !!codexDir)
+    (provider === "codex" && !!codexDir && capability?.format === "legacy" && capability.blocked_reasons.length === 0)
     || (provider === "claude" && !!claudeDir && !isSubagentSession(session))
     || (provider === "opencode" && !!opencodeDir)
   );
   const forkLabel = provider === "codex" ? "回溯" : "复制到此处";
   // 备份/导入预览（customRolloutPath）不允许编辑，只能编辑真实会话文件
   const canMutateSession =
-    !customRolloutPath && !!session && !!backupDir && !!rolloutPath;
+    !customRolloutPath && !!session && !!backupDir && !!rolloutPath && !readError
+    && lastReport?.status !== "needs_recovery"
+    && (provider === "opencode" || (capability !== null && capability.blocked_reasons.length === 0));
+  const sourceLabel = `${isTauriRuntime() ? "本地" : `WebUI · ${window.location.host}`} · ${provider}`;
   const relatedSubagents = useMemo(() => {
     if (!session || session.provider !== "codex" || customRolloutPath) return [];
     return collectRelatedSubagents(session.id, allSessions);
@@ -263,12 +279,35 @@ export function PreviewDialog({
     [processDefaultCollapsed],
   );
 
+  const readPage = useCallback(async (offset: number, limit: number) => {
+    const generation = generationRef.current;
+    try {
+      const page = await api.previewPage(provider, rolloutPath, offset, limit, revisionRef.current);
+      if (generation !== generationRef.current) return null;
+      revisionRef.current = page.capability?.revision ?? null;
+      setCapability(page.capability);
+      return page.events;
+    } catch (error) {
+      if (generation === generationRef.current) {
+        readErrorRef.current = true;
+        setReadError(String((error as Error)?.message ?? error));
+        setIsSelecting(false);
+        setSelectionFirstIndex(null);
+        setSelectionSecondIndex(null);
+        setDeletePlan(null);
+      }
+      return null;
+    }
+  }, [provider, rolloutPath]);
+
   const loadMore = useCallback(async () => {
-    if (loadingRef.current || doneRef.current || !rolloutPath) return;
+    if (loadingRef.current || doneRef.current || readErrorRef.current || !rolloutPath) return;
+    const generation = generationRef.current;
     loadingRef.current = true;
     setLoading(true);
     try {
-      const next = await api.previewRange(provider, rolloutPath, offsetRef.current, PAGE);
+      const next = await readPage(offsetRef.current, PAGE);
+      if (!next) return;
       if (next.length === 0) {
         doneRef.current = true;
         setDone(true);
@@ -281,10 +320,12 @@ export function PreviewDialog({
         }
       }
     } finally {
-      loadingRef.current = false;
-      setLoading(false);
+      if (generation === generationRef.current) {
+        loadingRef.current = false;
+        setLoading(false);
+      }
     }
-  }, [provider, rolloutPath]);
+  }, [readPage, rolloutPath]);
 
   /** 等待进行中的分页请求结束，避免并发拉取重复区间 */
   const waitForIdle = useCallback(async () => {
@@ -296,13 +337,15 @@ export function PreviewDialog({
   /** 一次性把事件加载到指定事件序号（时间线跳转用），带一页余量 */
   const loadUpTo = useCallback(
     async (targetOffset: number) => {
+      const generation = generationRef.current;
       await waitForIdle();
-      if (doneRef.current || offsetRef.current > targetOffset || !rolloutPath) return;
+      if (generation !== generationRef.current || readErrorRef.current || doneRef.current || offsetRef.current > targetOffset || !rolloutPath) return;
       loadingRef.current = true;
       setLoading(true);
       try {
         const need = targetOffset - offsetRef.current + 1 + PAGE;
-        const next = await api.previewRange(provider, rolloutPath, offsetRef.current, need);
+        const next = await readPage(offsetRef.current, need);
+        if (!next) return;
         if (next.length > 0) {
           offsetRef.current += next.length;
           setEvents((prev) => [...prev, ...next]);
@@ -312,42 +355,48 @@ export function PreviewDialog({
           setDone(true);
         }
       } finally {
-        loadingRef.current = false;
-        setLoading(false);
+        if (generation === generationRef.current) {
+          loadingRef.current = false;
+          setLoading(false);
+        }
       }
     },
-    [provider, rolloutPath, waitForIdle],
+    [readPage, rolloutPath, waitForIdle],
   );
 
   /** 一次加载余下全部事件 */
   const loadAll = useCallback(async () => {
+    const generation = generationRef.current;
     await waitForIdle();
-    if (doneRef.current || !rolloutPath) return;
+    if (generation !== generationRef.current || doneRef.current || readErrorRef.current || !rolloutPath) return;
     loadingRef.current = true;
     setLoading(true);
     setLoadingAll(true);
+    cancelLoadAllRef.current = false;
     try {
-      const next = await api.previewRange(
-        provider,
-        rolloutPath,
-        offsetRef.current,
-        Number.MAX_SAFE_INTEGER,
-      );
-      if (next.length > 0) {
+      while (!cancelLoadAllRef.current && generation === generationRef.current) {
+        const next = await readPage(offsetRef.current, PAGE);
+        if (!next) break;
         offsetRef.current += next.length;
         setEvents((prev) => [...prev, ...next]);
+        if (next.length < PAGE) {
+          doneRef.current = true;
+          setDone(true);
+          break;
+        }
       }
-      doneRef.current = true;
-      setDone(true);
     } finally {
-      loadingRef.current = false;
-      setLoading(false);
-      setLoadingAll(false);
+      if (generation === generationRef.current) {
+        loadingRef.current = false;
+        setLoading(false);
+        setLoadingAll(false);
+      }
     }
-  }, [provider, rolloutPath, waitForIdle]);
+  }, [readPage, rolloutPath, waitForIdle]);
 
   /** 拉取全量用户提问（时间线数据）；属于增强功能，失败时静默降级为无时间线 */
   const loadPrompts = useCallback(async () => {
+    const generation = generationRef.current;
     if (!rolloutPath) {
       setPrompts(null);
       setTotalEvents(0);
@@ -355,15 +404,31 @@ export function PreviewDialog({
     }
     try {
       const list = await api.previewUserPrompts(provider, rolloutPath);
+      if (generation !== generationRef.current) return;
       setPrompts(list.prompts);
       setTotalEvents(list.total_events);
     } catch {
+      if (generation !== generationRef.current) return;
       setPrompts(null);
       setTotalEvents(0);
     }
   }, [provider, rolloutPath]);
 
   const resetAndReload = useCallback(() => {
+    generationRef.current += 1;
+    deleteRequestRef.current += 1;
+    revisionRef.current = null;
+    readErrorRef.current = false;
+    cancelLoadAllRef.current = true;
+    setCapability(null);
+    setReadError("");
+    setLoadingAll(false);
+    setEditTarget(null);
+    setDeleteTarget(null);
+    setDeleteSelectedTarget(null);
+    setDeletePlan(null);
+    setSelectionFirstIndex(null);
+    setSelectionSecondIndex(null);
     setEvents([]);
     setProcessExpansionOverrides({});
     setDone(false);
@@ -386,7 +451,10 @@ export function PreviewDialog({
     setSelectionSecondIndex(null);
     setDeleteSelectedTarget(null);
     setDeletePlan(null);
+    setLastReport(null);
+    setHistoryOpen(false);
     resetAndReload();
+    return () => { generationRef.current += 1; cancelLoadAllRef.current = true; };
   }, [open, rolloutPath, resetAndReload]);
 
   const timelineIndexSet = useMemo(
@@ -420,7 +488,7 @@ export function PreviewDialog({
   }, [initialJump?.eventIndex, normalizedFilter, onlyMsg, searchableEvents, timelineIndexSet]);
 
   useEffect(() => {
-    if (!open || loading || done) return;
+    if (!open || loading || done || readError || normalizedFilter) return;
     const viewport = viewportRef.current;
     if (!viewport) return;
     // 收起过程、切换消息模式或应用延迟搜索后，继续补页直到结果填满视口。
@@ -429,6 +497,7 @@ export function PreviewDialog({
     }
   }, [
     done,
+    readError,
     events.length,
     filtered.length,
     loadMore,
@@ -688,6 +757,20 @@ export function PreviewDialog({
     }
   };
 
+  const recordEditResult = (report: EditApplyReport) => {
+    setLastReport(report);
+    if (report.status === "needs_recovery") {
+      toast.warning("部分完成，请核对提交状态", { description: report.warning ?? report.op_id });
+    } else {
+      toast.info("本地变更已保存，原生显示待验证", { description: `操作 ${report.op_id}；可在编辑历史中核对。` });
+    }
+  };
+
+  const refreshAfterEdit = async () => {
+    try { await onEdited?.(); }
+    catch (error) { toast.warning("本地变更已保存，列表刷新失败", { description: String((error as Error)?.message ?? error) }); }
+  };
+
   const requestEditAt = (event: PreviewEvent) => {
     if (!canMutateSession) return;
     setEditText(editableText(event));
@@ -696,32 +779,27 @@ export function PreviewDialog({
 
   const confirmEdit = async () => {
     if (!session || !backupDir || !rolloutPath || !editTarget) return;
+    if (mutationInFlightRef.current) return;
+    mutationInFlightRef.current = true;
     setMutating(true);
     try {
       const report = await api.editSessionEventText({
         provider,
+        expected_revision: revisionRef.current,
         rollout_path: rolloutPath,
         session_id: session.id,
         backup_dir: backupDir,
         line_no: editTarget.index,
         new_text: editText,
       });
-      toast.success(
-        provider === "opencode"
-          ? `已改写 OpenCode 消息（${report.changed_lines} 个内容块）`
-          : `已改写消息（含镜像共 ${report.changed_lines} 行）`,
-        {
-          description: report.snapshot_created
-            ? `编辑前已自动保存原始快照 ${report.snapshot_created}`
-            : "本次编辑已记入编辑历史，可随时撤销",
-        },
-      );
+      recordEditResult(report);
       setEditTarget(null);
       resetAndReload();
-      await onEdited?.();
+      await refreshAfterEdit();
     } catch (e: any) {
       toast.error("改写失败", { description: String(e?.message ?? e) });
     } finally {
+      mutationInFlightRef.current = false;
       setMutating(false);
     }
   };
@@ -730,10 +808,12 @@ export function PreviewDialog({
     if (!canMutateSession || !rolloutPath) return;
     setDeletePlan(null);
     setDeleteTarget(event);
+    const requestId = ++deleteRequestRef.current;
     api
-      .planSessionEventDeletion(provider, rolloutPath, [event.index])
-      .then(setDeletePlan)
+      .planSessionEventDeletion(provider, rolloutPath, [event.index], revisionRef.current)
+      .then((plan) => { if (requestId === deleteRequestRef.current) setDeletePlan(plan); })
       .catch((e: any) => {
+        if (requestId !== deleteRequestRef.current) return;
         toast.error("生成删除计划失败", { description: String(e?.message ?? e) });
         setDeleteTarget(null);
       });
@@ -741,27 +821,28 @@ export function PreviewDialog({
 
   const confirmDelete = async () => {
     if (!session || !backupDir || !rolloutPath || !deleteTarget) return;
+    if (!deletePlan || deletePlan.blocked.length > 0 || !canMutateSession) return;
+    if (mutationInFlightRef.current) return;
+    mutationInFlightRef.current = true;
     setMutating(true);
     try {
       const report = await api.deleteSessionEvents({
         provider,
+        expected_revision: deletePlan?.revision ?? null,
         rollout_path: rolloutPath,
         session_id: session.id,
         backup_dir: backupDir,
         line_nos: [deleteTarget.index],
       });
-      toast.success(`已删除 ${report.deleted_lines} 个事件`, {
-        description: report.snapshot_created
-          ? `删除前已自动保存原始快照 ${report.snapshot_created}`
-          : "本次删除已记入编辑历史，可随时撤销",
-      });
+      recordEditResult(report);
       setDeleteTarget(null);
       setDeletePlan(null);
       resetAndReload();
-      await onEdited?.();
+      await refreshAfterEdit();
     } catch (e: any) {
       toast.error("删除失败", { description: String(e?.message ?? e) });
     } finally {
+      mutationInFlightRef.current = false;
       setMutating(false);
     }
   };
@@ -772,13 +853,15 @@ export function PreviewDialog({
     const end = Math.max(selectionFirstIndex, selectionSecondIndex);
     setDeletePlan(null);
     setDeleteSelectedTarget({ start, end });
+    const requestId = ++deleteRequestRef.current;
     const indices = events
       .filter((e) => e.index >= start && e.index <= end && canDeleteEvent(provider, e))
       .map((e) => e.index);
     api
-      .planSessionEventDeletion(provider, rolloutPath, indices)
-      .then(setDeletePlan)
+      .planSessionEventDeletion(provider, rolloutPath, indices, revisionRef.current)
+      .then((plan) => { if (requestId === deleteRequestRef.current) setDeletePlan(plan); })
       .catch((e: any) => {
+        if (requestId !== deleteRequestRef.current) return;
         toast.error("生成删除计划失败", { description: String(e?.message ?? e) });
         setDeleteSelectedTarget(null);
       });
@@ -786,34 +869,32 @@ export function PreviewDialog({
 
   const confirmDeleteSelected = async () => {
     if (!session || !backupDir || !rolloutPath || !deleteSelectedTarget) return;
+    if (!deletePlan || deletePlan.blocked.length > 0 || !canMutateSession) return;
+    if (mutationInFlightRef.current) return;
+    mutationInFlightRef.current = true;
     setMutating(true);
     try {
-      const { start, end } = deleteSelectedTarget;
-      const indices = events
-        .filter((e) => e.index >= start && e.index <= end && canDeleteEvent(provider, e))
-        .map((e) => e.index);
+      const indices = deletePlan.lines.filter((line) => line.reason === "selected").map((line) => line.line_no);
       const report = await api.deleteSessionEvents({
         provider,
+        expected_revision: deletePlan?.revision ?? null,
         rollout_path: rolloutPath,
         session_id: session.id,
         backup_dir: backupDir,
         line_nos: indices,
       });
-      toast.success(`已删除 ${report.deleted_lines} 个事件`, {
-        description: report.snapshot_created
-          ? `删除前已自动保存原始快照 ${report.snapshot_created}`
-          : "本次删除已记入编辑历史，可随时撤销",
-      });
+      recordEditResult(report);
       setDeleteSelectedTarget(null);
       setDeletePlan(null);
       setIsSelecting(false);
       setSelectionFirstIndex(null);
       setSelectionSecondIndex(null);
       resetAndReload();
-      await onEdited?.();
+      await refreshAfterEdit();
     } catch (e: any) {
       toast.error("删除失败", { description: String(e?.message ?? e) });
     } finally {
+      mutationInFlightRef.current = false;
       setMutating(false);
     }
   };
@@ -829,6 +910,7 @@ export function PreviewDialog({
       });
       setEditHistory(h);
     } catch (e: any) {
+      setHistoryOpen(false);
       toast.error("读取编辑历史失败", { description: String(e?.message ?? e) });
     }
   }, [backupDir, provider, rolloutPath, session]);
@@ -841,47 +923,70 @@ export function PreviewDialog({
 
   const undoLastEdit = async () => {
     if (!session || !backupDir || !rolloutPath) return;
+    if (mutationInFlightRef.current) return;
+    mutationInFlightRef.current = true;
     setMutating(true);
     try {
-      await api.undoLastSessionEdit({
+      const report = await api.undoLastSessionEdit({
         provider,
+        expected_revision: editHistory?.revision ?? revisionRef.current,
         rollout_path: rolloutPath,
         session_id: session.id,
         backup_dir: backupDir,
       });
-      toast.success("已撤销最近一次编辑");
+      recordEditResult(report);
       await loadEditHistory();
       resetAndReload();
-      await onEdited?.();
+      await refreshAfterEdit();
     } catch (e: any) {
       toast.error("撤销失败", { description: String(e?.message ?? e) });
     } finally {
+      mutationInFlightRef.current = false;
       setMutating(false);
     }
   };
 
   const restoreSnapshot = async (name: string) => {
     if (!session || !backupDir || !rolloutPath) return;
+    if (mutationInFlightRef.current) return;
+    mutationInFlightRef.current = true;
     setMutating(true);
     try {
       const report = await api.restoreSessionEditSnapshot({
         provider,
+        expected_revision: editHistory?.revision ?? revisionRef.current,
         rollout_path: rolloutPath,
         session_id: session.id,
         backup_dir: backupDir,
         snapshot_name: name,
       });
-      toast.success(`已还原快照 ${name}`, {
-        description: report.snapshot_created
-          ? `还原前状态已另存为 ${report.snapshot_created}`
-          : undefined,
-      });
+      recordEditResult(report);
       await loadEditHistory();
       resetAndReload();
-      await onEdited?.();
+      await refreshAfterEdit();
     } catch (e: any) {
       toast.error("还原快照失败", { description: String(e?.message ?? e) });
     } finally {
+      mutationInFlightRef.current = false;
+      setMutating(false);
+    }
+  };
+
+  const reconcileEdit = async () => {
+    if (!session || !backupDir || !editHistory || mutationInFlightRef.current) return;
+    mutationInFlightRef.current = true;
+    setMutating(true);
+    try {
+      await api.reconcileSessionEdit({ provider, rollout_path: rolloutPath, session_id: session.id,
+        backup_dir: backupDir, expected_revision: editHistory.revision });
+      setLastReport(null);
+      await loadEditHistory();
+      resetAndReload();
+      toast.info("操作记录已核对；会话内容未再次修改");
+    } catch (error) {
+      toast.error("核对未完成", { description: String((error as Error)?.message ?? error) });
+    } finally {
+      mutationInFlightRef.current = false;
       setMutating(false);
     }
   };
@@ -897,7 +1002,7 @@ export function PreviewDialog({
 
   return (
     <>
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={(next) => !mutating && onOpenChange(next)}>
       <DialogContent
         className="flex h-[90vh] max-w-[96vw] min-w-0 flex-col gap-0 overflow-hidden p-0 sm:max-w-[1200px]"
         onKeyDown={onPreviewKeyDown}
@@ -919,7 +1024,8 @@ export function PreviewDialog({
               </DialogDescription>
               {session && (
                 <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
-                  <span className="font-mono text-foreground/70">{session.id.slice(0, 8)}</span>
+                  <span className="text-foreground/70">{sourceLabel}</span>
+                  <span className="font-mono text-foreground/70" title={session.id}>{session.id.slice(0, 8)}</span>
                   {session.model && (
                     <>
                       <Dot />
@@ -947,13 +1053,13 @@ export function PreviewDialog({
                   )}
                   <Dot />
                   <span className="text-[11px] text-muted-foreground">
-                    显示 <span className="tabular-nums text-foreground/80">{filtered.length}</span>
+                    {onlyMsg ? "筛选后对话/状态" : "筛选后事件"} <span className="tabular-nums text-foreground/80">{filtered.length}</span>
                     <span className="mx-1 text-muted-foreground/50">/</span>
-                    已加载 <span className="tabular-nums text-foreground/80">{events.length}</span>
+                    已加载底层事件 <span className="tabular-nums text-foreground/80">{events.length}</span>
                     {totalEvents > 0 && (
                       <>
                         <span className="mx-1 text-muted-foreground/50">/</span>
-                        共 <span className="tabular-nums text-foreground/80">{totalEvents}</span>
+                        底层共 <span className="tabular-nums text-foreground/80">{totalEvents}</span>
                       </>
                     )}{" "}
                     条
@@ -968,7 +1074,8 @@ export function PreviewDialog({
 
           <div className="mt-3.5 flex flex-wrap items-center gap-2">
             <Input
-              placeholder="在事件中过滤…"
+              placeholder="搜索已加载内容…"
+              aria-label="搜索已加载的会话内容"
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
               className="h-8 w-64 border-border/70"
@@ -1022,15 +1129,15 @@ export function PreviewDialog({
                 variant="outline"
                 size="sm"
                 className="h-8 gap-1.5 border-border/70 bg-muted/30 px-2.5 text-xs font-normal hover:bg-muted/50"
-                disabled={loadingAll}
-                onClick={() => void loadAll()}
+                disabled={Boolean(readError)}
+                onClick={() => loadingAll ? (cancelLoadAllRef.current = true) : void loadAll()}
               >
                 {loadingAll ? (
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
                 ) : (
                   <ChevronsDown className="h-3.5 w-3.5" />
                 )}
-                {loadingAll ? "加载中…" : "加载全部"}
+                {loadingAll ? `停止加载 · ${events.length}` : filter ? "搜索整个会话" : "加载全部"}
               </Button>
             )}
             {canMutateSession && !isSelecting && (
@@ -1090,7 +1197,7 @@ export function PreviewDialog({
             )}
             <PreviewToolbarActions
               hasSession={!!session}
-              canOpenEditHistory={canMutateSession}
+              canOpenEditHistory={!customRolloutPath && !!session && !!backupDir && provider !== "cursor"}
               onCopySessionId={copySessionId}
               onCopyResume={copyResume}
               onRevealDirectory={reveal}
@@ -1098,6 +1205,31 @@ export function PreviewDialog({
               onCopyPath={copyPath}
             />
           </div>
+          <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+            <span>筛选与折叠只改变显示，不会删除数据。{filter && `${done ? "整个会话" : "已加载范围"}匹配 ${filtered.length} 条。`}</span>
+            <button className="underline underline-offset-2" onClick={resetAndReload} disabled={mutating}>刷新预览</button>
+            <details className="min-w-0">
+              <summary className="cursor-pointer">会话身份与路径</summary>
+              <div className="break-all font-mono">{session?.id}<br />{rolloutPath}</div>
+            </details>
+          </div>
+          {capability && capability.blocked_reasons.length > 0 && (
+            <div role="status" className="mt-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs">
+              <strong>只读 · {capability.format === "paginated" ? "分页历史" : "暂不支持消息写入"}</strong>
+              <div className="mt-1">{capability.blocked_reasons.join("；")}</div>
+              {capability.format === "paginated" && <div className="mt-1">对话按正式消息显示；完整事件中保留模型上下文记录。旧版删除可能仅修改了上下文，未移除正式消息。</div>}
+            </div>
+          )}
+          {readError && <div role="alert" className="mt-2 text-xs text-destructive">{readError}</div>}
+          {lastReport && (
+            <div role="status" className="mt-2 rounded-md border bg-muted/40 px-3 py-2 text-xs">
+              <strong>{lastReport.status === "needs_recovery" ? "部分完成，需要处理" : "已提交，原生显示待验证"}</strong>
+              <div>改写 {lastReport.changed_lines} · 删除 {lastReport.deleted_lines} · 恢复 {lastReport.restored_lines} 条底层记录</div>
+              <div className="break-all font-mono">操作 {lastReport.op_id}</div>
+              {lastReport.warning && <div>{lastReport.warning}</div>}
+              <button className="mt-1 underline" onClick={openEditHistory}>查看操作记录与恢复状态</button>
+            </div>
+          )}
         </DialogHeader>
 
         <div className="relative min-h-0 flex-1">
@@ -1115,7 +1247,7 @@ export function PreviewDialog({
                 <div className="flex flex-col items-center justify-center gap-2 py-16 text-center text-muted-foreground">
                   <Sparkles className="h-8 w-8 opacity-50" />
                   <div className="text-sm">
-                    {events.length === 0 ? "无事件" : "无匹配事件"}
+                    {readError ? "读取未完成，请刷新预览" : !done ? "已加载范围暂无匹配，尚未搜索完整会话" : events.length === 0 ? "无事件" : "当前筛选下无匹配事件"}
                   </div>
                 </div>
               )}
@@ -1272,6 +1404,9 @@ export function PreviewDialog({
     </Dialog>
     <PreviewMutationDialogs
       provider={provider}
+      sourceLabel={sourceLabel}
+      sessionId={session?.id ?? ""}
+      rolloutPath={rolloutPath}
       fork={{
         target: forkTarget,
         running: forking,
@@ -1291,6 +1426,7 @@ export function PreviewDialog({
         plan: deletePlan,
         running: mutating,
         onClose: () => {
+          deleteRequestRef.current += 1;
           setDeleteTarget(null);
           setDeletePlan(null);
         },
@@ -1301,6 +1437,7 @@ export function PreviewDialog({
         plan: deletePlan,
         running: mutating,
         onClose: () => {
+          deleteRequestRef.current += 1;
           setDeleteSelectedTarget(null);
           setDeletePlan(null);
         },
@@ -1311,6 +1448,8 @@ export function PreviewDialog({
       open={historyOpen}
       history={editHistory}
       mutating={mutating}
+      blockedReason={capability?.blocked_reasons.join("；") || readError || null}
+      onReconcile={() => void reconcileEdit()}
       onOpenChange={setHistoryOpen}
       onUndo={() => void undoLastEdit()}
       onRestore={(snapshotName) => void restoreSnapshot(snapshotName)}
@@ -1365,6 +1504,10 @@ function ProcessTurnGroup({
 
 function EventBubble({ e, actions }: { e: PreviewEvent; actions: NodeActionSet }) {
   const ts = formatTimeString(e.timestamp);
+
+  if (e.kind === "turn_error") {
+    return <div className="rounded-md border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm"><strong>本轮未完成</strong><div className="mt-1 break-words">{e.text_summary}</div><div className="mt-1 text-xs text-muted-foreground">{ts}</div></div>;
+  }
 
   if (e.role === "subagent") {
     return <SubagentEventBubble e={e} ts={ts} actions={actions} />;
@@ -1566,6 +1709,7 @@ function UserBubble({ e, ts, actions }: { e: PreviewEvent; ts: string; actions: 
   }
 
   const message = parseUserMessageAttachments(text);
+  const images = [...new Map([...message.images, ...canonicalMessageImages(e)].map((image) => [image.path, image])).values()];
 
   return (
     <div className="group flex justify-end gap-3">
@@ -1577,10 +1721,10 @@ function UserBubble({ e, ts, actions }: { e: PreviewEvent; ts: string; actions: 
           {ts && <span className="font-mono">· {ts}</span>}
         </div>
         <div className="chat-md max-w-full rounded-2xl rounded-tr-sm bg-primary px-4 py-2.5 text-primary-foreground">
-          {message.markdown ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.markdown}</ReactMarkdown> : message.images.length === 0 ? (
+          {message.markdown ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.markdown}</ReactMarkdown> : images.length === 0 ? (
             <span className="italic opacity-70">(空消息)</span>
           ) : null}
-          <LocalImageAttachments images={message.images} />
+          <LocalImageAttachments images={images} />
         </div>
       </div>
       <Avatar role="user" />
@@ -1946,7 +2090,7 @@ function EventSourceBadge({ e }: { e: PreviewEvent }) {
   const outer = rawType(e);
   const payload = payloadType(e);
   if (outer !== "event_msg" && outer !== "response_item") return null;
-  if (payload !== "user_message" && payload !== "agent_message" && payload !== "message") return null;
+  if (payload !== "user_message" && payload !== "agent_message" && payload !== "message" && payload !== "item_completed") return null;
 
   const title =
     outer === "event_msg"
@@ -1959,7 +2103,7 @@ function EventSourceBadge({ e }: { e: PreviewEvent }) {
       title={title}
       className="h-4 px-1 py-0 font-mono text-[10px] font-normal text-muted-foreground"
     >
-      {outer}/{payload}
+      {payload === "item_completed" ? "正式消息" : `${outer}/${payload}`}
     </Badge>
   );
 }

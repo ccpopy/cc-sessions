@@ -99,6 +99,7 @@ fn jsonl_page(provider: &str, path: &str, offset: usize) -> AppResult<(Vec<Previ
     let mut event_offset = 0;
     let mut line_index = 0;
     let mut page_bytes = 0;
+    let mut canonical = false;
     loop {
         if events.len() >= PAGE_EVENTS || page_bytes >= PAGE_SOURCE_BYTES {
             return Ok((events, !reader.fill_buf()?.is_empty()));
@@ -127,10 +128,13 @@ fn jsonl_page(provider: &str, path: &str, offset: usize) -> AppResult<(Vec<Previ
         let Ok(raw) = serde_json::from_slice::<Value>(&line) else {
             continue;
         };
+        if raw["type"] == "session_meta" {
+            canonical = raw["payload"]["history_mode"] == "paginated";
+        }
         let event = if provider == "claude" {
             crate::claude_sessions::classify_preview(index, raw)
         } else {
-            Some(crate::rollout::classify_preview(index, raw))
+            Some(crate::rollout::classify_history(index, raw, canonical))
         };
         if let Some(event) = event {
             event_offset += 1;

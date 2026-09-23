@@ -335,9 +335,17 @@ pub async fn plan_session_event_deletion(
     provider: String,
     rollout_path: String,
     line_nos: Vec<usize>,
+    expected_revision: Option<String>,
 ) -> AppResult<DeletePlan> {
-    run_blocking(move || crate::edit::plan_session_event_deletion(provider, rollout_path, line_nos))
-        .await
+    run_blocking(move || {
+        crate::edit::plan_session_event_deletion(
+            provider,
+            rollout_path,
+            line_nos,
+            expected_revision,
+        )
+    })
+    .await
 }
 
 #[tauri::command]
@@ -348,6 +356,7 @@ pub async fn edit_session_event_text(
     backup_dir: String,
     line_no: usize,
     new_text: String,
+    expected_revision: Option<String>,
     lock: SharedLock<'_>,
 ) -> AppResult<EditApplyReport> {
     let lock = lock.inner().clone();
@@ -359,6 +368,7 @@ pub async fn edit_session_event_text(
             backup_dir,
             line_no,
             new_text,
+            expected_revision,
             &lock,
         )
     })
@@ -372,6 +382,7 @@ pub async fn delete_session_events(
     session_id: String,
     backup_dir: String,
     line_nos: Vec<usize>,
+    expected_revision: Option<String>,
     lock: SharedLock<'_>,
 ) -> AppResult<EditApplyReport> {
     let lock = lock.inner().clone();
@@ -382,6 +393,7 @@ pub async fn delete_session_events(
             session_id,
             backup_dir,
             line_nos,
+            expected_revision,
             &lock,
         )
     })
@@ -394,6 +406,7 @@ pub async fn undo_last_session_edit(
     rollout_path: String,
     session_id: String,
     backup_dir: String,
+    expected_revision: Option<String>,
     lock: SharedLock<'_>,
 ) -> AppResult<EditApplyReport> {
     let lock = lock.inner().clone();
@@ -403,6 +416,7 @@ pub async fn undo_last_session_edit(
             rollout_path,
             session_id,
             backup_dir,
+            expected_revision,
             &lock,
         )
     })
@@ -416,6 +430,7 @@ pub async fn restore_session_edit_snapshot(
     session_id: String,
     backup_dir: String,
     snapshot_name: String,
+    expected_revision: Option<String>,
     lock: SharedLock<'_>,
 ) -> AppResult<EditApplyReport> {
     let lock = lock.inner().clone();
@@ -426,6 +441,7 @@ pub async fn restore_session_edit_snapshot(
             session_id,
             backup_dir,
             snapshot_name,
+            expected_revision,
             &lock,
         )
     })
@@ -948,6 +964,49 @@ pub async fn preview_session_range(
 ) -> AppResult<Vec<PreviewEvent>> {
     run_blocking(move || {
         crate::rollout::preview_session_range(provider, rollout_path, offset, limit)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn reconcile_session_edit(
+    provider: String,
+    rollout_path: String,
+    session_id: String,
+    backup_dir: String,
+    expected_revision: Option<String>,
+    lock: SharedLock<'_>,
+) -> AppResult<()> {
+    let lock = lock.inner().clone();
+    run_blocking(move || {
+        crate::edit::reconcile_session_edit_with_lock(
+            provider,
+            rollout_path,
+            session_id,
+            backup_dir,
+            expected_revision,
+            &lock,
+        )
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn preview_session_page(
+    provider: String,
+    rollout_path: String,
+    offset: usize,
+    limit: usize,
+    expected_revision: Option<String>,
+) -> AppResult<crate::models::PreviewPage> {
+    run_blocking(move || {
+        crate::rollout::preview_session_page(
+            provider,
+            rollout_path,
+            offset,
+            limit,
+            expected_revision,
+        )
     })
     .await
 }

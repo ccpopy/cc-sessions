@@ -512,6 +512,7 @@ fn expand_delete(
         .count() as u32;
     Ok(DeleteExpansion {
         plan: DeletePlan {
+            revision: None,
             rollout_path: locator.to_string(),
             lines,
             blocked,
@@ -711,6 +712,8 @@ pub fn apply_edit_text(
     );
     append_entry(&dir, &mut journal, entry)?;
     Ok(EditApplyReport {
+        status: "committed_unverified".into(),
+        warning: None,
         op_id,
         kind: "edit_text".into(),
         snapshot_created: public_snapshot,
@@ -780,6 +783,8 @@ pub fn apply_delete(
     );
     append_entry(&dir, &mut journal, entry)?;
     Ok(EditApplyReport {
+        status: "committed_unverified".into(),
+        warning: None,
         op_id,
         kind: "delete_events".into(),
         snapshot_created: public_snapshot,
@@ -849,6 +854,8 @@ pub fn undo_last(locator: &str, session_id: &str, backup_dir: &str) -> AppResult
     );
     append_entry(&dir, &mut journal, entry)?;
     Ok(EditApplyReport {
+        status: "committed_unverified".into(),
+        warning: None,
         op_id,
         kind: "undo".into(),
         snapshot_created: None,
@@ -907,6 +914,8 @@ pub fn restore_snapshot(
     );
     append_entry(&dir, &mut journal, entry)?;
     Ok(EditApplyReport {
+        status: "committed_unverified".into(),
+        warning: None,
         op_id,
         kind: "restore_snapshot".into(),
         snapshot_created: Some(pre_restore_name),
@@ -974,6 +983,7 @@ pub fn history(locator: &str, session_id: &str, backup_dir: &str) -> AppResult<E
         .iter()
         .rev()
         .map(|entry| EditHistoryEntry {
+            status: "committed_unverified".into(),
             op_id: entry.op_id.clone(),
             ts: entry.ts.clone(),
             kind: entry.kind.clone(),
@@ -982,6 +992,9 @@ pub fn history(locator: &str, session_id: &str, backup_dir: &str) -> AppResult<E
         })
         .collect();
     Ok(EditHistory {
+        pending_operation: None,
+        restore_available: true,
+        revision: None,
         entries,
         snapshots,
         undo_available,

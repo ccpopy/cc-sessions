@@ -1,4 +1,6 @@
 import { Undo2 } from "lucide-react";
+import { useState } from "react";
+import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -20,6 +22,8 @@ type Props = {
   onOpenChange: (open: boolean) => void;
   onUndo: () => void;
   onRestore: (snapshotName: string) => void;
+  blockedReason: string | null;
+  onReconcile: () => void;
 };
 
 export function PreviewEditHistoryDialog({
@@ -29,8 +33,12 @@ export function PreviewEditHistoryDialog({
   onOpenChange,
   onUndo,
   onRestore,
+  blockedReason,
+  onReconcile,
 }: Props) {
+  const [restoreTarget, setRestoreTarget] = useState<string | null>(null);
   return (
+    <>
     <Dialog open={open} onOpenChange={(nextOpen) => !mutating && onOpenChange(nextOpen)}>
       <DialogContent className="sm:max-w-[640px]">
         <DialogHeader>
@@ -43,6 +51,16 @@ export function PreviewEditHistoryDialog({
           <div className="py-6 text-center text-xs text-muted-foreground">加载中…</div>
         ) : (
           <div className="space-y-4">
+            {history.pending_operation && (
+              <div role="alert" className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs">
+                <strong>提交状态待核对</strong>
+                <div className="mt-1 break-all font-mono">{history.pending_operation.op_id}</div>
+                <div>{history.pending_operation.description}</div>
+                <div className="mt-1">{history.pending_operation.status === "conflict" ? "文件已有其他变化，保留操作清单和快照，请在独立副本中核对。" : "只补齐或清理操作记录，不会再次修改会话内容。"}</div>
+                <Button className="mt-2 h-7 text-xs" disabled={mutating || !history.pending_operation.can_reconcile} onClick={onReconcile}>核对提交状态</Button>
+              </div>
+            )}
+            {blockedReason && <div className="text-xs text-muted-foreground">{blockedReason}</div>}
             <div className="flex items-center justify-between">
               <div className="text-xs text-muted-foreground">
                 {history.entries.length > 0
@@ -53,7 +71,7 @@ export function PreviewEditHistoryDialog({
                 size="sm"
                 variant="outline"
                 className="h-8 gap-1.5"
-                disabled={mutating || !history.undo_available}
+                disabled={mutating || !!blockedReason || !history.undo_available}
                 title={history.undo_blocked_reason ?? undefined}
                 onClick={onUndo}
               >
@@ -69,7 +87,7 @@ export function PreviewEditHistoryDialog({
             {history.entries.length > 0 && (
               <div className="max-h-48 space-y-1 overflow-auto rounded-md border bg-muted/30 p-2">
                 {history.entries.map((entry) => (
-                  <div key={entry.op_id} className="flex items-center gap-2 text-xs">
+                  <div key={entry.op_id} className="flex flex-wrap items-center gap-2 text-xs" title={entry.op_id}>
                     <span className="shrink-0 font-mono text-muted-foreground">
                       {formatTimeString(entry.ts)}
                     </span>
@@ -77,6 +95,8 @@ export function PreviewEditHistoryDialog({
                       {editKindLabel(entry.kind)}
                     </Badge>
                     <span className="min-w-0 flex-1 truncate">{entry.description}</span>
+                    <span className="text-muted-foreground">本地已提交 · 原生未验证</span>
+                    <span className="w-full break-all font-mono text-[10px] text-muted-foreground">{entry.op_id}</span>
                   </div>
                 ))}
               </div>
@@ -99,8 +119,8 @@ export function PreviewEditHistoryDialog({
                         size="sm"
                         variant="ghost"
                         className="h-6 shrink-0 px-2 text-xs"
-                        disabled={mutating}
-                        onClick={() => onRestore(snapshot.name)}
+                        disabled={mutating || !!blockedReason || !history.restore_available}
+                        onClick={() => setRestoreTarget(snapshot.name)}
                       >
                         还原
                       </Button>
@@ -113,5 +133,19 @@ export function PreviewEditHistoryDialog({
         )}
       </DialogContent>
     </Dialog>
+    <AlertDialog open={open && restoreTarget !== null} onOpenChange={(next) => !next && !mutating && setRestoreTarget(null)}>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>确认还原快照</AlertDialogTitle>
+          <AlertDialogDescription>将用所选快照覆盖当前会话内容，并保存还原前状态。如果检测到外部新增或修改，本次还原将被拒绝。</AlertDialogDescription>
+        </AlertDialogHeader>
+        <div className="break-all font-mono text-xs">{restoreTarget}</div>
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={mutating}>取消</AlertDialogCancel>
+          <AlertDialogAction disabled={mutating} onClick={() => { if (restoreTarget) onRestore(restoreTarget); setRestoreTarget(null); }}>还原快照</AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+    </>
   );
 }

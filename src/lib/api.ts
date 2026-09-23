@@ -305,12 +305,15 @@ export type DeletePlanLine = {
 
 export type DeletePlan = {
   rollout_path: string;
+  revision: string | null;
   lines: DeletePlanLine[];
   blocked: string[];
 };
 
 export type EditApplyReport = {
   op_id: string;
+  status: "committed_unverified" | "needs_recovery";
+  warning: string | null;
   kind: string;
   snapshot_created: string | null;
   changed_lines: number;
@@ -320,6 +323,7 @@ export type EditApplyReport = {
 
 export type EditHistoryEntry = {
   op_id: string;
+  status: string;
   ts: string;
   kind: string;
   description: string;
@@ -332,7 +336,20 @@ export type EditSnapshotInfo = {
   bytes: number;
 };
 
+export type EditCapability = {
+  revision: string;
+  file_sha256: string;
+  thread_id: string | null;
+  format: string;
+  blocked_reasons: string[];
+};
+
+export type PreviewPage = { events: PreviewEvent[]; capability: EditCapability | null };
+
 export type EditHistory = {
+  restore_available: boolean;
+  revision: string | null;
+  pending_operation: { op_id: string; status: string; description: string; can_reconcile: boolean } | null;
   entries: EditHistoryEntry[];
   snapshots: EditSnapshotInfo[];
   undo_available: boolean;
@@ -1116,6 +1133,8 @@ export const api = {
     invokeCommand<PreviewEvent[]>("preview_session_head", { provider, rolloutPath, limit }),
   previewRange: (provider: SessionProvider, rolloutPath: string, offset: number, limit: number) =>
     invokeCommand<PreviewEvent[]>("preview_session_range", { provider, rolloutPath, offset, limit }),
+  previewPage: (provider: SessionProvider, rolloutPath: string, offset: number, limit: number, expectedRevision: string | null) =>
+    invokeCommand<PreviewPage>("preview_session_page", { provider, rolloutPath, offset, limit, expectedRevision }),
   previewUserPrompts: (provider: SessionProvider, rolloutPath: string) =>
     invokeCommand<UserPromptList>("preview_session_user_prompts", { provider, rolloutPath }),
   previewMeta: (provider: SessionProvider, rolloutPath: string) =>
@@ -1481,14 +1500,16 @@ export const api = {
       sessionId: p.session_id,
       rolloutPath: p.rollout_path,
     }),
-  planSessionEventDeletion: (provider: string, rolloutPath: string, lineNos: number[]) =>
+  planSessionEventDeletion: (provider: string, rolloutPath: string, lineNos: number[], expectedRevision: string | null) =>
     invokeCommand<DeletePlan>("plan_session_event_deletion", {
       provider,
       rolloutPath,
       lineNos,
+      expectedRevision,
     }),
   editSessionEventText: (p: {
     provider: string;
+    expected_revision: string | null;
     rollout_path: string;
     session_id: string;
     backup_dir: string;
@@ -1497,6 +1518,7 @@ export const api = {
   }) =>
     invokeCommand<EditApplyReport>("edit_session_event_text", {
       provider: p.provider,
+      expectedRevision: p.expected_revision,
       rolloutPath: p.rollout_path,
       sessionId: p.session_id,
       backupDir: p.backup_dir,
@@ -1505,6 +1527,7 @@ export const api = {
     }),
   deleteSessionEvents: (p: {
     provider: string;
+    expected_revision: string | null;
     rollout_path: string;
     session_id: string;
     backup_dir: string;
@@ -1512,6 +1535,7 @@ export const api = {
   }) =>
     invokeCommand<EditApplyReport>("delete_session_events", {
       provider: p.provider,
+      expectedRevision: p.expected_revision,
       rolloutPath: p.rollout_path,
       sessionId: p.session_id,
       backupDir: p.backup_dir,
@@ -1519,18 +1543,21 @@ export const api = {
     }),
   undoLastSessionEdit: (p: {
     provider: string;
+    expected_revision: string | null;
     rollout_path: string;
     session_id: string;
     backup_dir: string;
   }) =>
     invokeCommand<EditApplyReport>("undo_last_session_edit", {
       provider: p.provider,
+      expectedRevision: p.expected_revision,
       rolloutPath: p.rollout_path,
       sessionId: p.session_id,
       backupDir: p.backup_dir,
     }),
   restoreSessionEditSnapshot: (p: {
     provider: string;
+    expected_revision: string | null;
     rollout_path: string;
     session_id: string;
     backup_dir: string;
@@ -1538,10 +1565,16 @@ export const api = {
   }) =>
     invokeCommand<EditApplyReport>("restore_session_edit_snapshot", {
       provider: p.provider,
+      expectedRevision: p.expected_revision,
       rolloutPath: p.rollout_path,
       sessionId: p.session_id,
       backupDir: p.backup_dir,
       snapshotName: p.snapshot_name,
+    }),
+  reconcileSessionEdit: (p: { provider: string; rollout_path: string; session_id: string; backup_dir: string; expected_revision: string | null }) =>
+    invokeCommand<void>("reconcile_session_edit", {
+      provider: p.provider, rolloutPath: p.rollout_path, sessionId: p.session_id,
+      backupDir: p.backup_dir, expectedRevision: p.expected_revision,
     }),
   sessionEditHistory: (p: {
     provider: string;

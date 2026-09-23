@@ -31,6 +31,9 @@ type ActionState<T> = {
 
 type Props = {
   provider: SessionProvider;
+  sourceLabel: string;
+  sessionId: string;
+  rolloutPath: string;
   fork: ActionState<PreviewEvent>;
   edit: ActionState<PreviewEvent> & {
     text: string;
@@ -44,6 +47,9 @@ type Props = {
 
 export function PreviewMutationDialogs({
   provider,
+  sourceLabel,
+  sessionId,
+  rolloutPath,
   fork,
   edit,
   deleteEvent,
@@ -97,13 +103,14 @@ export function PreviewMutationDialogs({
             <DialogDescription className="sr-only">修改当前会话事件中的可编辑文本。</DialogDescription>
           </DialogHeader>
           <div className="space-y-3">
+            <div className="break-all text-xs text-muted-foreground">{sourceLabel} · {sessionId}<br />{rolloutPath}</div>
             <div className="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
               <span className="font-mono">line {edit.target ? edit.target.index + 1 : ""}</span>
               <span className="mx-2 text-muted-foreground/50">·</span>
               {provider === "opencode" ? (
                 <>只更新 opencode.db 中当前会话的 text 内容块（会话 ID 与时间戳不变，可直接续聊）；推理、工具调用及其他会话保持原样。编辑前会保存会话级快照，可在「编辑历史」中撤销或还原。</>
               ) : (
-                <>会话文件会原地改写（会话 ID 不变，可直接 resume 续聊）；Codex 镜像行会同步更新，思考/推理与工具块保持原样。编辑前会自动保存原始快照，可在「编辑历史」中撤销或还原。</>
+                <>将改写当前会话及可唯一关联的镜像文本，编辑前保存快照。原生客户端显示尚需验证；仅在会话没有外部修改时允许撤销或还原。</>
               )}
             </div>
             <Textarea
@@ -125,6 +132,7 @@ export function PreviewMutationDialogs({
 
       <DeletePlanDialog
         provider={provider}
+        identity={`${sourceLabel} · ${sessionId}\n${rolloutPath}`}
         open={Boolean(deleteEvent.target)}
         selectedRange={false}
         plan={deleteEvent.plan}
@@ -134,6 +142,7 @@ export function PreviewMutationDialogs({
       />
       <DeletePlanDialog
         provider={provider}
+        identity={`${sourceLabel} · ${sessionId}\n${rolloutPath}`}
         open={Boolean(deleteSelection.target)}
         selectedRange
         plan={deleteSelection.plan}
@@ -147,6 +156,7 @@ export function PreviewMutationDialogs({
 
 function DeletePlanDialog({
   provider,
+  identity,
   open,
   selectedRange,
   plan,
@@ -155,6 +165,7 @@ function DeletePlanDialog({
   onConfirm,
 }: {
   provider: SessionProvider;
+  identity: string;
   open: boolean;
   selectedRange: boolean;
   plan: DeletePlan | null;
@@ -172,6 +183,13 @@ function DeletePlanDialog({
             {deleteDescription(provider, selectedRange)}
           </AlertDialogDescription>
         </AlertDialogHeader>
+        <div className="whitespace-pre-wrap break-all text-xs text-muted-foreground">{identity}</div>
+        {plan && plan.blocked.length === 0 && (
+          <div className="rounded-md border bg-muted/40 p-3 text-xs">
+            选中 {plan.lines.filter((line) => line.reason === "selected").length} 条记录，联动 {plan.lines.filter((line) => line.reason !== "selected").length} 条，合计 {plan.lines.length} 条底层记录。
+            <div className="mt-1">影响当前会话及编辑备份；原生显示待验证。{selectedRange && "范围包含筛选或折叠后不可见的事件，请核对下方完整列表。"}</div>
+          </div>
+        )}
         {!plan && <div className="py-2 text-center text-xs text-muted-foreground">正在生成删除计划…</div>}
         {plan && plan.blocked.length > 0 && (
           <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
@@ -207,7 +225,7 @@ function DeletePlanDialog({
         <AlertDialogFooter>
           <AlertDialogCancel disabled={running}>取消</AlertDialogCancel>
           <AlertDialogAction
-            disabled={running || !plan || plan.blocked.length > 0}
+            disabled={running || !plan || plan.blocked.length > 0 || plan.lines.length === 0}
             className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             onClick={(event) => {
               event.preventDefault();
@@ -231,6 +249,6 @@ function deleteDescription(provider: SessionProvider, selectedRange: boolean) {
       : "OpenCode 会按同轮消息安全删除：选择用户消息会同时删除本轮完整响应；选择推理、工具或回答时，会删除该轮完整 assistant 响应链并保留用户提问。只快照当前会话，不会覆盖整个数据库。";
   }
   return selectedRange
-    ? "将删除选取范围内的事件（含首尾）。为保证续聊不报错，配对的工具调用/返回、镜像行与关联推理会一起删除。删除前会自动保存原始快照，可在「编辑历史」中撤销或还原。"
-    : "为保证续聊不报错，配对的工具调用/返回、镜像行与关联推理会一起删除。删除前会自动保存原始快照，可在「编辑历史」中撤销或还原。";
+    ? "将删除选取范围内可删除的事件（含首尾）及关联工具、镜像与推理。删除前保存快照；文件发生外部修改后不能直接撤销或覆盖快照。"
+    : "将删除所选消息及关联工具、镜像与推理。删除前保存快照；文件发生外部修改后不能直接撤销或覆盖快照。";
 }

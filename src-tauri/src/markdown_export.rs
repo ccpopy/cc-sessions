@@ -6,7 +6,7 @@
 //! 设计取舍（详见 issue #7 / #39 讨论）：
 //! - 默认只保留 user / assistant 对话，工具调用与模型推理默认关闭；
 //! - 同一条 Codex 消息在 rollout 里既有 `event_msg` 又有 `response_item`，
-//!   这里只取 `response_item`（与预览的"仅看对话消息"一致）以避免重复；
+//!   旧格式只取 `response_item`，分页格式取正式 `item_completed` 消息以避免重复；
 //! - Claude 的 assistant 回合常把 text 与 tool_use 混在一条消息里，
 //!   这里会保留其中的正文，不会因为含 tool_use 就整条丢弃；
 //! - 用户中途的"引导"消息会保留（它是任务意图的高价值信号），
@@ -287,6 +287,7 @@ fn stream_conversation_export(
         let mut index = 0;
         let mut written = 0u64;
         let mut body_end = 0u64;
+        let mut canonical = false;
         loop {
             line.clear();
             const MAX_EVENT_BYTES: u64 = 64 * 1024 * 1024;
@@ -313,10 +314,13 @@ fn stream_conversation_export(
             let Ok(raw) = serde_json::from_str::<Value>(text) else {
                 continue;
             };
+            if raw["type"] == "session_meta" {
+                canonical = raw["payload"]["history_mode"] == "paginated";
+            }
             let event = if provider == "claude" {
                 crate::claude_sessions::classify_preview(position, raw)
             } else {
-                Some(crate::rollout::classify_preview(position, raw))
+                Some(crate::rollout::classify_history(position, raw, canonical))
             };
             let Some(event) = event else {
                 continue;
@@ -689,6 +693,27 @@ fn render_preamble(
 /// 以便正确处理 Codex 去重与 Claude 的 text+tool_use 混排。
 fn segment(e: &PreviewEvent) -> Segment {
     let raw = &e.raw;
+
+    if e.role == "context" {
+        return Segment::Skip;
+    }
+    if raw["type"] == "event_msg" && raw["payload"]["type"] == "item_completed" {
+        let role = match raw["payload"]["item"]["type"].as_str() {
+            Some("UserMessage") => "user",
+            Some("AgentMessage") => "assistant",
+            _ => return Segment::Skip,
+        };
+        let text = crate::rollout::preview_event_text(e);
+        if text.trim().is_empty() {
+            return Segment::Skip;
+        }
+        return Segment::Message {
+            role,
+            text,
+            tool_calls: Vec::new(),
+            tool_results: Vec::new(),
+        };
+    }
 
     if raw.get("type").and_then(Value::as_str) == Some("event_msg")
         && raw
@@ -3198,6 +3223,55 @@ mod tests {
             parse_event_epoch("2026-09-02T02:00:00Z"),
             Some(epoch("2026-09-02T02:00:00Z"))
         );
+    }
+
+    #[test]
+    fn paginated_exports_use_formal_messages_in_preview_memory_and_file() -> AppResult<()> {
+        let source = temp_file("paginated-export");
+        let output = source.with_extension("md");
+        let mut file = File::create(&source)?;
+        for raw in [
+            json!({"type":"session_meta","payload":{"id":"id","history_mode":"paginated"}}),
+            user("obsolete context"),
+            assistant("obsolete answer"),
+            json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","content":[{"type":"text","text":"# AGENTS.md\nactual user question"}]}}}),
+            json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","phase":"final_answer","content":[{"type":"Text","text":"formal answer"}]}}}),
+        ] {
+            writeln!(file, "{raw}")?;
+        }
+        drop(file);
+        let path = source.to_string_lossy().into_owned();
+        let preview = preview_session_markdown(
+            Some("codex".into()),
+            path.clone(),
+            header(),
+            default_options(),
+            0,
+        )?;
+        for destination in [None, Some(output.to_string_lossy().into_owned())] {
+            let report = export_session_markdown(
+                Some("codex".into()),
+                path.clone(),
+                destination.clone(),
+                header(),
+                default_options(),
+            )?;
+            let text = if destination.is_some() {
+                fs::read_to_string(&output)?
+            } else {
+                report.markdown
+            };
+            assert_eq!(report.message_count, 2);
+            assert!(text.contains("actual user question"));
+            assert!(text.contains("formal answer"));
+            assert!(!text.contains("obsolete"));
+        }
+        assert_eq!(preview.messages.len(), 2);
+        assert!(preview.markdown.contains("formal answer"));
+        assert!(!preview.markdown.contains("obsolete"));
+        fs::remove_file(source)?;
+        fs::remove_file(output)?;
+        Ok(())
     }
 
     #[test]

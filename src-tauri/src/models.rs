@@ -1222,6 +1222,7 @@ pub struct DeletePlanLine {
 #[derive(Debug, Clone, Serialize)]
 pub struct DeletePlan {
     pub rollout_path: String,
+    pub revision: Option<String>,
     pub lines: Vec<DeletePlanLine>,
     /// 不允许删除的行与原因（如 session_meta）
     pub blocked: Vec<String>,
@@ -1230,6 +1231,8 @@ pub struct DeletePlan {
 #[derive(Debug, Clone, Serialize)]
 pub struct EditApplyReport {
     pub op_id: String,
+    pub status: String,
+    pub warning: Option<String>,
     /// edit_text / delete_events / undo / restore_snapshot
     pub kind: String,
     /// 本次操作前若新建了原始快照，返回快照文件名
@@ -1246,6 +1249,7 @@ pub struct EditHistoryEntry {
     pub kind: String,
     pub description: String,
     pub changes: u32,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1263,4 +1267,30 @@ pub struct EditHistory {
     pub snapshots: Vec<EditSnapshotInfo>,
     pub undo_available: bool,
     pub undo_blocked_reason: Option<String>,
+    pub pending_operation: Option<EditPendingOperation>,
+    pub restore_available: bool,
+    pub revision: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EditPendingOperation {
+    pub op_id: String,
+    pub status: String,
+    pub description: String,
+    pub can_reconcile: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EditCapability {
+    pub revision: String,
+    pub file_sha256: String,
+    pub thread_id: Option<String>,
+    pub format: String,
+    pub blocked_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PreviewPage {
+    pub events: Vec<PreviewEvent>,
+    pub capability: Option<EditCapability>,
 }

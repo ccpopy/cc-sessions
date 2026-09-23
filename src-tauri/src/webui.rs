@@ -332,6 +332,13 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             usize_arg(&args, "offset")?,
             usize_arg(&args, "limit")?,
         )),
+        "preview_session_page" => to_result_value(rollout::preview_session_page(
+            string_arg(&args, "provider")?,
+            string_arg(&args, "rolloutPath")?,
+            usize_arg(&args, "offset")?,
+            usize_arg(&args, "limit")?,
+            opt_string_arg(&args, "expectedRevision")?,
+        )),
         "preview_session_user_prompts" => to_result_value(rollout::preview_session_user_prompts(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "rolloutPath")?,
@@ -377,6 +384,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "provider")?,
             string_arg(&args, "rolloutPath")?,
             arg(&args, "lineNos")?,
+            opt_string_arg(&args, "expectedRevision")?,
         )),
         "edit_session_event_text" => to_result_value(edit::edit_session_event_text_with_lock(
             string_arg(&args, "provider")?,
@@ -385,6 +393,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "backupDir")?,
             usize_arg(&args, "lineNo")?,
             string_arg(&args, "newText")?,
+            opt_string_arg(&args, "expectedRevision")?,
             &state.family_lock,
         )),
         "delete_session_events" => to_result_value(edit::delete_session_events_with_lock(
@@ -393,6 +402,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "sessionId")?,
             string_arg(&args, "backupDir")?,
             arg(&args, "lineNos")?,
+            opt_string_arg(&args, "expectedRevision")?,
             &state.family_lock,
         )),
         "undo_last_session_edit" => to_result_value(edit::undo_last_session_edit_with_lock(
@@ -400,6 +410,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "rolloutPath")?,
             string_arg(&args, "sessionId")?,
             string_arg(&args, "backupDir")?,
+            opt_string_arg(&args, "expectedRevision")?,
             &state.family_lock,
         )),
         "restore_session_edit_snapshot" => {
@@ -409,6 +420,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
                 string_arg(&args, "sessionId")?,
                 string_arg(&args, "backupDir")?,
                 string_arg(&args, "snapshotName")?,
+                opt_string_arg(&args, "expectedRevision")?,
                 &state.family_lock,
             ))
         }
@@ -417,6 +429,14 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "rolloutPath")?,
             string_arg(&args, "sessionId")?,
             string_arg(&args, "backupDir")?,
+        )),
+        "reconcile_session_edit" => to_result_value(edit::reconcile_session_edit_with_lock(
+            string_arg(&args, "provider")?,
+            string_arg(&args, "rolloutPath")?,
+            string_arg(&args, "sessionId")?,
+            string_arg(&args, "backupDir")?,
+            opt_string_arg(&args, "expectedRevision")?,
+            &state.family_lock,
         )),
         "preview_session_markdown" => to_result_value(markdown_export::preview_session_markdown(
             opt_string_arg(&args, "provider")?,
@@ -1170,6 +1190,40 @@ fn local_request_allowed(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn webui_message_edits_require_the_version_returned_by_preview() -> AppResult<()> {
+        let root = temp_codex_dir("webui-edit-revision");
+        fs::create_dir_all(&root)?;
+        let rollout = root.join("rollout.jsonl");
+        let before = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"unique\"}]}}\n"
+        );
+        fs::write(&rollout, before)?;
+        let state = test_state(&root);
+        let page = dispatch_invoke(
+            &state,
+            "preview_session_page",
+            json!({"provider":"codex","rolloutPath":rollout,"offset":0,"limit":20}),
+        )?;
+        let mut args = json!({"provider":"codex","rolloutPath":rollout,"sessionId":"s","backupDir":root.join("backup"),"lineNos":[1]});
+        assert!(dispatch_invoke(&state, "delete_session_events", args.clone()).is_err());
+        assert_eq!(fs::read(&rollout)?, before.as_bytes());
+        args["expectedRevision"] = page["capability"]["revision"].clone();
+        let plan = dispatch_invoke(&state, "plan_session_event_deletion", args.clone())?;
+        assert_eq!(plan["revision"], args["expectedRevision"]);
+        let report = dispatch_invoke(&state, "delete_session_events", args.clone())?;
+        assert_eq!(report["status"], "committed_unverified");
+        assert_eq!(report["deleted_lines"], 1);
+        let committed = fs::read(&rollout)?;
+        assert!(
+            dispatch_invoke(&state, "delete_session_events", args).is_err(),
+            "超时后重试旧请求不能再次删除"
+        );
+        assert_eq!(fs::read(&rollout)?, committed);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
     #[test]
     fn review_webui_checks_host_origin_and_runtime_nonce() -> AppResult<()> {
         assert!(local_request_allowed(
