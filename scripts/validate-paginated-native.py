@@ -64,6 +64,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--codex', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--with-tools', action='store_true', help='Include a command chain, failed turn and interrupted turn')
     args = parser.parse_args()
     binary = args.codex.resolve()
     version = subprocess.check_output([str(binary), '--version'], text=True).strip()
@@ -113,11 +114,28 @@ def main():
                 'last_agent_message': f'reply-{k}', 'started_at': 1790150000,
                 'completed_at': 1790150001, 'duration_ms': 1000}},
         ])
+    if args.with_tools:
+        rows[12]['payload']['error'] = {'message': 'synthetic failure'}
+        rows[18]['payload']['type'] = 'turn_aborted'
+        rows[18]['payload']['reason'] = 'interrupted'
+        rows[18]['payload'].pop('last_agent_message')
+        rows[10:10] = [
+            {'type': 'response_item', 'payload': {'type': 'function_call', 'name': 'exec_command',
+                'call_id': 'call-1', 'arguments': '{"cmd":"synthetic-never-execute"}'}},
+            {'type': 'event_msg', 'payload': {'type': 'item_completed', 'thread_id': tid,
+                'turn_id': turns[1], 'started_at_ms': 1790150000000, 'completed_at_ms': 1790150001000,
+                'item': {'type': 'CommandExecution', 'id': 'tool-1', 'command': ['synthetic-never-execute'],
+                    'cwd': home.as_uri(), 'parsed_cmd': [], 'source': 'agent', 'status': 'completed',
+                    'aggregated_output': 'synthetic output', 'exit_code': 0}}},
+            {'type': 'response_item', 'payload': {'type': 'function_call_output', 'call_id': 'call-1',
+                'output': 'synthetic output'}},
+        ]
     for i, row in enumerate(rows):
         row.update(ordinal=i, timestamp='2026-09-23T10:00:00Z')
     path.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8', newline='\n')
     (home / '.cc-synthetic-fixture.json').write_text(json.dumps({
-        'id': tid, 'path': str(path), 'turns': turns}), encoding='utf-8')
+        'id': tid, 'path': str(path), 'turns': turns,
+        'range_items': ['user-1', 'tool-1', 'agent-1'] if args.with_tools else ['user-1', 'agent-1']}), encoding='utf-8')
 
     def edit(action):
         result = subprocess.run(['cargo', 'test', '--manifest-path', 'src-tauri/Cargo.toml',
@@ -137,6 +155,8 @@ def main():
     original = path.read_bytes()
     stages = []
     all_ids = ['user-0', 'agent-0', 'user-1', 'agent-1', 'user-2', 'agent-2']
+    if args.with_tools:
+        all_ids.insert(3, 'tool-1')
 
     def read_stage(stage, expected_ids, preview='KEEP-A', texts=None, resume=False):
         before = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -163,6 +183,10 @@ def main():
                 evidence[method] = data
             items = [v['item'] for v in evidence['thread/items/list']]
             assert [v['id'] for v in items] == expected_ids
+            if args.with_tools:
+                states = {turn['id']: turn['status'] for turn in evidence['thread/turns/list']}
+                assert states[turns[1]] == 'failed', states
+                assert states[turns[2]] == 'interrupted', states
             for item_id, text in (texts or {}).items():
                 item = next(v for v in items if v['id'] == item_id)
                 actual = item.get('text', ''.join(c.get('text', '') for c in item.get('content', [])))
@@ -189,7 +213,7 @@ def main():
     assert path.read_bytes() == original
     edit('undo'); read_stage('redo-delete', [i for i in all_ids if i != 'user-1'])
     edit('undo'); read_stage('undo-redo', all_ids)
-    edit('range'); read_stage('range-delete', [i for i in all_ids if i not in ('user-1', 'agent-1')])
+    edit('range'); read_stage('range-delete', [i for i in all_ids if i not in ('user-1', 'agent-1', 'tool-1')])
     edit('undo'); read_stage('undo-range', all_ids)
     edit('rewrite'); read_stage('rewrite-user', all_ids, 'NATIVE-EDITED-A', {'user-0': 'NATIVE-EDITED-A'})
     edit('rewrite-assistant'); read_stage('rewrite-assistant', all_ids, 'NATIVE-EDITED-A', {'agent-0': 'NATIVE-EDITED-ASSISTANT'})
@@ -200,6 +224,7 @@ def main():
         'passed': True, 'version': version, 'threadId': tid, 'stages': stages,
         'nativeWriterRejection': True, 'nativeProcessRestarts': True,
         'desktopColdStartup': 'NOT VERIFIED', 'modelGeneration': False, 'toolReplay': False,
+        'toolsAndTerminalStates': args.with_tools,
     }, indent=2), encoding='utf-8')
     print(str(home / 'result.json'), flush=True)
 

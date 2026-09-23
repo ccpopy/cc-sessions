@@ -339,7 +339,7 @@ fn paginated_shared_prefix_and_compaction_only_block_affected_range() {
 fn paginated_tool_turn_and_failed_interrupted_turns_can_be_deleted() {
     let f = Fixture::new();
     f.update(|rows,seed| {
-        let tool=json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":"thread-1","turn_id":"turn-1","item":{"type":"CommandExecution","id":"tool-1","command":"synthetic-never-execute","status":"completed"}}});
+        let tool=json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":"thread-1","turn_id":"turn-1","item":{"type":"CommandExecution","id":"tool-1","command":["synthetic-never-execute"],"cwd":url::Url::from_directory_path(&f.root).unwrap().to_string(),"parsed_cmd":[],"source":"agent","status":"completed"}}});
         rows.splice(10..10,[
             json!({"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"synthetic-never-execute"}}),
             tool,
@@ -375,7 +375,8 @@ fn paginated_tool_turn_and_failed_interrupted_turns_can_be_deleted() {
             } else {
                 "task_complete"
             });
-            rows[12]["payload"]["error"] = json!({"message":"synthetic failure"});
+            if interrupted {rows[12]["payload"]["reason"]=json!("interrupted");}
+            else {rows[12]["payload"]["error"] = json!({"message":"synthetic failure"});}
             let turn = seed
                 .rows
                 .get_mut("thread_turns")
@@ -384,7 +385,7 @@ fn paginated_tool_turn_and_failed_interrupted_turns_can_be_deleted() {
                 .find(|r| r["turn_id"] == "turn-1")
                 .unwrap();
             turn["status"] = json!(if interrupted { "interrupted" } else { "failed" });
-            turn["error_json"] = json!(json!({"message":"synthetic failure"}).to_string());
+            turn["error_json"] = if interrupted {Value::Null} else {json!(json!({"message":"synthetic failure","codexErrorInfo":null,"additionalDetails":null}).to_string())};
         });
         failed.delete(&[9, 10]).unwrap();
         assert!(!failed.items().contains("DELETE-B"));
@@ -563,6 +564,15 @@ fn paginated_native_fixture_command() {
         .unwrap()
         .revision;
     let action = std::env::var("CC_SYNTHETIC_ACTION").unwrap();
+    let range_items: Vec<String> = marker["range_items"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| item.as_str().unwrap().to_owned())
+                .collect()
+        })
+        .unwrap_or_else(|| vec!["user-1".into(), "agent-1".into()]);
     let report = match action.as_str() {
         "delete" | "range" | "busy" => delete_session_events_with_lock(
             "codex".into(),
@@ -570,16 +580,16 @@ fn paginated_native_fixture_command() {
             id.into(),
             backup.to_string_lossy().into(),
             if action == "range" {
-                vec![9, 10]
+                vec![9; range_items.len()]
             } else {
                 vec![9]
             },
             Some(revision),
             Some(
                 (if action == "range" {
-                    vec!["user-1", "agent-1"]
+                    range_items
                 } else {
-                    vec!["user-1"]
+                    vec!["user-1".into()]
                 })
                 .into_iter()
                 .map(|item| crate::models::PaginatedItemTarget {
@@ -638,7 +648,8 @@ fn paginated_native_fixture_command() {
         _ => panic!("unknown synthetic action"),
     };
     if action == "busy" {
-        assert!(report.unwrap_err().to_string().contains("EDIT_BUSY"));
+        let error = report.unwrap_err().to_string();
+        assert!(error.contains("EDIT_BUSY"), "{error}");
         fs::write(
             root.join("busy-report.json"),
             b"{\"nativeWriterRejected\":true}",
