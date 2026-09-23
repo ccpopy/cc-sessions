@@ -19,7 +19,7 @@ import {
 } from "@/components/ui/dialog";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Textarea } from "@/components/ui/textarea";
-import type { DeletePlan, PreviewEvent, SessionProvider } from "@/lib/api";
+import type { DeletePlan, DeleteTurnSelection, PreviewEvent, SessionProvider, TextBlockEdit } from "@/lib/api";
 import { deleteReasonLabel } from "@/lib/previewEvent";
 
 type ActionState<T> = {
@@ -38,11 +38,14 @@ type Props = {
   edit: ActionState<PreviewEvent> & {
     text: string;
     onTextChange: (text: string) => void;
+    blocks: TextBlockEdit[];
+    onBlockChange: (index: number, text: string) => void;
   };
   deleteEvent: ActionState<PreviewEvent> & { plan: DeletePlan | null };
   deleteSelection: ActionState<{ start: number; end: number }> & {
     plan: DeletePlan | null;
   };
+  onSelectTurn: (turn: DeleteTurnSelection) => void;
 };
 
 export function PreviewMutationDialogs({
@@ -54,6 +57,7 @@ export function PreviewMutationDialogs({
   edit,
   deleteEvent,
   deleteSelection,
+  onSelectTurn,
 }: Props) {
   return (
     <>
@@ -103,27 +107,27 @@ export function PreviewMutationDialogs({
             <DialogDescription className="sr-only">修改当前会话事件中的可编辑文本。</DialogDescription>
           </DialogHeader>
           <div className="space-y-3">
-            <div className="break-all text-xs text-muted-foreground">{sourceLabel} · {sessionId}<br />{rolloutPath}</div>
-            <div className="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-              <span className="font-mono">line {edit.target ? edit.target.index + 1 : ""}</span>
-              <span className="mx-2 text-muted-foreground/50">·</span>
-              {provider === "opencode" ? (
-                <>只更新 opencode.db 中当前会话的 text 内容块（会话 ID 与时间戳不变，可直接续聊）；推理、工具调用及其他会话保持原样。编辑前会保存会话级快照，可在「编辑历史」中撤销或还原。</>
-              ) : (
-                <>将改写当前会话及可唯一关联的镜像文本，编辑前保存快照。原生客户端显示尚需验证；仅在会话没有外部修改时允许撤销或还原。</>
-              )}
-            </div>
-            <Textarea
+            <p className="text-xs text-muted-foreground">修改原会话，保存前自动备份，可在编辑历史中撤销。{edit.blocks.length > 1 && "请分别编辑文本块，图片及其他内容保持原位。"}</p>
+            <div className="max-h-[50vh] space-y-3 overflow-auto">
+            {edit.target && edit.blocks.length > 0 ? ((edit.target.raw as any).payload.item.content as any[]).map((block, index) => {
+              const editable = edit.blocks.find((b) => b.content_index === index);
+              return editable ? <label key={index} className="block space-y-1 text-xs text-muted-foreground">
+                <span>文本块 {index + 1}</span>
+                <Textarea value={editable.text} onChange={(event) => edit.onBlockChange(index, event.target.value)} rows={4} className="font-mono text-sm" />
+              </label> : <div key={index} className="rounded border bg-muted/40 p-2 text-xs text-muted-foreground">{["local_image", "image"].includes(block.type) ? "图片" : "其他内容"} · 保留原位</div>;
+            }) : <Textarea
               value={edit.text}
               onChange={(event) => edit.onTextChange(event.target.value)}
               rows={10}
               className="max-h-[50vh] font-mono text-sm"
               placeholder="消息文本"
-            />
+            />}
+            </div>
+            <details className="text-xs text-muted-foreground"><summary className="cursor-pointer">操作详情</summary><div className="mt-2 break-all">{sourceLabel} · {sessionId}<br />{rolloutPath}<br />line {edit.target ? edit.target.index + 1 : ""}<br />本地保存不代表本次修改已通过原生客户端验证。外部更新后需刷新并重新选择。</div></details>
           </div>
           <div className="flex justify-end gap-2">
             <Button variant="outline" disabled={edit.running} onClick={edit.onClose}>取消</Button>
-            <Button disabled={edit.running || !edit.text.trim()} onClick={edit.onConfirm}>
+            <Button disabled={edit.running || (edit.blocks.length ? !edit.blocks.some((b) => b.text !== (edit.target?.raw as any)?.payload?.item?.content[b.content_index]?.text) : !edit.text.trim())} onClick={edit.onConfirm}>
               {edit.running ? "保存中…" : "保存改写"}
             </Button>
           </div>
@@ -139,6 +143,7 @@ export function PreviewMutationDialogs({
         running={deleteEvent.running}
         onClose={deleteEvent.onClose}
         onConfirm={deleteEvent.onConfirm}
+        onSelectTurn={onSelectTurn}
       />
       <DeletePlanDialog
         provider={provider}
@@ -149,6 +154,7 @@ export function PreviewMutationDialogs({
         running={deleteSelection.running}
         onClose={deleteSelection.onClose}
         onConfirm={deleteSelection.onConfirm}
+        onSelectTurn={onSelectTurn}
       />
     </>
   );
@@ -163,6 +169,7 @@ function DeletePlanDialog({
   running,
   onClose,
   onConfirm,
+  onSelectTurn,
 }: {
   provider: SessionProvider;
   identity: string;
@@ -172,22 +179,25 @@ function DeletePlanDialog({
   running: boolean;
   onClose: () => void;
   onConfirm: () => void;
+  onSelectTurn: (turn: DeleteTurnSelection) => void;
 }) {
-  const title = selectedRange ? "删除选中事件" : "删除会话事件";
+  const title = selectedRange ? "删除选中消息" : "删除这条消息？";
+  const messages = plan?.messages.length ? plan.messages : plan?.lines.map((line) => ({ ...line, target: null })) ?? [];
+  const unit = plan?.messages.length ? "条消息" : "项内容";
+  const turns = new Set(messages.flatMap((m) => m.target ? [m.target.turn_id] : []));
   return (
     <AlertDialog open={open} onOpenChange={(nextOpen) => !nextOpen && !running && onClose()}>
-      <AlertDialogContent className="sm:max-w-[640px]">
+      <AlertDialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-[640px]">
         <AlertDialogHeader>
           <AlertDialogTitle>{title}</AlertDialogTitle>
           <AlertDialogDescription>
             {deleteDescription(provider, selectedRange)}
           </AlertDialogDescription>
         </AlertDialogHeader>
-        <div className="whitespace-pre-wrap break-all text-xs text-muted-foreground">{identity}</div>
         {plan && plan.blocked.length === 0 && (
           <div className="rounded-md border bg-muted/40 p-3 text-xs">
-            选中 {plan.lines.filter((line) => line.reason === "selected").length} 条记录，联动 {plan.lines.filter((line) => line.reason !== "selected").length} 条，合计 {plan.lines.length} 条底层记录。
-            <div className="mt-1">影响当前会话及编辑备份；原生显示待验证。{selectedRange && "范围包含筛选或折叠后不可见的事件，请核对下方完整列表。"}</div>
+            将删除 {messages.length} {unit}{turns.size > 0 && `，涉及 ${turns.size} 个回合`}。
+            {selectedRange && <div className="mt-1">包含筛选或折叠后不可见的内容，请核对完整范围。</div>}
           </div>
         )}
         {!plan && <div className="py-2 text-center text-xs text-muted-foreground">正在生成删除计划…</div>}
@@ -196,7 +206,18 @@ function DeletePlanDialog({
             {plan.blocked.map((reason, index) => <div key={index}>{reason}</div>)}
           </div>
         )}
+        {plan?.required_turns.map((turn, index) => <div key={turn.turn_id} className="rounded-md border p-3 text-xs">
+          <div>工具链所在回合 {index + 1}：{turn.messages.length} 条消息</div>
+          <div className="my-2 space-y-1">{turn.messages.map((m) => <div key={m.target?.item_id} className="line-clamp-2">{m.role === "user" ? "你" : m.role === "assistant" ? "助手" : "工具 / 过程"} · {m.summary}</div>)}</div>
+          <Button variant="outline" size="sm" disabled={running} onClick={() => onSelectTurn(turn)}>选择整轮</Button>
+        </div>)}
         {plan && plan.blocked.length === 0 && (
+          <ScrollArea className="rounded-md border" viewportClassName="max-h-52"><div className="space-y-3 p-3">
+            {messages.map((m) => <div key={m.target?.item_id ?? m.line_no} className="text-xs"><span className="text-muted-foreground">{m.role === "user" ? "你" : m.role === "assistant" ? "助手" : "工具 / 过程"}{m.target && ` · 回合 ${[...turns].indexOf(m.target.turn_id) + 1}`}</span><div className="mt-1 whitespace-pre-wrap break-words">{m.summary || "（无文本）"}</div></div>)}
+          </div></ScrollArea>
+        )}
+        {plan && <details className="min-w-0 text-xs text-muted-foreground"><summary className="cursor-pointer">底层记录与验证详情</summary>
+          <div className="my-2 whitespace-pre-wrap break-all">{identity}<br />涉及 {plan.lines.length} 条底层记录；本地保存不代表本次操作已完成原生验证。</div>
           <ScrollArea className="rounded-md border bg-muted/40" viewportClassName="max-h-72">
             <div className="space-y-1.5 p-2 pr-3">
               {selectedRange && (
@@ -221,7 +242,7 @@ function DeletePlanDialog({
               ))}
             </div>
           </ScrollArea>
-        )}
+        </details>}
         <AlertDialogFooter>
           <AlertDialogCancel disabled={running}>取消</AlertDialogCancel>
           <AlertDialogAction
@@ -234,7 +255,7 @@ function DeletePlanDialog({
           >
             {running
               ? "删除中…"
-              : `${selectedRange ? "删除选中" : "删除"} ${plan?.lines.length ?? 0} 个事件`}
+              : `删除 ${messages.length} ${unit}`}
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
@@ -248,7 +269,5 @@ function deleteDescription(provider: SessionProvider, selectedRange: boolean) {
       ? "将删除选取范围内的事件（含首尾），并按同轮消息补全安全删除范围；用户消息会连同本轮响应删除，assistant 过程或回答会删除本轮完整响应链。删除前会保存当前会话快照，不影响数据库中的其他会话。"
       : "OpenCode 会按同轮消息安全删除：选择用户消息会同时删除本轮完整响应；选择推理、工具或回答时，会删除该轮完整 assistant 响应链并保留用户提问。只快照当前会话，不会覆盖整个数据库。";
   }
-  return selectedRange
-    ? "将删除选取范围内可删除的事件（含首尾）及关联工具、镜像与推理。删除前保存快照；文件发生外部修改后不能直接撤销或覆盖快照。"
-    : "将删除所选消息及关联工具、镜像与推理。删除前保存快照；文件发生外部修改后不能直接撤销或覆盖快照。";
+  return "删除前自动备份，可在编辑历史中撤销。删除历史不会撤销已执行的代码修改、命令或其他外部操作，也不会重新执行工具。";
 }

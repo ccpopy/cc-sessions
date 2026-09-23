@@ -1,4 +1,4 @@
-import type { OpenCodeForkPoint, PreviewEvent, PaginatedItemTarget } from "./api.ts";
+import type { OpenCodeForkPoint, PreviewEvent, PaginatedItemTarget, TextBlockEdit } from "./api.ts";
 import {
   isAssistantTextToolUseEvent,
   isOpenCodeConversationEvent,
@@ -97,6 +97,39 @@ export function paginatedTargets(events: PreviewEvent[]): PaginatedItemTarget[] 
     targets.set(JSON.stringify(target), target);
   }
   return [...targets.values()];
+}
+
+export function previewEventKey(event: PreviewEvent, record = false): string {
+  const raw = event.raw as any;
+  if (record && typeof raw?.ordinal === "number") return `ordinal:${raw.ordinal}`;
+  const target = paginatedTargets([event])[0];
+  if (target) return `item:${JSON.stringify(target)}`;
+  if (raw?.opencode?.part_id) return `part:${raw.opencode.message_id}:${raw.opencode.part_id}`;
+  if (raw?.uuid) return `uuid:${raw.uuid}`;
+  if (typeof raw?.ordinal === "number") return `ordinal:${raw.ordinal}`;
+  if (raw?.payload?.id) return `response:${raw.payload.type}:${raw.payload.id}`;
+  // Legacy records without an ID have no stable native identity.
+  return `legacy:${JSON.stringify(raw)}`;
+}
+
+export function previewProcessKey(events: PreviewEvent[]): string {
+  return `process:${previewEventKey(events[0])}`;
+}
+
+export function survivingPreviewAnchor(previous: string[], anchor: string, next: string[]): string | null {
+  const present = new Set(next);
+  if (present.has(anchor)) return anchor;
+  const index = previous.indexOf(anchor);
+  for (let i = index + 1; i < previous.length; i++) if (present.has(previous[i])) return previous[i];
+  for (let i = index - 1; i >= 0; i--) if (present.has(previous[i])) return previous[i];
+  return next[0] ?? null;
+}
+
+export function editableTextBlocks(event: PreviewEvent): TextBlockEdit[] {
+  const p = (event.raw as any)?.payload;
+  if (p?.type !== "item_completed" || !Array.isArray(p.item?.content)) return [];
+  return p.item.content.flatMap((block: any, content_index: number) =>
+    ["text", "Text"].includes(block?.type) && typeof block.text === "string" ? [{ content_index, text: block.text }] : []);
 }
 
 /** Keep native first-occurrence order while showing the latest item snapshot. */

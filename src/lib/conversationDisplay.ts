@@ -170,18 +170,18 @@ export function buildConversationPreviewRows(
  * 全局偏好只定义新过程分组的默认状态；单轮手动操作通过稳定的事件索引覆盖。
  */
 export function isProcessGroupExpanded(
-  key: number,
+  key: number | string,
   collapseByDefault: boolean,
-  overrides: Readonly<Record<number, boolean>>,
+  overrides: Readonly<Record<string, boolean>>,
 ): boolean {
   return overrides[key] ?? !collapseByDefault;
 }
 
 /** 当前已加载的过程分组是否全部收起、全部展开或处于混合状态。 */
 export function summarizeProcessGroupExpansion(
-  keys: readonly number[],
+  keys: readonly (number | string)[],
   collapseByDefault: boolean,
-  overrides: Readonly<Record<number, boolean>>,
+  overrides: Readonly<Record<string, boolean>>,
 ): ProcessGroupExpansionState {
   if (keys.length === 0) {
     return collapseByDefault ? "collapsed" : "expanded";

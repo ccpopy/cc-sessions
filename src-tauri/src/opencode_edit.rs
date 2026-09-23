@@ -512,6 +512,8 @@ fn expand_delete(
         .count() as u32;
     Ok(DeleteExpansion {
         plan: DeletePlan {
+            messages: Vec::new(),
+            required_turns: Vec::new(),
             revision: None,
             rollout_path: locator.to_string(),
             lines,

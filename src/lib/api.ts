@@ -296,6 +296,9 @@ export type DeleteTarget = {
 };
 
 export type PaginatedItemTarget = { thread_id: string; turn_id: string; item_id: string };
+export type TextBlockEdit = { content_index: number; text: string };
+export type DeletePlanMessage = { target: PaginatedItemTarget | null; line_no: number; role: string; summary: string; reason: string };
+export type DeleteTurnSelection = { turn_id: string; messages: DeletePlanMessage[] };
 
 export type DeletePlanLine = {
   line_no: number;
@@ -310,6 +313,8 @@ export type DeletePlan = {
   revision: string | null;
   lines: DeletePlanLine[];
   blocked: string[];
+  messages: DeletePlanMessage[];
+  required_turns: DeleteTurnSelection[];
 };
 
 export type EditApplyReport = {
@@ -344,6 +349,7 @@ export type EditCapability = {
   thread_id: string | null;
   format: string;
   blocked_reasons: string[];
+  diagnostics: string[];
 };
 
 export type PreviewPage = { events: PreviewEvent[]; capability: EditCapability | null };
@@ -1511,6 +1517,7 @@ export const api = {
       targets,
     }),
   editSessionEventText: (p: {
+    text_blocks?: TextBlockEdit[];
     targets?: PaginatedItemTarget[];
     provider: string;
     expected_revision: string | null;
@@ -1528,6 +1535,7 @@ export const api = {
       backupDir: p.backup_dir,
       lineNo: p.line_no,
       newText: p.new_text,
+      textBlocks: p.text_blocks,
       targets: p.targets,
     }),
   deleteSessionEvents: (p: {

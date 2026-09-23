@@ -32,6 +32,7 @@ pub(super) fn inspect(
         thread_id: None,
         format: "legacy".into(),
         blocked_reasons: Vec::new(),
+        diagnostics: Vec::new(),
     };
     if loaded
         .lines
@@ -72,6 +73,7 @@ pub(super) fn inspect(
             .any(|v| codex_outer(v) == "event_msg" && codex_ptype(v) == "item_completed")
     {
         result.format = "paginated".into();
+        result.diagnostics = paginated::diagnostics(loaded).unwrap_or_default();
         if let Err(error) = paginated::inspect(path, loaded) {
             result.blocked_reasons.push(error.to_string());
         }

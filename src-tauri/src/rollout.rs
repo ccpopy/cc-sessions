@@ -50,12 +50,14 @@ fn classify(index: usize, raw: Value) -> PreviewEvent {
             let role = match item["type"].as_str() {
                 Some("UserMessage") => "user",
                 Some("AgentMessage") => "assistant",
+                Some("CommandExecution" | "McpToolCall" | "FileChange") => "tool_call",
+                Some("Reasoning") => "reasoning",
                 _ => "other",
             };
             (
                 role.into(),
                 "item_completed".into(),
-                trim(&flatten_content(item.get("content")), 120),
+                trim(&canonical_item_text(item), 120),
             )
         }
         ("event_msg", "task_complete") if raw["payload"]["error"]["message"].is_string() => (
@@ -403,13 +405,7 @@ fn payload_type(event: &PreviewEvent) -> &str {
 
 pub fn preview_event_text(event: &PreviewEvent) -> String {
     if payload_type(event) == "item_completed" {
-        return flatten_rich_content(
-            event
-                .raw
-                .get("payload")
-                .and_then(|p| p.get("item"))
-                .and_then(|item| item.get("content")),
-        );
+        return canonical_item_text(&event.raw["payload"]["item"]);
     }
     if let Some(message) = event.raw.get("message") {
         let content = message.get("content");
@@ -438,6 +434,24 @@ pub fn preview_event_text(event: &PreviewEvent) -> String {
         event.text_summary.clone()
     } else {
         text
+    }
+}
+
+fn canonical_item_text(item: &Value) -> String {
+    match item["type"].as_str() {
+        Some("CommandExecution") => item["command"]
+            .as_array()
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default(),
+        Some("McpToolCall") => "MCP 工具调用".into(),
+        Some("FileChange") => "文件修改".into(),
+        _ => flatten_rich_content(item.get("content")),
     }
 }
 
@@ -1011,6 +1025,17 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
+
+    #[test]
+    fn canonical_tool_has_actionable_role_and_summary() {
+        let event = classify_preview(
+            5,
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"tool","command":["echo","fixture"]}}}),
+        );
+        assert_eq!(event.role, "tool_call");
+        assert_eq!(event.text_summary, "echo fixture");
+        assert_eq!(preview_event_text(&event), "echo fixture");
+    }
 
     #[test]
     fn paginated_timeline_uses_latest_snapshot_at_original_offset() {

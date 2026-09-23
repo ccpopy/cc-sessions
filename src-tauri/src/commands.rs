@@ -360,6 +360,7 @@ pub async fn edit_session_event_text(
     new_text: String,
     expected_revision: Option<String>,
     targets: Option<Vec<crate::models::PaginatedItemTarget>>,
+    text_blocks: Option<Vec<crate::models::TextBlockEdit>>,
     lock: SharedLock<'_>,
 ) -> AppResult<EditApplyReport> {
     let lock = lock.inner().clone();
@@ -373,6 +374,7 @@ pub async fn edit_session_event_text(
             new_text,
             expected_revision,
             targets,
+            text_blocks,
             &lock,
         )
     })

@@ -1,8 +1,10 @@
 """Validate in-place edits with a matching native binary, using synthetic data only.
 
 No turn/start, tool calls, authentication copying, or existing Codex homes are used.
-The output directory must not exist. This tests app-server restarts, not Desktop UI
-cold startup. Run after compiling the Rust test target to shorten each edit step.
+The output directory must not exist. Automated results cover app-server restarts,
+not Desktop UI cold startup. Desktop checkpoints require separately recorded GUI
+evidence; native resume may append settings and correctly prevent later undo.
+Run after compiling the Rust test target to shorten each edit step.
 """
 import argparse
 import hashlib
@@ -65,6 +67,9 @@ def main():
     parser.add_argument('--codex', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--with-tools', action='store_true', help='Include a command chain, failed turn and interrupted turn')
+    parser.add_argument('--with-blocks', action='store_true', help='Include interleaved text/image/text blocks')
+    parser.add_argument('--desktop-checkpoints', action='store_true', help='Pause after key stages for a separate isolated Desktop cold-start check')
+    parser.add_argument('--legacy-damage', action='store_true', help='Separately diagnose a context-only deletion left by an older editor')
     args = parser.parse_args()
     binary = args.codex.resolve()
     version = subprocess.check_output([str(binary), '--version'], text=True).strip()
@@ -130,6 +135,20 @@ def main():
             {'type': 'response_item', 'payload': {'type': 'function_call_output', 'call_id': 'call-1',
                 'output': 'synthetic output'}},
         ]
+    if args.with_blocks:
+        import base64
+        png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII='
+        image_path = home / 'synthetic.png'
+        image_path.write_bytes(base64.b64decode(png))
+        rows[3]['payload']['item']['content'] += [
+            {'type': 'local_image', 'path': str(image_path)},
+            {'type': 'text', 'text': 'KEEP-TAIL', 'text_elements': []},
+        ]
+        rows[2]['payload']['content'] += [
+            {'type': 'input_image', 'image_url': 'data:image/png;base64,' + png},
+            {'type': 'input_text', 'text': 'KEEP-TAIL'},
+        ]
+        rows[2]['payload']['internal_chat_message_metadata_passthrough']['content_item_kinds'] += ['user.image', 'user.text']
     for i, row in enumerate(rows):
         row.update(ordinal=i, timestamp='2026-09-23T10:00:00Z')
     path.write_text(''.join(json.dumps(row) + '\n' for row in rows), encoding='utf-8', newline='\n')
@@ -159,6 +178,10 @@ def main():
         all_ids.insert(3, 'tool-1')
 
     def read_stage(stage, expected_ids, preview='KEEP-A', texts=None, resume=False):
+        nonlocal original
+        if args.with_blocks:
+            preview += 'KEEP-TAIL'
+            texts = {**(texts or {}), 'user-0': ('NATIVE-EDITED-A' if preview.startswith('NATIVE-EDITED-A') else 'KEEP-A') + 'KEEP-TAIL'}
         before = hashlib.sha256(path.read_bytes()).hexdigest()
         native = Native(binary, home)
         evidence = {'version': version, 'threadId': tid, 'stage': stage}
@@ -183,6 +206,14 @@ def main():
                 evidence[method] = data
             items = [v['item'] for v in evidence['thread/items/list']]
             assert [v['id'] for v in items] == expected_ids
+            if args.with_blocks:
+                user = next(v for v in items if v['id'] == 'user-0')
+                assert [b['type'] for b in user['content']] == ['text', 'localImage', 'text']
+                assert user['content'][1]['path'] == str(image_path)
+                assert user['content'][2] == {'type': 'text', 'text': 'KEEP-TAIL', 'text_elements': []}
+                current = [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
+                context = next(r for r in current if r['payload'].get('id') == 'context-0')
+                assert context['payload']['content'][1:] == rows[2]['payload']['content'][1:]
             if args.with_tools:
                 states = {turn['id']: turn['status'] for turn in evidence['thread/turns/list']}
                 assert states[turns[1]] == 'failed', states
@@ -206,6 +237,20 @@ def main():
         (home / (stage + '.json')).write_text(json.dumps(evidence, indent=2), encoding='utf-8')
         stages.append(stage)
         print(stage + ': passed', flush=True)
+        if args.desktop_checkpoints and stage in ('baseline', 'single-delete', 'undo-delete', 'rewrite-user', 'rewrite-assistant'):
+            (home / 'desktop-checkpoint.json').write_text(json.dumps({'stage': stage, 'threadId': tid, 'path': str(path)}), encoding='utf-8')
+            input('DESKTOP CHECKPOINT: close the isolated App after recording evidence, then press Enter: ')
+            after_desktop = path.read_bytes()
+            if stage == 'baseline':
+                original = after_desktop
+            elif hashlib.sha256(after_desktop).hexdigest() != evidence['rolloutSha256AfterRead']:
+                (home / 'desktop-external-change.json').write_text(json.dumps({
+                    'threadId': tid, 'stage': stage, 'sequenceComplete': False,
+                    'beforeDesktopSha256': evidence['rolloutSha256AfterRead'],
+                    'afterDesktopSha256': hashlib.sha256(after_desktop).hexdigest(),
+                    'reason': 'Desktop appended or changed history. Undo/restore must not overwrite it. Validate a closed-App edit/undo sequence separately.',
+                }, indent=2), encoding='utf-8')
+                raise RuntimeError('Desktop changed the rollout. Stopping this sequence without bypassing conflict protection; see desktop-external-change.json.')
 
     read_stage('baseline', all_ids)
     edit('delete'); read_stage('single-delete', [i for i in all_ids if i != 'user-1'])
@@ -219,12 +264,30 @@ def main():
     edit('rewrite-assistant'); read_stage('rewrite-assistant', all_ids, 'NATIVE-EDITED-A', {'agent-0': 'NATIVE-EDITED-ASSISTANT'})
     edit('restore'); read_stage('restore-snapshot', all_ids)
     assert path.read_bytes() == original
+    if args.legacy_damage:
+        lines = path.read_text(encoding='utf-8').splitlines(keepends=True)
+        path.write_text(''.join(line for line in lines if json.loads(line)['payload'].get('id') != 'context-1'), encoding='utf-8', newline='\n')
+        damaged_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        edit('diagnose-damage')
+        (home / 'before-native-diagnosis.json').write_bytes((home / 'diagnose-damage-report.json').read_bytes())
+        read_stage('legacy-damage-native-read', all_ids)
+        edit('diagnose-damage')
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == damaged_hash
+        (home / 'result.json').write_text(json.dumps({
+            'passed': True, 'scenario': 'legacy-context-only-deletion', 'version': version,
+            'threadId': tid, 'stages': stages, 'automaticallyRepaired': False,
+            'recovery': 'Snapshot restore refused external changes; original good snapshot retained for isolated manual comparison',
+            'desktopColdStartup': 'NOT VERIFIED', 'modelGeneration': False, 'toolReplay': False,
+        }, indent=2), encoding='utf-8')
+        print(str(home / 'result.json'), flush=True)
+        return
     edit('delete'); read_stage('resume-edited-history', [i for i in all_ids if i != 'user-1'], resume=True)
     (home / 'result.json').write_text(json.dumps({
         'passed': True, 'version': version, 'threadId': tid, 'stages': stages,
         'nativeWriterRejection': True, 'nativeProcessRestarts': True,
         'desktopColdStartup': 'NOT VERIFIED', 'modelGeneration': False, 'toolReplay': False,
         'toolsAndTerminalStates': args.with_tools,
+        'interleavedContentBlocks': args.with_blocks,
     }, indent=2), encoding='utf-8')
     print(str(home / 'result.json'), flush=True)
 

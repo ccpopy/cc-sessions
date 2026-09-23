@@ -1071,18 +1071,36 @@ pub fn plan_delete(
     let loaded = load_file(Path::new(&path))?;
     safety::check_revision(Path::new(&path), &loaded, expected_revision)?;
     let capability = safety::inspect(provider, Path::new(&path), &loaded)?;
+    let required_turns = if provider == "codex"
+        && paginated::is_paginated(&loaded)
+        && capability.blocked_reasons.is_empty()
+    {
+        paginated::required_turns(&loaded, line_nos)?
+    } else {
+        Vec::new()
+    };
     let (plan, mut blocked) = match provider {
         "codex" if paginated::is_paginated(&loaded) && !capability.blocked_reasons.is_empty() => {
             (BTreeMap::new(), Vec::new())
         }
         "codex" if paginated::is_paginated(&loaded) => {
-            paginated::delete_plan(Path::new(&path), &loaded, line_nos)?
+            if required_turns.is_empty() {
+                paginated::delete_plan(Path::new(&path), &loaded, line_nos)?
+            } else {
+                (
+                    line_nos
+                        .iter()
+                        .map(|&i| (i, REASON_SELECTED.into()))
+                        .collect(),
+                    vec!["所选工具链需要整轮删除；请先选择整轮并核对新增范围".into()],
+                )
+            }
         }
         "codex" => codex_expand_delete(&loaded.parsed, line_nos)?,
         _ => claude_expand_delete(&loaded.parsed, line_nos)?,
     };
     blocked.extend(capability.blocked_reasons);
-    let lines = plan
+    let lines: Vec<DeletePlanLine> = plan
         .iter()
         .map(|(&i, reason)| {
             let v = loaded.parsed[i].as_ref().unwrap();
@@ -1100,11 +1118,28 @@ pub fn plan_delete(
             }
         })
         .collect();
+    let messages = if provider == "codex" && paginated::is_paginated(&loaded) && !plan.is_empty() {
+        paginated::logical_messages(&loaded, &plan)?
+    } else {
+        lines
+            .iter()
+            .filter(|l| l.reason != REASON_MIRROR)
+            .map(|l| crate::models::DeletePlanMessage {
+                target: None,
+                line_no: l.line_no,
+                role: l.role.clone(),
+                summary: l.summary.clone(),
+                reason: l.reason.clone(),
+            })
+            .collect()
+    };
     Ok(DeletePlan {
         rollout_path: path,
         revision: Some(capability.revision),
         lines,
         blocked,
+        messages,
+        required_turns,
     })
 }
 
@@ -1222,6 +1257,28 @@ pub fn apply_edit_text(
     new_text: &str,
     expected_revision: Option<&str>,
 ) -> AppResult<EditApplyReport> {
+    apply_edit_text_blocks(
+        provider,
+        rollout_path,
+        session_id,
+        backup_dir,
+        line_no,
+        new_text,
+        expected_revision,
+        None,
+    )
+}
+
+fn apply_edit_text_blocks(
+    provider: &str,
+    rollout_path: &str,
+    session_id: &str,
+    backup_dir: &str,
+    line_no: usize,
+    new_text: &str,
+    expected_revision: Option<&str>,
+    text_blocks: Option<&[crate::models::TextBlockEdit]>,
+) -> AppResult<EditApplyReport> {
     let provider = provider_normalized(provider)?;
     let mut ctx = open_op_context(
         provider,
@@ -1232,7 +1289,7 @@ pub fn apply_edit_text(
     )?;
     let changes = match provider {
         "codex" if paginated::is_paginated(&ctx.loaded) => {
-            paginated::edit_changes(&ctx.path, &ctx.loaded, line_no, new_text)?
+            paginated::edit_changes(&ctx.path, &ctx.loaded, line_no, new_text, text_blocks)?
         }
         "codex" => codex_edit_changes(&ctx.loaded.lines, &ctx.loaded.parsed, line_no, new_text)?,
         _ => claude_edit_changes(&ctx.loaded.lines, &ctx.loaded.parsed, line_no, new_text)?,
@@ -1354,7 +1411,7 @@ pub fn undo_last(
         .ok_or_else(|| AppError::Other("该会话没有编辑记录".into()))?;
     if last.after_hash != ctx.loaded.hash {
         return Err(AppError::Other(
-            "会话文件在本工具之外被修改过，无法直接撤销或覆盖快照；请在独立副本中核对".into(),
+            "[EDIT_CONFLICT] 会话文件在本工具之外被修改过，无法直接撤销或覆盖快照；请在独立副本中核对".into(),
         ));
     }
     if last.changes.is_empty() {
@@ -1737,6 +1794,7 @@ pub fn edit_session_event_text_with_lock(
     new_text: String,
     expected_revision: Option<String>,
     targets: Option<Vec<crate::models::PaginatedItemTarget>>,
+    text_blocks: Option<Vec<crate::models::TextBlockEdit>>,
     lock: &crate::family::FamilyLock,
 ) -> AppResult<EditApplyReport> {
     let roots = mutation_roots(&provider, &rollout_path, &backup_dir, &session_id)?;
@@ -1758,7 +1816,7 @@ pub fn edit_session_event_text_with_lock(
             targets.as_deref(),
             expected_revision.as_deref(),
         )?;
-        apply_edit_text(
+        apply_edit_text_blocks(
             &provider,
             &rollout_path,
             &session_id,
@@ -1766,6 +1824,7 @@ pub fn edit_session_event_text_with_lock(
             selected[0],
             &new_text,
             expected_revision.as_deref(),
+            text_blocks.as_deref(),
         )
     })
 }

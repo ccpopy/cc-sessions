@@ -1,4 +1,4 @@
-import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { createContext, useContext, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import {
   Bot,
   Check,
@@ -49,6 +49,9 @@ import { PreviewMutationDialogs } from "@/components/PreviewMutationDialogs";
 import {
   api,
   type DeletePlan,
+  type DeleteTurnSelection,
+  type DeletePlanMessage,
+  type TextBlockEdit,
   type EditApplyReport,
   type EditCapability,
   type EditHistory,
@@ -83,6 +86,10 @@ import {
   canonicalMessageImages,
   paginatedTargets,
   latestCanonicalEvents,
+  previewEventKey,
+  previewProcessKey,
+  survivingPreviewAnchor,
+  editableTextBlocks,
   editableText,
   eventMessageLabel,
   extractPreviewEventText as extractText,
@@ -144,6 +151,7 @@ type NodeActionSet = {
 };
 
 const PAGE = 200;
+const PreviewTechnicalContext = createContext(false);
 
 export function PreviewDialog({
   open,
@@ -166,12 +174,15 @@ export function PreviewDialog({
   const [onlyMsg, setOnlyMsg] = useState(true);
   const [processDefaultCollapsed, setProcessDefaultCollapsed] = useState(true);
   const [processExpansionOverrides, setProcessExpansionOverrides] = useState<
-    Record<number, boolean>
+    Record<string, boolean>
   >({});
   const [forkTarget, setForkTarget] = useState<PreviewEvent | null>(null);
   const [forking, setForking] = useState(false);
   const [editTarget, setEditTarget] = useState<PreviewEvent | null>(null);
   const [editText, setEditText] = useState("");
+  const [editBlocks, setEditBlocks] = useState<TextBlockEdit[]>([]);
+  const [sessionInfoOpen, setSessionInfoOpen] = useState(false);
+  const [mutationError, setMutationError] = useState("");
   const [mutating, setMutating] = useState(false);
   const mutationInFlightRef = useRef(false);
   const [deleteTarget, setDeleteTarget] = useState<PreviewEvent | null>(null);
@@ -180,6 +191,7 @@ export function PreviewDialog({
   const [selectionSecondIndex, setSelectionSecondIndex] = useState<number | null>(null);
   const [deleteSelectedTarget, setDeleteSelectedTarget] = useState<{ start: number; end: number; events: PreviewEvent[] } | null>(null);
   const [deletePlan, setDeletePlan] = useState<DeletePlan | null>(null);
+  const [deleteScope, setDeleteScope] = useState<DeletePlanMessage[]>([]);
   const deleteRequestRef = useRef(0);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [editHistory, setEditHistory] = useState<EditHistory | null>(null);
@@ -199,6 +211,7 @@ export function PreviewDialog({
   const doneRef = useRef(false);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const pendingJumpRef = useRef<number | null>(null);
+  const pendingReadingRef = useRef<{ keys: string[]; anchor: string; offset: number; scrollTop: number } | null>(null);
   const scrollSpyRafRef = useRef(0);
   const preferenceSaveRef = useRef<Promise<void>>(Promise.resolve());
   const appSettings = useSettings((state) => state.settings);
@@ -214,6 +227,7 @@ export function PreviewDialog({
   const canMutateSession =
     !customRolloutPath && !!session && !!backupDir && !!rolloutPath && !readError
     && lastReport?.status !== "needs_recovery"
+    && !mutationError
     && (provider === "opencode" || (capability !== null && capability.blocked_reasons.length === 0));
   const sourceLabel = `${isTauriRuntime() ? "本地" : `WebUI · ${window.location.host}`} · ${provider}`;
   const canDeletePreviewEvent = (event: PreviewEvent) => canDeleteEvent(provider, event)
@@ -268,7 +282,7 @@ export function PreviewDialog({
   );
 
   const changeProcessGroupExpanded = useCallback(
-    (key: number, expanded: boolean) => {
+    (key: string, expanded: boolean) => {
       setProcessExpansionOverrides((current) => {
         const defaultExpanded = !processDefaultCollapsed;
         if (expanded === defaultExpanded) {
@@ -443,9 +457,68 @@ export function PreviewDialog({
     setActiveTimelineIndex(null);
     setPrompts(null);
     setTotalEvents(0);
+    pendingReadingRef.current = null;
+    setMutationError("");
     void loadMore();
     void loadPrompts();
   }, [loadMore, loadPrompts]);
+
+  // Replace the loaded range atomically so stable React keys preserve expanded
+  // message details. Do not blank the list or reset filters during a mutation.
+  const reloadPreservingView = async () => {
+    const viewport = viewportRef.current;
+    const nodes = viewport ? [...viewport.querySelectorAll<HTMLElement>("[data-reading-key]")] : [];
+    const top = viewport?.getBoundingClientRect().top ?? 0;
+    const anchor = nodes.find((node) => node.getBoundingClientRect().bottom > top) ?? nodes[0];
+    const reading = anchor ? { keys: nodes.map((node) => node.dataset.readingKey!), anchor: anchor.dataset.readingKey!,
+      offset: anchor.getBoundingClientRect().top - top, scrollTop: viewport?.scrollTop ?? 0 } : null;
+    const needed = Math.max(PAGE, offsetRef.current + PAGE);
+    const generation = ++generationRef.current;
+    deleteRequestRef.current += 1;
+    revisionRef.current = null;
+    readErrorRef.current = false;
+    cancelLoadAllRef.current = true;
+    setLoadingAll(false);
+    setReadError("");
+    setMutationError("");
+    setDeletePlan(null);
+    setIsSelecting(false);
+    setSelectionFirstIndex(null);
+    setSelectionSecondIndex(null);
+    pendingJumpRef.current = null;
+    loadingRef.current = true;
+    setLoading(true);
+    try {
+      const next: PreviewEvent[] = [];
+      let exhausted = false;
+      while (!exhausted && generation === generationRef.current) {
+        const limit = next.length === 0 ? needed : PAGE;
+        const page = await readPage(next.length, limit);
+        if (!page) return;
+        next.push(...page);
+        exhausted = page.length < limit;
+        if (!reading || next.some((e) => previewEventKey(e, !onlyMsg) === reading.anchor) || exhausted) break;
+        // A deleted anchor can only be resolved after reaching a known successor.
+        const successors = reading.keys.slice(reading.keys.indexOf(reading.anchor) + 1);
+        if (next.some((e) => successors.includes(previewEventKey(e, !onlyMsg)))) break;
+      }
+      if (generation !== generationRef.current) return;
+      offsetRef.current = next.length;
+      doneRef.current = exhausted;
+      setDone(exhausted);
+      try {
+        const list = await api.previewUserPrompts(provider, rolloutPath);
+        if (generation !== generationRef.current) return;
+        setPrompts(list.prompts);
+        setTotalEvents(list.total_events);
+      } catch { if (generation === generationRef.current) setPrompts(null); }
+      if (generation !== generationRef.current) return;
+      pendingReadingRef.current = reading;
+      setEvents(next);
+    } finally {
+      if (generation === generationRef.current) { loadingRef.current = false; setLoading(false); }
+    }
+  };
 
   useEffect(() => {
     if (!open || !rolloutPath) return;
@@ -457,6 +530,7 @@ export function PreviewDialog({
     setDeletePlan(null);
     setLastReport(null);
     setHistoryOpen(false);
+    setSessionInfoOpen(false);
     resetAndReload();
     return () => { generationRef.current += 1; cancelLoadAllRef.current = true; };
   }, [open, rolloutPath, resetAndReload]);
@@ -526,9 +600,20 @@ export function PreviewDialog({
   }, [filtered, normalizedFilter, onlyMsg]);
 
   const processRowKeys = useMemo(
-    () => rows.flatMap((row) => (row.type === "process" ? [row.key] : [])),
+    () => rows.flatMap((row) => (row.type === "process" ? [previewProcessKey(row.events)] : [])),
     [rows],
   );
+
+  useLayoutEffect(() => {
+    const saved = pendingReadingRef.current;
+    const viewport = viewportRef.current;
+    if (!saved || !viewport) return;
+    const nodes = [...viewport.querySelectorAll<HTMLElement>("[data-reading-key]")];
+    const key = survivingPreviewAnchor(saved.keys, saved.anchor, nodes.map((node) => node.dataset.readingKey!));
+    const anchor = nodes.find((node) => node.dataset.readingKey === key);
+    viewport.scrollTop = anchor ? viewport.scrollTop + anchor.getBoundingClientRect().top - viewport.getBoundingClientRect().top - saved.offset : saved.scrollTop;
+    pendingReadingRef.current = null;
+  }, [rows]);
   const processExpansionState = useMemo(
     () =>
       summarizeProcessGroupExpansion(
@@ -766,8 +851,14 @@ export function PreviewDialog({
     if (report.status === "needs_recovery") {
       toast.warning("部分完成，请核对提交状态", { description: report.warning ?? report.op_id });
     } else {
-      toast.info("本地变更已保存，原生显示待验证", { description: `操作 ${report.op_id}；可在编辑历史中核对。` });
+      toast.success("本地修改已保存", { action: { label: "详情", onClick: () => setSessionInfoOpen(true) } });
     }
+  };
+
+  const recordMutationFailure = (title: string, error: unknown) => {
+    const message = String((error as Error)?.message ?? error);
+    if (/EDIT_CONFLICT|EDIT_RECOVERY|EDIT_INCONSISTENT/.test(message)) setMutationError(message);
+    toast.error(title, { description: message });
   };
 
   const refreshAfterEdit = async () => {
@@ -778,6 +869,7 @@ export function PreviewDialog({
   const requestEditAt = (event: PreviewEvent) => {
     if (!canMutateSession) return;
     setEditText(editableText(event));
+    setEditBlocks(editableTextBlocks(event));
     setEditTarget(event);
   };
 
@@ -796,13 +888,14 @@ export function PreviewDialog({
         line_no: editTarget.index,
         targets: paginatedTargets([editTarget]),
         new_text: editText,
+        text_blocks: editBlocks.length ? editBlocks.filter((b) => b.text !== editableTextBlocks(editTarget).find((old) => old.content_index === b.content_index)?.text) : undefined,
       });
       recordEditResult(report);
       setEditTarget(null);
-      resetAndReload();
+      await reloadPreservingView();
       await refreshAfterEdit();
     } catch (e: any) {
-      toast.error("改写失败", { description: String(e?.message ?? e) });
+      recordMutationFailure("改写失败", e);
     } finally {
       mutationInFlightRef.current = false;
       setMutating(false);
@@ -816,12 +909,29 @@ export function PreviewDialog({
     const requestId = ++deleteRequestRef.current;
     api
       .planSessionEventDeletion(provider, rolloutPath, [event.index], revisionRef.current, paginatedTargets([event]))
-      .then((plan) => { if (requestId === deleteRequestRef.current) setDeletePlan(plan); })
+      .then((plan) => { if (requestId === deleteRequestRef.current) { setDeletePlan(plan); setDeleteScope(plan.messages.filter((m) => m.reason === "selected")); } })
       .catch((e: any) => {
         if (requestId !== deleteRequestRef.current) return;
-        toast.error("生成删除计划失败", { description: String(e?.message ?? e) });
+        recordMutationFailure("生成删除计划失败", e);
         setDeleteTarget(null);
       });
+  };
+
+  const selectWholeTurn = async (turn: DeleteTurnSelection) => {
+    const scope = [...new Map([...deleteScope, ...turn.messages].map((m) => [JSON.stringify(m.target), m])).values()];
+    const requestId = ++deleteRequestRef.current;
+    setDeletePlan(null);
+    try {
+      const plan = await api.planSessionEventDeletion(provider, rolloutPath, scope.map((m) => m.line_no), revisionRef.current, scope.flatMap((m) => m.target ? [m.target] : []));
+      if (requestId !== deleteRequestRef.current) return;
+      setDeleteScope(scope);
+      setDeletePlan(plan);
+    } catch (error) {
+      if (requestId !== deleteRequestRef.current) return;
+      recordMutationFailure("选择整轮失败", error);
+      setDeleteTarget(null);
+      setDeleteSelectedTarget(null);
+    }
   };
 
   const confirmDelete = async () => {
@@ -837,16 +947,16 @@ export function PreviewDialog({
         rollout_path: rolloutPath,
         session_id: session.id,
         backup_dir: backupDir,
-        line_nos: [deleteTarget.index],
-        targets: paginatedTargets([deleteTarget]),
+        line_nos: deleteScope.length ? deleteScope.map((m) => m.line_no) : [deleteTarget.index],
+        targets: deleteScope.length ? deleteScope.flatMap((m) => m.target ? [m.target] : []) : paginatedTargets([deleteTarget]),
       });
       recordEditResult(report);
       setDeleteTarget(null);
       setDeletePlan(null);
-      resetAndReload();
+      await reloadPreservingView();
       await refreshAfterEdit();
     } catch (e: any) {
-      toast.error("删除失败", { description: String(e?.message ?? e) });
+      recordMutationFailure("删除失败", e);
     } finally {
       mutationInFlightRef.current = false;
       setMutating(false);
@@ -866,10 +976,10 @@ export function PreviewDialog({
       .map((e) => e.index);
     api
       .planSessionEventDeletion(provider, rolloutPath, indices, revisionRef.current, paginatedTargets(selected))
-      .then((plan) => { if (requestId === deleteRequestRef.current) setDeletePlan(plan); })
+      .then((plan) => { if (requestId === deleteRequestRef.current) { setDeletePlan(plan); setDeleteScope(plan.messages.filter((m) => m.reason === "selected")); } })
       .catch((e: any) => {
         if (requestId !== deleteRequestRef.current) return;
-        toast.error("生成删除计划失败", { description: String(e?.message ?? e) });
+        recordMutationFailure("生成删除计划失败", e);
         setDeleteSelectedTarget(null);
       });
   };
@@ -888,8 +998,8 @@ export function PreviewDialog({
         rollout_path: rolloutPath,
         session_id: session.id,
         backup_dir: backupDir,
-        line_nos: indices,
-        targets: paginatedTargets(deleteSelectedTarget.events),
+        line_nos: deleteScope.length ? deleteScope.map((m) => m.line_no) : indices,
+        targets: deleteScope.length ? deleteScope.flatMap((m) => m.target ? [m.target] : []) : paginatedTargets(deleteSelectedTarget.events),
       });
       recordEditResult(report);
       setDeleteSelectedTarget(null);
@@ -897,10 +1007,10 @@ export function PreviewDialog({
       setIsSelecting(false);
       setSelectionFirstIndex(null);
       setSelectionSecondIndex(null);
-      resetAndReload();
+      await reloadPreservingView();
       await refreshAfterEdit();
     } catch (e: any) {
-      toast.error("删除失败", { description: String(e?.message ?? e) });
+      recordMutationFailure("删除失败", e);
     } finally {
       mutationInFlightRef.current = false;
       setMutating(false);
@@ -944,10 +1054,10 @@ export function PreviewDialog({
       });
       recordEditResult(report);
       await loadEditHistory();
-      resetAndReload();
+      await reloadPreservingView();
       await refreshAfterEdit();
     } catch (e: any) {
-      toast.error("撤销失败", { description: String(e?.message ?? e) });
+      recordMutationFailure("撤销失败", e);
     } finally {
       mutationInFlightRef.current = false;
       setMutating(false);
@@ -970,10 +1080,10 @@ export function PreviewDialog({
       });
       recordEditResult(report);
       await loadEditHistory();
-      resetAndReload();
+      await reloadPreservingView();
       await refreshAfterEdit();
     } catch (e: any) {
-      toast.error("还原快照失败", { description: String(e?.message ?? e) });
+      recordMutationFailure("还原快照失败", e);
     } finally {
       mutationInFlightRef.current = false;
       setMutating(false);
@@ -989,7 +1099,7 @@ export function PreviewDialog({
         backup_dir: backupDir, expected_revision: editHistory.revision });
       setLastReport(null);
       await loadEditHistory();
-      resetAndReload();
+      await reloadPreservingView();
       toast.info("操作记录已核对；会话内容未再次修改");
     } catch (error) {
       toast.error("核对未完成", { description: String((error as Error)?.message ?? error) });
@@ -1033,7 +1143,6 @@ export function PreviewDialog({
               {session && (
                 <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
                   <span className="text-foreground/70">{sourceLabel}</span>
-                  <span className="font-mono text-foreground/70" title={session.id}>{session.id.slice(0, 8)}</span>
                   {session.model && (
                     <>
                       <Dot />
@@ -1051,26 +1160,11 @@ export function PreviewDialog({
                       </span>
                     </>
                   )}
-                  {session.cwd_display && (
-                    <>
-                      <Dot />
-                      <span className="min-w-0 truncate" title={session.cwd}>
-                        {session.cwd_display}
-                      </span>
-                    </>
-                  )}
                   <Dot />
                   <span className="text-[11px] text-muted-foreground">
                     {onlyMsg ? "筛选后对话/状态" : "筛选后事件"} <span className="tabular-nums text-foreground/80">{filtered.length}</span>
                     <span className="mx-1 text-muted-foreground/50">/</span>
-                    已加载底层事件 <span className="tabular-nums text-foreground/80">{events.length}</span>
-                    {totalEvents > 0 && (
-                      <>
-                        <span className="mx-1 text-muted-foreground/50">/</span>
-                        底层共 <span className="tabular-nums text-foreground/80">{totalEvents}</span>
-                      </>
-                    )}{" "}
-                    条
+                    {done ? "全部已加载" : "部分已加载"}
                     <span className="ml-1 text-muted-foreground/70">
                       {!done ? "· 滚动加载更多" : "· 已到末尾"}
                     </span>
@@ -1211,15 +1305,10 @@ export function PreviewDialog({
               onRevealDirectory={reveal}
               onOpenEditHistory={openEditHistory}
               onCopyPath={copyPath}
+              onRefresh={() => void reloadPreservingView()}
+              refreshing={mutating || loading}
+              onSessionInfo={() => setSessionInfoOpen(true)}
             />
-          </div>
-          <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
-            <span>筛选与折叠只改变显示，不会删除数据。{filter && `${done ? "整个会话" : "已加载范围"}匹配 ${filtered.length} 条。`}</span>
-            <button className="underline underline-offset-2" onClick={resetAndReload} disabled={mutating}>刷新预览</button>
-            <details className="min-w-0">
-              <summary className="cursor-pointer">会话身份与路径</summary>
-              <div className="break-all font-mono">{session?.id}<br />{rolloutPath}</div>
-            </details>
           </div>
           {capability && capability.blocked_reasons.length > 0 && (
             <div role="status" className="mt-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs">
@@ -1228,22 +1317,19 @@ export function PreviewDialog({
               {capability.format === "paginated" && <div className="mt-1">对话按正式消息显示；完整事件中保留模型上下文记录。旧版删除可能仅修改了上下文，未移除正式消息。</div>}
             </div>
           )}
-          {capability?.format === "paginated" && capability.blocked_reasons.length === 0 && (
-            <div className="mt-2 text-xs text-muted-foreground">编辑会保留原会话 ID，并同步正式消息、上下文与历史投影。删除历史不会撤销已执行的外部操作；涉及共享历史、压缩或工具依赖时，将按所选范围核对后提示。</div>
-          )}
-          {readError && <div role="alert" className="mt-2 text-xs text-destructive">{readError}</div>}
-          {lastReport && (
-            <div role="status" className="mt-2 rounded-md border bg-muted/40 px-3 py-2 text-xs">
-              <strong>{lastReport.status === "needs_recovery" ? "部分完成，需要处理" : "已提交，原生显示待验证"}</strong>
-              <div>改写 {lastReport.changed_lines} · 删除 {lastReport.deleted_lines} · 恢复 {lastReport.restored_lines} 条底层记录</div>
-              <div className="break-all font-mono">操作 {lastReport.op_id}</div>
-              {lastReport.warning && <div>{lastReport.warning}</div>}
+          {!!capability?.diagnostics?.length && <div role="alert" className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2 text-xs">检测到历史不一致，需要单独核对。<button className="ml-2 underline" onClick={() => setSessionInfoOpen(true)}>查看诊断</button><button className="ml-2 underline" onClick={openEditHistory}>编辑历史与恢复</button></div>}
+          {(readError || mutationError) && <div role="alert" className="mt-2 rounded-md border border-destructive/40 p-2 text-xs text-destructive">{readError || mutationError}<div className="mt-1 flex gap-3"><button className="underline" disabled={mutating || loading} onClick={() => void reloadPreservingView()}>刷新并重新选择</button><button className="underline" onClick={openEditHistory}>核对操作与恢复状态</button></div></div>}
+          {lastReport?.status === "needs_recovery" && (
+            <div role="alert" className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs">
+              <strong>部分完成，需要处理</strong>
+              <div>{lastReport.warning}</div>
               <button className="mt-1 underline" onClick={openEditHistory}>查看操作记录与恢复状态</button>
             </div>
           )}
         </DialogHeader>
 
         <div className="relative min-h-0 flex-1">
+          <PreviewTechnicalContext.Provider value={!onlyMsg}>
           <ScrollArea
             className="h-full bg-muted/30"
             viewportRef={viewportRef}
@@ -1266,15 +1352,15 @@ export function PreviewDialog({
               {rows.map((row) =>
                 row.type === "process" ? (
                   <ProcessTurnGroup
-                    key={`process-${row.key}`}
+                    key={previewProcessKey(row.events)}
                     events={row.events}
                     expanded={isProcessGroupExpanded(
-                      row.key,
+                      previewProcessKey(row.events),
                       processDefaultCollapsed,
                       processExpansionOverrides,
                     )}
                     onExpandedChange={(expanded) =>
-                      changeProcessGroupExpanded(row.key, expanded)
+                      changeProcessGroupExpanded(previewProcessKey(row.events), expanded)
                     }
                   >
                     {(event) => {
@@ -1291,8 +1377,9 @@ export function PreviewDialog({
                         event.index === selectionFirstIndex;
                       return (
                       <div
-                        key={event.index}
+                        key={previewEventKey(event)}
                         data-event-index={event.index}
+                        data-reading-key={previewEventKey(event)}
                         className={cn(
                           isSelecting && "cursor-pointer",
                           inRange && "bg-destructive/10 ring-1 ring-destructive/30",
@@ -1331,8 +1418,9 @@ export function PreviewDialog({
                   </ProcessTurnGroup>
                 ) : (
                   <div
-                    key={row.event.index}
+                    key={previewEventKey(row.event, !onlyMsg)}
                     data-event-index={row.event.index}
+                    data-reading-key={previewEventKey(row.event, !onlyMsg)}
                     data-timeline-anchor={timelineIndexSet?.has(row.event.index) || undefined}
                     className={cn(
                       isSelecting && "cursor-pointer",
@@ -1402,6 +1490,7 @@ export function PreviewDialog({
               )}
             </div>
           </ScrollArea>
+          </PreviewTechnicalContext.Provider>
 
           {prompts && prompts.length > 0 && (
             <PromptTimeline
@@ -1413,11 +1502,20 @@ export function PreviewDialog({
         </div>
       </DialogContent>
     </Dialog>
+    <Dialog open={sessionInfoOpen} onOpenChange={setSessionInfoOpen}>
+      <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-[640px]">
+        <DialogHeader><DialogTitle>会话信息</DialogTitle><DialogDescription>数据来源、历史诊断与本地修改详情。</DialogDescription></DialogHeader>
+        <dl className="space-y-2 break-all text-xs"><dt className="text-muted-foreground">来源</dt><dd>{sourceLabel}</dd><dt className="text-muted-foreground">会话 ID</dt><dd className="font-mono">{session?.id}</dd><dt className="text-muted-foreground">路径</dt><dd className="font-mono">{rolloutPath}</dd><dt className="text-muted-foreground">工作目录</dt><dd>{session?.cwd}</dd><dt className="text-muted-foreground">已加载 / 总底层记录</dt><dd>{events.length} / {totalEvents || "未知"}</dd></dl>
+        {capability?.diagnostics?.map((reason, i) => <div key={i} className="break-all rounded-md border border-amber-500/40 p-3 text-xs">{reason}</div>)}
+        {lastReport && <div className="space-y-2 rounded-md border p-3 text-xs"><strong>{lastReport.status === "needs_recovery" ? "需要处理" : "本地修改已保存"}</strong><div className="break-all">操作 {lastReport.op_id}</div><div>改写 {lastReport.changed_lines} · 删除 {lastReport.deleted_lines} · 恢复 {lastReport.restored_lines} 条底层记录</div><div>{lastReport.warning}</div><p>{lastReport.status === "needs_recovery" ? "提交尚未完成核对，请先查看操作记录与恢复状态。" : "已保存本地会话与相关投影。"}本次操作未自动执行原生读取或 Codex App 冷启动验证；测试样本的验证结果不代表当前会话已验收。</p><Button variant="outline" size="sm" onClick={() => { setSessionInfoOpen(false); openEditHistory(); }}>查看编辑历史与恢复</Button></div>}
+      </DialogContent>
+    </Dialog>
     <PreviewMutationDialogs
       provider={provider}
       sourceLabel={sourceLabel}
       sessionId={session?.id ?? ""}
       rolloutPath={rolloutPath}
+      onSelectTurn={(turn) => void selectWholeTurn(turn)}
       fork={{
         target: forkTarget,
         running: forking,
@@ -1429,6 +1527,8 @@ export function PreviewDialog({
         running: mutating,
         text: editText,
         onTextChange: setEditText,
+        blocks: editBlocks,
+        onBlockChange: (index, text) => setEditBlocks((current) => current.map((block) => block.content_index === index ? { ...block, text } : block)),
         onClose: () => setEditTarget(null),
         onConfirm: () => void confirmEdit(),
       }}
@@ -1487,7 +1587,7 @@ function ProcessTurnGroup({
   children: (event: PreviewEvent) => React.ReactNode;
 }) {
   return (
-    <div className="space-y-4">
+    <div className="space-y-4" data-reading-key={previewProcessKey(events)}>
       <button
         type="button"
         aria-expanded={expanded}
@@ -2098,8 +2198,10 @@ function Dot() {
 }
 
 function EventSourceBadge({ e }: { e: PreviewEvent }) {
+  const showTechnical = useContext(PreviewTechnicalContext);
   const outer = rawType(e);
   const payload = payloadType(e);
+  if (payload === "item_completed" && !showTechnical) return null;
   if (outer !== "event_msg" && outer !== "response_item") return null;
   if (payload !== "user_message" && payload !== "agent_message" && payload !== "message" && payload !== "item_completed") return null;
 

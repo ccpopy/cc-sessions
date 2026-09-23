@@ -230,6 +230,123 @@ pub(super) fn inspect(path: &Path, loaded: &LoadedFile) -> AppResult<()> {
     Ok(())
 }
 
+pub(super) fn diagnostics(loaded: &LoadedFile) -> AppResult<Vec<String>> {
+    let h = model(loaded)?;
+    let mut diagnostics = Vec::new();
+    for item in h
+        .items
+        .iter()
+        .filter(|item| matches!(item.kind.as_str(), "UserMessage" | "AgentMessage"))
+    {
+        let reason = if item.contexts.is_empty() {
+            Some("缺少可关联的上下文")
+        } else {
+            let canonical = &loaded.parsed[*item.records.last().unwrap()]
+                .as_ref()
+                .unwrap()["payload"]["item"]["content"];
+            let Ok(positions) = text_positions(canonical) else {
+                continue;
+            };
+            let mut mismatch = false;
+            for &i in &item.contexts {
+                let context = loaded.parsed[i].as_ref().unwrap();
+                // Unknown block metadata remains an operation-scoped unsupported case.
+                let Ok(mapping) = context_text_positions(context, &item.kind) else {
+                    continue;
+                };
+                mismatch |= mapping.len() != positions.len()
+                    || mapping.iter().zip(&positions).any(|(&a, &b)| {
+                        context["payload"]["content"][a]["text"] != canonical[b]["text"]
+                    });
+            }
+            mismatch.then_some("的上下文文本块与正式消息不一致")
+        };
+        if let Some(reason) = reason {
+            diagnostics.push(format!(
+                "[EDIT_INCONSISTENT] 回合 {} / 消息 {} {}；可能是旧版编辑遗留。不会自动修复，请在隔离副本中核对编辑前快照与原生历史后恢复。",
+                item.key.turn, item.key.id, reason
+            ));
+        }
+    }
+    Ok(diagnostics)
+}
+
+fn message(loaded: &LoadedFile, item: &Item, reason: &str) -> crate::models::DeletePlanMessage {
+    let i = *item.records.last().unwrap();
+    let raw = loaded.parsed[i].as_ref().unwrap();
+    let (role, _, summary) = codex_line_brief(raw);
+    crate::models::DeletePlanMessage {
+        target: Some(crate::models::PaginatedItemTarget {
+            thread_id: raw["payload"]["thread_id"].as_str().unwrap().into(),
+            turn_id: item.key.turn.clone(),
+            item_id: item.key.id.clone(),
+        }),
+        line_no: i,
+        role,
+        summary,
+        reason: reason.into(),
+    }
+}
+
+pub(super) fn logical_messages(
+    loaded: &LoadedFile,
+    plan: &BTreeMap<usize, String>,
+) -> AppResult<Vec<crate::models::DeletePlanMessage>> {
+    Ok(model(loaded)?
+        .items
+        .iter()
+        .filter_map(|it| {
+            let reason = it
+                .records
+                .iter()
+                .filter_map(|i| plan.get(i))
+                .find(|r| r.as_str() == REASON_SELECTED)
+                .or_else(|| it.records.iter().find_map(|i| plan.get(i)))?;
+            Some(message(loaded, it, reason))
+        })
+        .collect())
+}
+
+pub(super) fn required_turns(
+    loaded: &LoadedFile,
+    selected: &[usize],
+) -> AppResult<Vec<crate::models::DeleteTurnSelection>> {
+    let h = model(loaded)?;
+    let selected_items: BTreeSet<_> = h
+        .items
+        .iter()
+        .filter(|it| it.records.iter().any(|i| selected.contains(i)))
+        .map(|it| &it.key)
+        .collect();
+    let turns: BTreeSet<_> = h
+        .items
+        .iter()
+        .filter(|it| {
+            selected_items.contains(&it.key)
+                && !matches!(
+                    it.kind.as_str(),
+                    "UserMessage" | "AgentMessage" | "Reasoning"
+                )
+                && h.items.iter().any(|other| {
+                    other.key.turn == it.key.turn && !selected_items.contains(&other.key)
+                })
+        })
+        .map(|it| it.key.turn.as_str())
+        .collect();
+    Ok(turns
+        .into_iter()
+        .map(|turn| crate::models::DeleteTurnSelection {
+            turn_id: turn.into(),
+            messages: h
+                .items
+                .iter()
+                .filter(|it| it.key.turn == turn)
+                .map(|it| message(loaded, it, REASON_SELECTED))
+                .collect(),
+        })
+        .collect())
+}
+
 fn check_scope(path: &Path, loaded: &LoadedFile, selected: &BTreeSet<usize>) -> AppResult<()> {
     let history = model(loaded)?;
     let touched: BTreeSet<&str> = selected
@@ -455,6 +572,7 @@ pub(super) fn edit_changes(
     loaded: &LoadedFile,
     index: usize,
     text: &str,
+    edits: Option<&[crate::models::TextBlockEdit]>,
 ) -> AppResult<Vec<LineChange>> {
     let h = model(loaded)?;
     let item = h
@@ -478,15 +596,82 @@ pub(super) fn edit_changes(
     }
     let indices: BTreeSet<usize> = item.records.iter().chain(&item.contexts).copied().collect();
     check_scope(path, loaded, &indices)?;
+    let canonical = &loaded.parsed[*item.records.last().unwrap()]
+        .as_ref()
+        .unwrap()["payload"]["item"]["content"];
+    let positions = text_positions(canonical)?;
+    let single;
+    let edits = if let Some(edits) = edits {
+        edits
+    } else {
+        if positions.len() != 1 {
+            return Err(unsupported(
+                "多文本块消息请逐块改写，不能将全部文本合并到首块",
+            ));
+        }
+        single = vec![crate::models::TextBlockEdit {
+            content_index: positions[0],
+            text: text.into(),
+        }];
+        &single
+    };
+    let mut seen = BTreeSet::new();
+    if edits.is_empty()
+        || edits
+            .iter()
+            .any(|e| !positions.contains(&e.content_index) || !seen.insert(e.content_index))
+    {
+        return Err(unsupported("改写包含重复或非文本内容块"));
+    }
+    let mut updated = canonical.clone();
+    for edit in edits {
+        replace_block(&mut updated[edit.content_index], &edit.text);
+    }
+    let final_text = positions
+        .iter()
+        .filter_map(|&i| updated[i]["text"].as_str())
+        .collect::<String>();
     let mut changes = Vec::new();
     for i in indices {
         let mut raw = loaded.parsed[i].clone().unwrap();
+        let formal = codex_ptype(&raw) == "item_completed";
+        let mapping = if formal {
+            let content = &raw["payload"]["item"]["content"];
+            if content.as_array().map(Vec::len) != canonical.as_array().map(Vec::len)
+                || text_positions(content)? != positions
+            {
+                return Err(unsupported(
+                    "同一消息的快照内容块结构不同，无法逐块关联；请先核对快照",
+                ));
+            }
+            positions.clone()
+        } else {
+            context_text_positions(&raw, &item.kind)?
+        };
         let content = if codex_ptype(&raw) == "item_completed" {
             &mut raw["payload"]["item"]["content"]
         } else {
             &mut raw["payload"]["content"]
         };
-        replace_text(content, text)?;
+        if mapping.len() != positions.len()
+            || (!formal
+                && mapping
+                    .iter()
+                    .zip(&positions)
+                    .any(|(&a, &b)| content[a]["text"] != canonical[b]["text"]))
+        {
+            return Err(AppError::Other(format!("[EDIT_INCONSISTENT] 回合 {} / 消息 {} 的上下文文本块与正式消息不一致；未改写，请在隔离副本中核对编辑前快照后恢复", item.key.turn, item.key.id)));
+        }
+        for edit in edits {
+            let ordinal = positions
+                .iter()
+                .position(|&p| p == edit.content_index)
+                .unwrap();
+            replace_block(&mut content[mapping[ordinal]], &edit.text);
+        }
+        if raw == *loaded.parsed[i].as_ref().unwrap() {
+            continue;
+        }
         changes.push(LineChange {
             line_no: i,
             before: Some(loaded.lines[i].clone()),
@@ -501,7 +686,7 @@ pub(super) fn edit_changes(
             let Some(v) = v else { continue };
             if codex_ptype(v) == "task_complete" && v["payload"]["turn_id"] == item.key.turn {
                 let mut raw = v.clone();
-                raw["payload"]["last_agent_message"] = Value::String(text.into());
+                raw["payload"]["last_agent_message"] = Value::String(final_text.clone());
                 changes.push(LineChange {
                     line_no: i,
                     before: Some(loaded.lines[i].clone()),
@@ -553,28 +738,51 @@ pub(super) fn validate_change(
 
 // Preserve block positions, image content and per-block metadata. Text offsets no
 // longer describe rewritten text, so reset only their documented text_elements.
-fn replace_text(content: &mut Value, text: &str) -> AppResult<()> {
+fn replace_block(block: &mut Value, text: &str) {
+    if block["text"].as_str() == Some(text) {
+        return;
+    }
+    block["text"] = Value::String(text.into());
+    if block.get("text_elements").is_some() {
+        block["text_elements"] = serde_json::json!([]);
+    }
+}
+
+fn text_positions(content: &Value) -> AppResult<Vec<usize>> {
     let blocks = content
-        .as_array_mut()
+        .as_array()
         .ok_or_else(|| unsupported("消息内容不是已验证的块数组"))?;
-    let mut found = false;
-    for block in blocks {
-        if matches!(
-            block["type"].as_str(),
-            Some("text" | "Text" | "input_text" | "output_text")
-        ) && block["text"].is_string()
-        {
-            block["text"] = Value::String(if found { String::new() } else { text.into() });
-            if block.get("text_elements").is_some() {
-                block["text_elements"] = serde_json::json!([]);
-            }
-            found = true;
-        }
+    Ok(blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| {
+            matches!(
+                b["type"].as_str(),
+                Some("text" | "Text" | "input_text" | "output_text")
+            ) && b["text"].is_string()
+        })
+        .map(|(i, _)| i)
+        .collect())
+}
+
+fn context_text_positions(raw: &Value, kind: &str) -> AppResult<Vec<usize>> {
+    let content = &raw["payload"]["content"];
+    let positions = text_positions(content)?;
+    if kind != "UserMessage" {
+        return Ok(positions);
     }
-    if !found {
-        return Err(unsupported("消息没有可编辑文本块"));
+    // Native metadata labels each context block. Image labels are also text;
+    // only user.text blocks correspond to canonical user text inputs.
+    let kinds = raw["payload"]["internal_chat_message_metadata_passthrough"]["content_item_kinds"]
+        .as_array()
+        .ok_or_else(|| unsupported("用户上下文缺少内容块来源"))?;
+    if Some(kinds.len()) != content.as_array().map(Vec::len) {
+        return Err(unsupported("用户上下文内容块来源数量不一致"));
     }
-    Ok(())
+    Ok(positions
+        .into_iter()
+        .filter(|&i| kinds[i] == "user.text")
+        .collect())
 }
 
 pub(super) fn deletion_updates(

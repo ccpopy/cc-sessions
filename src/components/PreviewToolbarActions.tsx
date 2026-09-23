@@ -1,4 +1,4 @@
-import { Copy, FileJson, FolderOpen, History, MoreHorizontal } from "lucide-react";
+import { Copy, FileJson, FolderOpen, History, Info, MoreHorizontal, RefreshCw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -17,6 +17,9 @@ type Props = {
   onRevealDirectory: () => void | Promise<void>;
   onOpenEditHistory: () => void;
   onCopyPath: () => void | Promise<void>;
+  onRefresh: () => void;
+  refreshing: boolean;
+  onSessionInfo: () => void;
 };
 
 export function PreviewToolbarActions({
@@ -27,22 +30,27 @@ export function PreviewToolbarActions({
   onRevealDirectory,
   onOpenEditHistory,
   onCopyPath,
+  onRefresh,
+  refreshing,
+  onSessionInfo,
 }: Props) {
   return (
     <div className="ml-auto flex shrink-0 items-center gap-0.5">
+      <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground" aria-label="刷新预览" title="刷新预览" disabled={refreshing} onClick={onRefresh}><RefreshCw className={refreshing ? "h-4 w-4 animate-spin" : "h-4 w-4"} /></Button>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button
             variant="ghost"
             size="icon"
             className="h-8 w-8 text-muted-foreground hover:text-foreground"
-            aria-label="会话操作"
-            title="会话操作"
+            aria-label="更多"
+            title="更多"
           >
             <MoreHorizontal className="h-4 w-4" />
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className="w-44">
+          <DropdownMenuItem onSelect={onSessionInfo}><Info className="h-4 w-4" />会话信息</DropdownMenuItem>
           {hasSession && (
             <>
               <DropdownMenuItem onSelect={() => void onCopySessionId()}>

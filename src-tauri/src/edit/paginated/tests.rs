@@ -169,6 +169,51 @@ fn paginated_duplicate_text_and_snapshots_are_selected_by_identity() {
 }
 
 #[test]
+fn paginated_flat_text_cannot_silently_collapse_multiple_blocks() {
+    let f = Fixture::new();
+    f.update(|rows, seed| {
+        rows[9]["payload"]["item"]["content"] = json!([
+            {"type":"text","text":"DELETE-B"},
+            {"type":"local_image","path":"synthetic.png"},
+            {"type":"text","text":"untouched tail"}
+        ]);
+        rows[8]["payload"]["content"] = json!([
+            {"type":"input_text","text":"DELETE-B"},
+            {"type":"input_image","image_url":"synthetic"},
+            {"type":"input_text","text":"untouched tail"}
+        ]);
+        rows[8]["payload"]["internal_chat_message_metadata_passthrough"]["content_item_kinds"] =
+            json!(["user.text", "user.image", "user.text"]);
+        let row = seed
+            .rows
+            .get_mut("thread_items")
+            .unwrap()
+            .iter_mut()
+            .find(|r| r["item_id"] == "user-1")
+            .unwrap();
+        let mut native: Value = serde_json::from_str(row["item_json"].as_str().unwrap()).unwrap();
+        native["content"] = rows[9]["payload"]["item"]["content"].clone();
+        native["content"][1]["type"] = json!("localImage");
+        row["item_json"] = json!(native.to_string());
+    });
+    let before = fs::read(&f.path).unwrap();
+    let result = apply_edit_text(
+        "codex",
+        f.path.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        9,
+        "replacement",
+        Some(&f.revision()),
+    );
+    assert!(
+        result.is_err(),
+        "flat text must not silently move text across images"
+    );
+    assert_eq!(fs::read(&f.path).unwrap(), before);
+}
+
+#[test]
 fn paginated_user_and_assistant_rewrite_preserve_nontext_blocks() {
     let f = Fixture::new();
     f.update(|rows,seed| {
@@ -182,8 +227,45 @@ fn paginated_user_and_assistant_rewrite_preserve_nontext_blocks() {
     });
     let original = fs::read(&f.path).unwrap();
     let items = f.items();
-    let report = f.rewrite(9, "changed user");
+    let before_rows = load_file(&f.path).unwrap().parsed;
+    let report = apply_edit_text_blocks(
+        "codex",
+        f.path.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        9,
+        "",
+        Some(&f.revision()),
+        Some(&[crate::models::TextBlockEdit {
+            content_index: 0,
+            text: "changed user".into(),
+        }]),
+    )
+    .unwrap();
     let rows = load_file(&f.path).unwrap().parsed;
+    for (row, content_path) in [(9, "/payload/item/content"), (8, "/payload/content")] {
+        let before = before_rows[row]
+            .as_ref()
+            .unwrap()
+            .pointer(content_path)
+            .unwrap()
+            .as_array()
+            .unwrap();
+        let after = rows[row]
+            .as_ref()
+            .unwrap()
+            .pointer(content_path)
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(after.len(), before.len());
+        assert_eq!(
+            &after[1..],
+            &before[1..],
+            "unedited blocks and their relative order must be identical"
+        );
+        assert_eq!(after[0]["text"], "changed user");
+    }
     assert_eq!(
         rows[9].as_ref().unwrap()["payload"]["item"]["content"][1]["path"],
         "synthetic.png"
@@ -354,7 +436,52 @@ fn paginated_tool_turn_and_failed_interrupted_turns_can_be_deleted() {
         .contains("全部正式记录"));
     let original = fs::read(&f.path).unwrap();
     let items = f.items();
-    f.delete(&[9, 11, 13]).unwrap();
+    let partial = plan_delete(
+        "codex",
+        f.path.to_str().unwrap(),
+        &[11],
+        Some(&f.revision()),
+    )
+    .unwrap();
+    assert_eq!(partial.messages.len(), 1);
+    assert_eq!(partial.required_turns.len(), 1);
+    assert!(!partial.blocked.is_empty());
+    assert_eq!(
+        fs::read(&f.path).unwrap(),
+        original,
+        "suggesting a turn must not edit data"
+    );
+    let targets: Vec<_> = partial.required_turns[0]
+        .messages
+        .iter()
+        .map(|m| m.target.clone().unwrap())
+        .collect();
+    assert_eq!(
+        targets
+            .iter()
+            .map(|t| t.item_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["user-1", "tool-1", "agent-1"]
+    );
+    let selected = resolve_selection(
+        "codex",
+        f.path.to_str().unwrap(),
+        vec![0; targets.len()],
+        Some(&targets),
+        Some(&f.revision()),
+    )
+    .unwrap();
+    let full = plan_delete(
+        "codex",
+        f.path.to_str().unwrap(),
+        &selected,
+        Some(&f.revision()),
+    )
+    .unwrap();
+    assert!(full.required_turns.is_empty());
+    assert!(full.blocked.is_empty());
+    assert_eq!(full.messages.len(), 3);
+    f.delete(&selected).unwrap();
     assert!(!fs::read_to_string(&f.path).unwrap().contains("call-1"));
     assert!(!f.items().contains("tool-1"));
     undo_last(
@@ -390,6 +517,79 @@ fn paginated_tool_turn_and_failed_interrupted_turns_can_be_deleted() {
         failed.delete(&[9, 10]).unwrap();
         assert!(!failed.items().contains("DELETE-B"));
     }
+}
+
+#[test]
+fn paginated_legacy_damage_is_diagnosed_separately_and_not_auto_repaired() {
+    let f = Fixture::new();
+    f.update(|rows, _| {
+        rows.remove(8);
+    }); // old editor removed only the user context
+    let damaged = fs::read(&f.path).unwrap();
+    let capability = inspect_edit_capability("codex", f.path.to_str().unwrap()).unwrap();
+    assert!(
+        capability.blocked_reasons.is_empty(),
+        "unaffected ranges remain usable"
+    );
+    assert_eq!(capability.diagnostics.len(), 1);
+    assert!(capability.diagnostics[0].contains("turn-1 / 消息 user-1"));
+    assert!(f.delete(&[8]).is_err());
+    assert_eq!(fs::read(&f.path).unwrap(), damaged);
+    let report = f.rewrite(3, "unaffected edit");
+    assert_eq!(
+        inspect_edit_capability("codex", f.path.to_str().unwrap())
+            .unwrap()
+            .diagnostics
+            .len(),
+        1
+    );
+    restore_snapshot(
+        "codex",
+        f.path.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        report.snapshot_created.as_deref().unwrap(),
+        Some(&f.revision()),
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read(&f.path).unwrap(),
+        damaged,
+        "a snapshot of damaged history is not a repair"
+    );
+    assert!(f.items().contains("DELETE-B"));
+}
+
+#[test]
+fn paginated_legacy_text_mismatch_is_diagnosed_without_repairing_it() {
+    let f = Fixture::new();
+    f.update(|rows, _| rows[8]["payload"]["content"][0]["text"] = json!("old edited context"));
+    let before = fs::read(&f.path).unwrap();
+    let capability = inspect_edit_capability("codex", f.path.to_str().unwrap()).unwrap();
+    assert!(capability.blocked_reasons.is_empty());
+    assert_eq!(capability.diagnostics.len(), 1);
+    assert!(capability.diagnostics[0].contains("user-1"));
+    assert!(apply_edit_text(
+        "codex",
+        f.path.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        9,
+        "new text",
+        Some(&f.revision())
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("EDIT_INCONSISTENT"));
+    assert_eq!(fs::read(&f.path).unwrap(), before);
+    f.rewrite(3, "unaffected edit");
+    assert_eq!(
+        inspect_edit_capability("codex", f.path.to_str().unwrap())
+            .unwrap()
+            .diagnostics
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -564,6 +764,47 @@ fn paginated_native_fixture_command() {
         .unwrap()
         .revision;
     let action = std::env::var("CC_SYNTHETIC_ACTION").unwrap();
+    if action == "diagnose-damage" {
+        let before = fs::read(&path).unwrap();
+        let capability = inspect_edit_capability("codex", path.to_str().unwrap()).unwrap();
+        assert!(!capability.diagnostics.is_empty());
+        let target = load_file(&path)
+            .unwrap()
+            .parsed
+            .iter()
+            .position(|v| {
+                v.as_ref()
+                    .is_some_and(|v| v["payload"]["item"]["id"] == "user-1")
+            })
+            .unwrap();
+        let deletion = apply_delete(
+            "codex",
+            path.to_str().unwrap(),
+            id,
+            backup.to_str().unwrap(),
+            &[target],
+            Some(&revision),
+        )
+        .unwrap_err()
+        .to_string();
+        let journal = read_journal(&edit_dir(backup.to_str().unwrap(), "codex", id)).unwrap();
+        let restore = restore_snapshot(
+            "codex",
+            path.to_str().unwrap(),
+            id,
+            backup.to_str().unwrap(),
+            journal[0].base_snapshot.as_deref().unwrap(),
+            Some(&revision),
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(fs::read(&path).unwrap(), before);
+        fs::write(root.join("diagnose-damage-report.json"), serde_json::to_vec_pretty(&json!({
+            "threadId":id, "capability":capability, "deleteRejected":deletion,
+            "snapshotRestoreRejected":restore, "rolloutUnchanged":true, "automaticallyRepaired":false,
+        })).unwrap()).unwrap();
+        return;
+    }
     let range_items: Vec<String> = marker["range_items"]
         .as_array()
         .map(|items| {
@@ -628,6 +869,15 @@ fn paginated_native_fixture_command() {
                     "user-0"
                 } else {
                     "agent-0"
+                }
+                .into(),
+            }]),
+            Some(vec![crate::models::TextBlockEdit {
+                content_index: 0,
+                text: if action == "rewrite" {
+                    "NATIVE-EDITED-A"
+                } else {
+                    "NATIVE-EDITED-ASSISTANT"
                 }
                 .into(),
             }]),

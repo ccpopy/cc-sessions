@@ -396,6 +396,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "newText")?,
             opt_string_arg(&args, "expectedRevision")?,
             opt_arg(&args, "targets")?,
+            opt_arg(&args, "textBlocks")?,
             &state.family_lock,
         )),
         "delete_session_events" => to_result_value(edit::delete_session_events_with_lock(

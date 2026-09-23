@@ -8,6 +8,10 @@ import {
   canonicalMessageImages,
   latestCanonicalEvents,
   paginatedTargets,
+  previewEventKey,
+  previewProcessKey,
+  survivingPreviewAnchor,
+  editableTextBlocks,
   editableText,
   extractPreviewEventText,
   isConversationMessage,
@@ -27,6 +31,23 @@ function event(raw: unknown, role: PreviewEvent["role"] = "user"): PreviewEvent 
   };
 }
 
+test("block editor retains content indices around images and does not join text", () => {
+  const e = event({ payload: { type: "item_completed", item: { content: [
+    { type: "text", text: "before" }, { type: "local_image", path: "a.png" }, { type: "text", text: "after" },
+  ] } } });
+  assert.deepEqual(editableTextBlocks(e), [{ content_index: 0, text: "before" }, { content_index: 2, text: "after" }]);
+});
+
+test("reading anchor survives shifted lines and repeated text, deletion chooses adjacent survivor", () => {
+  const canonical = (id: string, index: number) => ({ ...event({ payload: { type: "item_completed", thread_id: "thread", turn_id: "turn", item: { id, type: "UserMessage", content: [{ type: "text", text: "继续" }] } } }), index });
+  const old = [canonical("a", 201), canonical("b", 205), canonical("c", 209)].map((e) => previewEventKey(e));
+  const next = [canonical("a", 198), canonical("c", 202)].map((e) => previewEventKey(e));
+  assert.equal(survivingPreviewAnchor(old, old[1], next), next[1]);
+  assert.equal(survivingPreviewAnchor(old, old[2], next), next[1]);
+  assert.equal(survivingPreviewAnchor(old, old[2], [next[0]]), next[0]);
+  assert.equal(survivingPreviewAnchor(old, old[1], []), null);
+});
+
 test("duplicate snapshots keep first position and latest text, repeated messages keep distinct identities", () => {
   const canonical = (id: string, text: string, index: number) => ({ ...event({ type: "event_msg", payload: {
     type: "item_completed", thread_id: "thread", turn_id: "turn", item: { id, type: "UserMessage", content: [{ type: "text", text }] },
@@ -37,6 +58,16 @@ test("duplicate snapshots keep first position and latest text, repeated messages
   assert.equal(latest[0].index, 1);
   assert.equal(editableText(latest[0]), "updated");
   assert.deepEqual(paginatedTargets(events).map((target) => target.item_id), ["a", "b"]);
+});
+
+test("full event records and separate process groups keep distinct stable keys", () => {
+  const a = event({ ordinal: 10, payload: { type: "item_completed", thread_id: "thread", turn_id: "turn", item: { id: "a" } } });
+  const snapshot = { ...a, raw: { ...(a.raw as object), ordinal: 20 }, index: 2 };
+  const b = event({ ordinal: 11, payload: { type: "item_completed", thread_id: "thread", turn_id: "turn", item: { id: "b" } } });
+  assert.equal(previewEventKey(a), previewEventKey(snapshot));
+  assert.notEqual(previewEventKey(a, true), previewEventKey(snapshot, true));
+  assert.equal(previewEventKey(a, true), previewEventKey({ ...a, index: 99 }, true));
+  assert.notEqual(previewProcessKey([a]), previewProcessKey([b]));
 });
 
 test("canonical paginated messages support identified edits without changing fork semantics", () => {

@@ -1213,6 +1213,27 @@ pub struct PaginatedItemTarget {
     pub item_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextBlockEdit {
+    pub content_index: usize,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeletePlanMessage {
+    pub target: Option<PaginatedItemTarget>,
+    pub line_no: usize,
+    pub role: String,
+    pub summary: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeleteTurnSelection {
+    pub turn_id: String,
+    pub messages: Vec<DeletePlanMessage>,
+}
+
 /// 删除计划中的一行：除用户选中的行外，还包含按完整性规则级联进来的行。
 #[derive(Debug, Clone, Serialize)]
 pub struct DeletePlanLine {
@@ -1233,6 +1254,9 @@ pub struct DeletePlan {
     pub lines: Vec<DeletePlanLine>,
     /// 不允许删除的行与原因（如 session_meta）
     pub blocked: Vec<String>,
+    pub messages: Vec<DeletePlanMessage>,
+    /// Suggested scope only. The caller must explicitly select these targets and replan.
+    pub required_turns: Vec<DeleteTurnSelection>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1294,6 +1318,7 @@ pub struct EditCapability {
     pub thread_id: Option<String>,
     pub format: String,
     pub blocked_reasons: Vec<String>,
+    pub diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
