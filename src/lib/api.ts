@@ -375,6 +375,18 @@ export type EditCapability = {
   blocked_reasons: string[];
   diagnostics: string[];
   content_mappings: ContentMappingDetail[];
+  projection?: {
+    state: "ready" | "updating" | "failed" | "identity_pending" | "inconsistent";
+    reason_code: string;
+    message: string;
+    thread_id: string;
+    rollout_id: string;
+    rollout_path: string;
+    next_rollout_byte_offset: number | null;
+    next_rollout_ordinal: number | null;
+    file_bytes: number;
+    item: { turn_id: string; item_id: string; item_type: string; ordinal: number; start_byte: number; end_byte: number; covered: boolean } | null;
+  } | null;
 };
 
 export type PreviewPage = { events: PreviewEvent[]; capability: EditCapability | null };

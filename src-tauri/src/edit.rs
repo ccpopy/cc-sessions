@@ -43,7 +43,58 @@ pub fn inspect_edit_capability(
 ) -> AppResult<crate::models::EditCapability> {
     let provider = provider_normalized(provider)?;
     let path = PathBuf::from(paths::strip_verbatim(path));
-    safety::inspect(provider, &path, &load_file(&path)?)
+    load_inspected(provider, &path).map(|(_, capability)| capability)
+}
+
+fn load_inspected(
+    provider: &str,
+    path: &Path,
+) -> AppResult<(LoadedFile, crate::models::EditCapability)> {
+    for attempt in 0..3 {
+        let loaded = load_file(path)?;
+        let capability = safety::inspect(provider, path, &loaded)?;
+        if attempt == 2
+            || !capability
+                .projection
+                .as_ref()
+                .is_some_and(|s| s.state == "updating")
+        {
+            return Ok((loaded, capability));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    unreachable!()
+}
+
+pub(crate) fn codex_preview_page(
+    path: &str,
+    offset: usize,
+    limit: usize,
+    expected: Option<&str>,
+) -> AppResult<crate::models::PreviewPage> {
+    let path = PathBuf::from(paths::strip_verbatim(path));
+    let (loaded, capability) = load_inspected("codex", &path)?;
+    if expected.is_some_and(|revision| revision != capability.revision) {
+        return Err(AppError::Other(
+            "[EDIT_CONFLICT] 会话已更新，请刷新预览后重新选择".into(),
+        ));
+    }
+    // Events and revision must describe exactly the same bytes, even if the
+    // native writer appends throughout all bounded observation attempts.
+    let canonical = paginated::is_paginated(&loaded);
+    let events = loaded
+        .parsed
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, v)| v.map(|v| (i, v)))
+        .skip(offset)
+        .take(limit)
+        .map(|(i, v)| crate::rollout::classify_history(i, v, canonical))
+        .collect();
+    Ok(crate::models::PreviewPage {
+        events,
+        capability: Some(capability),
+    })
 }
 
 const REASON_SELECTED: &str = "selected";

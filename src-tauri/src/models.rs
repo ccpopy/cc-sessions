@@ -1371,6 +1371,37 @@ pub struct ContentMappingDetail {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ProjectionItemEvidence {
+    pub turn_id: String,
+    pub item_id: String,
+    pub item_type: String,
+    pub ordinal: u64,
+    pub start_byte: u64,
+    pub end_byte: u64,
+    pub covered: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EditProjectionStatus {
+    pub state: String,
+    pub reason_code: String,
+    pub message: String,
+    pub thread_id: String,
+    pub rollout_id: String,
+    pub rollout_path: String,
+    pub next_rollout_byte_offset: Option<u64>,
+    pub next_rollout_ordinal: Option<u64>,
+    pub file_bytes: u64,
+    pub item: Option<ProjectionItemEvidence>,
+}
+
+impl std::fmt::Display for EditProjectionStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}] {}", self.reason_code, self.message)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct EditCapability {
     pub revision: String,
     pub file_sha256: String,
@@ -1379,6 +1410,7 @@ pub struct EditCapability {
     pub blocked_reasons: Vec<String>,
     pub diagnostics: Vec<String>,
     pub content_mappings: Vec<ContentMappingDetail>,
+    pub projection: Option<EditProjectionStatus>,
 }
 
 #[derive(Debug, Clone, Serialize)]

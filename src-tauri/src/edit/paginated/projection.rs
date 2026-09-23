@@ -4,6 +4,17 @@ use super::*;
 use rusqlite::OptionalExtension;
 use rusqlite::{types::Value as SqlValue, Connection, OpenFlags};
 
+mod observation;
+pub(in crate::edit) use observation::{observe, rollout_identity};
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub(in crate::edit) struct ProjectionIdentity {
+    pub thread_id: String,
+    pub rollout_id: String,
+    pub rollout_path: String,
+    pub selected_rollout_path: Option<String>,
+}
+
 const TABLES: &[(&str,&str)] = &[
     ("thread_items","thread_id,turn_id,item_id,rollout_ordinal,created_at_ms,item_json,item_type,updated_at_ordinal"),
     ("thread_turns","thread_id,turn_id,rollout_ordinal,status,error_json,started_at,completed_at,duration_ms,first_user_item_id,final_agent_item_id,rollout_byte_offset,rollout_end_ordinal,rollout_end_byte_offset"),
@@ -16,6 +27,8 @@ pub(in crate::edit) struct HistoryImage {
     pub rows: BTreeMap<String, Vec<Value>>,
     #[serde(default)]
     pub summary: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<ProjectionIdentity>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(in crate::edit) struct HistoryChange {
@@ -42,16 +55,11 @@ pub(in crate::edit) fn open(path: &Path, write: bool) -> AppResult<Connection> {
     let conn = Connection::open_with_flags(
         path,
         if write {
-            OpenFlags::SQLITE_OPEN_READ_WRITE
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI
         } else {
-            OpenFlags::SQLITE_OPEN_READ_ONLY
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI
         },
-    )
-    .map_err(|e| {
-        unsupported(format!(
-            "无法打开目标历史库：{e}；请先用匹配版本 Codex 读取该会话并关闭写入方"
-        ))
-    })?;
+    )?;
     conn.busy_timeout(std::time::Duration::from_millis(250))?;
     for (table, columns) in TABLES {
         let mut q = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -71,16 +79,73 @@ pub(in crate::edit) fn open(path: &Path, write: bool) -> AppResult<Connection> {
     }
     let state = path.parent().unwrap().join("state_5.sqlite");
     if state.is_file() {
-        conn.execute(
-            "ATTACH DATABASE ?1 AS core_state",
-            [state.to_string_lossy().as_ref()],
-        )?;
+        let state = PathBuf::from(paths::strip_verbatim(
+            &state.canonicalize()?.to_string_lossy(),
+        ));
+        let mut uri = url::Url::from_file_path(&state)
+            .map_err(|_| unsupported("无法解析 Core 数据库的绝对路径"))?;
+        uri.query_pairs_mut()
+            .append_pair("mode", if write { "rw" } else { "ro" });
+        conn.execute("ATTACH DATABASE ?1 AS core_state", [uri.as_str()])?;
         conn.prepare("SELECT id,title,first_user_message,preview FROM core_state.threads LIMIT 0")?;
     }
     Ok(conn)
 }
 
+#[cfg(test)]
 pub(in crate::edit) fn capture(conn: &Connection, id: &str) -> AppResult<HistoryImage> {
+    capture_for(conn, id, None)
+}
+
+fn capture_for(
+    conn: &Connection,
+    id: &str,
+    identity: Option<&ProjectionIdentity>,
+) -> AppResult<HistoryImage> {
+    if !conn.is_autocommit() {
+        return capture_rows(conn, id, identity);
+    }
+    // Pin all history tables in one SQLite read transaction. Attached WAL databases
+    // do not share a commit clock; data_version fences also reject cross-DB races.
+    for _ in 0..3 {
+        let versions = data_versions(conn)?;
+        let tx = conn.unchecked_transaction()?;
+        let image = capture_rows(&tx, id, identity)?;
+        tx.rollback()?;
+        if data_versions(conn)? == versions {
+            return Ok(image);
+        }
+    }
+    Err(AppError::Other(
+        "[PROJECTION_CHANGING] 数据库在读取期间持续更新，请刷新".into(),
+    ))
+}
+
+fn attached(conn: &Connection) -> AppResult<bool> {
+    Ok(conn
+        .prepare("PRAGMA database_list")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|name| name == "core_state"))
+}
+
+fn data_versions(conn: &Connection) -> AppResult<(i64, Option<i64>)> {
+    Ok((
+        conn.query_row("PRAGMA main.data_version", [], |r| r.get(0))?,
+        if attached(conn)? {
+            Some(conn.query_row("PRAGMA core_state.data_version", [], |r| r.get(0))?)
+        } else {
+            None
+        },
+    ))
+}
+
+fn capture_rows(
+    conn: &Connection,
+    id: &str,
+    identity: Option<&ProjectionIdentity>,
+) -> AppResult<HistoryImage> {
     let mut rows = BTreeMap::new();
     for (table, columns) in TABLES {
         let names: Vec<&str> = columns.split(',').collect();
@@ -109,33 +174,49 @@ pub(in crate::edit) fn capture(conn: &Connection, id: &str) -> AppResult<History
             })?
             .collect::<Result<Vec<_>, _>>()?;
         rows.insert((*table).into(), values);
+        #[cfg(test)]
+        if *table == "thread_items" {
+            AFTER_ITEMS_READ.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().take() {
+                    hook();
+                }
+            });
+        }
     }
-    let attached = conn
-        .prepare("PRAGMA database_list")?
-        .query_map([], |r| r.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?
-        .iter()
-        .any(|name| name == "core_state");
+    let attached = attached(conn)?;
+    let logical_id = identity.map_or(id, |v| v.thread_id.as_str());
     let summary = if attached {
-        conn.query_row("SELECT title,first_user_message,preview FROM core_state.threads WHERE id=?1",[id],|r|Ok(serde_json::json!({"title":r.get::<_,String>(0)?,"first_user_message":r.get::<_,String>(1)?,"preview":r.get::<_,String>(2)?}))).optional()?
+        conn.query_row("SELECT title,first_user_message,preview FROM core_state.threads WHERE id=?1",[logical_id],|r|Ok(serde_json::json!({"title":r.get::<_,String>(0)?,"first_user_message":r.get::<_,String>(1)?,"preview":r.get::<_,String>(2)?}))).optional()?
     } else {
         None
     };
-    Ok(HistoryImage { rows, summary })
+    let mut identity = identity.cloned();
+    if let Some(identity) = &mut identity {
+        identity.selected_rollout_path = if attached {
+            conn.query_row(
+                "SELECT rollout_path FROM core_state.threads WHERE id=?1",
+                [logical_id],
+                |r| r.get(0),
+            )
+            .optional()?
+        } else {
+            None
+        };
+    }
+    Ok(HistoryImage {
+        rows,
+        summary,
+        identity,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(in crate::edit) static AFTER_ITEMS_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 pub(in crate::edit) fn read(rollout: &Path, loaded: &LoadedFile) -> AppResult<HistoryImage> {
-    let conn = open(&path(rollout)?, false)?;
-    let image = capture(&conn, identity(loaded)?)?;
-    if image.rows["thread_history_projection_state"].len() != 1 {
-        return Err(unsupported(
-            "该线程尚无完整原生投影；先用匹配版本 Codex 读取历史，再停止写入方",
-        ));
-    }
-    if project(loaded, &image)? != image {
-        return Err(unsupported("日志与原生历史投影不一致（消息、回合或字节检查点）；请先用匹配版本原生读取核对后刷新，未覆盖旧投影"));
-    }
-    Ok(image)
+    observe(rollout, loaded).map(|(image, _)| image)
 }
 
 pub(in crate::edit) fn prepare(
@@ -148,8 +229,37 @@ pub(in crate::edit) fn prepare(
     if identity(before)? != identity(after)? {
         return Err(unsupported("恢复数据的 thread ID 与原会话不一致"));
     }
-    let mut after_image = project(after, seed.unwrap_or(&before_image))?;
-    if seed.is_none() {
+    let mut seed = seed.cloned();
+    if let Some(seed) = &mut seed {
+        // Snapshots from before physical identities were recorded are valid
+        // only for an ordinary rollout whose physical and logical IDs coincide.
+        if seed.identity.is_none()
+            && before_image.identity.as_ref().is_some_and(|id| {
+                id.thread_id == id.rollout_id
+                    && seed
+                        .rows
+                        .values()
+                        .flatten()
+                        .all(|row| row["thread_id"] == id.thread_id)
+            })
+        {
+            seed.identity = before_image.identity.clone();
+        }
+        if seed.identity != before_image.identity {
+            return Err(unsupported(
+                "恢复快照来自不同 rollout 或旧身份格式，请在隔离副本核对；未覆盖当前投影",
+            ));
+        }
+    }
+    let mut after_image = project(after, seed.as_ref().unwrap_or(&before_image))?;
+    // A suffix after revert/fork is not the first user message of the logical
+    // thread. Never derive its Core title/preview from the suffix alone.
+    let inherited = before
+        .parsed
+        .iter()
+        .flatten()
+        .any(|v| codex_outer(v) == "session_meta" && !v["payload"]["history_base"].is_null());
+    if seed.is_none() && !inherited {
         let old = first_user_summary(before)?;
         let new = first_user_summary(after)?;
         if old != new {
@@ -176,7 +286,16 @@ pub(in crate::edit) fn prepare(
 
 pub(super) fn project(loaded: &LoadedFile, seed: &HistoryImage) -> AppResult<HistoryImage> {
     let h = model(loaded)?;
-    let id = identity(loaded)?;
+    let id = seed
+        .identity
+        .as_ref()
+        .map(|v| v.rollout_id.as_str())
+        .or_else(|| {
+            seed.rows["thread_history_projection_state"]
+                .first()
+                .and_then(|r| r["thread_id"].as_str())
+        })
+        .unwrap_or(identity(loaded)?);
     let mut image = seed.clone();
     let mut positions = BTreeMap::new();
     let mut offset = 0u64;
@@ -315,6 +434,18 @@ pub(super) fn project(loaded: &LoadedFile, seed: &HistoryImage) -> AppResult<His
 }
 
 pub(in crate::edit) fn replace(conn: &Connection, id: &str, image: &HistoryImage) -> AppResult<()> {
+    let logical_id = id;
+    if image
+        .identity
+        .as_ref()
+        .is_some_and(|identity| identity.thread_id != logical_id)
+    {
+        return Err(unsupported("投影快照与逻辑会话身份不一致"));
+    }
+    let id = image
+        .identity
+        .as_ref()
+        .map_or(id, |v| v.rollout_id.as_str());
     for (table, _) in TABLES {
         conn.execute(&format!("DELETE FROM {table} WHERE thread_id=?1"), [id])?;
     }
@@ -344,7 +475,7 @@ pub(in crate::edit) fn replace(conn: &Connection, id: &str, image: &HistoryImage
         if conn.execute(
             "UPDATE core_state.threads SET title=?2,first_user_message=?3,preview=?4 WHERE id=?1",
             rusqlite::params![
-                id,
+                logical_id,
                 summary["title"].as_str(),
                 summary["first_user_message"].as_str(),
                 summary["preview"].as_str()
@@ -358,16 +489,40 @@ pub(in crate::edit) fn replace(conn: &Connection, id: &str, image: &HistoryImage
 }
 
 impl HistoryChange {
+    pub(in crate::edit) fn capture_current(
+        &self,
+        conn: &Connection,
+        id: &str,
+    ) -> AppResult<HistoryImage> {
+        if self.before.identity != self.after.identity
+            || self
+                .before
+                .identity
+                .as_ref()
+                .is_some_and(|v| v.thread_id != id)
+        {
+            return Err(unsupported("操作清单的投影身份不一致"));
+        }
+        capture_for(
+            conn,
+            self.before
+                .identity
+                .as_ref()
+                .map_or(id, |v| v.rollout_id.as_str()),
+            self.before.identity.as_ref(),
+        )
+    }
     pub(in crate::edit) fn can_reconcile(&self, current: &HistoryImage) -> bool {
         // Attached SQLite databases in WAL mode may commit separately on a crash.
         // Only finish components equal to the saved before/after images.
         (current.rows == self.before.rows || current.rows == self.after.rows)
             && (current.summary == self.before.summary || current.summary == self.after.summary)
+            && current.identity == self.before.identity
     }
     pub(in crate::edit) fn begin(&self, id: &str) -> AppResult<Connection> {
         let conn = open(&self.path, true)?;
         conn.execute_batch("BEGIN IMMEDIATE")?;
-        if capture(&conn, id)? != self.before {
+        if self.capture_current(&conn, id)? != self.before {
             return Err(AppError::Other(
                 "[EDIT_CONFLICT] 原生历史在预览后变化，未执行修改".into(),
             ));

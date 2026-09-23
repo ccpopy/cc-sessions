@@ -129,7 +129,7 @@ pub(super) fn pending_summary(dir: &Path, path: &Path) -> AppResult<Option<EditP
         .map(|history| -> AppResult<(bool, bool)> {
             validate_history_path(history, path)?;
             let db = paginated::projection::open(&history.path, false)?;
-            let current = paginated::projection::capture(&db, &entry.session_id)?;
+            let current = history.capture_current(&db, &entry.session_id)?;
             Ok((current == history.before, history.can_reconcile(&current)))
         })
         .transpose();
@@ -188,7 +188,7 @@ pub(super) fn reconcile(
             let _guard = paginated::writer_guard(path)?;
             let db = paginated::projection::open(&history.path, true)?;
             db.execute_batch("BEGIN IMMEDIATE")?;
-            let current = paginated::projection::capture(&db, id)?;
+            let current = history.capture_current(&db, id)?;
             if history.can_reconcile(&current) {
                 paginated::projection::replace(&db, id, &history.after)?;
             } else {
@@ -202,7 +202,7 @@ pub(super) fn reconcile(
     } else if loaded.hash == entry.before_hash {
         if let Some(history) = &entry.history {
             let db = paginated::projection::open(&history.path, false)?;
-            if paginated::projection::capture(&db, id)? != history.before {
+            if history.capture_current(&db, id)? != history.before {
                 return Err(AppError::Other(
                     "[EDIT_CONFLICT] 日志尚未提交但原生投影已有变化，已保留操作清单".into(),
                 ));

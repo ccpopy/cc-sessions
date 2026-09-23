@@ -238,12 +238,6 @@ fn model(loaded: &LoadedFile) -> AppResult<History> {
     Ok(History { items, turns })
 }
 
-pub(super) fn inspect(path: &Path, loaded: &LoadedFile) -> AppResult<()> {
-    model(loaded)?;
-    projection::read(path, loaded)?;
-    Ok(())
-}
-
 pub(super) fn diagnostics(
     loaded: &LoadedFile,
 ) -> AppResult<Vec<crate::models::ContentMappingDetail>> {
@@ -512,14 +506,8 @@ fn check_scope(path: &Path, loaded: &LoadedFile, selected: &BTreeSet<usize>) -> 
         }
     }
     if let Some(root) = safety::codex_root(path) {
-        let id = loaded
-            .parsed
-            .iter()
-            .flatten()
-            .find(|v| codex_outer(v) == "session_meta")
-            .unwrap()["payload"]["id"]
-            .as_str()
-            .unwrap();
+        let identity = projection::rollout_identity(path, loaded)?;
+        let id = identity.rollout_id.as_str();
         let ordinal = selected
             .iter()
             .filter_map(|&i| loaded.parsed[i].as_ref()?["ordinal"].as_u64())

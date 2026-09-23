@@ -1,6 +1,8 @@
 use super::super::*;
 use serde_json::json;
 
+mod projection_read_tests;
+
 #[test]
 #[ignore = "read-only audit of explicitly supplied rollout paths; structural output only"]
 fn paginated_mapping_readonly_audit() {
@@ -1450,7 +1452,12 @@ fn paginated_unphased_assistant_updates_completion_and_projection() {
 fn paginated_core_summary_and_split_database_recovery_preserve_other_threads() {
     let f = Fixture::new();
     let db = rusqlite::Connection::open(f.root.join("state_5.sqlite")).unwrap();
-    db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,title TEXT,first_user_message TEXT,preview TEXT,project_id TEXT); INSERT INTO threads VALUES('thread-1','Named thread','KEEP-A','KEEP-A','unchanged-project'),('other','other','other','other','other-project');").unwrap();
+    db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,title TEXT,first_user_message TEXT,preview TEXT,project_id TEXT,rollout_path TEXT); INSERT INTO threads VALUES('thread-1','Named thread','KEEP-A','KEEP-A','unchanged-project',NULL),('other','other','other','other','other-project',NULL);").unwrap();
+    db.execute(
+        "UPDATE threads SET rollout_path=?1 WHERE id='thread-1'",
+        [f.path.to_str().unwrap()],
+    )
+    .unwrap();
     let original = fs::read(&f.path).unwrap();
     transaction::FAIL_AFTER_PROJECTION.with(|flag| flag.set(true));
     let report = f.rewrite(3, "NEW-A");

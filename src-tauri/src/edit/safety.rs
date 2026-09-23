@@ -34,6 +34,7 @@ pub(super) fn inspect(
         blocked_reasons: Vec::new(),
         diagnostics: Vec::new(),
         content_mappings: Vec::new(),
+        projection: None,
     };
     if loaded
         .lines
@@ -81,8 +82,13 @@ pub(super) fn inspect(
             .filter(|detail| detail.status == "inconsistent")
             .filter_map(paginated::content_mapping::issue)
             .collect();
-        if let Err(error) = paginated::inspect(path, loaded) {
-            result.blocked_reasons.push(error.to_string());
+        match paginated::projection::observe(path, loaded) {
+            Ok((_, status)) => result.projection = Some(status),
+            Err(AppError::EditProjection(status)) => {
+                result.blocked_reasons.push(status.to_string());
+                result.projection = Some(*status);
+            }
+            Err(error) => result.blocked_reasons.push(error.to_string()),
         }
         return Ok(result);
     } else if history_mode.is_some_and(|mode| mode != "legacy") {
@@ -245,6 +251,9 @@ pub(super) fn ensure_writable(
         ));
     }
     if !capability.blocked_reasons.is_empty() {
+        if let Some(status) = capability.projection.filter(|s| s.state != "ready") {
+            return Err(AppError::EditProjection(Box::new(status)));
+        }
         return Err(AppError::Other(format!(
             "[EDIT_UNSUPPORTED] 未执行：{}",
             capability.blocked_reasons.join("；")

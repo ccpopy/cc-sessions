@@ -7,6 +7,8 @@ pub enum AppError {
     Io(#[from] std::io::Error),
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("{0}")]
+    EditProjection(Box<crate::models::EditProjectionStatus>),
     #[error("serde: {0}")]
     Serde(#[from] serde_json::Error),
     #[error("path: {0}")]
