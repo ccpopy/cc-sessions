@@ -385,6 +385,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "rolloutPath")?,
             arg(&args, "lineNos")?,
             opt_string_arg(&args, "expectedRevision")?,
+            opt_arg(&args, "targets")?,
         )),
         "edit_session_event_text" => to_result_value(edit::edit_session_event_text_with_lock(
             string_arg(&args, "provider")?,
@@ -394,6 +395,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             usize_arg(&args, "lineNo")?,
             string_arg(&args, "newText")?,
             opt_string_arg(&args, "expectedRevision")?,
+            opt_arg(&args, "targets")?,
             &state.family_lock,
         )),
         "delete_session_events" => to_result_value(edit::delete_session_events_with_lock(
@@ -403,6 +405,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "backupDir")?,
             arg(&args, "lineNos")?,
             opt_string_arg(&args, "expectedRevision")?,
+            opt_arg(&args, "targets")?,
             &state.family_lock,
         )),
         "undo_last_session_edit" => to_result_value(edit::undo_last_session_edit_with_lock(

@@ -81,6 +81,8 @@ import {
   canDeleteEvent,
   canEditEventText,
   canonicalMessageImages,
+  paginatedTargets,
+  latestCanonicalEvents,
   editableText,
   eventMessageLabel,
   extractPreviewEventText as extractText,
@@ -176,7 +178,7 @@ export function PreviewDialog({
   const [isSelecting, setIsSelecting] = useState(false);
   const [selectionFirstIndex, setSelectionFirstIndex] = useState<number | null>(null);
   const [selectionSecondIndex, setSelectionSecondIndex] = useState<number | null>(null);
-  const [deleteSelectedTarget, setDeleteSelectedTarget] = useState<{ start: number; end: number } | null>(null);
+  const [deleteSelectedTarget, setDeleteSelectedTarget] = useState<{ start: number; end: number; events: PreviewEvent[] } | null>(null);
   const [deletePlan, setDeletePlan] = useState<DeletePlan | null>(null);
   const deleteRequestRef = useRef(0);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -214,6 +216,8 @@ export function PreviewDialog({
     && lastReport?.status !== "needs_recovery"
     && (provider === "opencode" || (capability !== null && capability.blocked_reasons.length === 0));
   const sourceLabel = `${isTauriRuntime() ? "本地" : `WebUI · ${window.location.host}`} · ${provider}`;
+  const canDeletePreviewEvent = (event: PreviewEvent) => canDeleteEvent(provider, event)
+    && (capability?.format !== "paginated" || paginatedTargets([event]).length === 1);
   const relatedSubagents = useMemo(() => {
     if (!session || session.provider !== "codex" || customRolloutPath) return [];
     return collectRelatedSubagents(session.id, allSessions);
@@ -465,8 +469,8 @@ export function PreviewDialog({
   const deferredFilter = useDeferredValue(filter);
   const normalizedFilter = deferredFilter.trim().toLowerCase();
   const searchableEvents = useMemo(
-    () => events.map((event) => ({ event, searchText: previewEventSearchText(event) })),
-    [events],
+    () => (onlyMsg ? latestCanonicalEvents(events) : events).map((event) => ({ event, searchText: previewEventSearchText(event) })),
+    [events, onlyMsg],
   );
 
   const filtered = useMemo(() => {
@@ -790,6 +794,7 @@ export function PreviewDialog({
         session_id: session.id,
         backup_dir: backupDir,
         line_no: editTarget.index,
+        targets: paginatedTargets([editTarget]),
         new_text: editText,
       });
       recordEditResult(report);
@@ -810,7 +815,7 @@ export function PreviewDialog({
     setDeleteTarget(event);
     const requestId = ++deleteRequestRef.current;
     api
-      .planSessionEventDeletion(provider, rolloutPath, [event.index], revisionRef.current)
+      .planSessionEventDeletion(provider, rolloutPath, [event.index], revisionRef.current, paginatedTargets([event]))
       .then((plan) => { if (requestId === deleteRequestRef.current) setDeletePlan(plan); })
       .catch((e: any) => {
         if (requestId !== deleteRequestRef.current) return;
@@ -833,6 +838,7 @@ export function PreviewDialog({
         session_id: session.id,
         backup_dir: backupDir,
         line_nos: [deleteTarget.index],
+        targets: paginatedTargets([deleteTarget]),
       });
       recordEditResult(report);
       setDeleteTarget(null);
@@ -852,13 +858,14 @@ export function PreviewDialog({
     const start = Math.min(selectionFirstIndex, selectionSecondIndex);
     const end = Math.max(selectionFirstIndex, selectionSecondIndex);
     setDeletePlan(null);
-    setDeleteSelectedTarget({ start, end });
     const requestId = ++deleteRequestRef.current;
-    const indices = events
-      .filter((e) => e.index >= start && e.index <= end && canDeleteEvent(provider, e))
+    const selected = latestCanonicalEvents(events)
+      .filter((e) => e.index >= start && e.index <= end && canDeletePreviewEvent(e));
+    setDeleteSelectedTarget({ start, end, events: selected });
+    const indices = selected
       .map((e) => e.index);
     api
-      .planSessionEventDeletion(provider, rolloutPath, indices, revisionRef.current)
+      .planSessionEventDeletion(provider, rolloutPath, indices, revisionRef.current, paginatedTargets(selected))
       .then((plan) => { if (requestId === deleteRequestRef.current) setDeletePlan(plan); })
       .catch((e: any) => {
         if (requestId !== deleteRequestRef.current) return;
@@ -882,6 +889,7 @@ export function PreviewDialog({
         session_id: session.id,
         backup_dir: backupDir,
         line_nos: indices,
+        targets: paginatedTargets(deleteSelectedTarget.events),
       });
       recordEditResult(report);
       setDeleteSelectedTarget(null);
@@ -994,8 +1002,8 @@ export function PreviewDialog({
   const editActions: EditActions = {
     enabled: canMutateSession,
     pending: mutating,
-    canEditText: (e) => canEditEventText(provider, e),
-    canDelete: (e) => canDeleteEvent(provider, e),
+    canEditText: (e) => canEditEventText(provider, e) && (capability?.format !== "paginated" || paginatedTargets([e]).length === 1),
+    canDelete: canDeletePreviewEvent,
     onEdit: requestEditAt,
     onDelete: requestDeleteAt,
   };
@@ -1184,7 +1192,7 @@ export function PreviewDialog({
                         (e) =>
                           e.index >= Math.min(selectionFirstIndex, selectionSecondIndex) &&
                           e.index <= Math.max(selectionFirstIndex, selectionSecondIndex) &&
-                          canDeleteEvent(provider, e),
+                          canDeletePreviewEvent(e),
                       ).length}
                       条
                     </span>
@@ -1215,10 +1223,13 @@ export function PreviewDialog({
           </div>
           {capability && capability.blocked_reasons.length > 0 && (
             <div role="status" className="mt-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs">
-              <strong>只读 · {capability.format === "paginated" ? "分页历史" : "暂不支持消息写入"}</strong>
+              <strong>当前无法写入 · {capability.format === "paginated" ? "分页历史需核对" : "暂不支持消息写入"}</strong>
               <div className="mt-1">{capability.blocked_reasons.join("；")}</div>
               {capability.format === "paginated" && <div className="mt-1">对话按正式消息显示；完整事件中保留模型上下文记录。旧版删除可能仅修改了上下文，未移除正式消息。</div>}
             </div>
+          )}
+          {capability?.format === "paginated" && capability.blocked_reasons.length === 0 && (
+            <div className="mt-2 text-xs text-muted-foreground">编辑会保留原会话 ID，并同步正式消息、上下文与历史投影。删除历史不会撤销已执行的外部操作；涉及共享历史、压缩或工具依赖时，将按所选范围核对后提示。</div>
           )}
           {readError && <div role="alert" className="mt-2 text-xs text-destructive">{readError}</div>}
           {lastReport && (

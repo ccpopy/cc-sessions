@@ -1,0 +1,723 @@
+use super::super::*;
+use serde_json::json;
+
+struct Fixture {
+    root: PathBuf,
+    path: PathBuf,
+    backup: PathBuf,
+}
+impl Fixture {
+    fn update(&self, change: impl FnOnce(&mut Vec<Value>, &mut paginated::HistoryImage)) {
+        let loaded = load_file(&self.path).unwrap();
+        let mut seed = paginated::projection::read(&self.path, &loaded).unwrap();
+        let mut rows: Vec<Value> = loaded.parsed.into_iter().map(Option::unwrap).collect();
+        change(&mut rows, &mut seed);
+        for (i, row) in rows.iter_mut().enumerate() {
+            row["ordinal"] = json!(i);
+        }
+        let lines: Vec<String> = rows.iter().map(Value::to_string).collect();
+        fs::write(&self.path, lines.join("\n") + "\n").unwrap();
+        let image = paginated::projection::project(&load_file(&self.path).unwrap(), &seed).unwrap();
+        let db =
+            paginated::projection::open(&self.root.join("thread_history_1.sqlite"), true).unwrap();
+        paginated::projection::replace(&db, "thread-1", &image).unwrap();
+    }
+    fn rewrite(&self, index: usize, text: &str) -> EditApplyReport {
+        apply_edit_text(
+            "codex",
+            self.path.to_str().unwrap(),
+            "thread-1",
+            self.backup.to_str().unwrap(),
+            index,
+            text,
+            Some(&self.revision()),
+        )
+        .unwrap()
+    }
+    fn new() -> Self {
+        let root = std::env::temp_dir().join(format!(
+            "cc-paginated-edit-{}",
+            crate::repair::new_session_id()
+        ));
+        let path = root.join("sessions/rollout-test.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let backup = root.join("backup");
+        let mut rows = vec![
+            json!({"type":"session_meta","payload":{"id":"thread-1","history_mode":"paginated","cli_version":"0.155.0-alpha.16"}}),
+        ];
+        for (n, text) in ["KEEP-A", "DELETE-B", "KEEP-C"].iter().enumerate() {
+            let turn = format!("turn-{n}");
+            rows.extend([
+                json!({"type":"event_msg","payload":{"type":"task_started","turn_id":turn,"started_at":1790059469}}),
+                json!({"type":"response_item","payload":{"type":"message","id":format!("context-{n}"),"role":"user","content":[{"type":"input_text","text":text}],"internal_chat_message_metadata_passthrough":{"turn_id":turn,"content_item_kinds":["user.text"]}}}),
+                json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":"thread-1","turn_id":turn,"started_at_ms":1790059469000i64,"completed_at_ms":1790059469000i64,"item":{"type":"UserMessage","id":format!("user-{n}"),"client_id":null,"content":[{"type":"text","text":text}]}}}),
+                json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":"thread-1","turn_id":turn,"started_at_ms":1790059470000i64,"completed_at_ms":1790059470000i64,"item":{"type":"AgentMessage","id":format!("agent-{n}"),"content":[{"type":"Text","text":format!("reply-{n}")}],"phase":"final_answer"}}}),
+                json!({"type":"response_item","payload":{"type":"message","id":format!("agent-{n}"),"role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":format!("reply-{n}")}]}}),
+                json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":turn,"last_agent_message":format!("reply-{n}"),"started_at":1790059469,"completed_at":1790059470,"duration_ms":1000}}),
+            ]);
+        }
+        let db = rusqlite::Connection::open(root.join("thread_history_1.sqlite")).unwrap();
+        db.execute_batch(include_str!("schema_v6.sql")).unwrap();
+        let mut file = fs::File::create(&path).unwrap();
+        let mut offset = 0;
+        for (i, mut row) in rows.into_iter().enumerate() {
+            row["ordinal"] = json!(i);
+            row["timestamp"] = json!("2026-09-22T08:04:29Z");
+            let line = serde_json::to_string(&row).unwrap() + "\n";
+            let p = &row["payload"];
+            let turn = p["turn_id"].as_str().unwrap_or("");
+            match p["type"].as_str().unwrap_or("") {
+                "task_started" => {
+                    db.execute("INSERT INTO thread_turns(thread_id,turn_id,rollout_ordinal,status,started_at,rollout_byte_offset) VALUES('thread-1',?1,?2,'inProgress',1790059469,?3)",rusqlite::params![turn,i,offset]).unwrap();
+                }
+                "task_complete" => {
+                    db.execute("UPDATE thread_turns SET status='completed',completed_at=1790059470,duration_ms=1000,rollout_end_ordinal=?2,rollout_end_byte_offset=?3 WHERE turn_id=?1",rusqlite::params![turn,i,offset+line.len()]).unwrap();
+                }
+                "item_completed" => {
+                    let item = &p["item"];
+                    let id = item["id"].as_str().unwrap();
+                    let projected = if item["type"] == "UserMessage" {
+                        json!({"type":"userMessage","id":id,"clientId":null,"content":item["content"]})
+                    } else {
+                        json!({"type":"agentMessage","id":id,"text":item["content"][0]["text"],"phase":"final_answer","memoryCitation":null,"delivery":null,"questions":null})
+                    };
+                    db.execute("INSERT INTO thread_items(thread_id,turn_id,item_id,rollout_ordinal,created_at_ms,item_json,item_type,updated_at_ordinal) VALUES('thread-1',?1,?2,?3,1790059469000,?4,?5,?3)",rusqlite::params![turn,id,i,projected.to_string(),projected["type"].as_str().unwrap()]).unwrap();
+                    let column = if item["type"] == "UserMessage" {
+                        "first_user_item_id"
+                    } else {
+                        "final_agent_item_id"
+                    };
+                    db.execute(
+                        &format!("UPDATE thread_turns SET {column}=?2 WHERE turn_id=?1"),
+                        rusqlite::params![turn, id],
+                    )
+                    .unwrap();
+                }
+                _ => {}
+            }
+            file.write_all(line.as_bytes()).unwrap();
+            offset += line.len();
+        }
+        db.execute(
+            "INSERT INTO thread_history_projection_state VALUES('thread-1',?1,19)",
+            [offset],
+        )
+        .unwrap();
+        Self { root, path, backup }
+    }
+    fn revision(&self) -> String {
+        inspect_edit_capability("codex", self.path.to_str().unwrap())
+            .unwrap()
+            .revision
+    }
+    fn delete(&self, indices: &[usize]) -> AppResult<EditApplyReport> {
+        apply_delete(
+            "codex",
+            self.path.to_str().unwrap(),
+            "thread-1",
+            self.backup.to_str().unwrap(),
+            indices,
+            Some(&self.revision()),
+        )
+    }
+    fn items(&self) -> String {
+        let db = rusqlite::Connection::open(self.root.join("thread_history_1.sqlite")).unwrap();
+        let mut q=db.prepare("SELECT item_json FROM thread_items WHERE thread_id='thread-1' ORDER BY rollout_ordinal").unwrap();
+        q.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n")
+    }
+}
+
+#[test]
+fn paginated_duplicate_text_and_snapshots_are_selected_by_identity() {
+    let f = Fixture::new();
+    f.update(|rows, _| {
+        for row in rows.iter_mut() {
+            if row["payload"]["role"] == "user" {
+                row["payload"]["content"][0]["text"] = json!("继续");
+            }
+            if row["payload"]["item"]["type"] == "UserMessage" {
+                row["payload"]["item"]["content"][0]["text"] = json!("继续");
+            }
+        }
+        rows.insert(10, rows[9].clone());
+    });
+    let target = crate::models::PaginatedItemTarget {
+        thread_id: "thread-1".into(),
+        turn_id: "turn-1".into(),
+        item_id: "user-1".into(),
+    };
+    let selected = resolve_selection(
+        "codex",
+        f.path.to_str().unwrap(),
+        vec![0],
+        Some(&[target]),
+        Some(&f.revision()),
+    )
+    .unwrap();
+    assert_eq!(selected, vec![10]);
+    f.delete(&selected).unwrap();
+    let loaded = load_file(&f.path).unwrap();
+    let h = super::model(&loaded).unwrap();
+    assert!(!h.items.iter().any(|i| i.key.id == "user-1"));
+    assert!(h.items.iter().any(|i| i.key.id == "user-0"));
+    assert!(h.items.iter().any(|i| i.key.id == "user-2"));
+    assert_eq!(f.items().matches("继续").count(), 2);
+}
+
+#[test]
+fn paginated_user_and_assistant_rewrite_preserve_nontext_blocks() {
+    let f = Fixture::new();
+    f.update(|rows,seed| {
+        rows[9]["payload"]["item"]["content"]=json!([{"type":"text","text":"DELETE-B","text_elements":[{"start":0,"end":8}]},{"type":"local_image","path":"synthetic.png","detail":"original"},{"type":"text","text":"tail","text_elements":[]}]);
+        rows[8]["payload"]["content"]=json!([{"type":"input_text","text":"DELETE-B"},{"type":"input_image","image_url":"data:image/png;base64,AA==","detail":"original"},{"type":"input_text","text":"tail"}]);
+        rows[8]["payload"]["internal_chat_message_metadata_passthrough"]["content_item_kinds"]=json!(["user.text","user.image","user.text"]);
+        let row=seed.rows.get_mut("thread_items").unwrap().iter_mut().find(|r|r["item_id"]=="user-1").unwrap();
+        let mut native:Value=serde_json::from_str(row["item_json"].as_str().unwrap()).unwrap();
+        native["content"]=rows[9]["payload"]["item"]["content"].clone();native["content"][1]["type"]=json!("localImage");
+        row["item_json"]=json!(native.to_string());
+    });
+    let original = fs::read(&f.path).unwrap();
+    let items = f.items();
+    let report = f.rewrite(9, "changed user");
+    let rows = load_file(&f.path).unwrap().parsed;
+    assert_eq!(
+        rows[9].as_ref().unwrap()["payload"]["item"]["content"][1]["path"],
+        "synthetic.png"
+    );
+    assert_eq!(
+        rows[9].as_ref().unwrap()["payload"]["item"]["content"][0]["text_elements"],
+        json!([])
+    );
+    assert_eq!(
+        rows[8].as_ref().unwrap()["payload"]["content"][1]["image_url"],
+        "data:image/png;base64,AA=="
+    );
+    assert_eq!(
+        rows[8].as_ref().unwrap()["payload"]["content"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    f.rewrite(10, "changed assistant");
+    assert!(!fs::read_to_string(&f.path).unwrap().contains("reply-1"));
+    assert!(f.items().contains("changed assistant"));
+    assert!(f.items().contains("localImage"));
+    restore_snapshot(
+        "codex",
+        f.path.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        report.snapshot_created.as_deref().unwrap(),
+        Some(&f.revision()),
+    )
+    .unwrap();
+    assert_eq!(fs::read(&f.path).unwrap(), original);
+    assert_eq!(f.items(), items);
+}
+
+#[test]
+fn paginated_append_lock_and_interruption_recovery_preserve_history() {
+    let f = Fixture::new();
+    let original = fs::read(&f.path).unwrap();
+    let items = f.items();
+    let db = paginated::projection::open(&f.root.join("thread_history_1.sqlite"), true).unwrap();
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert!(f.delete(&[9]).is_err());
+    assert_eq!(fs::read(&f.path).unwrap(), original);
+    assert_eq!(f.items(), items);
+    db.execute_batch("ROLLBACK").unwrap();
+    transaction::FAIL_AFTER_ROLLOUT.with(|flag| flag.set(true));
+    let report = f.delete(&[9]).unwrap();
+    assert_eq!(report.status, "needs_recovery");
+    assert_eq!(f.items(), items);
+    let dir = edit_dir(f.backup.to_str().unwrap(), "codex", "thread-1");
+    assert!(
+        transaction::pending_summary(&dir, &f.path)
+            .unwrap()
+            .unwrap()
+            .can_reconcile
+    );
+    transaction::reconcile("codex", &f.path, "thread-1", &dir, Some(&f.revision())).unwrap();
+    transaction::reconcile("codex", &f.path, "thread-1", &dir, Some(&f.revision())).unwrap();
+    assert!(!f.items().contains("DELETE-B"));
+    undo_last(
+        "codex",
+        f.path.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        Some(&f.revision()),
+    )
+    .unwrap();
+    assert_eq!(fs::read(&f.path).unwrap(), original);
+    assert_eq!(f.items(), items);
+    let revision = f.revision();
+    fs::OpenOptions::new().append(true).open(&f.path).unwrap().write_all(b"{\"ordinal\":19,\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_settings_applied\"}}\n").unwrap();
+    let appended = fs::read(&f.path).unwrap();
+    assert!(apply_delete(
+        "codex",
+        f.path.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        &[9],
+        Some(&revision)
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("EDIT_CONFLICT"));
+    assert_eq!(fs::read(&f.path).unwrap(), appended);
+}
+
+#[test]
+fn paginated_disk_failure_and_committed_projection_recovery() {
+    let f = Fixture::new();
+    let original = fs::read(&f.path).unwrap();
+    let items = f.items();
+    transaction::FAIL_ROLLOUT_WRITE.with(|flag| flag.set(true));
+    assert!(f
+        .delete(&[9])
+        .unwrap_err()
+        .to_string()
+        .contains("disk write failure"));
+    assert_eq!(fs::read(&f.path).unwrap(), original);
+    assert_eq!(f.items(), items);
+    let dir = edit_dir(f.backup.to_str().unwrap(), "codex", "thread-1");
+    assert!(transaction::pending_summary(&dir, &f.path)
+        .unwrap()
+        .is_none());
+    transaction::FAIL_AFTER_PROJECTION.with(|flag| flag.set(true));
+    assert_eq!(f.delete(&[9]).unwrap().status, "needs_recovery");
+    assert!(!f.items().contains("DELETE-B"));
+    transaction::reconcile("codex", &f.path, "thread-1", &dir, Some(&f.revision())).unwrap();
+    assert_eq!(read_journal(&dir).unwrap().len(), 1);
+    undo_last(
+        "codex",
+        f.path.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        Some(&f.revision()),
+    )
+    .unwrap();
+    assert_eq!(fs::read(&f.path).unwrap(), original);
+    assert_eq!(f.items(), items);
+}
+
+#[test]
+fn paginated_shared_prefix_and_compaction_only_block_affected_range() {
+    let f = Fixture::new();
+    let child = f.root.join("sessions/child.jsonl");
+    let child_bytes=json!({"type":"session_meta","payload":{"id":"child","history_mode":"paginated","history_base":{"thread_id":"thread-1","end_ordinal_exclusive":7}}}).to_string();
+    fs::write(&child, &child_bytes).unwrap();
+    let db = paginated::projection::open(&f.root.join("thread_history_1.sqlite"), true).unwrap();
+    db.execute(
+        "INSERT INTO thread_history_projection_state VALUES('child',123,7)",
+        [],
+    )
+    .unwrap();
+    let child_projection = paginated::projection::capture(&db, "child").unwrap();
+    assert!(f.delete(&[3]).unwrap_err().to_string().contains("继承"));
+    f.delete(&[15]).unwrap();
+    assert_eq!(fs::read_to_string(&child).unwrap(), child_bytes);
+    assert_eq!(
+        paginated::projection::capture(&db, "child").unwrap(),
+        child_projection
+    );
+    let c = Fixture::new();
+    c.update(|rows,_|rows.insert(7,json!({"type":"compacted","payload":{"message":"KEEP-A compressed","replacement_history":[]}})));
+    assert!(c.delete(&[3]).unwrap_err().to_string().contains("摘要"));
+    c.delete(&[16]).unwrap();
+    assert!(fs::read_to_string(&c.path)
+        .unwrap()
+        .contains("KEEP-A compressed"));
+}
+
+#[test]
+fn paginated_tool_turn_and_failed_interrupted_turns_can_be_deleted() {
+    let f = Fixture::new();
+    f.update(|rows,seed| {
+        let tool=json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":"thread-1","turn_id":"turn-1","item":{"type":"CommandExecution","id":"tool-1","command":"synthetic-never-execute","status":"completed"}}});
+        rows.splice(10..10,[
+            json!({"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"synthetic-never-execute"}}),
+            tool,
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"synthetic output"}}),
+        ]);
+        seed.rows.get_mut("thread_items").unwrap().push(json!({"thread_id":"thread-1","turn_id":"turn-1","item_id":"tool-1","rollout_ordinal":11,"created_at_ms":1790059470000i64,"item_json":json!({"id":"tool-1","type":"commandExecution","command":"synthetic-never-execute","status":"completed"}).to_string(),"item_type":"commandExecution","updated_at_ordinal":11}));
+    });
+    assert!(f
+        .delete(&[11])
+        .unwrap_err()
+        .to_string()
+        .contains("全部正式记录"));
+    let original = fs::read(&f.path).unwrap();
+    let items = f.items();
+    f.delete(&[9, 11, 13]).unwrap();
+    assert!(!fs::read_to_string(&f.path).unwrap().contains("call-1"));
+    assert!(!f.items().contains("tool-1"));
+    undo_last(
+        "codex",
+        f.path.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        Some(&f.revision()),
+    )
+    .unwrap();
+    assert_eq!(fs::read(&f.path).unwrap(), original);
+    assert_eq!(f.items(), items);
+    for interrupted in [false, true] {
+        let failed = Fixture::new();
+        failed.update(|rows, seed| {
+            rows[12]["payload"]["type"] = json!(if interrupted {
+                "turn_aborted"
+            } else {
+                "task_complete"
+            });
+            rows[12]["payload"]["error"] = json!({"message":"synthetic failure"});
+            let turn = seed
+                .rows
+                .get_mut("thread_turns")
+                .unwrap()
+                .iter_mut()
+                .find(|r| r["turn_id"] == "turn-1")
+                .unwrap();
+            turn["status"] = json!(if interrupted { "interrupted" } else { "failed" });
+            turn["error_json"] = json!(json!({"message":"synthetic failure"}).to_string());
+        });
+        failed.delete(&[9, 10]).unwrap();
+        assert!(!failed.items().contains("DELETE-B"));
+    }
+}
+
+#[test]
+fn paginated_unknown_turn_and_live_writer_leave_other_ranges_available() {
+    let f = Fixture::new();
+    f.update(|rows,_|rows.insert(10,json!({"type":"event_msg","payload":{"type":"unknown_future_state","turn_id":"turn-1"}})));
+    assert!(f.delete(&[9]).unwrap_err().to_string().contains("尚未映射"));
+    f.delete(&[3]).unwrap();
+    #[cfg(windows)]
+    {
+        let writer = fs::OpenOptions::new().append(true).open(&f.path).unwrap();
+        let before = fs::read(&f.path).unwrap();
+        let index = load_file(&f.path)
+            .unwrap()
+            .parsed
+            .iter()
+            .position(|v| v.as_ref().unwrap()["payload"]["item"]["id"] == "user-2")
+            .unwrap();
+        assert!(f
+            .delete(&[index])
+            .unwrap_err()
+            .to_string()
+            .contains("EDIT_BUSY"));
+        assert_eq!(fs::read(&f.path).unwrap(), before);
+        drop(writer);
+    }
+}
+
+#[test]
+fn paginated_pending_recovery_rejects_external_projection_changes() {
+    let f = Fixture::new();
+    transaction::FAIL_AFTER_ROLLOUT.with(|flag| flag.set(true));
+    assert_eq!(f.delete(&[9]).unwrap().status, "needs_recovery");
+    let db = paginated::projection::open(&f.root.join("thread_history_1.sqlite"), true).unwrap();
+    db.execute("UPDATE thread_items SET item_json='external-state' WHERE thread_id='thread-1' AND item_id='user-1'",[]).unwrap();
+    let dir = edit_dir(f.backup.to_str().unwrap(), "codex", "thread-1");
+    let after = fs::read(&f.path).unwrap();
+    let items = f.items();
+    assert!(
+        !transaction::pending_summary(&dir, &f.path)
+            .unwrap()
+            .unwrap()
+            .can_reconcile
+    );
+    assert!(
+        transaction::reconcile("codex", &f.path, "thread-1", &dir, Some(&f.revision()))
+            .unwrap_err()
+            .to_string()
+            .contains("EDIT_CONFLICT")
+    );
+    assert_eq!(fs::read(&f.path).unwrap(), after);
+    assert_eq!(f.items(), items);
+    assert!(dir.join("pending-operation.json").exists());
+}
+
+#[test]
+fn paginated_unphased_assistant_updates_completion_and_projection() {
+    let f = Fixture::new();
+    f.update(|rows, _| {
+        rows[10]["payload"]["item"]["phase"] = Value::Null;
+        rows[11]["payload"]["phase"] = Value::Null;
+    });
+    f.rewrite(10, "unphased changed");
+    assert!(!fs::read_to_string(&f.path).unwrap().contains("reply-1"));
+    let rows = load_file(&f.path).unwrap().parsed;
+    assert_eq!(
+        rows[12].as_ref().unwrap()["payload"]["last_agent_message"],
+        "unphased changed"
+    );
+    f.delete(&[10]).unwrap();
+    assert!(!fs::read_to_string(&f.path)
+        .unwrap()
+        .contains("unphased changed"));
+}
+
+#[test]
+fn paginated_core_summary_and_split_database_recovery_preserve_other_threads() {
+    let f = Fixture::new();
+    let db = rusqlite::Connection::open(f.root.join("state_5.sqlite")).unwrap();
+    db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,title TEXT,first_user_message TEXT,preview TEXT,project_id TEXT); INSERT INTO threads VALUES('thread-1','Named thread','KEEP-A','KEEP-A','unchanged-project'),('other','other','other','other','other-project');").unwrap();
+    let original = fs::read(&f.path).unwrap();
+    transaction::FAIL_AFTER_PROJECTION.with(|flag| flag.set(true));
+    let report = f.rewrite(3, "NEW-A");
+    assert_eq!(report.status, "needs_recovery");
+    let summary: Vec<String> = db
+        .query_row(
+            "SELECT title,first_user_message,preview,project_id FROM threads WHERE id='thread-1'",
+            [],
+            |r| Ok(vec![r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?]),
+        )
+        .unwrap();
+    assert_eq!(
+        summary,
+        vec!["Named thread", "NEW-A", "NEW-A", "unchanged-project"]
+    );
+    // Simulate power loss between the WAL commits of the two attached databases.
+    db.execute(
+        "UPDATE threads SET first_user_message='KEEP-A',preview='KEEP-A' WHERE id='thread-1'",
+        [],
+    )
+    .unwrap();
+    let dir = edit_dir(f.backup.to_str().unwrap(), "codex", "thread-1");
+    assert!(
+        transaction::pending_summary(&dir, &f.path)
+            .unwrap()
+            .unwrap()
+            .can_reconcile
+    );
+    transaction::reconcile("codex", &f.path, "thread-1", &dir, Some(&f.revision())).unwrap();
+    assert_eq!(
+        db.query_row("SELECT preview FROM threads WHERE id='thread-1'", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "NEW-A"
+    );
+    undo_last(
+        "codex",
+        f.path.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        Some(&f.revision()),
+    )
+    .unwrap();
+    assert_eq!(fs::read(&f.path).unwrap(), original);
+    assert_eq!(
+        db.query_row("SELECT preview FROM threads WHERE id='thread-1'", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "KEEP-A"
+    );
+    assert_eq!(
+        db.query_row("SELECT project_id FROM threads WHERE id='other'", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        "other-project"
+    );
+}
+
+#[test]
+fn paginated_native_writer_lock_blocks_without_an_open_rollout() {
+    let f = Fixture::new();
+    let dir = f.root.join("thread-writer-locks");
+    fs::create_dir_all(&dir).unwrap();
+    let lock = fs::File::create(dir.join("thread-1.lock")).unwrap();
+    lock.try_lock().unwrap();
+    let before = fs::read(&f.path).unwrap();
+    assert!(f
+        .delete(&[9])
+        .unwrap_err()
+        .to_string()
+        .contains("EDIT_BUSY"));
+    assert_eq!(fs::read(&f.path).unwrap(), before);
+    drop(lock);
+    f.delete(&[9]).unwrap();
+}
+
+#[test]
+#[ignore = "requires an explicitly created isolated native fixture"]
+fn paginated_native_fixture_command() {
+    let root = PathBuf::from(std::env::var("CC_SYNTHETIC_HOME").expect("isolated fixture home"));
+    let marker: Value =
+        serde_json::from_slice(&fs::read(root.join(".cc-synthetic-fixture.json")).unwrap())
+            .unwrap();
+    let path = PathBuf::from(marker["path"].as_str().unwrap());
+    assert!(path
+        .canonicalize()
+        .unwrap()
+        .starts_with(root.canonicalize().unwrap()));
+    let id = marker["id"].as_str().unwrap();
+    let backup = root.join("edit-backups");
+    let revision = inspect_edit_capability("codex", path.to_str().unwrap())
+        .unwrap()
+        .revision;
+    let action = std::env::var("CC_SYNTHETIC_ACTION").unwrap();
+    let report = match action.as_str() {
+        "delete" | "range" | "busy" => delete_session_events_with_lock(
+            "codex".into(),
+            path.to_string_lossy().into(),
+            id.into(),
+            backup.to_string_lossy().into(),
+            if action == "range" {
+                vec![9, 10]
+            } else {
+                vec![9]
+            },
+            Some(revision),
+            Some(
+                (if action == "range" {
+                    vec!["user-1", "agent-1"]
+                } else {
+                    vec!["user-1"]
+                })
+                .into_iter()
+                .map(|item| crate::models::PaginatedItemTarget {
+                    thread_id: id.into(),
+                    turn_id: marker["turns"][1].as_str().unwrap().into(),
+                    item_id: item.into(),
+                })
+                .collect(),
+            ),
+            &crate::family::FamilyLock::default(),
+        ),
+        "undo" => undo_last(
+            "codex",
+            path.to_str().unwrap(),
+            id,
+            backup.to_str().unwrap(),
+            Some(&revision),
+        ),
+        "rewrite" | "rewrite-assistant" => edit_session_event_text_with_lock(
+            "codex".into(),
+            path.to_string_lossy().into(),
+            id.into(),
+            backup.to_string_lossy().into(),
+            3,
+            if action == "rewrite" {
+                "NATIVE-EDITED-A"
+            } else {
+                "NATIVE-EDITED-ASSISTANT"
+            }
+            .into(),
+            Some(revision),
+            Some(vec![crate::models::PaginatedItemTarget {
+                thread_id: id.into(),
+                turn_id: marker["turns"][0].as_str().unwrap().into(),
+                item_id: if action == "rewrite" {
+                    "user-0"
+                } else {
+                    "agent-0"
+                }
+                .into(),
+            }]),
+            &crate::family::FamilyLock::default(),
+        ),
+        "restore" => {
+            let dir = edit_dir(backup.to_str().unwrap(), "codex", id);
+            let first = read_journal(&dir).unwrap();
+            restore_snapshot(
+                "codex",
+                path.to_str().unwrap(),
+                id,
+                backup.to_str().unwrap(),
+                first[0].base_snapshot.as_deref().unwrap(),
+                Some(&revision),
+            )
+        }
+        _ => panic!("unknown synthetic action"),
+    };
+    if action == "busy" {
+        assert!(report.unwrap_err().to_string().contains("EDIT_BUSY"));
+        fs::write(
+            root.join("busy-report.json"),
+            b"{\"nativeWriterRejected\":true}",
+        )
+        .unwrap();
+        return;
+    }
+    let report = report.unwrap();
+    assert_eq!(report.status, "committed_unverified");
+    fs::write(
+        root.join(format!("{action}-report.json")),
+        serde_json::to_vec_pretty(&report).unwrap(),
+    )
+    .unwrap();
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[test]
+fn paginated_middle_delete_preserves_id_neighbors_and_undo_restores_projection() {
+    let f = Fixture::new();
+    let original = fs::read(&f.path).unwrap();
+    let items = f.items();
+    let report = f
+        .delete(&[9])
+        .expect("normal stopped paginated history must support message deletion");
+    assert_ne!(report.status, "needs_recovery");
+    let after = fs::read_to_string(&f.path).unwrap();
+    assert!(!after.contains("DELETE-B"));
+    assert!(after.contains("thread-1"));
+    assert!(after.find("KEEP-A").unwrap() < after.find("KEEP-C").unwrap());
+    assert!(!f.items().contains("DELETE-B"));
+    undo_last(
+        "codex",
+        f.path.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        Some(&f.revision()),
+    )
+    .unwrap();
+    assert_eq!(fs::read(&f.path).unwrap(), original);
+    assert_eq!(f.items(), items);
+}
+
+#[test]
+fn paginated_range_delete_removes_completion_copy_and_supports_redo_and_snapshot() {
+    let f = Fixture::new();
+    let original = fs::read(&f.path).unwrap();
+    let items = f.items();
+    let report = f.delete(&[9, 10]).unwrap();
+    let after = fs::read(&f.path).unwrap();
+    assert!(!String::from_utf8_lossy(&after).contains("reply-1"));
+    let undo = || {
+        undo_last(
+            "codex",
+            f.path.to_str().unwrap(),
+            "thread-1",
+            f.backup.to_str().unwrap(),
+            Some(&f.revision()),
+        )
+        .unwrap()
+    };
+    undo();
+    assert_eq!(fs::read(&f.path).unwrap(), original);
+    assert_eq!(f.items(), items);
+    undo();
+    assert_eq!(fs::read(&f.path).unwrap(), after);
+    restore_snapshot(
+        "codex",
+        f.path.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        report.snapshot_created.as_deref().unwrap(),
+        Some(&f.revision()),
+    )
+    .unwrap();
+    assert_eq!(fs::read(&f.path).unwrap(), original);
+    assert_eq!(f.items(), items);
+}

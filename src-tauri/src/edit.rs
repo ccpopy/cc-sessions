@@ -33,6 +33,7 @@ use crate::models::{
 };
 use crate::paths;
 
+mod paginated;
 mod safety;
 mod transaction;
 
@@ -84,6 +85,8 @@ struct JournalEntry {
     after_hash: String,
     #[serde(default)]
     changes: Vec<LineChange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    history: Option<paginated::HistoryChange>,
 }
 
 // ========================= 文件读写 =========================
@@ -158,6 +161,11 @@ fn write_lines(
     });
     drop(current);
     let written = atomic_file::replace_with_writer_receipt(path, &expected, |file| {
+        #[cfg(test)]
+        if transaction::FAIL_ROLLOUT_WRITE.with(|flag| flag.replace(false)) {
+            file.write_all(b"partial")?;
+            return Err(std::io::Error::other("injected disk write failure").into());
+        }
         let mut writer = std::io::BufWriter::with_capacity(64 * 1024, file);
         for (index, line) in lines.iter().enumerate() {
             writer.write_all(line.as_bytes())?;
@@ -407,6 +415,17 @@ fn codex_delete_blocked(v: &Value) -> Option<String> {
 }
 
 fn codex_line_brief(v: &Value) -> (String, String, String) {
+    if codex_ptype(v) == "item_completed" {
+        let event = crate::rollout::classify_preview(0, v.clone());
+        return (
+            event.role.clone(),
+            event.kind.clone(),
+            crate::rollout::preview_event_text(&event)
+                .chars()
+                .take(160)
+                .collect(),
+        );
+    }
     let outer = codex_outer(v);
     let pt = codex_ptype(v);
     let (role, text) = match (outer, pt) {
@@ -1053,6 +1072,12 @@ pub fn plan_delete(
     safety::check_revision(Path::new(&path), &loaded, expected_revision)?;
     let capability = safety::inspect(provider, Path::new(&path), &loaded)?;
     let (plan, mut blocked) = match provider {
+        "codex" if paginated::is_paginated(&loaded) && !capability.blocked_reasons.is_empty() => {
+            (BTreeMap::new(), Vec::new())
+        }
+        "codex" if paginated::is_paginated(&loaded) => {
+            paginated::delete_plan(Path::new(&path), &loaded, line_nos)?
+        }
         "codex" => codex_expand_delete(&loaded.parsed, line_nos)?,
         _ => claude_expand_delete(&loaded.parsed, line_nos)?,
     };
@@ -1088,6 +1113,7 @@ struct OpContext {
     journal: Vec<JournalEntry>,
     loaded: LoadedFile,
     path: PathBuf,
+    history_seed: Option<paginated::HistoryImage>,
 }
 
 fn open_op_context(
@@ -1117,6 +1143,7 @@ fn open_op_context(
         journal,
         loaded,
         path,
+        history_seed: None,
     })
 }
 
@@ -1130,7 +1157,22 @@ fn commit_op(
     changes: Vec<LineChange>,
     new_lines: Vec<String>,
 ) -> AppResult<EditApplyReport> {
+    let history = if provider == "codex" && paginated::is_paginated(&ctx.loaded) {
+        let after = paginated::from_lines(&new_lines, ctx.loaded.trailing_newline);
+        paginated::validate_change(&ctx.path, &ctx.loaded, &after)?;
+        Some(paginated::projection::prepare(
+            &ctx.path,
+            &ctx.loaded,
+            &after,
+            ctx.history_seed.as_ref(),
+        )?)
+    } else {
+        None
+    };
     let snapshot = ensure_snapshot(&ctx.dir, &ctx.loaded, &ctx.loaded.hash, &ctx.journal)?;
+    if let (Some(name), Some(history)) = (&snapshot, &history) {
+        transaction::save_projection_snapshot(&ctx.dir, name, &history.before)?;
+    }
     let after_hash = transaction::lines_hash(&new_lines, ctx.loaded.trailing_newline);
     let changed = changes
         .iter()
@@ -1151,6 +1193,7 @@ fn commit_op(
         before_hash: ctx.loaded.hash.clone(),
         after_hash,
         changes,
+        history,
     };
     let warning = transaction::commit(ctx, &entry, &new_lines, ctx.loaded.trailing_newline)?;
     Ok(EditApplyReport {
@@ -1188,6 +1231,9 @@ pub fn apply_edit_text(
         expected_revision,
     )?;
     let changes = match provider {
+        "codex" if paginated::is_paginated(&ctx.loaded) => {
+            paginated::edit_changes(&ctx.path, &ctx.loaded, line_no, new_text)?
+        }
         "codex" => codex_edit_changes(&ctx.loaded.lines, &ctx.loaded.parsed, line_no, new_text)?,
         _ => claude_edit_changes(&ctx.loaded.lines, &ctx.loaded.parsed, line_no, new_text)?,
     };
@@ -1231,6 +1277,9 @@ pub fn apply_delete(
         expected_revision,
     )?;
     let (plan, blocked) = match provider {
+        "codex" if paginated::is_paginated(&ctx.loaded) => {
+            paginated::delete_plan(&ctx.path, &ctx.loaded, line_nos)?
+        }
         "codex" => codex_expand_delete(&ctx.loaded.parsed, line_nos)?,
         _ => claude_expand_delete(&ctx.loaded.parsed, line_nos)?,
     };
@@ -1246,6 +1295,8 @@ pub fn apply_delete(
 
     let mut changes: Vec<LineChange> = if provider == "claude" {
         claude_relink_changes(&ctx.loaded.lines, &ctx.loaded.parsed, &plan)?
+    } else if paginated::is_paginated(&ctx.loaded) {
+        paginated::deletion_updates(&ctx.loaded, &plan)?
     } else {
         Vec::new()
     };
@@ -1313,6 +1364,14 @@ pub fn undo_last(
     }
 
     let expected = last.before_hash.clone();
+    if let Some(history) = &last.history {
+        if paginated::projection::read(&ctx.path, &ctx.loaded)? != history.after {
+            return Err(AppError::Other(
+                "[EDIT_CONFLICT] 原生历史已发生外部修改，未执行撤销".into(),
+            ));
+        }
+        ctx.history_seed = Some(history.before.clone());
+    }
     let mut new_lines = ctx.loaded.lines.clone();
     let redo = last.kind == "undo"
         && forward_apply(&mut new_lines, &last.changes).is_ok()
@@ -1385,9 +1444,43 @@ pub fn restore_snapshot(
         return Err(AppError::NotFound(snap_path.to_string_lossy().into_owned()));
     }
     let snap_loaded = load_file(&snap_path)?;
-    safety::ensure_writable(provider, &snap_path, &snap_loaded, session_id)?;
+    if !paginated::is_paginated(&snap_loaded) {
+        safety::ensure_writable(provider, &snap_path, &snap_loaded, session_id)?;
+    }
+    let history = if provider == "codex" && paginated::is_paginated(&ctx.loaded) {
+        if ctx
+            .journal
+            .last()
+            .and_then(|entry| entry.history.as_ref())
+            .is_none_or(|history| {
+                paginated::projection::read(&ctx.path, &ctx.loaded)
+                    .ok()
+                    .as_ref()
+                    != Some(&history.after)
+            })
+        {
+            return Err(AppError::Other(
+                "[EDIT_CONFLICT] 原生历史与最后编辑记录不一致，未执行快照覆盖".into(),
+            ));
+        }
+        paginated::validate_change(&ctx.path, &ctx.loaded, &snap_loaded)?;
+        let seed: paginated::HistoryImage = serde_json::from_slice(&fs::read(
+            ctx.dir.join(format!("{snapshot_name}.history.json")),
+        )?)?;
+        Some(paginated::projection::prepare(
+            &ctx.path,
+            &ctx.loaded,
+            &snap_loaded,
+            Some(&seed),
+        )?)
+    } else {
+        None
+    };
     let pre_name = format!("pre-restore-{}.jsonl", crate::repair::new_session_id());
     transaction::snapshot(&ctx.dir.join(&pre_name), &ctx.loaded)?;
+    if let Some(history) = &history {
+        transaction::save_projection_snapshot(&ctx.dir, &pre_name, &history.before)?;
+    }
     let after_hash = snap_loaded.hash.clone();
     let description = format!("还原快照 {snapshot_name}（还原前状态已保存为 {pre_name}）");
     let entry = JournalEntry {
@@ -1403,6 +1496,7 @@ pub fn restore_snapshot(
         before_hash: ctx.loaded.hash.clone(),
         after_hash,
         changes: Vec::new(),
+        history,
     };
     let warning = transaction::commit(
         &ctx,
@@ -1530,15 +1624,71 @@ pub fn history(
 
 // ========================= 命令包装（带锁） =========================
 
+fn resolve_selection(
+    provider: &str,
+    path: &str,
+    indices: Vec<usize>,
+    targets: Option<&[crate::models::PaginatedItemTarget]>,
+    revision: Option<&str>,
+) -> AppResult<Vec<usize>> {
+    if provider != "codex" {
+        return Ok(indices);
+    }
+    let path = PathBuf::from(paths::strip_verbatim(path));
+    let loaded = load_file(&path)?;
+    safety::check_revision(&path, &loaded, revision)?;
+    if !paginated::is_paginated(&loaded) {
+        return Ok(indices);
+    }
+    let targets = targets
+        .filter(|targets| !targets.is_empty() && targets.len() == indices.len())
+        .ok_or_else(|| {
+            AppError::Other(
+                "[EDIT_IDENTITY] 分页操作必须携带 thread/turn/item 身份，请刷新预览后重新选择"
+                    .into(),
+            )
+        })?;
+    targets
+        .iter()
+        .map(|target| {
+            loaded
+                .parsed
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(i, v)| {
+                    let v = v.as_ref()?;
+                    let p = &v["payload"];
+                    (codex_ptype(v) == "item_completed"
+                        && p["thread_id"] == target.thread_id
+                        && p["turn_id"] == target.turn_id
+                        && p["item"]["id"] == target.item_id)
+                        .then_some(i)
+                })
+                .ok_or_else(|| {
+                    AppError::Other("[EDIT_IDENTITY] 所选正式消息身份已不存在，未执行修改".into())
+                })
+        })
+        .collect()
+}
+
 pub fn plan_session_event_deletion(
     provider: String,
     rollout_path: String,
     line_nos: Vec<usize>,
     expected_revision: Option<String>,
+    targets: Option<Vec<crate::models::PaginatedItemTarget>>,
 ) -> AppResult<DeletePlan> {
     if provider == "opencode" {
         return crate::opencode_edit::plan_delete(&rollout_path, &line_nos);
     }
+    let line_nos = resolve_selection(
+        &provider,
+        &rollout_path,
+        line_nos,
+        targets.as_deref(),
+        expected_revision.as_deref(),
+    )?;
     plan_delete(
         &provider,
         &rollout_path,
@@ -1586,6 +1736,7 @@ pub fn edit_session_event_text_with_lock(
     line_no: usize,
     new_text: String,
     expected_revision: Option<String>,
+    targets: Option<Vec<crate::models::PaginatedItemTarget>>,
     lock: &crate::family::FamilyLock,
 ) -> AppResult<EditApplyReport> {
     let roots = mutation_roots(&provider, &rollout_path, &backup_dir, &session_id)?;
@@ -1600,12 +1751,19 @@ pub fn edit_session_event_text_with_lock(
                 &new_text,
             );
         }
+        let selected = resolve_selection(
+            &provider,
+            &rollout_path,
+            vec![line_no],
+            targets.as_deref(),
+            expected_revision.as_deref(),
+        )?;
         apply_edit_text(
             &provider,
             &rollout_path,
             &session_id,
             &backup_dir,
-            line_no,
+            selected[0],
             &new_text,
             expected_revision.as_deref(),
         )
@@ -1619,6 +1777,7 @@ pub fn delete_session_events_with_lock(
     backup_dir: String,
     line_nos: Vec<usize>,
     expected_revision: Option<String>,
+    targets: Option<Vec<crate::models::PaginatedItemTarget>>,
     lock: &crate::family::FamilyLock,
 ) -> AppResult<EditApplyReport> {
     let roots = mutation_roots(&provider, &rollout_path, &backup_dir, &session_id)?;
@@ -1631,6 +1790,13 @@ pub fn delete_session_events_with_lock(
                 &line_nos,
             );
         }
+        let line_nos = resolve_selection(
+            &provider,
+            &rollout_path,
+            line_nos,
+            targets.as_deref(),
+            expected_revision.as_deref(),
+        )?;
         apply_delete(
             &provider,
             &rollout_path,

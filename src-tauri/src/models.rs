@@ -1206,6 +1206,13 @@ pub struct FamilyOverlay {
 
 // ========================= 会话消息级编辑 =========================
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaginatedItemTarget {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+}
+
 /// 删除计划中的一行：除用户选中的行外，还包含按完整性规则级联进来的行。
 #[derive(Debug, Clone, Serialize)]
 pub struct DeletePlanLine {

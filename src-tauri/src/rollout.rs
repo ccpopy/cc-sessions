@@ -674,11 +674,34 @@ pub(crate) fn user_prompts_from_events(
     event_is_agent_activity: impl Fn(&PreviewEvent) -> bool,
 ) -> UserPromptList {
     let total_events = events.len();
+    let key = |event: &PreviewEvent| -> Option<(String, String)> {
+        (payload_type(event) == "item_completed").then(|| {
+            Some((
+                event.raw["payload"]["turn_id"].as_str()?.into(),
+                event.raw["payload"]["item"]["id"].as_str()?.into(),
+            ))
+        })?
+    };
+    let latest: HashMap<_, _> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, event)| key(event).map(|key| (key, i)))
+        .collect();
+    let mut shown = std::collections::HashSet::new();
     let mut prompts = Vec::new();
     let mut current_has_agent_activity = false;
     let mut current_has_explicit_assistant_phase = false;
     let mut current_has_final_answer = false;
-    for (offset, event) in events.into_iter().enumerate() {
+    for (offset, source) in events.iter().enumerate() {
+        let mut event = source.clone();
+        if let Some(key) = key(source) {
+            if !shown.insert(key.clone()) {
+                continue;
+            }
+            event = events[latest[&key]].clone();
+            event.index = source.index;
+            event.timestamp = source.timestamp.clone();
+        }
         let is_conversation = preview_event_is_conversation(&event);
         if is_conversation && event.role == "user" {
             discard_inactive_current_prompt(&mut prompts, current_has_agent_activity);
@@ -988,6 +1011,26 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
+
+    #[test]
+    fn paginated_timeline_uses_latest_snapshot_at_original_offset() {
+        let raw = |kind: &str, id: &str, text: &str| serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","turn_id":"turn","item":{"type":kind,"id":id,"phase":"final_answer","content":[{"type":"Text","text":text}]}}});
+        let events = vec![
+            raw("UserMessage", "u", "old"),
+            raw("AgentMessage", "a", "answer"),
+            raw("UserMessage", "u", "latest"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| classify_preview(i, v))
+        .collect();
+        let prompts = user_prompts_from_events(events, |_| true);
+        assert_eq!(prompts.prompts.len(), 1);
+        assert_eq!(prompts.prompts[0].text, "latest");
+        assert_eq!(prompts.prompts[0].index, 0);
+        assert_eq!(prompts.prompts[0].offset, 0);
+        assert_eq!(prompts.total_events, 3);
+    }
 
     #[test]
     fn paginated_preview_uses_canonical_messages_and_keeps_failed_turns() -> AppResult<()> {

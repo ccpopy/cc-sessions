@@ -6,6 +6,8 @@ import {
   canDeleteEvent,
   canEditEventText,
   canonicalMessageImages,
+  latestCanonicalEvents,
+  paginatedTargets,
   editableText,
   extractPreviewEventText,
   isConversationMessage,
@@ -25,7 +27,19 @@ function event(raw: unknown, role: PreviewEvent["role"] = "user"): PreviewEvent 
   };
 }
 
-test("canonical paginated messages are readable but cannot use legacy mutation or fork actions", () => {
+test("duplicate snapshots keep first position and latest text, repeated messages keep distinct identities", () => {
+  const canonical = (id: string, text: string, index: number) => ({ ...event({ type: "event_msg", payload: {
+    type: "item_completed", thread_id: "thread", turn_id: "turn", item: { id, type: "UserMessage", content: [{ type: "text", text }] },
+  } }), index });
+  const events = [canonical("a", "继续", 1), canonical("b", "继续", 2), canonical("a", "updated", 3)];
+  const latest = latestCanonicalEvents(events);
+  assert.equal(latest.length, 2);
+  assert.equal(latest[0].index, 1);
+  assert.equal(editableText(latest[0]), "updated");
+  assert.deepEqual(paginatedTargets(events).map((target) => target.item_id), ["a", "b"]);
+});
+
+test("canonical paginated messages support identified edits without changing fork semantics", () => {
   const user = event({ type: "event_msg", payload: { type: "item_completed", item: {
     type: "UserMessage", id: "user-1", content: [{ type: "text", text: "继续" }, { type: "local_image", path: "C:/fixture/image.png" }],
   } } });
@@ -34,13 +48,15 @@ test("canonical paginated messages are readable but cannot use legacy mutation o
   } } }, "assistant");
   for (const message of [user, assistant]) {
     assert.equal(isConversationMessage(message), true);
-    assert.equal(canDeleteEvent("codex", message), false);
-    assert.equal(canEditEventText("codex", message), false);
+    assert.equal(canDeleteEvent("codex", message), true);
+    assert.equal(canEditEventText("codex", message), true);
     assert.equal(isStableForkNode(message, "codex"), false);
   }
   assert.equal(extractPreviewEventText(user), "继续");
   assert.deepEqual(canonicalMessageImages(user), [{ name: "image.png", path: "C:/fixture/image.png" }]);
   assert.equal(extractPreviewEventText(assistant), "完成");
+  assert.equal(editableText(user), "继续");
+  assert.equal(editableText(assistant), "完成");
 });
 
 test("Claude copy boundaries require an identified main-chain message", () => {

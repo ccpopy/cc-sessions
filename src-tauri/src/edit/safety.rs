@@ -72,7 +72,10 @@ pub(super) fn inspect(
             .any(|v| codex_outer(v) == "event_msg" && codex_ptype(v) == "item_completed")
     {
         result.format = "paginated".into();
-        result.blocked_reasons.push("此会话包含分页正式历史；尚不支持同步正式消息与原生历史投影，已禁用删除、改写、撤销和快照覆盖。可继续查看和导出。".into());
+        if let Err(error) = paginated::inspect(path, loaded) {
+            result.blocked_reasons.push(error.to_string());
+        }
+        return Ok(result);
     } else if history_mode.is_some_and(|mode| mode != "legacy") {
         result.format = "unknown".into();
         result

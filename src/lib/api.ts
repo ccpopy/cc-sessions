@@ -295,6 +295,8 @@ export type DeleteTarget = {
   rollout_path?: string;
 };
 
+export type PaginatedItemTarget = { thread_id: string; turn_id: string; item_id: string };
+
 export type DeletePlanLine = {
   line_no: number;
   role: string;
@@ -1500,14 +1502,16 @@ export const api = {
       sessionId: p.session_id,
       rolloutPath: p.rollout_path,
     }),
-  planSessionEventDeletion: (provider: string, rolloutPath: string, lineNos: number[], expectedRevision: string | null) =>
+  planSessionEventDeletion: (provider: string, rolloutPath: string, lineNos: number[], expectedRevision: string | null, targets?: PaginatedItemTarget[]) =>
     invokeCommand<DeletePlan>("plan_session_event_deletion", {
       provider,
       rolloutPath,
       lineNos,
       expectedRevision,
+      targets,
     }),
   editSessionEventText: (p: {
+    targets?: PaginatedItemTarget[];
     provider: string;
     expected_revision: string | null;
     rollout_path: string;
@@ -1524,8 +1528,10 @@ export const api = {
       backupDir: p.backup_dir,
       lineNo: p.line_no,
       newText: p.new_text,
+      targets: p.targets,
     }),
   deleteSessionEvents: (p: {
+    targets?: PaginatedItemTarget[];
     provider: string;
     expected_revision: string | null;
     rollout_path: string;
@@ -1540,6 +1546,7 @@ export const api = {
       sessionId: p.session_id,
       backupDir: p.backup_dir,
       lineNos: p.line_nos,
+      targets: p.targets,
     }),
   undoLastSessionEdit: (p: {
     provider: string;

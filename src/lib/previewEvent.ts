@@ -1,4 +1,4 @@
-import type { OpenCodeForkPoint, PreviewEvent } from "./api.ts";
+import type { OpenCodeForkPoint, PreviewEvent, PaginatedItemTarget } from "./api.ts";
 import {
   isAssistantTextToolUseEvent,
   isOpenCodeConversationEvent,
@@ -86,6 +86,34 @@ export function canonicalMessageImages(event: PreviewEvent): Array<{ name: strin
   if (raw?.payload?.type !== "item_completed" || !Array.isArray(content)) return [];
   return content.flatMap((item) => item?.type === "local_image" && typeof item.path === "string"
     ? [{ name: item.path.split(/[\\/]/).pop() || "图片", path: item.path }] : []);
+}
+
+export function paginatedTargets(events: PreviewEvent[]): PaginatedItemTarget[] {
+  const targets = new Map<string, PaginatedItemTarget>();
+  for (const event of events) {
+    const p = (event.raw as any)?.payload;
+    if (p?.type !== "item_completed" || !p.thread_id || !p.turn_id || !p.item?.id) continue;
+    const target = { thread_id: p.thread_id, turn_id: p.turn_id, item_id: p.item.id };
+    targets.set(JSON.stringify(target), target);
+  }
+  return [...targets.values()];
+}
+
+/** Keep native first-occurrence order while showing the latest item snapshot. */
+export function latestCanonicalEvents(events: PreviewEvent[]): PreviewEvent[] {
+  const result: PreviewEvent[] = [];
+  const positions = new Map<string, number>();
+  for (const event of events) {
+    const target = paginatedTargets([event])[0];
+    const key = target && JSON.stringify(target);
+    const position = key ? positions.get(key) : undefined;
+    if (position !== undefined) result[position] = { ...event, index: result[position].index, timestamp: result[position].timestamp };
+    else {
+      if (key) positions.set(key, result.length);
+      result.push(event);
+    }
+  }
+  return result;
 }
 
 export function parseDiffCommentPrompt(text: string): DiffCommentPrompt | null {
@@ -347,6 +375,7 @@ export function canEditEventText(provider: string, event: PreviewEvent): boolean
   if (provider === "codex") {
     const outer = rawType(event);
     const payload = payloadType(event);
+    if (payload === "item_completed") return ["UserMessage", "AgentMessage"].includes((event.raw as any)?.payload?.item?.type) && editableText(event).length > 0;
     if (outer === "event_msg") return payload === "user_message" || payload === "agent_message";
     if (outer === "response_item" && payload === "message") {
       return editableText(event).length > 0;
@@ -371,6 +400,7 @@ export function canDeleteEvent(provider: string, event: PreviewEvent): boolean {
   if (provider === "codex") {
     const outer = rawType(event);
     const payload = payloadType(event);
+    if (payload === "item_completed") return typeof (event.raw as any)?.payload?.item?.id === "string";
     if (outer === "event_msg") return payload === "user_message" || payload === "agent_message";
     if (outer === "response_item") return CODEX_DELETABLE_RESPONSE_ITEMS.has(payload);
     return false;
@@ -396,7 +426,7 @@ export function editableText(event: PreviewEvent): string {
   if (!raw) return "";
   if (raw.payload) {
     if (typeof raw.payload.message === "string") return raw.payload.message;
-    const content = raw.payload.content;
+    const content = raw.payload.type === "item_completed" ? raw.payload.item?.content : raw.payload.content;
     if (typeof content === "string") return content;
     if (Array.isArray(content)) {
       return content
@@ -421,6 +451,8 @@ export function deleteReasonLabel(reason: string): string {
   switch (reason) {
     case "selected":
       return "选中";
+    case "item_snapshot":
+      return "同一消息快照";
     case "tool_pair":
       return "工具配对";
     case "mirror":
