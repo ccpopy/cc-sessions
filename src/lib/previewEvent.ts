@@ -12,6 +12,12 @@ export type DiffCommentPrompt = {
 
 const previewEventSearchTextCache = new WeakMap<PreviewEvent, string>();
 
+export function isSessionWideMutationFailure(message: string | null): boolean {
+  if (!message) return false;
+  if (/\[EDIT_CONFLICT\]|\[EDIT_RECOVERY\]/.test(message)) return true;
+  return !/\[EDIT_INCONSISTENT\]|\[EDIT_MAPPING_UNSUPPORTED\]/.test(message);
+}
+
 export function buildPreviewEventSearchText(event: PreviewEvent): string {
   const rawText = event.raw == null ? "" : JSON.stringify(event.raw);
   return `${event.text_summary ?? ""}\n${event.kind}\n${rawText}`.toLowerCase();

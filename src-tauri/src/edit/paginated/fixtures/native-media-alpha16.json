@@ -1,0 +1,678 @@
+{
+  "provenance": {
+    "version": "0.155.0-alpha.16",
+    "sourceCommit": "0e2f848bf4a4e8d41a02d848a851ba126c09d185",
+    "threadId": "01a0cd82-3d0a-74c3-93a4-192e8892b337",
+    "path": "F:\\project\\sessions-management\\codex-session-manager\\output\\content-mapping-research\\native-capture-3\\sessions\\2026\\09\\23\\rollout-2026-09-23T17-04-19-01a0cd82-3d0a-74c3-93a4-192e8892b337.jsonl",
+    "cases": [
+      {
+        "case": "pure-image",
+        "turnId": "01a0cd82-3e26-7073-8730-7ab62bd184d6"
+      },
+      {
+        "case": "text-image",
+        "turnId": "01a0cd82-4018-7753-96b8-1d4c00418b57"
+      },
+      {
+        "case": "multi-image",
+        "turnId": "01a0cd82-411f-7122-b3f3-03fb792385a0"
+      },
+      {
+        "case": "local-audio",
+        "turnId": "01a0cd82-421b-7230-8251-214ca406a0f7"
+      },
+      {
+        "case": "mixed-blocks",
+        "turnId": "01a0cd82-430e-73a1-91df-6c293798e670"
+      },
+      {
+        "case": "inline-image",
+        "turnId": "01a0cd82-4406-7de2-9ca1-1b6351e78f8a"
+      },
+      {
+        "case": "inline-audio",
+        "turnId": "01a0cd82-44ff-7b01-b848-2205f3751ff2"
+      },
+      {
+        "case": "literal-tags",
+        "turnId": "01a0cd82-45f8-7611-a601-420f89e9eebe"
+      }
+    ],
+    "rolloutSha256": "17755712eca19644548e59d8c9511055506e4fd64c488e9c80ad3953822f57f7",
+    "nativeGenerated": true,
+    "ccSessionsEdits": false,
+    "modelService": "loopback fixture",
+    "requests": 8
+  },
+  "cases": [
+    {
+      "name": "pure-image",
+      "canonical": {
+        "timestamp": "2026-09-23T09:04:20.281Z",
+        "ordinal": 7,
+        "type": "event_msg",
+        "payload": {
+          "type": "item_completed",
+          "thread_id": "01a0cd82-3d0a-74c3-93a4-192e8892b337",
+          "turn_id": "01a0cd82-3e26-7073-8730-7ab62bd184d6",
+          "item": {
+            "type": "UserMessage",
+            "id": "01a0cd82-3f39-7913-bcc7-80d66c050a49",
+            "content": [
+              {
+                "type": "local_image",
+                "path": "F:\\project\\sessions-management\\codex-session-manager\\output\\content-mapping-research\\native-capture-3\\one.png"
+              }
+            ]
+          },
+          "started_at_ms": 1790154260281,
+          "completed_at_ms": 1790154260281
+        }
+      },
+      "context": {
+        "timestamp": "2026-09-23T09:04:20.280Z",
+        "ordinal": 6,
+        "type": "response_item",
+        "payload": {
+          "type": "message",
+          "id": "msg_01a0cd82-3f38-7330-897c-1000d2215689",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "<image name=[Image #1] path=\"F:\\project\\sessions-management\\codex-session-manager\\output\\content-mapping-research\\native-capture-3\\one.png\">"
+            },
+            {
+              "type": "input_image",
+              "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+              "detail": "high"
+            },
+            {
+              "type": "input_text",
+              "text": "</image>"
+            }
+          ],
+          "internal_chat_message_metadata_passthrough": {
+            "turn_id": "01a0cd82-3e26-7073-8730-7ab62bd184d6",
+            "create_time": 1790154260.280309,
+            "content_item_kinds": [
+              "user.text",
+              "user.image",
+              "user.text"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "text-image",
+      "canonical": {
+        "timestamp": "2026-09-23T09:04:20.539Z",
+        "ordinal": 16,
+        "type": "event_msg",
+        "payload": {
+          "type": "item_completed",
+          "thread_id": "01a0cd82-3d0a-74c3-93a4-192e8892b337",
+          "turn_id": "01a0cd82-4018-7753-96b8-1d4c00418b57",
+          "item": {
+            "type": "UserMessage",
+            "id": "01a0cd82-403b-7b60-825f-3ea6c3e7aed2",
+            "content": [
+              {
+                "type": "text",
+                "text": "KEEP-A",
+                "text_elements": []
+              },
+              {
+                "type": "local_image",
+                "path": "F:\\project\\sessions-management\\codex-session-manager\\output\\content-mapping-research\\native-capture-3\\one.png"
+              }
+            ]
+          },
+          "started_at_ms": 1790154260539,
+          "completed_at_ms": 1790154260539
+        }
+      },
+      "context": {
+        "timestamp": "2026-09-23T09:04:20.538Z",
+        "ordinal": 15,
+        "type": "response_item",
+        "payload": {
+          "type": "message",
+          "id": "msg_01a0cd82-403a-7711-9288-e6690c2777bf",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "KEEP-A"
+            },
+            {
+              "type": "input_text",
+              "text": "<image name=[Image #1] path=\"F:\\project\\sessions-management\\codex-session-manager\\output\\content-mapping-research\\native-capture-3\\one.png\">"
+            },
+            {
+              "type": "input_image",
+              "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+              "detail": "high"
+            },
+            {
+              "type": "input_text",
+              "text": "</image>"
+            }
+          ],
+          "internal_chat_message_metadata_passthrough": {
+            "turn_id": "01a0cd82-4018-7753-96b8-1d4c00418b57",
+            "create_time": 1790154260.5383923,
+            "content_item_kinds": [
+              "user.text",
+              "user.text",
+              "user.image",
+              "user.text"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "multi-image",
+      "canonical": {
+        "timestamp": "2026-09-23T09:04:20.789Z",
+        "ordinal": 25,
+        "type": "event_msg",
+        "payload": {
+          "type": "item_completed",
+          "thread_id": "01a0cd82-3d0a-74c3-93a4-192e8892b337",
+          "turn_id": "01a0cd82-411f-7122-b3f3-03fb792385a0",
+          "item": {
+            "type": "UserMessage",
+            "id": "01a0cd82-4135-71d2-b4b6-a9dae8766d3f",
+            "content": [
+              {
+                "type": "local_image",
+                "path": "F:\\project\\sessions-management\\codex-session-manager\\output\\content-mapping-research\\native-capture-3\\one.png"
+              },
+              {
+                "type": "text",
+                "text": "BETWEEN",
+                "text_elements": []
+              },
+              {
+                "type": "local_image",
+                "path": "F:\\project\\sessions-management\\codex-session-manager\\output\\content-mapping-research\\native-capture-3\\two.png"
+              },
+              {
+                "type": "text",
+                "text": "TAIL",
+                "text_elements": []
+              }
+            ]
+          },
+          "started_at_ms": 1790154260789,
+          "completed_at_ms": 1790154260789
+        }
+      },
+      "context": {
+        "timestamp": "2026-09-23T09:04:20.788Z",
+        "ordinal": 24,
+        "type": "response_item",
+        "payload": {
+          "type": "message",
+          "id": "msg_01a0cd82-4134-7fb2-bf8f-a8bb2d424b82",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "<image name=[Image #1] path=\"F:\\project\\sessions-management\\codex-session-manager\\output\\content-mapping-research\\native-capture-3\\one.png\">"
+            },
+            {
+              "type": "input_image",
+              "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+              "detail": "high"
+            },
+            {
+              "type": "input_text",
+              "text": "</image>"
+            },
+            {
+              "type": "input_text",
+              "text": "BETWEEN"
+            },
+            {
+              "type": "input_text",
+              "text": "<image name=[Image #2] path=\"F:\\project\\sessions-management\\codex-session-manager\\output\\content-mapping-research\\native-capture-3\\two.png\">"
+            },
+            {
+              "type": "input_image",
+              "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+              "detail": "high"
+            },
+            {
+              "type": "input_text",
+              "text": "</image>"
+            },
+            {
+              "type": "input_text",
+              "text": "TAIL"
+            }
+          ],
+          "internal_chat_message_metadata_passthrough": {
+            "turn_id": "01a0cd82-411f-7122-b3f3-03fb792385a0",
+            "create_time": 1790154260.7887957,
+            "content_item_kinds": [
+              "user.text",
+              "user.image",
+              "user.text",
+              "user.text",
+              "user.text",
+              "user.image",
+              "user.text",
+              "user.text"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "local-audio",
+      "canonical": {
+        "timestamp": "2026-09-23T09:04:21.040Z",
+        "ordinal": 34,
+        "type": "event_msg",
+        "payload": {
+          "type": "item_completed",
+          "thread_id": "01a0cd82-3d0a-74c3-93a4-192e8892b337",
+          "turn_id": "01a0cd82-421b-7230-8251-214ca406a0f7",
+          "item": {
+            "type": "UserMessage",
+            "id": "01a0cd82-4230-7df2-a1dd-a645026cc5e0",
+            "content": [
+              {
+                "type": "text",
+                "text": "LISTEN",
+                "text_elements": []
+              },
+              {
+                "type": "local_audio",
+                "path": "F:\\project\\sessions-management\\codex-session-manager\\output\\content-mapping-research\\native-capture-3\\tone.wav"
+              },
+              {
+                "type": "text",
+                "text": "AUDIO-TAIL",
+                "text_elements": []
+              }
+            ]
+          },
+          "started_at_ms": 1790154261040,
+          "completed_at_ms": 1790154261040
+        }
+      },
+      "context": {
+        "timestamp": "2026-09-23T09:04:21.039Z",
+        "ordinal": 33,
+        "type": "response_item",
+        "payload": {
+          "type": "message",
+          "id": "msg_01a0cd82-422f-7e12-8179-67edaa614abe",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "LISTEN"
+            },
+            {
+              "type": "input_text",
+              "text": "<audio name=[Audio #1] path=\"F:\\project\\sessions-management\\codex-session-manager\\output\\content-mapping-research\\native-capture-3\\tone.wav\">"
+            },
+            {
+              "type": "input_audio",
+              "audio_url": "data:audio/wav;base64,UklGRmQGAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUAGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            },
+            {
+              "type": "input_text",
+              "text": "</audio>"
+            },
+            {
+              "type": "input_text",
+              "text": "AUDIO-TAIL"
+            }
+          ],
+          "internal_chat_message_metadata_passthrough": {
+            "turn_id": "01a0cd82-421b-7230-8251-214ca406a0f7",
+            "create_time": 1790154261.0399437,
+            "content_item_kinds": [
+              "user.text",
+              "user.text",
+              "user.audio",
+              "user.text",
+              "user.text"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "mixed-blocks",
+      "canonical": {
+        "timestamp": "2026-09-23T09:04:21.284Z",
+        "ordinal": 43,
+        "type": "event_msg",
+        "payload": {
+          "type": "item_completed",
+          "thread_id": "01a0cd82-3d0a-74c3-93a4-192e8892b337",
+          "turn_id": "01a0cd82-430e-73a1-91df-6c293798e670",
+          "item": {
+            "type": "UserMessage",
+            "id": "01a0cd82-4324-78e1-9feb-1ed2d311b4e6",
+            "content": [
+              {
+                "type": "text",
+                "text": "HEAD",
+                "text_elements": []
+              },
+              {
+                "type": "text",
+                "text": "SECOND",
+                "text_elements": []
+              },
+              {
+                "type": "local_image",
+                "path": "F:\\project\\sessions-management\\codex-session-manager\\output\\content-mapping-research\\native-capture-3\\one.png"
+              },
+              {
+                "type": "text",
+                "text": "MIDDLE",
+                "text_elements": []
+              },
+              {
+                "type": "local_audio",
+                "path": "F:\\project\\sessions-management\\codex-session-manager\\output\\content-mapping-research\\native-capture-3\\tone.wav"
+              },
+              {
+                "type": "text",
+                "text": "LAST",
+                "text_elements": []
+              }
+            ]
+          },
+          "started_at_ms": 1790154261284,
+          "completed_at_ms": 1790154261284
+        }
+      },
+      "context": {
+        "timestamp": "2026-09-23T09:04:21.283Z",
+        "ordinal": 42,
+        "type": "response_item",
+        "payload": {
+          "type": "message",
+          "id": "msg_01a0cd82-4323-76f3-9245-5a2c901497b9",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "HEAD"
+            },
+            {
+              "type": "input_text",
+              "text": "SECOND"
+            },
+            {
+              "type": "input_text",
+              "text": "<image name=[Image #1] path=\"F:\\project\\sessions-management\\codex-session-manager\\output\\content-mapping-research\\native-capture-3\\one.png\">"
+            },
+            {
+              "type": "input_image",
+              "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+              "detail": "high"
+            },
+            {
+              "type": "input_text",
+              "text": "</image>"
+            },
+            {
+              "type": "input_text",
+              "text": "MIDDLE"
+            },
+            {
+              "type": "input_text",
+              "text": "<audio name=[Audio #1] path=\"F:\\project\\sessions-management\\codex-session-manager\\output\\content-mapping-research\\native-capture-3\\tone.wav\">"
+            },
+            {
+              "type": "input_audio",
+              "audio_url": "data:audio/wav;base64,UklGRmQGAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUAGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            },
+            {
+              "type": "input_text",
+              "text": "</audio>"
+            },
+            {
+              "type": "input_text",
+              "text": "LAST"
+            }
+          ],
+          "internal_chat_message_metadata_passthrough": {
+            "turn_id": "01a0cd82-430e-73a1-91df-6c293798e670",
+            "create_time": 1790154261.2834263,
+            "content_item_kinds": [
+              "user.text",
+              "user.text",
+              "user.text",
+              "user.image",
+              "user.text",
+              "user.text",
+              "user.text",
+              "user.audio",
+              "user.text",
+              "user.text"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "inline-image",
+      "canonical": {
+        "timestamp": "2026-09-23T09:04:21.532Z",
+        "ordinal": 52,
+        "type": "event_msg",
+        "payload": {
+          "type": "item_completed",
+          "thread_id": "01a0cd82-3d0a-74c3-93a4-192e8892b337",
+          "turn_id": "01a0cd82-4406-7de2-9ca1-1b6351e78f8a",
+          "item": {
+            "type": "UserMessage",
+            "id": "01a0cd82-441c-7992-9410-22859ba6f88f",
+            "content": [
+              {
+                "type": "text",
+                "text": "INLINE",
+                "text_elements": []
+              },
+              {
+                "type": "image",
+                "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
+              },
+              {
+                "type": "text",
+                "text": "INLINE-TAIL",
+                "text_elements": []
+              }
+            ]
+          },
+          "started_at_ms": 1790154261532,
+          "completed_at_ms": 1790154261532
+        }
+      },
+      "context": {
+        "timestamp": "2026-09-23T09:04:21.531Z",
+        "ordinal": 51,
+        "type": "response_item",
+        "payload": {
+          "type": "message",
+          "id": "msg_01a0cd82-441b-7e73-841f-6f8f86ecf1aa",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "INLINE"
+            },
+            {
+              "type": "input_image",
+              "image_url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==",
+              "detail": "high"
+            },
+            {
+              "type": "input_text",
+              "text": "INLINE-TAIL"
+            }
+          ],
+          "internal_chat_message_metadata_passthrough": {
+            "turn_id": "01a0cd82-4406-7de2-9ca1-1b6351e78f8a",
+            "create_time": 1790154261.5316095,
+            "content_item_kinds": [
+              "user.text",
+              "user.image",
+              "user.text"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "inline-audio",
+      "canonical": {
+        "timestamp": "2026-09-23T09:04:21.779Z",
+        "ordinal": 61,
+        "type": "event_msg",
+        "payload": {
+          "type": "item_completed",
+          "thread_id": "01a0cd82-3d0a-74c3-93a4-192e8892b337",
+          "turn_id": "01a0cd82-44ff-7b01-b848-2205f3751ff2",
+          "item": {
+            "type": "UserMessage",
+            "id": "01a0cd82-4512-7063-acd6-cc05c3ac0bd6",
+            "content": [
+              {
+                "type": "text",
+                "text": "INLINE-AUDIO",
+                "text_elements": []
+              },
+              {
+                "type": "audio",
+                "audio_url": "data:audio/wav;base64,UklGRmQGAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUAGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+              },
+              {
+                "type": "text",
+                "text": "AUDIO-END",
+                "text_elements": []
+              }
+            ]
+          },
+          "started_at_ms": 1790154261779,
+          "completed_at_ms": 1790154261779
+        }
+      },
+      "context": {
+        "timestamp": "2026-09-23T09:04:21.778Z",
+        "ordinal": 60,
+        "type": "response_item",
+        "payload": {
+          "type": "message",
+          "id": "msg_01a0cd82-4512-7063-acd6-cbfe62eb23e5",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "INLINE-AUDIO"
+            },
+            {
+              "type": "input_audio",
+              "audio_url": "data:audio/wav;base64,UklGRmQGAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YUAGAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            },
+            {
+              "type": "input_text",
+              "text": "AUDIO-END"
+            }
+          ],
+          "internal_chat_message_metadata_passthrough": {
+            "turn_id": "01a0cd82-44ff-7b01-b848-2205f3751ff2",
+            "create_time": 1790154261.7781396,
+            "content_item_kinds": [
+              "user.text",
+              "user.audio",
+              "user.text"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "literal-tags",
+      "canonical": {
+        "timestamp": "2026-09-23T09:04:22.033Z",
+        "ordinal": 70,
+        "type": "event_msg",
+        "payload": {
+          "type": "item_completed",
+          "thread_id": "01a0cd82-3d0a-74c3-93a4-192e8892b337",
+          "turn_id": "01a0cd82-45f8-7611-a601-420f89e9eebe",
+          "item": {
+            "type": "UserMessage",
+            "id": "01a0cd82-4611-7712-9820-79c2164c5e59",
+            "content": [
+              {
+                "type": "text",
+                "text": "<image>",
+                "text_elements": []
+              },
+              {
+                "type": "text",
+                "text": "  KEEP WHITESPACE  ",
+                "text_elements": []
+              },
+              {
+                "type": "text",
+                "text": "</audio>",
+                "text_elements": []
+              }
+            ]
+          },
+          "started_at_ms": 1790154262033,
+          "completed_at_ms": 1790154262033
+        }
+      },
+      "context": {
+        "timestamp": "2026-09-23T09:04:22.032Z",
+        "ordinal": 69,
+        "type": "response_item",
+        "payload": {
+          "type": "message",
+          "id": "msg_01a0cd82-4610-7140-807f-f5bf1748f8a4",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "<image>"
+            },
+            {
+              "type": "input_text",
+              "text": "  KEEP WHITESPACE  "
+            },
+            {
+              "type": "input_text",
+              "text": "</audio>"
+            }
+          ],
+          "internal_chat_message_metadata_passthrough": {
+            "turn_id": "01a0cd82-45f8-7611-a601-420f89e9eebe",
+            "create_time": 1790154262.0326211,
+            "content_item_kinds": [
+              "user.text",
+              "user.text",
+              "user.text"
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

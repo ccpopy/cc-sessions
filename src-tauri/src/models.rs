@@ -1312,6 +1312,47 @@ pub struct EditPendingOperation {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ContentBlockPair {
+    pub canonical_index: usize,
+    pub context_index: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContentWrapper {
+    pub context_index: usize,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContentMappingDifference {
+    pub canonical_index: Option<usize>,
+    pub context_index: Option<usize>,
+    pub utf8_byte_offset: Option<usize>,
+}
+
+/// Structural evidence only: never include message text, media URLs/data or paths.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContentMappingDetail {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub context_ordinal: Option<u64>,
+    pub cli_version: String,
+    pub mapping_basis: String,
+    pub status: String,
+    pub reason: Option<String>,
+    pub canonical_block_types: Vec<String>,
+    pub context_block_types: Vec<String>,
+    pub source_kinds: Vec<String>,
+    pub canonical_text_blocks: usize,
+    pub context_text_blocks: usize,
+    pub context_body_text_blocks: Option<usize>,
+    pub block_pairs: Vec<ContentBlockPair>,
+    pub wrappers: Vec<ContentWrapper>,
+    pub first_difference: Option<ContentMappingDifference>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct EditCapability {
     pub revision: String,
     pub file_sha256: String,
@@ -1319,6 +1360,7 @@ pub struct EditCapability {
     pub format: String,
     pub blocked_reasons: Vec<String>,
     pub diagnostics: Vec<String>,
+    pub content_mappings: Vec<ContentMappingDetail>,
 }
 
 #[derive(Debug, Clone, Serialize)]

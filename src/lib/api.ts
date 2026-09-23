@@ -343,6 +343,26 @@ export type EditSnapshotInfo = {
   bytes: number;
 };
 
+export type ContentMappingDetail = {
+  thread_id: string;
+  turn_id: string;
+  item_id: string;
+  context_ordinal: number | null;
+  cli_version: string;
+  mapping_basis: string;
+  status: "matched" | "unsupported" | "inconsistent";
+  reason: string | null;
+  canonical_block_types: string[];
+  context_block_types: string[];
+  source_kinds: string[];
+  canonical_text_blocks: number;
+  context_text_blocks: number;
+  context_body_text_blocks: number | null;
+  block_pairs: { canonical_index: number; context_index: number }[];
+  wrappers: { context_index: number; kind: string }[];
+  first_difference: { canonical_index: number | null; context_index: number | null; utf8_byte_offset: number | null } | null;
+};
+
 export type EditCapability = {
   revision: string;
   file_sha256: string;
@@ -350,6 +370,7 @@ export type EditCapability = {
   format: string;
   blocked_reasons: string[];
   diagnostics: string[];
+  content_mappings: ContentMappingDetail[];
 };
 
 export type PreviewPage = { events: PreviewEvent[]; capability: EditCapability | null };

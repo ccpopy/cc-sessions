@@ -1,12 +1,102 @@
 use super::super::*;
 use serde_json::json;
 
+fn native_media_cases() -> Vec<Value> {
+    serde_json::from_str::<Value>(include_str!("fixtures/native-media-alpha16.json")).unwrap()
+        ["cases"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+fn native_media_loaded(case: &Value) -> LoadedFile {
+    let p = &case["canonical"]["payload"];
+    let rows = [
+        json!({"type":"session_meta","payload":{"id":p["thread_id"],"history_mode":"paginated","cli_version":"0.155.0-alpha.16"}}),
+        json!({"type":"event_msg","payload":{"type":"task_started","turn_id":p["turn_id"]}}),
+        case["context"].clone(),
+        case["canonical"].clone(),
+        json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":p["turn_id"]}}),
+    ];
+    let lines = rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut row)| {
+            row["ordinal"] = json!(i);
+            row.to_string()
+        })
+        .collect::<Vec<_>>();
+    paginated::from_lines(&lines, true)
+}
+
+macro_rules! native_media_diagnostic_test {
+    ($test:ident, $case:literal) => {
+        #[test]
+        fn $test() {
+            let case = native_media_cases()
+                .into_iter()
+                .find(|v| v["name"] == $case)
+                .unwrap();
+            let diagnostics = super::diagnostics(&native_media_loaded(&case)).unwrap();
+            assert!(
+                diagnostics.iter().all(|d| d.status == "matched"),
+                "untouched native {}: {diagnostics:?}",
+                $case
+            );
+        }
+    };
+}
+native_media_diagnostic_test!(native_media_unedited_pure_image, "pure-image");
+native_media_diagnostic_test!(native_media_unedited_text_image, "text-image");
+native_media_diagnostic_test!(native_media_unedited_multi_image, "multi-image");
+native_media_diagnostic_test!(native_media_unedited_local_audio, "local-audio");
+native_media_diagnostic_test!(native_media_unedited_mixed_blocks, "mixed-blocks");
+native_media_diagnostic_test!(native_media_unedited_inline_image, "inline-image");
+native_media_diagnostic_test!(native_media_unedited_inline_audio, "inline-audio");
+native_media_diagnostic_test!(native_media_unedited_literal_tags, "literal-tags");
+
 struct Fixture {
     root: PathBuf,
     path: PathBuf,
     backup: PathBuf,
 }
 impl Fixture {
+    fn native_media(name: &str) -> Self {
+        let case = native_media_cases()
+            .into_iter()
+            .find(|v| v["name"] == name)
+            .unwrap();
+        let f = Self::new();
+        f.update(|rows, seed| {
+            rows[9]["payload"]["item"]["content"] =
+                case["canonical"]["payload"]["item"]["content"].clone();
+            rows[8]["payload"]["content"] = case["context"]["payload"]["content"].clone();
+            rows[8]["payload"]["internal_chat_message_metadata_passthrough"]
+                ["content_item_kinds"] = case["context"]["payload"]
+                ["internal_chat_message_metadata_passthrough"]["content_item_kinds"]
+                .clone();
+            let row = seed
+                .rows
+                .get_mut("thread_items")
+                .unwrap()
+                .iter_mut()
+                .find(|r| r["item_id"] == "user-1")
+                .unwrap();
+            let mut native: Value =
+                serde_json::from_str(row["item_json"].as_str().unwrap()).unwrap();
+            native["content"] = rows[9]["payload"]["item"]["content"].clone();
+            for block in native["content"].as_array_mut().unwrap() {
+                match block["type"].as_str() {
+                    Some("local_image") => block["type"] = json!("localImage"),
+                    Some("local_audio") => block["type"] = json!("localAudio"),
+                    _ => {}
+                }
+            }
+            row["item_json"] = json!(native.to_string());
+        });
+        f
+    }
+
     fn update(&self, change: impl FnOnce(&mut Vec<Value>, &mut paginated::HistoryImage)) {
         let loaded = load_file(&self.path).unwrap();
         let mut seed = paginated::projection::read(&self.path, &loaded).unwrap();
@@ -129,6 +219,291 @@ impl Fixture {
             .unwrap()
             .join("\n")
     }
+}
+
+#[test]
+fn native_media_edit_delete_and_undo_preserve_all_other_blocks() {
+    for case in native_media_cases() {
+        let f = Fixture::native_media(case["name"].as_str().unwrap());
+        let original = fs::read(&f.path).unwrap();
+        let original_items = f.items();
+        let loaded = load_file(&f.path).unwrap();
+        let mapping = super::diagnostics(&loaded)
+            .unwrap()
+            .into_iter()
+            .find(|d| d.item_id == "user-1")
+            .unwrap();
+        assert_eq!(mapping.status, "matched");
+        let undo = || {
+            undo_last(
+                "codex",
+                f.path.to_str().unwrap(),
+                "thread-1",
+                f.backup.to_str().unwrap(),
+                Some(&f.revision()),
+            )
+            .unwrap()
+        };
+        for pair in &mapping.block_pairs {
+            let canonical = &loaded.parsed[9].as_ref().unwrap()["payload"]["item"]["content"];
+            if canonical[pair.canonical_index]["type"] != "text" {
+                continue;
+            }
+            apply_edit_text_blocks(
+                "codex",
+                f.path.to_str().unwrap(),
+                "thread-1",
+                f.backup.to_str().unwrap(),
+                9,
+                "",
+                Some(&f.revision()),
+                Some(&[crate::models::TextBlockEdit {
+                    content_index: pair.canonical_index,
+                    text: "EDITED-BLOCK".into(),
+                }]),
+            )
+            .unwrap();
+            let after = load_file(&f.path).unwrap();
+            for (row, pointer, edited_index) in [
+                (9, "/payload/item/content", pair.canonical_index),
+                (8, "/payload/content", pair.context_index),
+            ] {
+                let before = loaded.parsed[row]
+                    .as_ref()
+                    .unwrap()
+                    .pointer(pointer)
+                    .unwrap()
+                    .as_array()
+                    .unwrap();
+                let content = after.parsed[row]
+                    .as_ref()
+                    .unwrap()
+                    .pointer(pointer)
+                    .unwrap()
+                    .as_array()
+                    .unwrap();
+                assert_eq!(before.len(), content.len());
+                for i in 0..before.len() {
+                    if i == edited_index {
+                        assert_eq!(content[i]["text"], "EDITED-BLOCK");
+                    } else {
+                        assert_eq!(
+                            before[i], content[i],
+                            "{}: untouched block {i}",
+                            case["name"]
+                        );
+                    }
+                }
+            }
+            assert!(inspect_edit_capability("codex", f.path.to_str().unwrap())
+                .unwrap()
+                .diagnostics
+                .is_empty());
+            undo();
+            assert_eq!(fs::read(&f.path).unwrap(), original);
+            assert_eq!(f.items(), original_items);
+        }
+        f.delete(&[9]).unwrap(); // Pure image messages must also remain deletable.
+        let after = load_file(&f.path).unwrap();
+        assert!(!super::model(&after)
+            .unwrap()
+            .items
+            .iter()
+            .any(|i| i.key.id == "user-1"));
+        assert!(!after
+            .parsed
+            .iter()
+            .flatten()
+            .any(|r| r["payload"]["id"] == "context-1"));
+        assert!(f.items().contains("KEEP-A") && f.items().contains("KEEP-C"));
+        undo();
+        assert_eq!(fs::read(&f.path).unwrap(), original);
+        assert_eq!(f.items(), original_items);
+    }
+}
+
+#[test]
+fn native_media_unsupported_mapping_is_scoped_and_not_reported_as_damage() {
+    let f = Fixture::native_media("text-image");
+    f.update(|rows, _| rows[8]["payload"]["content"][1]["text"] = json!("<future_image>"));
+    let before = fs::read(&f.path).unwrap();
+    let capability = inspect_edit_capability("codex", f.path.to_str().unwrap()).unwrap();
+    assert!(capability.blocked_reasons.is_empty());
+    assert_eq!(capability.diagnostics.len(), 1);
+    assert!(capability.diagnostics[0].contains("EDIT_MAPPING_UNSUPPORTED"));
+    assert!(!capability.diagnostics[0].contains("EDIT_INCONSISTENT"));
+    assert!(!capability.diagnostics[0].contains("旧版编辑"));
+    assert!(!capability.diagnostics[0].contains("快照"));
+    assert!(f
+        .delete(&[9])
+        .unwrap_err()
+        .to_string()
+        .contains("EDIT_MAPPING_UNSUPPORTED"));
+    assert_eq!(fs::read(&f.path).unwrap(), before);
+    assert!(history(
+        "codex",
+        f.path.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap()
+    )
+    .unwrap()
+    .snapshots
+    .is_empty());
+    f.rewrite(3, "unaffected edit");
+}
+
+#[test]
+fn native_media_real_body_difference_blocks_writes_and_reports_only_positions() {
+    let f = Fixture::native_media("mixed-blocks");
+    f.update(|rows, _| rows[8]["payload"]["content"][5]["text"] = json!("MIDDLe"));
+    let before = fs::read(&f.path).unwrap();
+    let capability = inspect_edit_capability("codex", f.path.to_str().unwrap()).unwrap();
+    let detail = capability
+        .content_mappings
+        .iter()
+        .find(|d| d.item_id == "user-1")
+        .unwrap();
+    assert_eq!(detail.status, "inconsistent");
+    let diff = detail.first_difference.as_ref().unwrap();
+    assert_eq!(
+        (
+            diff.canonical_index,
+            diff.context_index,
+            diff.utf8_byte_offset
+        ),
+        (Some(3), Some(5), Some(5))
+    );
+    let serialized = serde_json::to_string(detail).unwrap();
+    for secret in [
+        "MIDDLe",
+        "MIDDLE",
+        "data:image",
+        "data:audio",
+        "one.png",
+        "tone.wav",
+    ] {
+        assert!(!serialized.contains(secret));
+    }
+    assert!(f
+        .delete(&[9])
+        .unwrap_err()
+        .to_string()
+        .contains("EDIT_INCONSISTENT"));
+    assert!(apply_edit_text_blocks(
+        "codex",
+        f.path.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        9,
+        "",
+        Some(&f.revision()),
+        Some(&[crate::models::TextBlockEdit {
+            content_index: 0,
+            text: "new".into()
+        }])
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("EDIT_INCONSISTENT"));
+    assert_eq!(fs::read(&f.path).unwrap(), before);
+    f.rewrite(3, "unaffected edit");
+}
+
+#[test]
+fn native_media_literal_tags_and_whitespace_are_not_normalized() {
+    let f = Fixture::native_media("inline-image");
+    f.update(|rows, _| {
+        rows[8]["payload"]["content"][0]["text"] = json!("<image>");
+        rows[9]["payload"]["item"]["content"][0]["text"] = json!("<image>");
+    });
+    assert!(inspect_edit_capability("codex", f.path.to_str().unwrap())
+        .unwrap()
+        .diagnostics
+        .is_empty());
+    let f = Fixture::native_media("literal-tags");
+    f.update(|rows, _| rows[8]["payload"]["content"][1]["text"] = json!("KEEP WHITESPACE"));
+    assert!(inspect_edit_capability("codex", f.path.to_str().unwrap())
+        .unwrap()
+        .diagnostics[0]
+        .contains("EDIT_INCONSISTENT"));
+}
+
+#[test]
+fn native_media_unknown_version_source_and_shape_are_unsupported_not_inconsistent() {
+    for scenario in 0..3 {
+        let f = Fixture::native_media("text-image");
+        f.update(|rows, _| match scenario {
+            0 => rows[0]["payload"]["cli_version"] = json!("unverified-version"),
+            1 => {
+                rows[8]["payload"]["internal_chat_message_metadata_passthrough"]
+                    ["content_item_kinds"][1] = json!("unknown.source")
+            }
+            _ => {
+                rows[8]["payload"]["content"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"type":"input_text","text":"unmapped extra block"}));
+                rows[8]["payload"]["internal_chat_message_metadata_passthrough"]
+                    ["content_item_kinds"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!("user.text"));
+            }
+        });
+        let capability = inspect_edit_capability("codex", f.path.to_str().unwrap()).unwrap();
+        assert!(capability.blocked_reasons.is_empty());
+        assert_eq!(capability.diagnostics.len(), 1);
+        assert!(capability.diagnostics[0].contains("EDIT_MAPPING_UNSUPPORTED"));
+        assert!(!capability.diagnostics[0].contains("EDIT_INCONSISTENT"));
+        assert!(f
+            .delete(&[9])
+            .unwrap_err()
+            .to_string()
+            .contains("EDIT_MAPPING_UNSUPPORTED"));
+        f.rewrite(3, "unaffected text");
+    }
+}
+
+#[test]
+fn native_media_duplicate_snapshots_share_the_same_context_mapping() {
+    let f = Fixture::native_media("mixed-blocks");
+    f.update(|rows, _| rows.insert(10, rows[9].clone()));
+    let original = fs::read(&f.path).unwrap();
+    let report = apply_edit_text_blocks(
+        "codex",
+        f.path.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        9,
+        "",
+        Some(&f.revision()),
+        Some(&[crate::models::TextBlockEdit {
+            content_index: 3,
+            text: "changed middle".into(),
+        }]),
+    )
+    .unwrap();
+    assert_eq!(report.changed_lines, 3);
+    let loaded = load_file(&f.path).unwrap();
+    for i in [9, 10] {
+        assert_eq!(
+            loaded.parsed[i].as_ref().unwrap()["payload"]["item"]["content"][3]["text"],
+            "changed middle"
+        );
+    }
+    assert_eq!(
+        loaded.parsed[8].as_ref().unwrap()["payload"]["content"][5]["text"],
+        "changed middle"
+    );
+    undo_last(
+        "codex",
+        f.path.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        Some(&f.revision()),
+    )
+    .unwrap();
+    assert_eq!(fs::read(&f.path).unwrap(), original);
 }
 
 #[test]
@@ -744,6 +1119,91 @@ fn paginated_native_writer_lock_blocks_without_an_open_rollout() {
     assert_eq!(fs::read(&f.path).unwrap(), before);
     drop(lock);
     f.delete(&[9]).unwrap();
+}
+
+#[test]
+#[ignore = "requires an explicitly created isolated native fixture"]
+fn paginated_native_media_fixture_command() {
+    let root =
+        PathBuf::from(std::env::var("CC_NATIVE_MEDIA_HOME").expect("isolated native fixture"));
+    let marker: Value =
+        serde_json::from_slice(&fs::read(root.join("capture.json")).unwrap()).unwrap();
+    assert_eq!(marker["nativeGenerated"], true);
+    let path = PathBuf::from(marker["path"].as_str().unwrap());
+    assert!(path
+        .canonicalize()
+        .unwrap()
+        .starts_with(root.canonicalize().unwrap()));
+    let id = marker["threadId"].as_str().unwrap();
+    let backup = root.join("edit-backups");
+    let capability = inspect_edit_capability("codex", path.to_str().unwrap()).unwrap();
+    let action = std::env::var("CC_NATIVE_MEDIA_ACTION").unwrap();
+    let result = if action == "diagnose" {
+        json!({"capability":capability,"history":history("codex",path.to_str().unwrap(),id,backup.to_str().unwrap()).unwrap()})
+    } else {
+        let revision = Some(capability.revision);
+        let report = if action == "undo" {
+            undo_last(
+                "codex",
+                path.to_str().unwrap(),
+                id,
+                backup.to_str().unwrap(),
+                revision.as_deref(),
+            )
+        } else {
+            let target_id = std::env::var("CC_NATIVE_MEDIA_ITEM").unwrap();
+            let loaded = load_file(&path).unwrap();
+            let h = super::model(&loaded).unwrap();
+            let item = h.items.iter().find(|i| i.key.id == target_id).unwrap();
+            let targets = Some(vec![crate::models::PaginatedItemTarget {
+                thread_id: id.into(),
+                turn_id: item.key.turn.clone(),
+                item_id: target_id,
+            }]);
+            if action == "delete" {
+                delete_session_events_with_lock(
+                    "codex".into(),
+                    path.to_string_lossy().into(),
+                    id.into(),
+                    backup.to_string_lossy().into(),
+                    vec![0],
+                    revision,
+                    targets,
+                    &crate::family::FamilyLock::default(),
+                )
+            } else {
+                assert_eq!(action, "edit");
+                let block = std::env::var("CC_NATIVE_MEDIA_BLOCK")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                edit_session_event_text_with_lock(
+                    "codex".into(),
+                    path.to_string_lossy().into(),
+                    id.into(),
+                    backup.to_string_lossy().into(),
+                    0,
+                    "".into(),
+                    revision,
+                    targets,
+                    Some(vec![crate::models::TextBlockEdit {
+                        content_index: block,
+                        text: "NATIVE-MEDIA-EDITED".into(),
+                    }]),
+                    &crate::family::FamilyLock::default(),
+                )
+            }
+        };
+        match report {
+            Ok(report) => json!({"ok":true,"report":report}),
+            Err(error) => json!({"ok":false,"error":error.to_string()}),
+        }
+    };
+    fs::write(
+        root.join("last-operation.json"),
+        serde_json::to_vec_pretty(&result).unwrap(),
+    )
+    .unwrap();
 }
 
 #[test]

@@ -1,5 +1,6 @@
 //! In-place edits of canonical paginated history and its thread-scoped projection.
 use super::*;
+pub(super) mod content_mapping;
 pub(super) mod projection;
 pub(super) use projection::{HistoryChange, HistoryImage};
 
@@ -230,7 +231,9 @@ pub(super) fn inspect(path: &Path, loaded: &LoadedFile) -> AppResult<()> {
     Ok(())
 }
 
-pub(super) fn diagnostics(loaded: &LoadedFile) -> AppResult<Vec<String>> {
+pub(super) fn diagnostics(
+    loaded: &LoadedFile,
+) -> AppResult<Vec<crate::models::ContentMappingDetail>> {
     let h = model(loaded)?;
     let mut diagnostics = Vec::new();
     for item in h
@@ -238,35 +241,7 @@ pub(super) fn diagnostics(loaded: &LoadedFile) -> AppResult<Vec<String>> {
         .iter()
         .filter(|item| matches!(item.kind.as_str(), "UserMessage" | "AgentMessage"))
     {
-        let reason = if item.contexts.is_empty() {
-            Some("缺少可关联的上下文")
-        } else {
-            let canonical = &loaded.parsed[*item.records.last().unwrap()]
-                .as_ref()
-                .unwrap()["payload"]["item"]["content"];
-            let Ok(positions) = text_positions(canonical) else {
-                continue;
-            };
-            let mut mismatch = false;
-            for &i in &item.contexts {
-                let context = loaded.parsed[i].as_ref().unwrap();
-                // Unknown block metadata remains an operation-scoped unsupported case.
-                let Ok(mapping) = context_text_positions(context, &item.kind) else {
-                    continue;
-                };
-                mismatch |= mapping.len() != positions.len()
-                    || mapping.iter().zip(&positions).any(|(&a, &b)| {
-                        context["payload"]["content"][a]["text"] != canonical[b]["text"]
-                    });
-            }
-            mismatch.then_some("的上下文文本块与正式消息不一致")
-        };
-        if let Some(reason) = reason {
-            diagnostics.push(format!(
-                "[EDIT_INCONSISTENT] 回合 {} / 消息 {} {}；可能是旧版编辑遗留。不会自动修复，请在隔离副本中核对编辑前快照与原生历史后恢复。",
-                item.key.turn, item.key.id, reason
-            ));
-        }
+        diagnostics.extend(content_mapping::item_mappings(loaded, item));
     }
     Ok(diagnostics)
 }
@@ -496,6 +471,9 @@ pub(super) fn delete_plan(
         if !selected_items.contains(&item.key) {
             continue;
         }
+        if matches!(item.kind.as_str(), "UserMessage" | "AgentMessage") {
+            content_mapping::require_supported(&content_mapping::item_mappings(loaded, item))?;
+        }
         for &i in &item.records {
             plan.entry(i).or_insert_with(|| "item_snapshot".into());
         }
@@ -583,6 +561,8 @@ pub(super) fn edit_changes(
     if !matches!(item.kind.as_str(), "UserMessage" | "AgentMessage") {
         return Err(unsupported("工具和推理内容不支持文本改写"));
     }
+    let mappings = content_mapping::item_mappings(loaded, item);
+    content_mapping::require_supported(&mappings)?;
     if item.contexts.is_empty()
         || (item.kind == "UserMessage"
             && (item.contexts.len() != 1
@@ -646,22 +626,27 @@ pub(super) fn edit_changes(
             }
             positions.clone()
         } else {
-            context_text_positions(&raw, &item.kind)?
+            let mapping = mappings
+                .iter()
+                .find(|m| m.context_ordinal == raw["ordinal"].as_u64())
+                .unwrap();
+            positions
+                .iter()
+                .map(|&position| {
+                    mapping
+                        .block_pairs
+                        .iter()
+                        .find(|pair| pair.canonical_index == position)
+                        .unwrap()
+                        .context_index
+                })
+                .collect()
         };
         let content = if codex_ptype(&raw) == "item_completed" {
             &mut raw["payload"]["item"]["content"]
         } else {
             &mut raw["payload"]["content"]
         };
-        if mapping.len() != positions.len()
-            || (!formal
-                && mapping
-                    .iter()
-                    .zip(&positions)
-                    .any(|(&a, &b)| content[a]["text"] != canonical[b]["text"]))
-        {
-            return Err(AppError::Other(format!("[EDIT_INCONSISTENT] 回合 {} / 消息 {} 的上下文文本块与正式消息不一致；未改写，请在隔离副本中核对编辑前快照后恢复", item.key.turn, item.key.id)));
-        }
         for edit in edits {
             let ordinal = positions
                 .iter()
@@ -762,26 +747,6 @@ fn text_positions(content: &Value) -> AppResult<Vec<usize>> {
             ) && b["text"].is_string()
         })
         .map(|(i, _)| i)
-        .collect())
-}
-
-fn context_text_positions(raw: &Value, kind: &str) -> AppResult<Vec<usize>> {
-    let content = &raw["payload"]["content"];
-    let positions = text_positions(content)?;
-    if kind != "UserMessage" {
-        return Ok(positions);
-    }
-    // Native metadata labels each context block. Image labels are also text;
-    // only user.text blocks correspond to canonical user text inputs.
-    let kinds = raw["payload"]["internal_chat_message_metadata_passthrough"]["content_item_kinds"]
-        .as_array()
-        .ok_or_else(|| unsupported("用户上下文缺少内容块来源"))?;
-    if Some(kinds.len()) != content.as_array().map(Vec::len) {
-        return Err(unsupported("用户上下文内容块来源数量不一致"));
-    }
-    Ok(positions
-        .into_iter()
-        .filter(|&i| kinds[i] == "user.text")
         .collect())
 }
 

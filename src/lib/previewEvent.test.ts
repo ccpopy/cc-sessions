@@ -16,9 +16,19 @@ import {
   extractPreviewEventText,
   isConversationMessage,
   isStableForkNode,
+  isSessionWideMutationFailure,
   openCodeForkPoint,
   parseDiffCommentPrompt,
 } from "./previewEvent.ts";
+
+test("content mapping failures keep unaffected messages available without weakening conflict protection", () => {
+  for (const message of [null, "[EDIT_INCONSISTENT] body differs", "[EDIT_MAPPING_UNSUPPORTED] unknown block"]) {
+    assert.equal(isSessionWideMutationFailure(message), false);
+  }
+  for (const message of ["[EDIT_CONFLICT] external append", "[EDIT_RECOVERY] pending commit", "unknown failure", "[EDIT_CONFLICT] [EDIT_INCONSISTENT]"]) {
+    assert.equal(isSessionWideMutationFailure(message), true);
+  }
+});
 
 function event(raw: unknown, role: PreviewEvent["role"] = "user"): PreviewEvent {
   return {
