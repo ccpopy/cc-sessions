@@ -3351,6 +3351,68 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "native script supplies an isolated generated sample and expected item identities"]
+    fn native_isolated_logical_read_contract() {
+        let home = PathBuf::from(std::env::var("CC_NATIVE_READ_HOME").unwrap())
+            .canonicalize()
+            .unwrap();
+        let capture: Value =
+            serde_json::from_slice(&fs::read(home.join("capture.json")).unwrap()).unwrap();
+        assert_eq!(capture["nativeGenerated"], true);
+        let path = PathBuf::from(capture["path"].as_str().unwrap())
+            .canonicalize()
+            .unwrap();
+        assert!(path.starts_with(&home));
+        let expected: Value =
+            serde_json::from_slice(&fs::read(home.join("history-read-contract.json")).unwrap())
+                .unwrap();
+        let items = expected["items"].as_array().unwrap();
+        let history = crate::logical_history::read(&path, None).unwrap();
+        let ids = history
+            .events()
+            .into_iter()
+            .filter(|e| crate::rollout::preview_event_is_conversation(e))
+            .map(|e| e.raw["payload"]["item"]["id"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            items.iter().map(|i| i["id"].clone()).collect::<Vec<_>>()
+        );
+        let parsed = parse_codex_rollout(&path).unwrap();
+        let expected_text = items
+            .iter()
+            .map(|i| {
+                i["text"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| flatten_codex_content(i.get("content")))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parsed.messages.iter().map(|m| &m.text).collect::<Vec<_>>(),
+            expected_text.iter().collect::<Vec<_>>()
+        );
+        let before = fs::read(&path).unwrap();
+        for mode in [ClaudeImportMode::Simple, ClaudeImportMode::Native] {
+            let target = home.join(format!("claude-{}", mode.as_str()));
+            fs::create_dir_all(target.join("projects")).unwrap();
+            let report = convert_codex_to_claude(
+                home.to_str().unwrap(),
+                target.to_str().unwrap(),
+                path.to_str().unwrap(),
+                mode,
+            )
+            .unwrap();
+            let converted = fs::read_to_string(report.new_path).unwrap();
+            for text in ["INHERITED-A", "KEEP-A", "DELETE-B", "KEEP-C"] {
+                assert!(converted.contains(text));
+            }
+            assert!(!converted.contains("REVERT-AGAIN"));
+        }
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
     fn r05_paginated_conversion_uses_latest_formal_and_inherited_messages() {
         let root = temp_dir("logical-history");
         let sessions = root.join("sessions");
@@ -3442,6 +3504,31 @@ mod tests {
                 assert!(!text.contains(omitted));
             }
         }
+        // A second native revert/fork references the physical ID of an already
+        // switched rollout, whose filename retains the logical ID before `_`.
+        let physical = "33333333-3333-4333-8333-333333333333";
+        let switched = sessions.join(format!(
+            "rollout-2026-09-24T00-00-01-{child_id}_{physical}.jsonl"
+        ));
+        fs::rename(&child, &switched).unwrap();
+        let grandchild =
+            sessions.join("rollout-2026-09-24T00-00-02-44444444-4444-4444-8444-444444444444.jsonl");
+        write_lines(
+            &grandchild,
+            &[
+                json!({"type":"session_meta","payload":{"id":"44444444-4444-4444-8444-444444444444","history_mode":"paginated","history_base":{"thread_id":physical,"end_ordinal_exclusive":7,"end_byte_offset":fs::metadata(&switched).unwrap().len()}}}),
+                message("d", "UserMessage", "KEEP-D"),
+            ],
+        );
+        let nested = parse_codex_rollout(&grandchild).unwrap();
+        assert_eq!(
+            nested
+                .messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["KEEP-A", "KEEP-B", "KEEP-C", "KEEP-D"]
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -60,7 +60,17 @@ def main():
         assert reverted['thread']['id'] == tid
         path = Path(reverted['thread']['path']).resolve()
         assert path != original_path and path.is_relative_to(home)
-        for prompt in ['KEEP-A', 'DELETE-B', 'KEEP-C']:
+        second_turns = []
+        for prompt in ['KEEP-A', 'REVERT-AGAIN']:
+            turn = native.call('turn/start', {'threadId': tid, 'input': [
+                {'type': 'text', 'text': prompt, 'text_elements': []}]})['turn']['id']
+            assert native.wait_turn(turn)['status'] == 'completed'
+            second_turns.append(turn)
+        second = native.call('thread/revert', {'threadId': tid, 'beforeTurnId': second_turns[-1]})
+        switched_parent = path
+        path = Path(second['thread']['path']).resolve()
+        assert path != switched_parent and path.is_relative_to(home)
+        for prompt in ['DELETE-B', 'KEEP-C']:
             turn = native.call('turn/start', {'threadId': tid, 'input': [
                 {'type': 'text', 'text': prompt, 'text_elements': []}]})['turn']['id']
             assert native.wait_turn(turn)['status'] == 'completed'
@@ -68,6 +78,7 @@ def main():
         native.close()
         server.shutdown()
     original_prefix = original_path.read_bytes()
+    switched_prefix = switched_parent.read_bytes()
     original = path.read_bytes()
     rid = path.stem.rsplit('_', 1)[1]
     (home/'capture.json').write_text(json.dumps({'threadId': tid, 'path': str(path),
@@ -100,6 +111,7 @@ def main():
         finally:
             client.close()
         assert path.read_bytes() == before and original_path.read_bytes() == original_prefix
+        assert switched_parent.read_bytes() == switched_prefix
         items = [row['item'] for row in data]
         evidence.append({'stage': stage, 'itemIds': [item['id'] for item in items],
             'rolloutSha256': hashlib.sha256(before).hexdigest(), 'nativeProcessRestart': True})
@@ -115,6 +127,10 @@ def main():
         assert result['ok'], result
 
     baseline = read('baseline')
+    (home/'history-read-contract.json').write_text(json.dumps({'items': baseline}), encoding='utf-8')
+    subprocess.run([binaries[0], 'convert::tests::native_isolated_logical_read_contract', '--exact', '--ignored'],
+        cwd=REPO, env={**os.environ, 'CC_NATIVE_READ_HOME': str(home)}, check=True)
+
     target = next(item['id'] for item in baseline if item.get('content', [{}])[0].get('text') == 'DELETE-B')
     edit('edit', target)
     edited = read('edited')

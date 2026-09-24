@@ -186,7 +186,8 @@ fn resolve_records(
             let name = entry.file_name().to_string_lossy();
             if entry.file_type().is_file()
                 && name.starts_with("rollout-")
-                && name.ends_with(&format!("-{id}.jsonl"))
+                && (name.ends_with(&format!("-{id}.jsonl"))
+                    || name.ends_with(&format!("_{id}.jsonl")))
             {
                 let resolved = entry.path().canonicalize()?;
                 if !resolved.starts_with(&managed) {
