@@ -10,7 +10,7 @@
 //!
 //! 导入时按当前库的列做交集写入，Cursor 升级新增列不会导致导入失败。
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 
@@ -84,6 +84,7 @@ pub fn export_snapshot(cursor_dir: &Path, session_id: &str) -> AppResult<CursorS
     validate_session_id(session_id)?;
     let db = cursor_sessions::state_db_path(cursor_dir);
     let connection = cursor_sessions::open_readonly(&db)?;
+    let connection = connection.unchecked_transaction()?;
     if !cursor_sessions::table_exists(&connection, "composerHeaders")? {
         return Err(AppError::Other(
             "这个 Cursor 版本还没有 composerHeaders 表，无法导出会话".into(),
@@ -109,23 +110,11 @@ pub fn export_snapshot(cursor_dir: &Path, session_id: &str) -> AppResult<CursorS
 
     let composer_data = read_text(&connection, &format!("composerData:{session_id}"))?;
     let mut bubbles = Vec::new();
-    if let Some(raw) = composer_data.as_deref() {
-        let data =
-            serde_json::from_str::<serde_json::Value>(raw).unwrap_or(serde_json::Value::Null);
-        for entry in data
-            .get("fullConversationHeadersOnly")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            let Some(bubble) = entry.get("bubbleId").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            if let Some(text) = read_text(&connection, &format!("bubbleId:{session_id}:{bubble}"))?
-            {
-                bubbles.push((bubble.to_string(), text));
-            }
-        }
+    let data = composer_index(composer_data.as_deref())?;
+    for bubble in index_ids(&data, session_id)? {
+        let text = read_text(&connection, &format!("bubbleId:{session_id}:{bubble}"))?
+            .ok_or_else(|| snapshot_error("索引引用的气泡正文缺失，不能生成完整快照"))?;
+        bubbles.push((bubble, text));
     }
 
     let source_cwd = header
@@ -148,7 +137,7 @@ pub fn export_snapshot(cursor_dir: &Path, session_id: &str) -> AppResult<CursorS
         _ => 0,
     };
 
-    Ok(CursorSessionSnapshot {
+    let snapshot = CursorSessionSnapshot {
         version: SNAPSHOT_VERSION,
         exported_at: chrono::Utc::now().to_rfc3339(),
         session_id: session_id.to_string(),
@@ -157,7 +146,9 @@ pub fn export_snapshot(cursor_dir: &Path, session_id: &str) -> AppResult<CursorS
         header,
         composer_data,
         bubbles,
-    })
+    };
+    validate_snapshot(&snapshot)?;
+    Ok(snapshot)
 }
 
 pub fn write_snapshot(path: &Path, snapshot: &CursorSessionSnapshot) -> AppResult<()> {
@@ -215,7 +206,8 @@ pub fn import_snapshot(
             "这个 Cursor 版本还没有 composerHeaders 表，无法导入会话".into(),
         ));
     }
-    let transaction = connection.transaction()?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let exists = transaction
         .query_row(
             "SELECT 1 FROM composerHeaders WHERE composerId = ?1",
@@ -245,8 +237,19 @@ pub fn import_snapshot(
         .iter()
         .map(|name| snapshot.header[name].to_sql())
         .collect::<AppResult<Vec<_>>>()?;
+    let updates = columns
+        .iter()
+        .filter(|name| name.as_str() != "composerId")
+        .map(|name| format!("{name}=excluded.{name}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let conflict = if updates.is_empty() {
+        "DO NOTHING".into()
+    } else {
+        format!("DO UPDATE SET {updates}")
+    };
     transaction.execute(
-        &format!("INSERT OR REPLACE INTO composerHeaders ({names}) VALUES ({marks})"),
+        &format!("INSERT INTO composerHeaders ({names}) VALUES ({marks}) ON CONFLICT(composerId) {conflict}"),
         rusqlite::params_from_iter(values),
     )?;
 
@@ -279,16 +282,103 @@ fn validate_snapshot(snapshot: &CursorSessionSnapshot) -> AppResult<()> {
         )));
     }
     validate_session_id(&snapshot.session_id)?;
-    for (bubble, _) in &snapshot.bubbles {
+    if !matches!(snapshot.header.get("composerId"), Some(SnapshotValue::Text(id)) if id == &snapshot.session_id)
+    {
+        return Err(snapshot_error("会话头 composerId 与快照 session_id 不一致"));
+    }
+    if let Some(value) = snapshot.header.get("value") {
+        let raw = match value.to_sql()? {
+            SqlValue::Text(raw) => raw,
+            SqlValue::Blob(bytes) => {
+                String::from_utf8(bytes).map_err(|_| snapshot_error("会话头不是有效 UTF-8"))?
+            }
+            _ => return Err(snapshot_error("会话头内容不是 JSON 文本")),
+        };
+        validate_owner(&snapshot_object(&raw)?, &snapshot.session_id)?;
+    }
+    let data = composer_index(snapshot.composer_data.as_deref())?;
+    let expected = index_ids(&data, &snapshot.session_id)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let mut actual = BTreeSet::new();
+    for (bubble, raw) in &snapshot.bubbles {
         validate_session_id(bubble)?;
+        if !actual.insert(bubble.clone()) {
+            return Err(snapshot_error("快照包含重复气泡 ID"));
+        }
+        let body = snapshot_object(raw)?;
+        validate_owner(&body, &snapshot.session_id)?;
+        if body
+            .get("bubbleId")
+            .is_some_and(|id| id.as_str() != Some(bubble))
+        {
+            return Err(snapshot_error("气泡正文 ID 与快照键不一致"));
+        }
+    }
+    if actual != expected {
+        return Err(snapshot_error(
+            "气泡正文与索引引用不闭合，存在缺失或未引用的内容",
+        ));
     }
     Ok(())
+}
+
+fn snapshot_error(message: &str) -> AppError {
+    AppError::Other(format!(
+        "[CURSOR_SNAPSHOT_INVALID] {message}；未导入或生成完整快照"
+    ))
+}
+
+fn snapshot_object(raw: &str) -> AppResult<serde_json::Value> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|_| snapshot_error("快照内容不是有效 JSON"))?;
+    if !value.is_object() {
+        return Err(snapshot_error("快照内容不是 JSON 对象"));
+    }
+    Ok(value)
+}
+
+fn validate_owner(value: &serde_json::Value, session_id: &str) -> AppResult<()> {
+    if value
+        .get("composerId")
+        .is_some_and(|id| id.as_str() != Some(session_id))
+    {
+        return Err(snapshot_error("内部 composerId 与快照会话身份不一致"));
+    }
+    Ok(())
+}
+
+fn composer_index(raw: Option<&str>) -> AppResult<serde_json::Value> {
+    snapshot_object(raw.ok_or_else(|| snapshot_error("缺少 composerData 正文索引"))?)
+}
+
+fn index_ids(data: &serde_json::Value, session_id: &str) -> AppResult<Vec<String>> {
+    validate_owner(data, session_id)?;
+    let entries = data
+        .get("fullConversationHeadersOnly")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| snapshot_error("缺少可验证的气泡索引数组"))?;
+    let mut seen = BTreeSet::new();
+    let mut ids = Vec::new();
+    for entry in entries {
+        validate_owner(entry, session_id)?;
+        let id = entry
+            .get("bubbleId")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| snapshot_error("索引项缺少气泡 ID"))?;
+        validate_session_id(id)?;
+        if !seen.insert(id) {
+            return Err(snapshot_error("气泡索引包含重复 ID"));
+        }
+        ids.push(id.into());
+    }
+    Ok(ids)
 }
 
 /// 会话与气泡 id 都会拼进 SQL 的 key，只允许安全字符。
 fn validate_session_id(id: &str) -> AppResult<()> {
     let trimmed = id.trim();
-    if trimmed.is_empty() || trimmed.len() > 128 {
+    if trimmed != id || trimmed.is_empty() || trimmed.len() > 128 {
         return Err(AppError::Other(format!("Cursor 会话 id 无效: {id}")));
     }
     if !trimmed
@@ -323,8 +413,11 @@ fn read_text(connection: &Connection, key: &str) -> AppResult<Option<String>> {
         .optional()?;
     Ok(match value {
         Some(SqlValue::Text(text)) => Some(text),
-        Some(SqlValue::Blob(bytes)) => Some(String::from_utf8_lossy(&bytes).into_owned()),
-        _ => None,
+        Some(SqlValue::Blob(bytes)) => {
+            Some(String::from_utf8(bytes).map_err(|_| snapshot_error("正文不是有效 UTF-8"))?)
+        }
+        None => None,
+        _ => return Err(snapshot_error("正文不是文本或二进制文本")),
     })
 }
 
@@ -507,5 +600,88 @@ mod tests {
         assert!(validate_session_id("a%b").is_err());
         assert!(validate_session_id("../x").is_err());
         assert!(validate_session_id("  ").is_err());
+    }
+
+    #[test]
+    fn r01_inconsistent_snapshot_is_rejected_before_any_database_write() -> AppResult<()> {
+        let fixture = fixture("identity")?;
+        let good = export_snapshot(&fixture.root, "s1")?;
+        let before = fs::read(cursor_sessions::state_db_path(&fixture.root))?;
+        let _probe = crate::cursor_mutate::CursorRunningProbe::not_running();
+        for kind in [
+            "header",
+            "composer",
+            "bubble-owner",
+            "bubble-id",
+            "duplicate",
+            "missing",
+            "extra",
+        ] {
+            let mut bad = good.clone();
+            match kind {
+                "header" => { bad.session_id = "new-session".into(); }
+                "composer" => bad.composer_data = Some(json!({"composerId":"other","fullConversationHeadersOnly":[{"bubbleId":"b1"},{"bubbleId":"b2"}]}).to_string()),
+                "bubble-owner" => bad.bubbles[0].1 = json!({"composerId":"other","bubbleId":"b1"}).to_string(),
+                "bubble-id" => bad.bubbles[0].1 = json!({"bubbleId":"b2"}).to_string(),
+                "duplicate" => bad.bubbles.push(bad.bubbles[0].clone()),
+                "missing" => { bad.bubbles.pop(); }
+                "extra" => bad.bubbles.push(("unreferenced".into(), "{}".into())),
+                _ => unreachable!(),
+            }
+            for overwrite in [false, true] {
+                assert!(
+                    import_snapshot(&fixture.root, &bad, overwrite).is_err(),
+                    "{kind}"
+                );
+                assert_eq!(
+                    fs::read(cursor_sessions::state_db_path(&fixture.root))?,
+                    before,
+                    "{kind}"
+                );
+            }
+        }
+        let file = fixture.root.join("wrong-manifest.json");
+        write_snapshot(&file, &good)?;
+        assert!(read_snapshot(&file, "other").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn r01_export_does_not_call_missing_or_malformed_content_a_complete_snapshot() -> AppResult<()>
+    {
+        for kind in [
+            "missing-data",
+            "invalid-data",
+            "missing-bubble",
+            "invalid-bubble",
+        ] {
+            let fixture = fixture(kind)?;
+            let connection = Connection::open(cursor_sessions::state_db_path(&fixture.root))?;
+            match kind {
+                "missing-data" => {
+                    connection
+                        .execute("DELETE FROM cursorDiskKV WHERE key='composerData:s1'", [])?;
+                }
+                "invalid-data" => {
+                    connection.execute(
+                        "UPDATE cursorDiskKV SET value='broken' WHERE key='composerData:s1'",
+                        [],
+                    )?;
+                }
+                "missing-bubble" => {
+                    connection
+                        .execute("DELETE FROM cursorDiskKV WHERE key='bubbleId:s1:b1'", [])?;
+                }
+                "invalid-bubble" => {
+                    connection.execute(
+                        "UPDATE cursorDiskKV SET value='broken' WHERE key='bubbleId:s1:b1'",
+                        [],
+                    )?;
+                }
+                _ => unreachable!(),
+            }
+            assert!(export_snapshot(&fixture.root, "s1").is_err(), "{kind}");
+        }
+        Ok(())
     }
 }
