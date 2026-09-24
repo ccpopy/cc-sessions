@@ -404,6 +404,7 @@ export type EditHistory = {
 };
 
 export type MoveSessionCwdReport = {
+  recovery_manifest: string | null;
   desktop_restart_required?: boolean;
   old_cwd: string;
   new_cwd: string;

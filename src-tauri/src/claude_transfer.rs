@@ -11,7 +11,14 @@ use crate::error::{AppError, AppResult};
 use crate::models::MoveSessionCwdReport;
 use crate::{claude_sessions, paths};
 
+mod source_version;
+
 static MOVE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_STAGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
 
 #[derive(Debug)]
 struct MoveArtifact {
@@ -69,6 +76,7 @@ pub fn move_session_cwd_with_options(
         same_existing_entry(&source_transcript, &destination_transcript)?;
     if transcript_stays_in_place && session.cwd == target_cwd {
         return Ok(MoveSessionCwdReport {
+            recovery_manifest: None,
             desktop_restart_required: false,
             old_cwd: session.cwd,
             new_cwd: target_cwd,
@@ -85,7 +93,9 @@ pub fn move_session_cwd_with_options(
     ensure_plain_directory(&paths::claude_projects_dir(claude_dir), "Claude projects")?;
     ensure_plain_directory_path(&destination_project, "Claude 目标项目目录")?;
     let sequence = MOVE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let stage_root = destination_project.join(format!(
+    let recovery_root = claude_dir.join(".cc-sessions-moves");
+    ensure_plain_directory_path(&recovery_root, "Claude 迁移恢复目录")?;
+    let stage_root = recovery_root.join(format!(
         ".ccsm-move-stage-{}-{sequence}",
         std::process::id()
     ));
@@ -107,20 +117,14 @@ pub fn move_session_cwd_with_options(
         source: source_transcript.clone(),
         destination: destination_transcript.clone(),
         stage: stage_root.join("transcript.jsonl"),
-        backup: source_transcript.with_file_name(format!(
-            ".ccsm-move-source-{}-{sequence}-transcript",
-            std::process::id()
-        )),
+        backup: stage_root.join("source-transcript"),
     });
     if path_exists(&source_sidecar)? {
         artifacts.push(MoveArtifact {
             source: source_sidecar.clone(),
             destination: destination_sidecar,
             stage: stage_root.join("sidecar"),
-            backup: source_sidecar.with_file_name(format!(
-                ".ccsm-move-source-{}-{sequence}-sidecar",
-                std::process::id()
-            )),
+            backup: stage_root.join("source-sidecar"),
         });
     }
     for (index, source) in companions.iter().enumerate() {
@@ -134,13 +138,15 @@ pub fn move_session_cwd_with_options(
             source: source.clone(),
             destination: destination_project.join(name),
             stage: stage_root.join("companions").join(name),
-            backup: source.with_file_name(format!(
-                ".ccsm-move-source-{}-{sequence}-companion-{index}",
-                std::process::id()
-            )),
+            backup: stage_root.join(format!("source-companion-{index}")),
         });
     }
 
+    let versions = artifacts
+        .iter()
+        .map(|asset| source_version::capture(&asset.source))
+        .collect::<AppResult<Vec<_>>>()?;
+    let source_sidecar_existed = path_exists(&source_sidecar)?;
     let operation = (|| -> AppResult<(u32, u32)> {
         for artifact in &artifacts {
             if path_exists(&artifact.destination)?
@@ -159,6 +165,17 @@ pub fn move_session_cwd_with_options(
             }
         }
 
+        let manifest = serde_json::json!({
+            "version":1,"session_id":session_id,"status":"prepared",
+            "assets":artifacts.iter().zip(&versions).map(|(a,v)| serde_json::json!({"source":a.source,"destination":a.destination,"backup":a.backup,"version":v})).collect::<Vec<_>>()
+        });
+        crate::atomic_file::create_with_writer_if_absent(
+            &stage_root.join("move-manifest.json"),
+            |file| {
+                serde_json::to_writer(file, &manifest)?;
+                Ok(())
+            },
+        )?;
         rewrite_jsonl(
             &source_transcript,
             &artifacts[0].stage,
@@ -173,22 +190,56 @@ pub fn move_session_cwd_with_options(
             }
         }
 
+        #[cfg(test)]
+        AFTER_STAGE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        let _guards = source_version::guard(&artifacts, &versions, false)?;
+        if path_exists(&source_sidecar)? != source_sidecar_existed
+            || claude_sessions::companion_files_for(&source_transcript)? != companions
+        {
+            return Err(source_version::conflict());
+        }
+        for (asset, version) in artifacts.iter().zip(&versions) {
+            source_version::check(&asset.source, version)?;
+        }
+        // Windows cannot rename a directory while descendant handles are held.
+        // Reacquire on the detached source and verify its full version before publishing.
+        drop(_guards);
         for (backed_up, artifact) in artifacts.iter().enumerate() {
-            if let Err(error) = fs::rename(&artifact.source, &artifact.backup) {
+            if let Err(error) =
+                crate::atomic_file::rename_file_no_replace(&artifact.source, &artifact.backup)
+            {
                 let rollback = rollback_source_backups(&artifacts[..backed_up]);
                 return Err(with_rollback(error.into(), rollback));
             }
         }
 
+        let mut backup_guards = Some(match source_version::guard(&artifacts, &versions, true) {
+            Ok(guards) => guards,
+            Err(error) => return Err(with_rollback(error, rollback_source_backups(&artifacts))),
+        });
+        for (asset, version) in artifacts.iter().zip(&versions) {
+            if let Err(error) = source_version::check(&asset.backup, version) {
+                drop(backup_guards.take());
+                return Err(with_rollback(error, rollback_source_backups(&artifacts)));
+            }
+        }
         let mut published = 0usize;
         for artifact in &artifacts {
             if let Some(parent) = artifact.destination.parent() {
                 if let Err(error) = fs::create_dir_all(parent) {
+                    drop(backup_guards.take());
                     let rollback = rollback_published(&artifacts[..published], &artifacts);
                     return Err(with_rollback(error.into(), rollback));
                 }
             }
-            if let Err(error) = fs::rename(&artifact.stage, &artifact.destination) {
+            if let Err(error) =
+                crate::atomic_file::rename_file_no_replace(&artifact.stage, &artifact.destination)
+            {
+                drop(backup_guards.take());
                 let rollback = rollback_published(&artifacts[..published], &artifacts);
                 return Err(with_rollback(error.into(), rollback));
             }
@@ -207,11 +258,13 @@ pub fn move_session_cwd_with_options(
         ) {
             Ok(verify) => verify,
             Err(error) => {
+                drop(backup_guards.take());
                 let rollback = rollback_published(&artifacts[..published], &artifacts);
                 return Err(with_rollback(error, rollback));
             }
         };
         if verify.cwd != target_cwd {
+            drop(backup_guards.take());
             let rollback = rollback_published(&artifacts[..published], &artifacts);
             return Err(with_rollback(
                 AppError::Other(format!(
@@ -222,6 +275,15 @@ pub fn move_session_cwd_with_options(
             ));
         }
 
+        for (asset, version) in artifacts.iter().zip(&versions) {
+            if let Err(error) = source_version::check(&asset.backup, version) {
+                drop(backup_guards.take());
+                return Err(with_rollback(
+                    error,
+                    rollback_published(&artifacts[..published], &artifacts),
+                ));
+            }
+        }
         let history_rows = match crate::history::rewrite_project_for_session(
             &paths::history_path(claude_dir),
             session_id,
@@ -229,6 +291,7 @@ pub fn move_session_cwd_with_options(
         ) {
             Ok(updated) => updated,
             Err(error) => {
+                drop(backup_guards.take());
                 let rollback = rollback_published(&artifacts[..published], &artifacts);
                 return Err(with_rollback(error, rollback));
             }
@@ -239,20 +302,39 @@ pub fn move_session_cwd_with_options(
     let result = match operation {
         Ok(result) => result,
         Err(error) => {
-            remove_path(&stage_root).ok();
-            return Err(error);
+            return Err(AppError::Other(format!(
+                "{error}；迁移材料已保留：{}",
+                stage_root.to_string_lossy()
+            )));
         }
     };
 
-    for artifact in &artifacts {
-        remove_path(&artifact.backup).ok();
-    }
-    remove_path(&stage_root).ok();
+    // Never delete the sole copy still reachable by a native process's old handle.
+    // Retained source assets and the durable manifest also survive process interruption.
+    crate::atomic_file::overwrite_with_writer(&stage_root.join("status.json"), |file| {
+        serde_json::to_writer(
+            file,
+            &serde_json::json!({"status":"committed","source_backups_retained":true}),
+        )?;
+        Ok(())
+    })
+    .map_err(|error| {
+        AppError::Other(format!(
+            "[MOVE_RECOVERY] 迁移已提交，但完成记录未保存：{error}；材料：{}",
+            stage_root.to_string_lossy()
+        ))
+    })?;
     if let Some(source_project) = source_transcript.parent() {
         remove_empty_directory(source_project).ok();
     }
 
     Ok(MoveSessionCwdReport {
+        recovery_manifest: Some(
+            stage_root
+                .join("move-manifest.json")
+                .to_string_lossy()
+                .into_owned(),
+        ),
         desktop_restart_required: false,
         old_cwd: session.cwd,
         new_cwd: target_cwd,
@@ -465,7 +547,9 @@ fn copy_regular_file(source: &Path, destination: &Path) -> AppResult<()> {
 fn rollback_source_backups(artifacts: &[MoveArtifact]) -> Vec<String> {
     let mut errors = Vec::new();
     for artifact in artifacts.iter().rev() {
-        if let Err(error) = fs::rename(&artifact.backup, &artifact.source) {
+        if let Err(error) =
+            crate::atomic_file::rename_file_no_replace(&artifact.backup, &artifact.source)
+        {
             errors.push(format!(
                 "恢复 Claude 源资产失败 {}: {error}",
                 artifact.source.to_string_lossy()
@@ -478,7 +562,9 @@ fn rollback_source_backups(artifacts: &[MoveArtifact]) -> Vec<String> {
 fn rollback_published(published: &[MoveArtifact], all: &[MoveArtifact]) -> Vec<String> {
     let mut errors = Vec::new();
     for artifact in published.iter().rev() {
-        if let Err(error) = remove_path(&artifact.destination) {
+        if let Err(error) =
+            crate::atomic_file::rename_file_no_replace(&artifact.destination, &artifact.stage)
+        {
             errors.push(format!(
                 "移除 Claude 已发布目标失败 {}: {error}",
                 artifact.destination.to_string_lossy()
@@ -513,21 +599,6 @@ fn same_existing_entry(source: &Path, destination: &Path) -> AppResult<bool> {
         return Ok(false);
     }
     same_file::is_same_file(source, destination).map_err(Into::into)
-}
-
-fn remove_path(path: &Path) -> AppResult<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if crate::path_safety::metadata_is_link_or_reparse(&metadata) => {
-            Err(AppError::Path(format!(
-                "拒绝移除链接或 junction: {}",
-                path.to_string_lossy()
-            )))
-        }
-        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path).map_err(Into::into),
-        Ok(_) => fs::remove_file(path).map_err(Into::into),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    }
 }
 
 fn ensure_plain_directory(path: &Path, label: &str) -> AppResult<()> {
@@ -574,6 +645,87 @@ mod tests {
     use super::*;
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn r04_stage_append_cannot_be_lost_by_move() -> AppResult<()> {
+        for sidecar in [false, true] {
+            let (claude, old, new) = fixture()?;
+            let project = claude_sessions::project_dir_for_cwd(&claude, old.to_str().unwrap());
+            let transcript = project.join("session-1.jsonl");
+            let changed = if sidecar {
+                project.join("session-1/subagents/agent-a.jsonl")
+            } else {
+                transcript.clone()
+            };
+            let append_path = changed.clone();
+            AFTER_STAGE.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
+                let mut file = fs::OpenOptions::new().append(true).open(append_path).unwrap();
+                writeln!(file,"{{\"type\":\"assistant\",\"sessionId\":\"session-1\",\"message\":{{\"role\":\"assistant\",\"content\":\"NEW-B\"}}}}").unwrap();
+            })));
+            let result = move_session_cwd(
+                &claude,
+                "session-1",
+                Some(transcript.to_str().unwrap()),
+                new.to_str().unwrap(),
+            );
+            assert!(
+                result.is_err(),
+                "changed source must conflict before publication"
+            );
+            assert!(fs::read_to_string(&changed)?.contains("NEW-B"));
+            assert!(!claude_sessions::project_dir_for_cwd(
+                &claude,
+                &normalize_target_cwd(new.to_str().unwrap(), false)?
+            )
+            .join("session-1.jsonl")
+            .exists());
+            fs::remove_dir_all(claude.parent().unwrap())?;
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn r04_open_native_writer_prevents_publication() -> AppResult<()> {
+        let (claude, old, new) = fixture()?;
+        let source = claude_sessions::project_dir_for_cwd(&claude, old.to_str().unwrap())
+            .join("session-1.jsonl");
+        let before = fs::read(&source)?;
+        let handle = fs::OpenOptions::new().append(true).open(&source)?;
+        let result = move_session_cwd(
+            &claude,
+            "session-1",
+            Some(source.to_str().unwrap()),
+            new.to_str().unwrap(),
+        );
+        assert!(result.unwrap_err().to_string().contains("SESSION_BUSY"));
+        assert_eq!(fs::read(&source)?, before);
+        drop(handle);
+        fs::remove_dir_all(claude.parent().unwrap())?;
+        Ok(())
+    }
+
+    #[test]
+    fn r04_new_sidecar_member_is_not_silently_omitted() -> AppResult<()> {
+        let (claude, old, new) = fixture()?;
+        let project = claude_sessions::project_dir_for_cwd(&claude, old.to_str().unwrap());
+        let source = project.join("session-1.jsonl");
+        let extra = project.join("session-1/subagents/new.txt");
+        let path = extra.clone();
+        AFTER_STAGE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || fs::write(path, "NEW-B").unwrap()))
+        });
+        assert!(move_session_cwd(
+            &claude,
+            "session-1",
+            Some(source.to_str().unwrap()),
+            new.to_str().unwrap()
+        )
+        .is_err());
+        assert_eq!(fs::read_to_string(extra)?, "NEW-B");
+        fs::remove_dir_all(claude.parent().unwrap())?;
+        Ok(())
+    }
 
     fn fixture() -> AppResult<(PathBuf, PathBuf, PathBuf)> {
         let root = std::env::temp_dir().join(format!(

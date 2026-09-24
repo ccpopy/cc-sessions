@@ -992,6 +992,9 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
                     ? `（移动 ${r.artifacts_moved} 项会话资产）`
                     : ""),
             );
+            if (r.recovery_manifest) {
+              toast.info("迁移源副本已保留", { description: `请确认原生会话已停止写入。恢复清单：${r.recovery_manifest}` });
+            }
             if (r.desktop_restart_required) {
               toast.info("工作目录已更新，重启 Codex App 后刷新列表；Desktop 项目归属未同步");
             } else if (provider === "codex" && !r.desktop_project_synced) {

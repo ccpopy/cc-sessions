@@ -273,6 +273,8 @@ pub struct DeleteResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MoveSessionCwdReport {
     #[serde(default)]
+    pub recovery_manifest: Option<String>,
+    #[serde(default)]
     pub desktop_restart_required: bool,
     pub old_cwd: String,
     pub new_cwd: String,

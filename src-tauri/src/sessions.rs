@@ -1046,6 +1046,7 @@ fn move_session_cwd_locked_with_post_project_sync(
     };
 
     Ok(MoveSessionCwdReport {
+        recovery_manifest: None,
         desktop_restart_required: crate::codex_projects::should_defer_desktop_state_mutation(),
         old_cwd,
         new_cwd,

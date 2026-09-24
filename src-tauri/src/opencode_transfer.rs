@@ -300,6 +300,7 @@ pub fn move_session_cwd(
     transaction.commit()?;
 
     Ok(MoveSessionCwdReport {
+        recovery_manifest: None,
         desktop_restart_required: false,
         old_cwd,
         new_cwd: target_cwd,

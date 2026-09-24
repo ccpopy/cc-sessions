@@ -253,12 +253,12 @@ fn unique_sibling_path(path: &Path, suffix: &str) -> AppResult<PathBuf> {
 }
 
 #[cfg(windows)]
-fn rename_file_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_file_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
     replace_file_atomically(source, destination, false)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn rename_file_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_file_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -285,7 +285,7 @@ fn rename_file_no_replace(source: &Path, destination: &Path) -> std::io::Result<
 }
 
 #[cfg(target_os = "macos")]
-fn rename_file_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_file_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -315,7 +315,7 @@ fn rename_file_no_replace(source: &Path, destination: &Path) -> std::io::Result<
     unix,
     not(any(target_os = "linux", target_os = "android", target_os = "macos"))
 ))]
-fn rename_file_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_file_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
     // These targets have no portable atomic no-replace rename API in std. Fail closed instead of
     // emulating it with a check-then-rename sequence that can overwrite another process's file.
     let _ = (source, destination);
