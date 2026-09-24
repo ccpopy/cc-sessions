@@ -34,6 +34,14 @@ use crate::models::{
 use crate::paths;
 
 mod paginated;
+mod preview_cache;
+
+pub(crate) fn read_preview_snapshot(
+    path: &Path,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> AppResult<std::sync::Arc<LoadedFile>> {
+    preview_cache::read(path, cancel)
+}
 mod safety;
 mod transaction;
 
@@ -49,9 +57,9 @@ pub fn inspect_edit_capability(
 fn load_inspected(
     provider: &str,
     path: &Path,
-) -> AppResult<(LoadedFile, crate::models::EditCapability)> {
+) -> AppResult<(std::sync::Arc<LoadedFile>, crate::models::EditCapability)> {
     for attempt in 0..3 {
-        let loaded = load_file(path)?;
+        let loaded = read_preview_snapshot(path, None)?;
         let capability = safety::inspect(provider, path, &loaded)?;
         if attempt == 2
             || !capability
@@ -90,27 +98,22 @@ pub(crate) fn codex_preview_page(
     }) {
         let history = crate::logical_history::from_records(
             &path,
-            loaded.parsed.into_iter().flatten().collect(),
+            loaded.parsed.iter().flatten().cloned().collect(),
             None,
         )?;
         return Ok(crate::models::PreviewPage {
-            events: history
-                .raw_events()
-                .into_iter()
-                .skip(offset)
-                .take(limit)
-                .collect(),
+            events: history.raw_events_range(offset, limit).collect(),
             capability: Some(capability),
         });
     }
     let events = loaded
         .parsed
-        .into_iter()
+        .iter()
         .enumerate()
-        .filter_map(|(i, v)| v.map(|v| (i, v)))
+        .filter_map(|(i, v)| v.as_ref().map(|v| (i, v)))
         .skip(offset)
         .take(limit)
-        .map(|(i, v)| crate::rollout::classify_history(i, v, canonical))
+        .map(|(i, v)| crate::rollout::classify_history(i, v.clone(), canonical))
         .collect();
     Ok(crate::models::PreviewPage {
         events,
@@ -163,13 +166,14 @@ struct JournalEntry {
 
 // ========================= 文件读写 =========================
 
-struct LoadedFile {
+#[derive(Clone)]
+pub(crate) struct LoadedFile {
     /// 按 '\n' 切分的行（不含换行符本身；CRLF 文件的 '\r' 保留在行尾）
-    lines: Vec<String>,
+    pub(crate) lines: Vec<String>,
     /// 每行 trim 后的 JSON 解析结果；空行/坏行为 None
-    parsed: Vec<Option<Value>>,
-    trailing_newline: bool,
-    hash: String,
+    pub(crate) parsed: Vec<Option<Value>>,
+    pub(crate) trailing_newline: bool,
+    pub(crate) hash: String,
 }
 
 fn sha_hex(bytes: &[u8]) -> String {
@@ -2060,6 +2064,33 @@ pub fn reconcile_session_edit_with_lock(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn r07_second_page_reuses_unchanged_parse() {
+        let root = temp_dir("preview-cache");
+        let path = root.join("rollout.jsonl");
+        write_jsonl(&path, &codex_fixture());
+        let (first, initial) = crate::operation_metrics::measured(|| {
+            codex_preview_page(path.to_str().unwrap(), 0, 2, None).unwrap()
+        });
+        let (second, cached) = crate::operation_metrics::measured(|| {
+            codex_preview_page(
+                path.to_str().unwrap(),
+                2,
+                2,
+                Some(&first.capability.unwrap().revision),
+            )
+            .unwrap()
+        });
+        assert!(!second.events.is_empty());
+        assert!(initial.read_bytes > 0);
+        assert_eq!(
+            cached.read_bytes, 0,
+            "unchanged second page reread the entire rollout"
+        );
+        assert!(cached.cache_hits > 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn stale_preview_rejects_insert_delete_rewrite_and_missing_revision() {
         for change in ["insert", "delete", "rewrite", "missing"] {
             let root = temp_dir("stale-preview");
@@ -2480,7 +2511,7 @@ mod tests {
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_dir(name: &str) -> PathBuf {
+    pub(super) fn temp_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")

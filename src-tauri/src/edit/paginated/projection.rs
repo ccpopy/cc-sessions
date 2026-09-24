@@ -310,12 +310,26 @@ pub(super) fn project(loaded: &LoadedFile, seed: &HistoryImage) -> AppResult<His
         offset = end;
         next = ord + 1;
     }
+    let item_rows: BTreeMap<_, _> = seed.rows["thread_items"]
+        .iter()
+        .filter_map(|r| Some(((r["turn_id"].as_str()?, r["item_id"].as_str()?), r)))
+        .collect();
+    let mut lifecycle_by_turn: BTreeMap<&str, Vec<&Value>> = BTreeMap::new();
+    for v in loaded.parsed.iter().flatten() {
+        if matches!(
+            codex_ptype(v),
+            "task_started" | "task_complete" | "turn_aborted"
+        ) {
+            if let Some(turn) = v["payload"]["turn_id"].as_str() {
+                lifecycle_by_turn.entry(turn).or_default().push(v);
+            }
+        }
+    }
     let mut rows = Vec::new();
     for item in &h.items {
-        let mut row = seed.rows["thread_items"]
-            .iter()
-            .find(|r| r["turn_id"] == item.key.turn && r["item_id"] == item.key.id)
-            .cloned()
+        let mut row = item_rows
+            .get(&(item.key.turn.as_str(), item.key.id.as_str()))
+            .map(|r| (*r).clone())
             .ok_or_else(|| {
                 unsupported(format!(
                     "item {} 缺少原生投影或恢复快照；请先完成原生历史读取",
@@ -390,18 +404,10 @@ pub(super) fn project(loaded: &LoadedFile, seed: &HistoryImage) -> AppResult<His
             .as_str()
             .ok_or_else(|| unsupported("投影回合 ID 无效"))?
             .to_owned();
-        let lifecycle: Vec<&Value> = loaded
-            .parsed
-            .iter()
-            .flatten()
-            .filter(|v| {
-                v["payload"]["turn_id"] == tid
-                    && matches!(
-                        codex_ptype(v),
-                        "task_started" | "task_complete" | "turn_aborted"
-                    )
-            })
-            .collect();
+        let lifecycle = lifecycle_by_turn
+            .get(tid.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         let first = lifecycle
             .first()
             .ok_or_else(|| unsupported(format!("回合 {tid} 缺少生命周期记录")))?;

@@ -585,12 +585,7 @@ fn preview_range_impl(path: &str, offset: usize, limit: usize) -> AppResult<Vec<
     }
     if crate::logical_history::is_paginated(Path::new(path))? {
         let history = crate::logical_history::read(Path::new(path), None)?;
-        return Ok(history
-            .raw_events()
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .collect());
+        return Ok(history.raw_events_range(offset, limit).collect());
     }
     let f = File::open(PathBuf::from(path))?;
     let reader = BufReader::new(f);

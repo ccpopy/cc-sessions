@@ -58,23 +58,32 @@ fn read_segment(
     if !seen.insert(physical.clone()) || seen.len() > 128 {
         return Err(invalid("继承历史存在环或超过 128 层"));
     }
-    let bytes = std::fs::read(&physical)?;
-    crate::operation_metrics::record(|c| c.read_bytes += bytes.len() as u64);
-    let length = end.map(|e| e.1).unwrap_or(bytes.len() as u64);
-    if length > bytes.len() as u64
-        || (length > 0 && length != bytes.len() as u64 && bytes[length as usize - 1] != b'\n')
-    {
-        return Err(invalid("继承字节边界越界或未落在完整记录边界"));
+    let loaded = crate::edit::read_preview_snapshot(&physical, cancel)?;
+    let total = loaded.lines.iter().map(|l| l.len() as u64 + 1).sum::<u64>()
+        - u64::from(!loaded.trailing_newline && !loaded.lines.is_empty());
+    let length = end.map(|e| e.1).unwrap_or(total);
+    if length > total {
+        return Err(invalid("继承字节边界越界"));
     }
-    let text = std::str::from_utf8(&bytes[..length as usize])
-        .map_err(|_| invalid("历史不是有效 UTF-8"))?;
     let mut records = Vec::new();
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+    let mut offset = 0;
+    for (i, (line, value)) in loaded.lines.iter().zip(&loaded.parsed).enumerate() {
         ensure_not_cancelled(cancel)?;
-        crate::operation_metrics::record(|c| c.parsed_lines += 1);
-        let record: Value =
-            serde_json::from_str(line).map_err(|_| invalid("历史包含不完整或无法解析的记录"))?;
-        records.push(record);
+        if offset >= length {
+            break;
+        }
+        offset +=
+            line.len() as u64 + u64::from(i + 1 < loaded.lines.len() || loaded.trailing_newline);
+        if offset > length {
+            return Err(invalid("继承字节边界未落在完整记录边界"));
+        }
+        if !line.trim().is_empty() {
+            records.push(
+                value
+                    .clone()
+                    .ok_or_else(|| invalid("历史包含不完整或无法解析的记录"))?,
+            );
+        }
     }
     resolve_records(records, root, end, seen, cancel)
 }
@@ -243,16 +252,31 @@ pub(crate) fn latest(records: &[Value]) -> Vec<(usize, &Value)> {
 
 impl History {
     pub fn raw_events(&self) -> Vec<PreviewEvent> {
+        self.raw_events_range(0, usize::MAX).collect()
+    }
+    pub fn raw_events_range(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> impl Iterator<Item = PreviewEvent> + '_ {
         self.records
             .iter()
             .enumerate()
+            .skip(offset)
+            .take(limit)
             .map(|(i, v)| crate::rollout::classify_history(i, v.clone(), self.paginated))
-            .collect()
     }
     pub fn events(&self) -> Vec<PreviewEvent> {
         latest(&self.records)
             .into_iter()
-            .map(|(index, v)| crate::rollout::classify_history(index, v.clone(), self.paginated))
+            .map(|(index, v)| {
+                let mut event = crate::rollout::classify_history(index, v.clone(), self.paginated);
+                event.timestamp = self.records[index]["timestamp"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                event
+            })
             .collect()
     }
 }
