@@ -26,6 +26,7 @@ pub mod error;
 pub mod family;
 pub mod fs_ops;
 pub mod history;
+pub(crate) mod logical_history;
 pub mod logs_db;
 pub mod markdown_export;
 pub mod models;

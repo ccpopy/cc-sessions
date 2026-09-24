@@ -346,6 +346,7 @@ pub(super) fn as_codex(parsed: &ParsedCursorSession) -> ParsedCodexRollout {
     }
     classify_codex_turn_phases(&mut messages);
     ParsedCodexRollout {
+        history_warnings: Vec::new(),
         source_id: Some(parsed.source_id.clone()),
         cwd: parsed.cwd.clone(),
         git_branch: parsed.git_branch.clone(),

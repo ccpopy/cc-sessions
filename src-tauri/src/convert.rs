@@ -1452,7 +1452,7 @@ fn convert_codex_to_claude(
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default()
     });
-    let mut warnings = Vec::new();
+    let mut warnings = parsed.history_warnings.clone();
     // Codex App 可能已经给会话起了短标题，比首条消息更适合作为新会话的名字。
     if !codex.as_os_str().is_empty() && !source_id.is_empty() {
         match sessions::codex_display_title(&codex, &source_id) {
@@ -1691,6 +1691,7 @@ struct ParsedCodexRollout {
     messages: Vec<ConvMessage>,
     events: Vec<CodexEvent>,
     stats: ExtractStats,
+    history_warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1709,22 +1710,85 @@ struct CodexToolEvent {
 }
 
 fn parse_codex_rollout(path: &Path) -> AppResult<ParsedCodexRollout> {
-    let file = fs::File::open(path)?;
-    let reader = BufReader::new(file);
+    let history = crate::logical_history::read(path, None)?;
     let mut out = ParsedCodexRollout::default();
+    if history.inherited_records > 0 {
+        out.history_warnings.push(format!(
+            "已按原生继承边界读取 {} 条前缀记录",
+            history.inherited_records
+        ));
+    }
+    let mut degraded_media = 0usize;
+    let mut unpaired_formal_tools = 0usize;
+    let tool_ids: HashSet<&str> = history
+        .records
+        .iter()
+        .filter(|v| v["type"] == "response_item")
+        .filter_map(|v| v["payload"]["call_id"].as_str())
+        .collect();
     // 优先读取 response_item；没有 message 时回退到旧版 event_msg。
     let mut fallback_messages: Vec<ConvMessage> = Vec::new();
     let mut fallback_events: Vec<CodexEvent> = Vec::new();
     let mut has_response_messages = false;
 
-    for line in reader.lines() {
-        let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+    for (_, raw) in crate::logical_history::latest(&history.records) {
+        let formal = history.paginated && raw["payload"]["type"] == "item_completed";
+        if history.paginated
+            && ((raw["type"] == "response_item" && raw["payload"]["type"] == "message")
+                || (raw["type"] == "event_msg"
+                    && matches!(
+                        raw["payload"]["type"].as_str(),
+                        Some("user_message" | "agent_message")
+                    )))
+        {
             continue;
         }
-        let Ok(record) = serde_json::from_str::<Value>(trimmed) else {
-            continue;
+        let record = if formal {
+            let item = &raw["payload"]["item"];
+            let role = match item["type"].as_str() {
+                Some("UserMessage") => "user",
+                Some("AgentMessage") => "assistant",
+                Some("Reasoning") => {
+                    out.stats.dropped_reasoning += 1;
+                    continue;
+                }
+                _ => {
+                    if !item["id"].as_str().is_some_and(|id| tool_ids.contains(id)) {
+                        unpaired_formal_tools += 1;
+                        let event = crate::rollout::classify_history(0, raw.clone(), true);
+                        let note = ConvMessage {
+                            role: Role::Assistant,
+                            text: format!(
+                                "[{}：{}；仅保留显示摘要，不重放工具]",
+                                item["type"].as_str().unwrap_or("未知记录"),
+                                crate::rollout::preview_event_text(&event)
+                            ),
+                            timestamp: raw["timestamp"].as_str().map(str::to_owned),
+                            phase: Some("commentary".into()),
+                            images: Vec::new(),
+                        };
+                        out.messages.push(note.clone());
+                        out.events.push(CodexEvent::ToolNote(note));
+                        out.stats.tool_notes += 1;
+                    }
+                    continue;
+                }
+            };
+            let mut blocks = Vec::new();
+            if let Some(content) = item["content"].as_array() {
+                for block in content {
+                    match block["type"].as_str() {
+                        Some("Text" | "text" | "input_text" | "output_text") => blocks.push(json!({"type":if role=="user" {"input_text"}else{"output_text"},"text":block["text"]})),
+                        Some("image" | "input_image") if block.get("image_url").or_else(||block.get("url")).and_then(Value::as_str).and_then(parse_data_image_uri).is_some() => {
+                            blocks.push(json!({"type":"input_image","image_url":block.get("image_url").or_else(||block.get("url"))}));
+                        }
+                        _ => { degraded_media += 1; blocks.push(json!({"type":"input_text","text":format!("[{} 附件未嵌入目标会话]", block["type"].as_str().unwrap_or("未知内容"))})); }
+                    }
+                }
+            }
+            json!({"type":"response_item","timestamp":raw["timestamp"],"payload":{"type":"message","role":role,"phase":item["phase"],"content":blocks}})
+        } else {
+            raw.clone()
         };
         let timestamp = record
             .get("timestamp")
@@ -1774,13 +1838,17 @@ fn parse_codex_rollout(path: &Path) -> AppResult<ParsedCodexRollout> {
                     }
                     match role {
                         "user" => {
-                            if is_internal_codex_context(&text) {
+                            if !formal && is_internal_codex_context(&text) {
                                 continue;
                             }
                             has_response_messages = true;
                             let message = ConvMessage {
                                 role: Role::User,
-                                text: strip_codex_request_wrapper(&text),
+                                text: if formal {
+                                    text
+                                } else {
+                                    strip_codex_request_wrapper(&text)
+                                },
                                 timestamp: timestamp.clone(),
                                 phase: None,
                                 images,
@@ -1908,6 +1976,15 @@ fn parse_codex_rollout(path: &Path) -> AppResult<ParsedCodexRollout> {
     if !has_response_messages {
         out.messages = fallback_messages;
         out.events = fallback_events;
+    }
+    if degraded_media > 0 {
+        out.history_warnings.push(format!(
+            "{} 个媒体或未知内容块已保留占位说明，原始媒体未迁移",
+            degraded_media
+        ));
+    }
+    if unpaired_formal_tools > 0 {
+        out.history_warnings.push(format!("{unpaired_formal_tools} 条正式过程记录缺少可配对的底层工具记录，原生模式保留显示摘要；简洁模式省略过程"));
     }
     Ok(out)
 }
@@ -3272,6 +3349,107 @@ fn parse_exit_code_text(text: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn r05_paginated_conversion_uses_latest_formal_and_inherited_messages() {
+        let root = temp_dir("logical-history");
+        let sessions = root.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let parent_id = "11111111-1111-4111-8111-111111111111";
+        let child_id = "22222222-2222-4222-8222-222222222222";
+        let parent = sessions.join(format!("rollout-2026-09-24T00-00-00-{parent_id}.jsonl"));
+        let child = sessions.join(format!("rollout-2026-09-24T00-00-01-{child_id}.jsonl"));
+        let message = |id: &str, kind: &str, text: &str| json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":parent_id,"turn_id":"turn","item":{"id":id,"type":kind,"content":[{"type":"text","text":text}]}}});
+        write_lines(
+            &parent,
+            &[
+                json!({"type":"session_meta","payload":{"id":parent_id,"history_mode":"paginated","cwd":root}}),
+                message("a", "UserMessage", "KEEP-A"),
+                message("b", "AgentMessage", "OLD-B"),
+                message("b", "AgentMessage", "KEEP-B"),
+            ],
+        );
+        let cutoff = fs::metadata(&parent).unwrap().len();
+        use std::io::Write;
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&parent).unwrap(),
+            "{}",
+            message("excluded", "AgentMessage", "OUTSIDE-PREFIX")
+        )
+        .unwrap();
+        write_lines(
+            &child,
+            &[
+                json!({"type":"session_meta","payload":{"id":child_id,"history_mode":"paginated","cwd":root,"history_base":{"thread_id":parent_id,"end_ordinal_exclusive":4,"end_byte_offset":cutoff}}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"CONTEXT-COPY"}]}}),
+                json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":child_id,"turn_id":"turn-c","item":{"id":"user-c","type":"UserMessage","content":[{"type":"text","text":"KEEP-C"}]}}}),
+            ],
+        );
+        let parsed = parse_codex_rollout(&child).unwrap();
+        assert_eq!(parsed.source_id.as_deref(), Some(child_id));
+        assert_eq!(
+            parsed
+                .messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["KEEP-A", "KEEP-B", "KEEP-C"]
+        );
+        for mode in [ClaudeImportMode::Simple, ClaudeImportMode::Native] {
+            let target = root.join(mode.as_str());
+            fs::create_dir_all(target.join("projects")).unwrap();
+            let report = convert_codex_to_claude(
+                root.to_str().unwrap(),
+                target.to_str().unwrap(),
+                child.to_str().unwrap(),
+                mode,
+            )
+            .unwrap();
+            let text = fs::read_to_string(report.new_path).unwrap();
+            for kept in ["KEEP-A", "KEEP-B", "KEEP-C"] {
+                assert!(text.contains(kept), "{} missing {kept}", mode.as_str());
+            }
+            for omitted in ["OLD-B", "OUTSIDE-PREFIX", "CONTEXT-COPY"] {
+                assert!(!text.contains(omitted));
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn r05_native_tool_generated_visible_messages_are_preserved_once() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "edit/paginated/fixtures/native-async-alpha9.json"
+        ))
+        .unwrap();
+        let root = temp_dir("formal-tools");
+        for case in fixture["cases"].as_array().unwrap() {
+            let mut rows = vec![
+                json!({"type":"session_meta","payload":{"id":"sample","history_mode":"paginated"}}),
+            ];
+            rows.extend(case["rows"].as_array().unwrap().iter().cloned());
+            let path = root.join("rollout.jsonl");
+            write_lines(&path, &rows);
+            let parsed = parse_codex_rollout(&path).unwrap();
+            for (_, row) in crate::logical_history::latest(&rows) {
+                if row["payload"]["item"]["type"] != "AgentMessage" {
+                    continue;
+                }
+                let expected = flatten_codex_content(row["payload"]["item"].get("content"));
+                assert_eq!(
+                    parsed
+                        .messages
+                        .iter()
+                        .filter(|m| m.text == expected)
+                        .count(),
+                    1,
+                    "{}",
+                    case["name"]
+                );
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
