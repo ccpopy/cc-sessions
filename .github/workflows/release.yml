@@ -8,8 +8,33 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  draft:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Prepare draft only
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --json isDraft > draft.json; then
+            node -e 'if (!JSON.parse(require("fs").readFileSync("draft.json")).isDraft) throw new Error("Release is already public")'
+          else
+            gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "CC Sessions $GITHUB_REF_NAME" --generate-notes --target "$GITHUB_SHA"
+          fi
+
   build:
+    needs: [verify, draft]
     name: Build ${{ matrix.label }}
     runs-on: ${{ matrix.platform }}
     strategy:
@@ -98,7 +123,7 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: CC Sessions ${{ github.ref_name }}
           generateReleaseNotes: true
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false
 
       - name: Create CLI package
@@ -139,3 +164,43 @@ jobs:
             }
           }
           gh release upload "${{ github.ref_name }}" $assets --clobber
+
+      - name: Record build source identity
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUILD_PLATFORM: ${{ matrix.label }}
+        run: |
+          $sha = git rev-parse HEAD
+          if ($sha -ne $env:GITHUB_SHA) { throw 'Build checkout differs from verified commit' }
+          $version = node -p "require('./package.json').version"
+          $proof = "build-proof-$env:BUILD_PLATFORM.json"
+          @{ sha = $sha; version = $version; platform = $env:BUILD_PLATFORM } | ConvertTo-Json | Set-Content -Encoding utf8NoBOM $proof
+      - name: Preserve build identity for the publish gate
+        uses: actions/upload-artifact@v6
+        with:
+          name: build-proof-${{ matrix.label }}
+          path: build-proof-${{ matrix.label }}.json
+          retention-days: 7
+
+  publish:
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: build-proof-*
+          path: output/release-gate
+          merge-multiple: true
+      - name: Verify all build identities and publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_NEEDS: ${{ toJSON(needs) }}
+        run: |
+          node scripts/release-gate.mjs

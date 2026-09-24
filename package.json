@@ -10,7 +10,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build --config vite.config.ts",
     "test": "npm run test:frontend && npm run test:rust",
-    "test:frontend": "tsx --test \"src/lib/*.test.ts\"",
+    "test:frontend": "tsx --test \"src/**/*.test.ts\" \"src/**/*.test.tsx\" \"scripts/*.test.mjs\"",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --all-targets",
     "preview": "vite preview",
     "tauri": "tauri",
@@ -79,6 +79,7 @@
     "tailwindcss": "^3.4.17",
     "tsx": "^4.23.12",
     "typescript": "^5.7.2",
-    "vite": "^6.4.3"
+    "vite": "^6.4.3",
+    "yaml": "^2.9.1"
   }
 }

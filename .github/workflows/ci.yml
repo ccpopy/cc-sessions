@@ -1,19 +1,18 @@
 name: CI
 
 on:
+  workflow_call:
   pull_request:
   push:
     branches:
       - main
       - master
-    tags:
-      - "v*.*.*"
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
@@ -56,6 +55,9 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Check standalone CLI
+        run: npm run cli:check
+
       - name: Check all Rust targets
         run: cargo check --manifest-path src-tauri/Cargo.toml --all-targets
 
@@ -89,5 +91,12 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Check standalone CLI
+        run: npm run cli:check
+
       - name: Check all Rust targets
         run: cargo check --manifest-path src-tauri/Cargo.toml --all-targets
+
+  native:
+    name: Pinned native contract
+    uses: ./.github/workflows/native-contract.yml

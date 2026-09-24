@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "codex": {
+    "version": "0.155.0-alpha.16",
+    "source_commit": "0e2f848bf4a4e8d41a02d848a851ba126c09d185",
+    "windows_asset": "https://github.com/openai/codex/releases/download/rust-v0.155.0-alpha.16/codex-x86_64-pc-windows-msvc.exe",
+    "windows_sha256": "dbc5fadd36a5adfd66c63d3e048011e5abdbaa9fbccbcc3597f8ee4a9569dbb8"
+  },
+  "scope": "isolated native app-server processes and generated loopback model responses",
+  "unverified": [
+    "Codex Desktop GUI cold startup",
+    "native Codex versions outside this profile",
+    "Claude, OpenCode and Cursor native clients (adapter fixtures run in ordinary Rust CI)",
+    "macOS and Linux native client acceptance"
+  ]
+}
