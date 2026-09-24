@@ -15,6 +15,7 @@ export function useSessions(provider: SessionProvider, query: string) {
   const [error, setError] = useState<string | null>(null);
   const timer = useRef<number | null>(null);
   const requestSeq = useRef(0);
+  const generation = useRef(0);
   const scopeRef = useRef(scope);
   const inFlight = useRef<{
     scope: string;
@@ -23,7 +24,9 @@ export function useSessions(provider: SessionProvider, query: string) {
   } | null>(null);
   scopeRef.current = scope;
 
-  const refresh = useCallback((): Promise<void> => {
+  const refresh = useCallback((options: { afterMutation?: boolean } = {}): Promise<void> => {
+    if (scopeRef.current !== scope) return Promise.resolve();
+    if (options.afterMutation) generation.current += 1;
     const active = inFlight.current;
     if (active?.scope === scope) return active.promise;
 
@@ -52,12 +55,20 @@ export function useSessions(provider: SessionProvider, query: string) {
         setLoading(true);
         setError(null);
         try {
-          const list = await api.listSessions(provider, codexDir, claudeDir, opencodeDir, cursorDir);
-          if (!isCurrent()) return;
-          setAllSessions(list);
-        } catch (error) {
-          if (!isCurrent()) return;
-          setError(String((error as Error)?.message ?? error));
+          while (isCurrent()) {
+            const observedGeneration = generation.current;
+            try {
+              const list = await api.listSessions(provider, codexDir, claudeDir, opencodeDir, cursorDir);
+              if (!isCurrent()) return;
+              if (observedGeneration !== generation.current) continue;
+              setAllSessions(list);
+            } catch (error) {
+              if (!isCurrent()) return;
+              if (observedGeneration !== generation.current) continue;
+              setError(String((error as Error)?.message ?? error));
+            }
+            return;
+          }
         } finally {
           if (isCurrent()) setLoading(false);
         }

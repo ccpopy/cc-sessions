@@ -209,12 +209,12 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     setFamilySheetId(null);
   }, [provider, clearSelection]);
 
-  const refreshOverlay = useCallback((): Promise<void> => {
+  const refreshOverlay = useCallback((afterMutation = false): Promise<void> => {
     const codexDir = settings?.codex_dir;
     if (!codexDir || !isCodex) return Promise.resolve();
 
     const active = overlayFlight.current;
-    if (active?.scope === overlayScope) return active.promise;
+    if (!afterMutation && active?.scope === overlayScope) return active.promise;
 
     const requestId = ++overlayRequestSeq.current;
     // ledger 单独捕获失败：来源分组是展示层增强，读取失败时回退 family 字段，
@@ -222,13 +222,13 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     const ledgerPromise = api
       .getArchiveLedger(codexDir)
       .then((ledger) => {
-        if (overlayScopeRef.current !== overlayScope) return undefined;
+        if (overlayScopeRef.current !== overlayScope || overlayRequestSeq.current !== requestId) return undefined;
         setLedgerBySession(new Map(ledger.map((entry) => [entry.session_id, entry.origin])));
         setArchiveLedgerError(null);
         return ledger;
       })
       .catch((error) => {
-        if (overlayScopeRef.current !== overlayScope) return undefined;
+        if (overlayScopeRef.current !== overlayScope || overlayRequestSeq.current !== requestId) return undefined;
         setLedgerBySession(new Map());
         setArchiveLedgerError(String((error as Error)?.message ?? error));
         return undefined;
@@ -240,7 +240,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
       ledgerPromise,
     ])
       .then(([ov, info, syncPlan, ledgerEntries]) => {
-        if (overlayScopeRef.current !== overlayScope) return;
+        if (overlayScopeRef.current !== overlayScope || overlayRequestSeq.current !== requestId) return;
         // 徽标显示与来源筛选共用同一数据源：ledger 优先。历史版本或不属于
         // family 的会话可能只有 ledger 记录；family 分支字段仅在 ledger 缺失时兜底。
         const ledgerOriginBySession = new Map(
@@ -258,7 +258,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         setMaintenanceError(null);
       })
       .catch((error) => {
-        if (overlayScopeRef.current !== overlayScope) return;
+        if (overlayScopeRef.current !== overlayScope || overlayRequestSeq.current !== requestId) return;
         setOverlay(new Map());
         setCurrentProvider(null);
         setProviderSyncPlan([]);
@@ -278,7 +278,8 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     void refreshOverlay();
   }, [refreshOverlay]);
 
-  const refreshAll = useCallback((): Promise<void> => {
+  const refreshAll = useCallback((afterMutation = false): Promise<void> => {
+    if (afterMutation) return Promise.all([refresh({ afterMutation: true }), refreshOverlay(true)]).then(() => {});
     const active = refreshAllFlight.current;
     if (active?.scope === refreshScope) return active.promise;
 
@@ -419,8 +420,8 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         if ("desktop_restart_required" in report && report.desktop_restart_required) {
           toast.warning("Fork 已完成，重启 Codex App 后刷新会话列表");
         }
-        await refresh();
-        await refreshOverlay();
+        await refresh({ afterMutation: true });
+        await refreshOverlay(true);
       } catch (e: any) {
         toast.error(s.provider === "codex" ? "Fork 会话失败" : "复制会话失败", {
           description: String(e?.message ?? e),
@@ -460,8 +461,8 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
           if (r.desktop_restart_required) {
             toast.warning("同步已完成，重启 Codex App 后刷新会话列表");
           }
-          await refresh();
-          await refreshOverlay();
+          await refresh({ afterMutation: true });
+          await refreshOverlay(true);
         } else {
           toast.error(r.error ?? "克隆失败");
         }
@@ -488,8 +489,8 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
       }, setProviderSyncProgress);
       const ok = r.filter((x) => x.ok).length;
       const failed = r.filter((x) => !x.ok);
-      await refresh();
-      await refreshOverlay();
+      await refresh({ afterMutation: true });
+      await refreshOverlay(true);
       if (r.length === 0) {
         toast.info("当前没有需要同步的会话");
       } else if (ok > 0) {
@@ -585,7 +586,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         settings.cursor_dir,
       );
       toast.success(s.archived ? "已取消归档" : "已归档");
-      await refreshAll();
+      await refreshAll(true);
     } catch (e: any) {
       toast.error(String(e?.message ?? e));
     }
@@ -601,7 +602,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             ? "已更新归档来源"
             : "已更新归档来源（该会话没有 family 记录）",
         );
-        await refreshAll();
+        await refreshAll(true);
       } catch (e: any) {
         toast.error("更新归档来源失败：" + String(e?.message ?? e));
       }
@@ -636,7 +637,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
       <TopBar
         title={`${providerLabel(provider)} 会话`}
         stats={loading ? "加载中…" : `${visibleSessions.length} 条`}
-        onRefresh={refreshAll}
+        onRefresh={() => refreshAll()}
         refreshing={loading}
         onBulkBackup={onBulkBackup}
         onBulkDelete={onBulkDelete}
@@ -926,12 +927,12 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         backupDir={settings.backup_dir}
         onForked={async () => {
           setPreview(null);
-          await refresh();
-          await refreshOverlay();
+          await refresh({ afterMutation: true });
+          await refreshOverlay(true);
         }}
         onEdited={async () => {
-          await refresh();
-          await refreshOverlay();
+          await refresh({ afterMutation: true });
+          await refreshOverlay(true);
         }}
       />
 
@@ -959,7 +960,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
               title,
             });
             toast.success(renamed > 1 ? `已重命名（同步 ${renamed} 个分支）` : "已重命名");
-            await refresh();
+            await refresh({ afterMutation: true });
           } catch (e: any) {
             toast.error("重命名失败：" + String(e?.message ?? e));
             throw e;
@@ -1005,7 +1006,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             if (r.requires_project_open) {
               toast.info("首次在目标目录启动 OpenCode 时，会由 OpenCode 自动登记真实项目 ID");
             }
-            await refresh();
+            await refresh({ afterMutation: true });
           } catch (e: any) {
             toast.error("移动失败：" + String(e?.message ?? e));
             throw e;
@@ -1028,8 +1029,8 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         codexDir={settings.codex_dir}
         currentProvider={currentProvider}
         onChanged={async () => {
-          await refresh();
-          await refreshOverlay();
+          await refresh({ afterMutation: true });
+          await refreshOverlay(true);
         }}
       />
 
@@ -1037,7 +1038,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         target={convertTarget}
         onOpenChange={(v) => !v && setConvertTarget(null)}
         onDone={() => {
-          void refresh();
+          void refresh({ afterMutation: true });
         }}
       />
 
@@ -1048,7 +1049,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         sessions={backupTargets}
         onDone={(backupPath) => {
           clearSelection();
-          void refresh();
+          void refresh({ afterMutation: true });
           const backupName = basename(backupPath);
           navigate(`/${provider}/backups/${encodeURIComponent(backupName)}`, {
             state: { path: backupPath },
@@ -1086,7 +1087,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
           const sharedPreserved = rolloutMissing.filter((x) => x.shared_data_preserved);
           const missingCleaned = rolloutMissing.filter((x) => !x.shared_data_preserved);
           clearSelection();
-          await refreshAll();
+          await refreshAll(true);
           if (okCount > 0) toast.success(`已删除 ${okCount}/${r.length}`);
           if (desktopRestartRequired) {
             toast.warning("删除已完成，但 Desktop 列表尚未刷新", {
