@@ -1214,6 +1214,21 @@ pub struct PaginatedItemTarget {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenCodePartTarget {
+    pub session_id: String,
+    pub message_id: String,
+    pub part_id: String,
+}
+
+/// Keep each provider's native identity at the shared command boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SessionEventTarget {
+    Codex(PaginatedItemTarget),
+    OpenCode(OpenCodePartTarget),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TextBlockEdit {
     pub content_index: usize,
     pub text: String,

@@ -527,6 +527,14 @@ pub fn preview_session_page(
             expected_revision.as_deref(),
         );
     }
+    if provider == "opencode" {
+        return crate::opencode_edit::preview_page(
+            &rollout_path,
+            offset,
+            limit,
+            expected_revision.as_deref(),
+        );
+    }
     let capability = if matches!(provider.as_str(), "codex" | "claude") {
         let capability = crate::edit::inspect_edit_capability(&provider, &rollout_path)?;
         if expected_revision

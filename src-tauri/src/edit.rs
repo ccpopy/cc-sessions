@@ -1736,7 +1736,7 @@ fn resolve_selection(
     provider: &str,
     path: &str,
     indices: Vec<usize>,
-    targets: Option<&[crate::models::PaginatedItemTarget]>,
+    targets: Option<&[crate::models::SessionEventTarget]>,
     revision: Option<&str>,
 ) -> AppResult<Vec<usize>> {
     if provider != "codex" {
@@ -1759,6 +1759,11 @@ fn resolve_selection(
     targets
         .iter()
         .map(|target| {
+            let crate::models::SessionEventTarget::Codex(target) = target else {
+                return Err(AppError::Other(
+                    "[EDIT_IDENTITY] 所选身份不属于 Codex".into(),
+                ));
+            };
             loaded
                 .parsed
                 .iter()
@@ -1785,10 +1790,15 @@ pub fn plan_session_event_deletion(
     rollout_path: String,
     line_nos: Vec<usize>,
     expected_revision: Option<String>,
-    targets: Option<Vec<crate::models::PaginatedItemTarget>>,
+    targets: Option<Vec<crate::models::SessionEventTarget>>,
 ) -> AppResult<DeletePlan> {
     if provider == "opencode" {
-        return crate::opencode_edit::plan_delete(&rollout_path, &line_nos);
+        return crate::opencode_edit::plan_delete(
+            &rollout_path,
+            &line_nos,
+            expected_revision.as_deref(),
+            targets.as_deref(),
+        );
     }
     let line_nos = resolve_selection(
         &provider,
@@ -1844,7 +1854,7 @@ pub fn edit_session_event_text_with_lock(
     line_no: usize,
     new_text: String,
     expected_revision: Option<String>,
-    targets: Option<Vec<crate::models::PaginatedItemTarget>>,
+    targets: Option<Vec<crate::models::SessionEventTarget>>,
     text_blocks: Option<Vec<crate::models::TextBlockEdit>>,
     lock: &crate::family::FamilyLock,
 ) -> AppResult<EditApplyReport> {
@@ -1858,6 +1868,8 @@ pub fn edit_session_event_text_with_lock(
                 &backup_dir,
                 line_no,
                 &new_text,
+                expected_revision.as_deref(),
+                targets.as_deref(),
             );
         }
         let selected = resolve_selection(
@@ -1887,7 +1899,7 @@ pub fn delete_session_events_with_lock(
     backup_dir: String,
     line_nos: Vec<usize>,
     expected_revision: Option<String>,
-    targets: Option<Vec<crate::models::PaginatedItemTarget>>,
+    targets: Option<Vec<crate::models::SessionEventTarget>>,
     lock: &crate::family::FamilyLock,
 ) -> AppResult<EditApplyReport> {
     let roots = mutation_roots(&provider, &rollout_path, &backup_dir, &session_id)?;
@@ -1898,6 +1910,8 @@ pub fn delete_session_events_with_lock(
                 &session_id,
                 &backup_dir,
                 &line_nos,
+                expected_revision.as_deref(),
+                targets.as_deref(),
             );
         }
         let line_nos = resolve_selection(
@@ -1929,7 +1943,12 @@ pub fn undo_last_session_edit_with_lock(
     let roots = mutation_roots(&provider, &rollout_path, &backup_dir, &session_id)?;
     crate::family::with_roots(lock, &roots, |_g| {
         if provider == "opencode" {
-            return crate::opencode_edit::undo_last(&rollout_path, &session_id, &backup_dir);
+            return crate::opencode_edit::undo_last(
+                &rollout_path,
+                &session_id,
+                &backup_dir,
+                expected_revision.as_deref(),
+            );
         }
         undo_last(
             &provider,
@@ -1958,6 +1977,7 @@ pub fn restore_session_edit_snapshot_with_lock(
                 &session_id,
                 &backup_dir,
                 &snapshot_name,
+                expected_revision.as_deref(),
             );
         }
         restore_snapshot(

@@ -928,7 +928,7 @@ fn paginated_duplicate_text_and_snapshots_are_selected_by_identity() {
         "codex",
         f.path.to_str().unwrap(),
         vec![0],
-        Some(&[target]),
+        Some(&[crate::models::SessionEventTarget::Codex(target)]),
         Some(&f.revision()),
     )
     .unwrap();
@@ -1241,7 +1241,12 @@ fn paginated_tool_turn_and_failed_interrupted_turns_can_be_deleted() {
         "codex",
         f.path.to_str().unwrap(),
         vec![0; targets.len()],
-        Some(&targets),
+        Some(
+            &targets
+                .into_iter()
+                .map(crate::models::SessionEventTarget::Codex)
+                .collect::<Vec<_>>(),
+        ),
         Some(&f.revision()),
     )
     .unwrap();
@@ -1573,7 +1578,7 @@ fn paginated_native_media_fixture_command() {
             let loaded = load_file(&path).unwrap();
             let h = super::model(&loaded).unwrap();
             let item = h.items.iter().find(|i| i.key.id == target_id).unwrap();
-            let targets: Option<Vec<crate::models::PaginatedItemTarget>> = Some(
+            let targets: Option<Vec<crate::models::SessionEventTarget>> = Some(
                 h.items
                     .iter()
                     .filter(|candidate| {
@@ -1583,10 +1588,14 @@ fn paginated_native_media_fixture_command() {
                             candidate.key.id == target_id
                         }
                     })
-                    .map(|candidate| crate::models::PaginatedItemTarget {
-                        thread_id: id.into(),
-                        turn_id: candidate.key.turn.clone(),
-                        item_id: candidate.key.id.clone(),
+                    .map(|candidate| {
+                        crate::models::SessionEventTarget::Codex(
+                            crate::models::PaginatedItemTarget {
+                                thread_id: id.into(),
+                                turn_id: candidate.key.turn.clone(),
+                                item_id: candidate.key.id.clone(),
+                            },
+                        )
                     })
                     .collect(),
             );
@@ -1724,10 +1733,12 @@ fn paginated_native_fixture_command() {
                     vec!["user-1".into()]
                 })
                 .into_iter()
-                .map(|item| crate::models::PaginatedItemTarget {
-                    thread_id: id.into(),
-                    turn_id: marker["turns"][1].as_str().unwrap().into(),
-                    item_id: item.into(),
+                .map(|item| {
+                    crate::models::SessionEventTarget::Codex(crate::models::PaginatedItemTarget {
+                        thread_id: id.into(),
+                        turn_id: marker["turns"][1].as_str().unwrap().into(),
+                        item_id: item.into(),
+                    })
                 })
                 .collect(),
             ),
@@ -1753,16 +1764,18 @@ fn paginated_native_fixture_command() {
             }
             .into(),
             Some(revision),
-            Some(vec![crate::models::PaginatedItemTarget {
-                thread_id: id.into(),
-                turn_id: marker["turns"][0].as_str().unwrap().into(),
-                item_id: if action == "rewrite" {
-                    "user-0"
-                } else {
-                    "agent-0"
-                }
-                .into(),
-            }]),
+            Some(vec![crate::models::SessionEventTarget::Codex(
+                crate::models::PaginatedItemTarget {
+                    thread_id: id.into(),
+                    turn_id: marker["turns"][0].as_str().unwrap().into(),
+                    item_id: if action == "rewrite" {
+                        "user-0"
+                    } else {
+                        "agent-0"
+                    }
+                    .into(),
+                },
+            )]),
             Some(vec![crate::models::TextBlockEdit {
                 content_index: 0,
                 text: if action == "rewrite" {

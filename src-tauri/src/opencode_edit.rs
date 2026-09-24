@@ -416,6 +416,90 @@ fn event_ref(event: &PreviewEvent) -> Option<EventRef> {
     })
 }
 
+fn revision(snapshot: &SessionSnapshot) -> String {
+    sha_hex(
+        format!(
+            "{}\0{}\0{}",
+            snapshot.database_path, snapshot.session_id, snapshot.hash
+        )
+        .as_bytes(),
+    )
+}
+
+fn check_revision(snapshot: &SessionSnapshot, expected: Option<&str>) -> AppResult<()> {
+    if expected != Some(revision(snapshot).as_str()) {
+        return Err(AppError::Other(
+            "[EDIT_CONFLICT] OpenCode 会话已更新或缺少预览版本，请刷新后重新选择".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_targets(
+    events: &[PreviewEvent],
+    session_id: &str,
+    indices: &[usize],
+    targets: Option<&[crate::models::SessionEventTarget]>,
+) -> AppResult<Vec<usize>> {
+    let invalid = || {
+        AppError::Other(
+            "[EDIT_IDENTITY] OpenCode 操作必须携带匹配的 session/message/part 身份".into(),
+        )
+    };
+    let targets = targets
+        .filter(|t| !t.is_empty() && t.len() == indices.len())
+        .ok_or_else(invalid)?;
+    targets
+        .iter()
+        .map(|target| {
+            let crate::models::SessionEventTarget::OpenCode(target) = target else {
+                return Err(invalid());
+            };
+            if target.session_id != session_id {
+                return Err(invalid());
+            }
+            events
+                .iter()
+                .find(|event| {
+                    event_ref(event).is_some_and(|r| {
+                        r.message_id == target.message_id && r.part_id == target.part_id
+                    })
+                })
+                .map(|event| event.index)
+                .ok_or_else(invalid)
+        })
+        .collect()
+}
+
+pub fn preview_page(
+    locator: &str,
+    offset: usize,
+    limit: usize,
+    expected: Option<&str>,
+) -> AppResult<crate::models::PreviewPage> {
+    let (database, session) = crate::opencode_sessions::resolve_locator(locator)?;
+    let connection = open_readonly(&database)?;
+    let tx = connection.unchecked_transaction()?;
+    let snapshot = load_snapshot(&tx, &database, &session)?;
+    if expected.is_some() {
+        check_revision(&snapshot, expected)?;
+    }
+    let events = crate::opencode_sessions::load_preview_page(&tx, &session, offset, limit)?;
+    Ok(crate::models::PreviewPage {
+        events,
+        capability: Some(crate::models::EditCapability {
+            revision: revision(&snapshot),
+            file_sha256: snapshot.hash,
+            thread_id: Some(session),
+            format: "opencode".into(),
+            blocked_reasons: Vec::new(),
+            diagnostics: Vec::new(),
+            content_mappings: Vec::new(),
+            projection: None,
+        }),
+    })
+}
+
 fn expand_delete(
     connection: &Connection,
     database_path: &Path,
@@ -514,7 +598,7 @@ fn expand_delete(
         plan: DeletePlan {
             messages: Vec::new(),
             required_turns: Vec::new(),
-            revision: None,
+            revision: Some(revision(&snapshot)),
             rollout_path: locator.to_string(),
             lines,
             blocked,
@@ -631,10 +715,20 @@ fn journal_entry(
     }
 }
 
-pub fn plan_delete(locator: &str, line_nos: &[usize]) -> AppResult<DeletePlan> {
+pub fn plan_delete(
+    locator: &str,
+    line_nos: &[usize],
+    expected: Option<&str>,
+    targets: Option<&[crate::models::SessionEventTarget]>,
+) -> AppResult<DeletePlan> {
     let (database_path, session_id) = crate::opencode_sessions::resolve_locator(locator)?;
     let connection = open_readonly(&database_path)?;
-    Ok(expand_delete(&connection, &database_path, locator, &session_id, line_nos)?.plan)
+    let tx = connection.unchecked_transaction()?;
+    let snapshot = load_snapshot(&tx, &database_path, &session_id)?;
+    check_revision(&snapshot, expected)?;
+    let events = crate::opencode_sessions::load_preview_events(&tx, &session_id)?;
+    let line_nos = resolve_targets(&events, &session_id, line_nos, targets)?;
+    Ok(expand_delete(&tx, &database_path, locator, &session_id, &line_nos)?.plan)
 }
 
 pub fn apply_edit_text(
@@ -643,12 +737,16 @@ pub fn apply_edit_text(
     backup_dir: &str,
     line_no: usize,
     new_text: &str,
+    expected: Option<&str>,
+    targets: Option<&[crate::models::SessionEventTarget]>,
 ) -> AppResult<EditApplyReport> {
     let (database_path, session_id) = resolve_context(locator, session_id)?;
     let mut connection = open_writable(&database_path)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let before = load_snapshot(&transaction, &database_path, &session_id)?;
+    check_revision(&before, expected)?;
     let events = crate::opencode_sessions::load_preview_events(&transaction, &session_id)?;
+    let line_no = resolve_targets(&events, &session_id, &[line_no], targets)?[0];
     let event = events
         .iter()
         .find(|event| event.index == line_no)
@@ -730,6 +828,8 @@ pub fn apply_delete(
     session_id: &str,
     backup_dir: &str,
     line_nos: &[usize],
+    expected: Option<&str>,
+    targets: Option<&[crate::models::SessionEventTarget]>,
 ) -> AppResult<EditApplyReport> {
     if line_nos.is_empty() {
         return Err(AppError::Other("未选择要删除的 OpenCode 事件".into()));
@@ -738,7 +838,16 @@ pub fn apply_delete(
     let mut connection = open_writable(&database_path)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let before = load_snapshot(&transaction, &database_path, &session_id)?;
-    let expansion = expand_delete(&transaction, &database_path, locator, &session_id, line_nos)?;
+    check_revision(&before, expected)?;
+    let events = crate::opencode_sessions::load_preview_events(&transaction, &session_id)?;
+    let line_nos = resolve_targets(&events, &session_id, line_nos, targets)?;
+    let expansion = expand_delete(
+        &transaction,
+        &database_path,
+        locator,
+        &session_id,
+        &line_nos,
+    )?;
     if !expansion.plan.blocked.is_empty() {
         return Err(AppError::Other(format!(
             "存在不可删除的 OpenCode 事件：{}",
@@ -796,7 +905,12 @@ pub fn apply_delete(
     })
 }
 
-pub fn undo_last(locator: &str, session_id: &str, backup_dir: &str) -> AppResult<EditApplyReport> {
+pub fn undo_last(
+    locator: &str,
+    session_id: &str,
+    backup_dir: &str,
+    expected: Option<&str>,
+) -> AppResult<EditApplyReport> {
     let (database_path, session_id) = resolve_context(locator, session_id)?;
     let dir = edit_dir(backup_dir, &session_id);
     let mut journal = read_journal(&dir)?;
@@ -808,6 +922,7 @@ pub fn undo_last(locator: &str, session_id: &str, backup_dir: &str) -> AppResult
     let mut connection = open_writable(&database_path)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let before = load_snapshot(&transaction, &database_path, &session_id)?;
+    check_revision(&before, expected)?;
     if before.hash != last.after_hash {
         return Err(AppError::Other(
             "OpenCode 会话上下文已在本工具之外发生变化，无法直接撤销；可从快照还原".into(),
@@ -872,6 +987,7 @@ pub fn restore_snapshot(
     session_id: &str,
     backup_dir: &str,
     snapshot_name: &str,
+    expected: Option<&str>,
 ) -> AppResult<EditApplyReport> {
     safe_public_snapshot_name(snapshot_name)?;
     let (database_path, session_id) = resolve_context(locator, session_id)?;
@@ -885,6 +1001,7 @@ pub fn restore_snapshot(
     let mut connection = open_writable(&database_path)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let before = load_snapshot(&transaction, &database_path, &session_id)?;
+    check_revision(&before, expected)?;
     let pre_restore_name = unique_public_snapshot_name(&dir, "pre-restore")?;
     write_json_absent(&dir.join(&pre_restore_name), &before)?;
     let op_id = new_op_id(journal.entries.len());
@@ -932,7 +1049,8 @@ pub fn history(locator: &str, session_id: &str, backup_dir: &str) -> AppResult<E
     let dir = edit_dir(backup_dir, &session_id);
     let journal = read_journal(&dir)?;
     let connection = open_readonly(&database_path)?;
-    let current = load_snapshot(&connection, &database_path, &session_id)?;
+    let transaction = connection.unchecked_transaction()?;
+    let current = load_snapshot(&transaction, &database_path, &session_id)?;
 
     let mut snapshots = Vec::new();
     if dir.is_dir() {
@@ -996,7 +1114,7 @@ pub fn history(locator: &str, session_id: &str, backup_dir: &str) -> AppResult<E
     Ok(EditHistory {
         pending_operation: None,
         restore_available: true,
-        revision: None,
+        revision: Some(revision(&current)),
         entries,
         snapshots,
         undo_available,
@@ -1200,6 +1318,111 @@ mod tests {
 
     fn backup_dir(fixture: &Fixture) -> String {
         fixture.backup_dir.to_string_lossy().into_owned()
+    }
+
+    fn selection(
+        locator: &str,
+        indices: &[usize],
+    ) -> AppResult<(String, Vec<crate::models::SessionEventTarget>)> {
+        let page = super::preview_page(locator, 0, usize::MAX, None)?;
+        let targets = indices
+            .iter()
+            .map(|i| {
+                let event = page.events.iter().find(|e| e.index == *i).unwrap();
+                let r = event_ref(event).unwrap();
+                crate::models::SessionEventTarget::OpenCode(crate::models::OpenCodePartTarget {
+                    session_id: event.raw["opencode"]["session_id"].as_str().unwrap().into(),
+                    message_id: r.message_id,
+                    part_id: r.part_id,
+                })
+            })
+            .collect();
+        Ok((page.capability.unwrap().revision, targets))
+    }
+    fn apply_edit_text(
+        l: &str,
+        id: &str,
+        b: &str,
+        i: usize,
+        text: &str,
+    ) -> AppResult<EditApplyReport> {
+        let (rev, targets) = selection(l, &[i])?;
+        super::apply_edit_text(l, id, b, i, text, Some(&rev), Some(&targets))
+    }
+    fn apply_delete(l: &str, id: &str, b: &str, indices: &[usize]) -> AppResult<EditApplyReport> {
+        let (rev, targets) = selection(l, indices)?;
+        super::apply_delete(l, id, b, indices, Some(&rev), Some(&targets))
+    }
+    fn plan_delete(l: &str, indices: &[usize]) -> AppResult<DeletePlan> {
+        let (rev, targets) = selection(l, indices)?;
+        super::plan_delete(l, indices, Some(&rev), Some(&targets))
+    }
+    fn undo_last(l: &str, id: &str, b: &str) -> AppResult<EditApplyReport> {
+        let page = super::preview_page(l, 0, 0, None)?;
+        super::undo_last(l, id, b, Some(&page.capability.unwrap().revision))
+    }
+    fn restore_snapshot(l: &str, id: &str, b: &str, name: &str) -> AppResult<EditApplyReport> {
+        let page = super::preview_page(l, 0, 0, None)?;
+        super::restore_snapshot(l, id, b, name, Some(&page.capability.unwrap().revision))
+    }
+
+    #[test]
+    fn r02_stale_preview_cannot_overwrite_or_delete_a_new_target() -> AppResult<()> {
+        for change in ["insert", "delete", "rewrite"] {
+            let fixture = fixture()?;
+            let page = crate::rollout::preview_session_page(
+                "opencode".into(),
+                fixture.locator.clone(),
+                0,
+                20,
+                None,
+            )?;
+            let revision = page.capability.map(|c| c.revision);
+            let (_, targets) = selection(&fixture.locator, &[3])?;
+            let connection = open_connection(&fixture)?;
+            match change {
+                "insert" => {
+                    connection.execute("INSERT INTO part SELECT 'part_before',message_id,session_id,0,0,data FROM part WHERE id='part_u1'", [])?;
+                }
+                "delete" => {
+                    connection.execute("DELETE FROM part WHERE id='part_u1'", [])?;
+                }
+                _ => {
+                    connection.execute("UPDATE part SET data=json_set(data,'$.text','external') WHERE id='part_a1'", [])?;
+                }
+            }
+            let before = session_rows(&connection, "ses_target")?;
+            drop(connection);
+            let result = crate::edit::edit_session_event_text_with_lock(
+                "opencode".into(),
+                fixture.locator.clone(),
+                "ses_target".into(),
+                backup_dir(&fixture),
+                3,
+                "replacement".into(),
+                revision.clone(),
+                Some(targets.clone()),
+                None,
+                &Default::default(),
+            );
+            assert!(result.is_err(), "stale {change} preview must fail");
+            let result = crate::edit::delete_session_events_with_lock(
+                "opencode".into(),
+                fixture.locator.clone(),
+                "ses_target".into(),
+                backup_dir(&fixture),
+                vec![3],
+                revision,
+                Some(targets),
+                &Default::default(),
+            );
+            assert!(result.is_err(), "stale delete must fail");
+            assert_eq!(
+                session_rows(&open_connection(&fixture)?, "ses_target")?,
+                before
+            );
+        }
+        Ok(())
     }
 
     #[test]

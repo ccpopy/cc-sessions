@@ -1,4 +1,4 @@
-import type { ContentMappingDetail, OpenCodeForkPoint, PreviewEvent, PaginatedItemTarget, TextBlockEdit } from "./api.ts";
+import type { ContentMappingDetail, OpenCodeForkPoint, PreviewEvent, SessionEventTarget, PaginatedItemTarget, TextBlockEdit } from "./api.ts";
 import {
   isAssistantTextToolUseEvent,
   isOpenCodeConversationEvent,
@@ -105,6 +105,16 @@ export function canonicalMessageImages(event: PreviewEvent): Array<{ name: strin
   if (raw?.payload?.type !== "item_completed" || !Array.isArray(content)) return [];
   return content.flatMap((item) => item?.type === "local_image" && typeof item.path === "string"
     ? [{ name: item.path.split(/[\\/]/).pop() || "图片", path: item.path }] : []);
+}
+
+export function sessionEventTargets(events: PreviewEvent[]): SessionEventTarget[] {
+  return events.flatMap((event): SessionEventTarget[] => {
+    const source = (event.raw as { opencode?: { session_id?: unknown; message_id?: unknown; part_id?: unknown } } | null)?.opencode;
+    if (source && typeof source.session_id === "string" && typeof source.message_id === "string" && typeof source.part_id === "string") {
+      return [{ session_id: source.session_id, message_id: source.message_id, part_id: source.part_id }];
+    }
+    return paginatedTargets([event]);
+  });
 }
 
 export function paginatedTargets(events: PreviewEvent[]): PaginatedItemTarget[] {

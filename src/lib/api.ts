@@ -296,6 +296,8 @@ export type DeleteTarget = {
 };
 
 export type PaginatedItemTarget = { thread_id: string; turn_id: string; item_id: string };
+export type OpenCodePartTarget = { session_id: string; message_id: string; part_id: string };
+export type SessionEventTarget = PaginatedItemTarget | OpenCodePartTarget;
 export type TextBlockEdit = { content_index: number; text: string };
 export type DeletePlanMessage = { target: PaginatedItemTarget | null; line_no: number; role: string; summary: string; reason: string };
 export type DeleteTurnSelection = { turn_id: string; messages: DeletePlanMessage[] };
@@ -1545,7 +1547,7 @@ export const api = {
       sessionId: p.session_id,
       rolloutPath: p.rollout_path,
     }),
-  planSessionEventDeletion: (provider: string, rolloutPath: string, lineNos: number[], expectedRevision: string | null, targets?: PaginatedItemTarget[]) =>
+  planSessionEventDeletion: (provider: string, rolloutPath: string, lineNos: number[], expectedRevision: string | null, targets?: SessionEventTarget[]) =>
     invokeCommand<DeletePlan>("plan_session_event_deletion", {
       provider,
       rolloutPath,
@@ -1555,7 +1557,7 @@ export const api = {
     }),
   editSessionEventText: (p: {
     text_blocks?: TextBlockEdit[];
-    targets?: PaginatedItemTarget[];
+    targets?: SessionEventTarget[];
     provider: string;
     expected_revision: string | null;
     rollout_path: string;
@@ -1576,7 +1578,7 @@ export const api = {
       targets: p.targets,
     }),
   deleteSessionEvents: (p: {
-    targets?: PaginatedItemTarget[];
+    targets?: SessionEventTarget[];
     provider: string;
     expected_revision: string | null;
     rollout_path: string;

@@ -8,6 +8,7 @@ import {
   canonicalMessageImages,
   latestCanonicalEvents,
   paginatedTargets,
+  sessionEventTargets,
   previewEventKey,
   previewProcessKey,
   survivingPreviewAnchor,
@@ -222,4 +223,10 @@ test("parses diff comments and the follow-up request", () => {
     comments: [{ number: 1, context: "src/app.ts", body: "Handle the empty state." }],
     request: "Apply the review feedback.",
   });
+});
+
+test("OpenCode edit targets preserve session message and part identity", () => {
+  const event = { index: 3, raw: { opencode: { session_id: "s", message_id: "m", part_id: "p" } } } as PreviewEvent;
+  assert.deepEqual(sessionEventTargets([event]), [{ session_id: "s", message_id: "m", part_id: "p" }]);
+  assert.deepEqual(sessionEventTargets([{ ...event, raw: { opencode: { part_id: "p" } } }]), []);
 });

@@ -1195,6 +1195,55 @@ fn local_request_allowed(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn r02_opencode_webui_binds_preview_revision_and_native_identity() -> AppResult<()> {
+        let root = temp_codex_dir("opencode-preview");
+        fs::create_dir_all(&root)?;
+        let database = root.join("opencode.db");
+        let db = rusqlite::Connection::open(&database)?;
+        db.execute_batch("PRAGMA foreign_keys=ON;
+            CREATE TABLE session(id TEXT PRIMARY KEY);
+            CREATE TABLE message(id TEXT PRIMARY KEY,session_id TEXT,time_created INTEGER,time_updated INTEGER,data TEXT);
+            CREATE TABLE part(id TEXT PRIMARY KEY,message_id TEXT REFERENCES message(id) ON DELETE CASCADE,session_id TEXT,time_created INTEGER,time_updated INTEGER,data TEXT);
+            INSERT INTO session VALUES ('s');
+            INSERT INTO message VALUES ('m','s',1,1,'{\"role\":\"user\"}');
+            INSERT INTO part VALUES ('p','m','s',1,1,'{\"type\":\"text\",\"text\":\"before\"}');")?;
+        let locator = crate::opencode_sessions::encode_locator(&database, "s")?;
+        let state = test_state(&root);
+        let page = dispatch_invoke(
+            &state,
+            "preview_session_page",
+            json!({"provider":"opencode","rolloutPath":locator,"offset":0,"limit":10}),
+        )?;
+        let mut args = json!({"provider":"opencode","rolloutPath":locator,"sessionId":"s","backupDir":root.join("backup"),"lineNo":999,"newText":"after","expectedRevision":page["capability"]["revision"],"targets":[{"session_id":"s","message_id":"m","part_id":"p"}]});
+        let report = dispatch_invoke(&state, "edit_session_event_text", args.clone())?;
+        assert_eq!(
+            report["changed_lines"], 1,
+            "stable ID resolves even when ordinal is not used"
+        );
+        assert!(
+            dispatch_invoke(&state, "edit_session_event_text", args.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("EDIT_CONFLICT")
+        );
+        let page = dispatch_invoke(
+            &state,
+            "preview_session_page",
+            json!({"provider":"opencode","rolloutPath":locator,"offset":0,"limit":10}),
+        )?;
+        args["expectedRevision"] = page["capability"]["revision"].clone();
+        args["lineNos"] = json!([999]);
+        let plan = dispatch_invoke(&state, "plan_session_event_deletion", args.clone())?;
+        assert_eq!(plan["revision"], args["expectedRevision"]);
+        assert_eq!(
+            dispatch_invoke(&state, "delete_session_events", args)?["deleted_lines"],
+            1
+        );
+        drop(db);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+    #[test]
     fn webui_message_edits_require_the_version_returned_by_preview() -> AppResult<()> {
         let root = temp_codex_dir("webui-edit-revision");
         fs::create_dir_all(&root)?;

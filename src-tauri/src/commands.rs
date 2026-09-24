@@ -336,7 +336,7 @@ pub async fn plan_session_event_deletion(
     rollout_path: String,
     line_nos: Vec<usize>,
     expected_revision: Option<String>,
-    targets: Option<Vec<crate::models::PaginatedItemTarget>>,
+    targets: Option<Vec<crate::models::SessionEventTarget>>,
 ) -> AppResult<DeletePlan> {
     run_blocking(move || {
         crate::edit::plan_session_event_deletion(
@@ -359,7 +359,7 @@ pub async fn edit_session_event_text(
     line_no: usize,
     new_text: String,
     expected_revision: Option<String>,
-    targets: Option<Vec<crate::models::PaginatedItemTarget>>,
+    targets: Option<Vec<crate::models::SessionEventTarget>>,
     text_blocks: Option<Vec<crate::models::TextBlockEdit>>,
     lock: SharedLock<'_>,
 ) -> AppResult<EditApplyReport> {
@@ -389,7 +389,7 @@ pub async fn delete_session_events(
     backup_dir: String,
     line_nos: Vec<usize>,
     expected_revision: Option<String>,
-    targets: Option<Vec<crate::models::PaginatedItemTarget>>,
+    targets: Option<Vec<crate::models::SessionEventTarget>>,
     lock: SharedLock<'_>,
 ) -> AppResult<EditApplyReport> {
     let lock = lock.inner().clone();

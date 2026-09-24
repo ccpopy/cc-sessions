@@ -363,7 +363,7 @@ pub(crate) fn load_preview_events(
     load_preview_page(connection, session_id, 0, usize::MAX)
 }
 
-fn load_preview_page(
+pub(crate) fn load_preview_page(
     connection: &Connection,
     session_id: &str,
     offset: usize,
@@ -486,6 +486,7 @@ fn opencode_part_to_preview_raw(
         None
     };
     let opencode = json!({
+        "session_id": message.session_id,
         "part_id": part_id,
         "message_id": message.id,
         "parent_id": message.parent_id,

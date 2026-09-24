@@ -85,6 +85,7 @@ import {
   canEditEventText,
   canonicalMessageImages,
   paginatedTargets,
+  sessionEventTargets,
   latestCanonicalEvents,
   previewEventKey,
   previewProcessKey,
@@ -230,7 +231,7 @@ export function PreviewDialog({
     !customRolloutPath && !!session && !!backupDir && !!rolloutPath && !readError
     && lastReport?.status !== "needs_recovery"
     && !isSessionWideMutationFailure(mutationError)
-    && (provider === "opencode" || (capability !== null && capability.blocked_reasons.length === 0));
+    && (capability !== null && capability.blocked_reasons.length === 0);
   const sourceLabel = `${isTauriRuntime() ? "本地" : `WebUI · ${window.location.host}`} · ${provider}`;
   const canDeletePreviewEvent = (event: PreviewEvent) => canDeleteEvent(provider, event)
     && (capability?.format !== "paginated" || paginatedTargets([event]).length === 1);
@@ -894,7 +895,7 @@ export function PreviewDialog({
         session_id: session.id,
         backup_dir: backupDir,
         line_no: editTarget.index,
-        targets: paginatedTargets([editTarget]),
+        targets: sessionEventTargets([editTarget]),
         new_text: editText,
         text_blocks: editBlocks.length ? editBlocks.filter((b) => b.text !== editableTextBlocks(editTarget).find((old) => old.content_index === b.content_index)?.text) : undefined,
       });
@@ -916,7 +917,7 @@ export function PreviewDialog({
     setDeleteTarget(event);
     const requestId = ++deleteRequestRef.current;
     api
-      .planSessionEventDeletion(provider, rolloutPath, [event.index], revisionRef.current, paginatedTargets([event]))
+      .planSessionEventDeletion(provider, rolloutPath, [event.index], revisionRef.current, sessionEventTargets([event]))
       .then((plan) => { if (requestId === deleteRequestRef.current) { setDeletePlan(plan); setDeleteScope(plan.messages.filter((m) => m.reason === "selected")); } })
       .catch((e: any) => {
         if (requestId !== deleteRequestRef.current) return;
@@ -956,7 +957,7 @@ export function PreviewDialog({
         session_id: session.id,
         backup_dir: backupDir,
         line_nos: deleteScope.length ? deleteScope.map((m) => m.line_no) : [deleteTarget.index],
-        targets: deleteScope.length ? deleteScope.flatMap((m) => m.target ? [m.target] : []) : paginatedTargets([deleteTarget]),
+        targets: deleteScope.length ? deleteScope.flatMap((m) => m.target ? [m.target] : []) : sessionEventTargets([deleteTarget]),
       });
       recordEditResult(report);
       setDeleteTarget(null);
@@ -983,7 +984,7 @@ export function PreviewDialog({
     const indices = selected
       .map((e) => e.index);
     api
-      .planSessionEventDeletion(provider, rolloutPath, indices, revisionRef.current, paginatedTargets(selected))
+      .planSessionEventDeletion(provider, rolloutPath, indices, revisionRef.current, sessionEventTargets(selected))
       .then((plan) => { if (requestId === deleteRequestRef.current) { setDeletePlan(plan); setDeleteScope(plan.messages.filter((m) => m.reason === "selected")); } })
       .catch((e: any) => {
         if (requestId !== deleteRequestRef.current) return;
@@ -1007,7 +1008,7 @@ export function PreviewDialog({
         session_id: session.id,
         backup_dir: backupDir,
         line_nos: deleteScope.length ? deleteScope.map((m) => m.line_no) : indices,
-        targets: deleteScope.length ? deleteScope.flatMap((m) => m.target ? [m.target] : []) : paginatedTargets(deleteSelectedTarget.events),
+        targets: deleteScope.length ? deleteScope.flatMap((m) => m.target ? [m.target] : []) : sessionEventTargets(deleteSelectedTarget.events),
       });
       recordEditResult(report);
       setDeleteSelectedTarget(null);
