@@ -583,8 +583,8 @@ fn preview_range_impl(path: &str, offset: usize, limit: usize) -> AppResult<Vec<
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let history = crate::logical_history::read(Path::new(path), None)?;
-    if history.paginated {
+    if crate::logical_history::is_paginated(Path::new(path))? {
+        let history = crate::logical_history::read(Path::new(path), None)?;
         return Ok(history
             .raw_events()
             .into_iter()
@@ -643,8 +643,8 @@ pub fn preview_session_user_prompts(
 ) -> AppResult<UserPromptList> {
     match provider.as_deref().unwrap_or("codex") {
         "codex" => {
-            let history = crate::logical_history::read(Path::new(&rollout_path), None)?;
-            if history.paginated {
+            if crate::logical_history::is_paginated(Path::new(&rollout_path))? {
+                let history = crate::logical_history::read(Path::new(&rollout_path), None)?;
                 Ok(user_prompts_from_events(
                     history.raw_events(),
                     codex_event_is_agent_activity,

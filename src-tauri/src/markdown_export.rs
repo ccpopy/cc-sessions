@@ -146,7 +146,7 @@ pub fn export_session_markdown(
             && !options.include_reasoning
             && matches!(provider.as_deref().unwrap_or("codex"), "codex" | "claude")
             && (provider.as_deref() == Some("claude")
-                || !crate::logical_history::read(&source, None)?.paginated)
+                || !crate::logical_history::is_paginated(&source)?)
         {
             let result = stream_conversation_export(
                 provider.as_deref().unwrap_or("codex"),
@@ -162,13 +162,10 @@ pub fn export_session_markdown(
             return result;
         }
     }
-    let events = if provider.as_deref().unwrap_or("codex") == "codex" {
-        let history = crate::logical_history::read(&source, None)?;
-        if history.paginated {
-            history.events()
-        } else {
-            preview_session_range(provider, rollout_path, 0, usize::MAX)?
-        }
+    let events = if provider.as_deref().unwrap_or("codex") == "codex"
+        && crate::logical_history::is_paginated(&source)?
+    {
+        crate::logical_history::read(&source, None)?.events()
     } else {
         preview_session_range(provider, rollout_path, 0, usize::MAX)?
     };

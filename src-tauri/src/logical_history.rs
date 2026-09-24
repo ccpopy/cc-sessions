@@ -17,6 +17,21 @@ fn invalid(reason: &str) -> AppError {
     AppError::Other(format!("[HISTORY_READ] {reason}；未返回不完整历史"))
 }
 
+/// Probe only the header; legacy display paths keep their tolerant streaming reader.
+pub(crate) fn is_paginated(path: &Path) -> AppResult<bool> {
+    use std::io::BufRead;
+    for line in std::io::BufReader::new(std::fs::File::open(path)?).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        return Ok(serde_json::from_str::<Value>(&line).is_ok_and(|v| {
+            v["type"] == "session_meta" && v["payload"]["history_mode"] == "paginated"
+        }));
+    }
+    Ok(false)
+}
+
 pub(crate) fn read(path: &Path, cancel: Option<&AtomicBool>) -> AppResult<History> {
     let mut seen = HashSet::new();
     let root = path

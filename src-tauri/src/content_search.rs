@@ -333,7 +333,11 @@ fn scan_session_mode(
     completed_bytes: u64,
     raw_events: bool,
 ) -> AppResult<FileScanOutcome> {
-    if session.provider == "codex" && std::path::Path::new(&session.rollout_path).is_file() {
+    if session.provider == "codex"
+        && std::path::Path::new(&session.rollout_path).is_file()
+        && (raw_events
+            || crate::logical_history::is_paginated(std::path::Path::new(&session.rollout_path))?)
+    {
         let history = crate::logical_history::read(
             std::path::Path::new(&session.rollout_path),
             Some(&job.cancel),
