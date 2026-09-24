@@ -9,11 +9,19 @@ type State = {
   save: (patch: Partial<Settings>) => Promise<void>;
 };
 
+// One queue for every component and page using this store, including reloads.
+let pending: Promise<void> = Promise.resolve();
+function enqueue(operation: () => Promise<void>): Promise<void> {
+  const result = pending.then(operation);
+  pending = result.catch(() => {});
+  return result;
+}
+
 export const useSettings = create<State>((set, get) => ({
   settings: null,
   loading: false,
   error: null,
-  async load() {
+  load: () => enqueue(async () => {
     set({ loading: true, error: null });
     try {
       const s = await api.getSettings();
@@ -24,12 +32,15 @@ export const useSettings = create<State>((set, get) => ({
     } finally {
       set({ loading: false });
     }
-  },
-  async save(patch) {
-    const cur = get().settings;
-    if (!cur) throw new Error("设置尚未加载，无法保存");
-    const next = { ...cur, ...patch };
-    await api.saveSettings(next);
-    set({ settings: next });
+  }),
+  save(patch) {
+    const queuedPatch = { ...patch };
+    return enqueue(async () => {
+      const cur = get().settings;
+      if (!cur) throw new Error("设置尚未加载，无法保存");
+      const next = { ...cur, ...queuedPatch };
+      await api.saveSettings(next);
+      set({ settings: next });
+    });
   },
 }));
