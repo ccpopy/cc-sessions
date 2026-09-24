@@ -127,6 +127,8 @@ type Props = {
 };
 
 export type PreviewJump = {
+  eventKey?: string | null;
+  rawEvent?: boolean;
   eventIndex: number;
   eventOffset: number;
   query: string;
@@ -550,6 +552,7 @@ export function PreviewDialog({
     [events, onlyMsg],
   );
 
+  const jumpTargetIndex = initialJump?.eventKey ? events.find((e) => previewEventKey(e, initialJump.rawEvent) === initialJump.eventKey)?.index ?? null : initialJump?.eventIndex ?? null;
   const filtered = useMemo(() => {
     return searchableEvents.flatMap(({ event, searchText }) => {
       if (
@@ -558,15 +561,15 @@ export function PreviewDialog({
           || !isVisibleConversationEvent(
             event,
             timelineIndexSet,
-            initialJump?.eventIndex ?? null,
+            jumpTargetIndex,
           ))
       ) {
         return [];
       }
-      if (normalizedFilter && !searchText.includes(normalizedFilter)) return [];
+      if (normalizedFilter && !searchText.includes(normalizedFilter) && !(initialJump?.query.toLowerCase() === normalizedFilter && event.index === jumpTargetIndex)) return [];
       return [event];
     });
-  }, [initialJump?.eventIndex, normalizedFilter, onlyMsg, searchableEvents, timelineIndexSet]);
+  }, [jumpTargetIndex, initialJump?.query, normalizedFilter, onlyMsg, searchableEvents, timelineIndexSet]);
 
   useEffect(() => {
     if (!open || loading || done || readError || normalizedFilter) return;
@@ -628,6 +631,7 @@ export function PreviewDialog({
   );
 
   /** 把待跳转的目标消息滚动到视口顶部并闪烁高亮 */
+  const completedSearchJumpRef = useRef(false);
   const scrollPendingIntoView = useCallback(() => {
     const target = pendingJumpRef.current;
     if (target === null) return;
@@ -648,10 +652,27 @@ export function PreviewDialog({
 
   useEffect(() => {
     if (!open || !rolloutPath || !initialJump) return;
+    completedSearchJumpRef.current = false;
     setFilter(initialJump.query);
-    pendingJumpRef.current = initialJump.eventIndex;
+    if (initialJump.rawEvent) setOnlyMsg(false);
+    pendingJumpRef.current = initialJump.eventKey ? null : initialJump.eventIndex;
     void loadUpTo(initialJump.eventOffset).then(() => scrollPendingIntoView());
   }, [initialJump, loadUpTo, open, rolloutPath, scrollPendingIntoView]);
+
+  useEffect(() => {
+    if (!open || !initialJump?.eventKey || loading || readError || completedSearchJumpRef.current) return;
+    const target = events.find((e) => previewEventKey(e, initialJump.rawEvent) === initialJump.eventKey);
+    if (target) {
+      completedSearchJumpRef.current = true;
+      pendingJumpRef.current = target.index;
+      scrollPendingIntoView();
+    } else if (!done) {
+      void loadMore();
+    } else {
+      completedSearchJumpRef.current = true;
+      toast.info("搜索目标已变化，未跳转到其他消息");
+    }
+  }, [open, initialJump, events, loading, readError, done, loadMore, scrollPendingIntoView]);
 
   /** 滚动跟随：视口上沿 1/3 处上方最近的一条用户提问视为当前时间线位置。 */
   const updateActiveFromScroll = useCallback(() => {

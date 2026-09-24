@@ -181,6 +181,8 @@ pub struct SessionSummary {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ContentSearchMatch {
+    pub event_key: Option<String>,
+    pub raw_event: bool,
     pub event_index: usize,
     pub event_offset: usize,
     pub timestamp: String,

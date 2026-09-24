@@ -3395,6 +3395,35 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["KEEP-A", "KEEP-B", "KEEP-C"]
         );
+        let preview = crate::rollout::preview_session_range(
+            Some("codex".into()),
+            child.to_string_lossy().into(),
+            0,
+            usize::MAX,
+        )
+        .unwrap();
+        assert!(preview
+            .iter()
+            .any(|e| crate::rollout::preview_event_text(e) == "KEEP-A"));
+        let exported = crate::markdown_export::export_session_markdown(
+            Some("codex".into()),
+            child.to_string_lossy().into(),
+            None,
+            serde_json::from_value(
+                json!({"title":"test","session_id":child_id,"provider":"codex"}),
+            )
+            .unwrap(),
+            serde_json::from_value(json!({})).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            exported.markdown.contains("KEEP-A")
+                && exported.markdown.contains("KEEP-B")
+                && exported.markdown.contains("KEEP-C")
+        );
+        assert!(
+            !exported.markdown.contains("OLD-B") && !exported.markdown.contains("CONTEXT-COPY")
+        );
         for mode in [ClaudeImportMode::Simple, ClaudeImportMode::Native] {
             let target = root.join(mode.as_str());
             fs::create_dir_all(target.join("projects")).unwrap();

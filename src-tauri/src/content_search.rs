@@ -42,6 +42,7 @@ struct SearchManager {
 }
 
 struct SearchRequest {
+    raw_events: bool,
     provider: String,
     dirs: ProviderDirs,
     query: String,
@@ -160,8 +161,10 @@ pub fn start_content_search(
     dirs: ProviderDirs,
     query: String,
     rollout_paths: Vec<String>,
+    raw_events: bool,
 ) -> AppResult<ContentSearchStart> {
     manager().start(SearchRequest {
+        raw_events,
         provider,
         dirs,
         query: query.trim().to_string(),
@@ -269,7 +272,13 @@ fn execute_search(job: &SearchJob, request: &SearchRequest) -> AppResult<()> {
         if job.cancel.load(Ordering::Acquire) {
             return Ok(());
         }
-        let outcome = scan_session(job, &session, &request.query, completed_bytes)?;
+        let outcome = scan_session_mode(
+            job,
+            &session,
+            &request.query,
+            completed_bytes,
+            request.raw_events,
+        )?;
         if outcome.cancelled {
             return Ok(());
         }
@@ -307,23 +316,48 @@ fn session_matches_scope(session: &SessionSummary, rollout_paths: &HashSet<&str>
     rollout_paths.contains(session.rollout_path.as_str())
 }
 
+#[cfg(test)]
 fn scan_session(
     job: &SearchJob,
     session: &SessionSummary,
     query: &str,
     completed_bytes: u64,
 ) -> AppResult<FileScanOutcome> {
+    scan_session_mode(job, session, query, completed_bytes, false)
+}
+
+fn scan_session_mode(
+    job: &SearchJob,
+    session: &SessionSummary,
+    query: &str,
+    completed_bytes: u64,
+    raw_events: bool,
+) -> AppResult<FileScanOutcome> {
+    if session.provider == "codex" && std::path::Path::new(&session.rollout_path).is_file() {
+        let history = crate::logical_history::read(
+            std::path::Path::new(&session.rollout_path),
+            Some(&job.cancel),
+        )?;
+        if history.paginated || raw_events {
+            let events = if raw_events {
+                history.raw_events()
+            } else {
+                history.events()
+            };
+            return scan_event_sequence(job, session, query, completed_bytes, events, raw_events);
+        }
+    }
     // 这两个 provider 的会话不是可逐行扫描的文件，先还原成事件序列再匹配。
     match session.provider.as_str() {
         "opencode" => {
             let events =
                 crate::opencode_sessions::load_preview_events_from_locator(&session.rollout_path)?;
-            return scan_event_sequence(job, session, query, completed_bytes, events);
+            return scan_event_sequence(job, session, query, completed_bytes, events, false);
         }
         "cursor" => {
             let events =
                 crate::cursor_sessions::load_preview_events_from_locator(&session.rollout_path)?;
-            return scan_event_sequence(job, session, query, completed_bytes, events);
+            return scan_event_sequence(job, session, query, completed_bytes, events, false);
         }
         _ => {}
     }
@@ -399,6 +433,8 @@ fn scan_session(
             continue;
         }
         matches.push(ContentSearchMatch {
+            event_key: search_event_key(&event, false),
+            raw_event: false,
             event_index: event.index,
             event_offset: current_offset,
             timestamp: event.timestamp,
@@ -426,6 +462,7 @@ fn scan_event_sequence(
     query: &str,
     completed_bytes: u64,
     events: Vec<crate::models::PreviewEvent>,
+    raw_events: bool,
 ) -> AppResult<FileScanOutcome> {
     let total_events = events.len().max(1);
     let mut matches = Vec::new();
@@ -451,16 +488,26 @@ fn scan_event_sequence(
             continue;
         }
         let mixed_assistant_text = rollout::preview_event_has_assistant_text_tool_use(&event);
-        if !rollout::preview_event_is_conversation(&event) && !mixed_assistant_text {
+        if !raw_events && !rollout::preview_event_is_conversation(&event) && !mixed_assistant_text {
             continue;
         }
-        let text = rollout::preview_event_text(&event);
+        let text = if raw_events {
+            serde_json::to_string(&event.raw)?
+        } else {
+            rollout::preview_event_text(&event)
+        };
         if find_query(&text, query).is_none() {
             continue;
         }
         matches.push(ContentSearchMatch {
+            event_key: search_event_key(&event, raw_events),
+            raw_event: raw_events,
             event_index: event.index,
-            event_offset,
+            event_offset: if session.provider == "codex" {
+                event.index
+            } else {
+                event_offset
+            },
             timestamp: event.timestamp,
             role: if mixed_assistant_text {
                 "assistant".to_string()
@@ -477,6 +524,23 @@ fn scan_event_sequence(
         cancelled: false,
         missing: false,
     })
+}
+
+fn search_event_key(event: &crate::models::PreviewEvent, raw: bool) -> Option<String> {
+    if raw {
+        return event.raw["ordinal"]
+            .as_u64()
+            .map(|o| format!("ordinal:{o}"));
+    }
+    if let Some((thread_id, turn_id, item_id)) = crate::logical_history::item_key(&event.raw) {
+        let target = crate::models::PaginatedItemTarget {
+            thread_id,
+            turn_id,
+            item_id,
+        };
+        return Some(format!("item:{}", serde_json::to_string(&target).ok()?));
+    }
+    event.raw["uuid"].as_str().map(|id| format!("uuid:{id}"))
 }
 
 fn classify_event(provider: &str, index: usize, raw: Value) -> Option<crate::models::PreviewEvent> {
@@ -612,6 +676,35 @@ mod tests {
                 error: None,
             })),
         }
+    }
+
+    #[test]
+    fn r06_paginated_search_does_not_match_context_or_obsolete_snapshots() {
+        let path = temp_file(
+            "logical",
+            &[
+                json!({"type":"session_meta","payload":{"id":"s","history_mode":"paginated"}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"text":"needle copy"}]}}),
+                json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":"s","turn_id":"t","item":{"id":"u","type":"UserMessage","content":[{"type":"text","text":"needle current"}]}}}),
+                json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":"s","turn_id":"t","item":{"id":"a","type":"AgentMessage","content":[{"type":"Text","text":"needle obsolete"}]}}}),
+                json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":"s","turn_id":"t","item":{"id":"a","type":"AgentMessage","content":[{"type":"Text","text":"current answer"}]}}}),
+            ],
+        );
+        let result = scan_session(&test_job(), &session("codex", &path), "needle", 0).unwrap();
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.matches[0].event_index, 2);
+        let obsolete = scan_session(&test_job(), &session("codex", &path), "obsolete", 0).unwrap();
+        assert!(obsolete.matches.is_empty());
+        let raw =
+            scan_session_mode(&test_job(), &session("codex", &path), "obsolete", 0, true).unwrap();
+        assert_eq!(raw.matches.len(), 1);
+        assert!(raw.matches[0].raw_event);
+        assert!(result.matches[0]
+            .event_key
+            .as_ref()
+            .unwrap()
+            .contains("\"item_id\":\"u\""));
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -818,6 +911,7 @@ mod tests {
         let job = test_job();
         job.cancel.store(true, Ordering::Release);
         let request = SearchRequest {
+            raw_events: false,
             provider: "claude".to_string(),
             dirs: ProviderDirs {
                 codex_dir: root.join("codex").to_string_lossy().into_owned(),

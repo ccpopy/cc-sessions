@@ -61,6 +61,34 @@ fn read_segment(
             serde_json::from_str(line).map_err(|_| invalid("历史包含不完整或无法解析的记录"))?;
         records.push(record);
     }
+    resolve_records(records, root, end, seen, cancel)
+}
+
+pub(crate) fn from_records(
+    path: &Path,
+    records: Vec<Value>,
+    cancel: Option<&AtomicBool>,
+) -> AppResult<History> {
+    let root = path
+        .ancestors()
+        .find(|p| {
+            matches!(
+                p.file_name().and_then(|s| s.to_str()),
+                Some("sessions" | "archived_sessions")
+            )
+        })
+        .and_then(Path::parent);
+    let mut seen = HashSet::from([path.canonicalize()?]);
+    resolve_records(records, root, None, &mut seen, cancel)
+}
+
+fn resolve_records(
+    mut records: Vec<Value>,
+    root: Option<&Path>,
+    end: Option<(u64, u64)>,
+    seen: &mut HashSet<PathBuf>,
+    cancel: Option<&AtomicBool>,
+) -> AppResult<History> {
     let Some(meta) = records.first().filter(|v| v["type"] == "session_meta") else {
         // Legacy read-only exports may lack metadata.
         if end.is_some() {
@@ -199,6 +227,13 @@ pub(crate) fn latest(records: &[Value]) -> Vec<(usize, &Value)> {
 }
 
 impl History {
+    pub fn raw_events(&self) -> Vec<PreviewEvent> {
+        self.records
+            .iter()
+            .enumerate()
+            .map(|(i, v)| crate::rollout::classify_history(i, v.clone(), self.paginated))
+            .collect()
+    }
     pub fn events(&self) -> Vec<PreviewEvent> {
         latest(&self.records)
             .into_iter()

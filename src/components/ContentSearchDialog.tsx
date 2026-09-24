@@ -55,6 +55,7 @@ export function ContentSearchDialog({
   onOpenResult,
 }: Props) {
   const [query, setQuery] = useState("");
+  const [rawEvents, setRawEvents] = useState(false);
   const [jobId, setJobId] = useState<number | null>(null);
   const [status, setStatus] = useState<ContentSearchStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -69,6 +70,7 @@ export function ContentSearchDialog({
   const pendingStartGenerationRef = useRef<number | null>(null);
   const scopeKey = JSON.stringify([
     provider,
+    rawEvents,
     codexDir,
     claudeDir,
     opencodeDir,
@@ -223,6 +225,7 @@ export function ContentSearchDialog({
     setStatus(null);
     try {
       const started = await api.startContentSearch({
+        rawEvents: provider === "codex" && rawEvents,
         provider,
         codexDir,
         claudeDir,
@@ -341,6 +344,12 @@ export function ContentSearchDialog({
             )}
           </div>
 
+          {provider === "codex" && (
+            <label className="mt-3 flex items-center gap-2 text-xs text-muted-foreground">
+              <input type="checkbox" checked={rawEvents} disabled={running} onChange={(e) => setRawEvents(e.target.checked)} />
+              底层事件（包含上下文与旧快照）
+            </label>
+          )}
           {status && (
             <div className="mt-3 space-y-1.5">
               <div className="flex min-w-0 items-center justify-between gap-4 text-[11px] text-muted-foreground">

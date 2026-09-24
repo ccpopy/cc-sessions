@@ -36,12 +36,14 @@ pub fn start_content_search(
     cursor_dir: Option<String>,
     query: String,
     rollout_paths: Vec<String>,
+    raw_events: Option<bool>,
 ) -> AppResult<ContentSearchStart> {
     crate::content_search::start_content_search(
         provider,
         provider_dirs(codex_dir, claude_dir, opencode_dir, cursor_dir),
         query,
         rollout_paths,
+        raw_events.unwrap_or(false),
     )
 }
 

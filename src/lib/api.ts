@@ -174,6 +174,8 @@ export type SessionSummary = {
 };
 
 export type ContentSearchMatch = {
+  event_key: string | null;
+  raw_event: boolean;
   event_index: number;
   event_offset: number;
   timestamp: string;
@@ -1077,6 +1079,7 @@ export const api = {
   searchSessions: (provider: SessionProvider, codexDir: string, claudeDir: string | undefined, opencodeDir: string | undefined, cursorDir: string | undefined, query: string) =>
     invokeCommand<SessionSummary[]>("search_sessions", { provider, codexDir, claudeDir, opencodeDir, cursorDir, query }),
   startContentSearch: (p: {
+    rawEvents?: boolean;
     provider: SessionProvider;
     codexDir: string;
     claudeDir: string;

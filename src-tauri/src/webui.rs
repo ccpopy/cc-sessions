@@ -271,6 +271,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             provider_dirs_arg(&args)?,
             string_arg(&args, "query")?,
             arg(&args, "rolloutPaths")?,
+            opt_arg::<bool>(&args, "rawEvents")?.unwrap_or(false),
         )),
         "content_search_status" => to_result_value(content_search::content_search_status(
             usize_arg(&args, "jobId")? as u64,

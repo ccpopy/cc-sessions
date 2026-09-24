@@ -583,6 +583,15 @@ fn preview_range_impl(path: &str, offset: usize, limit: usize) -> AppResult<Vec<
     if limit == 0 {
         return Ok(Vec::new());
     }
+    let history = crate::logical_history::read(Path::new(path), None)?;
+    if history.paginated {
+        return Ok(history
+            .raw_events()
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect());
+    }
     let f = File::open(PathBuf::from(path))?;
     let reader = BufReader::new(f);
     let mut out = Vec::with_capacity(preview_capacity_hint(limit));
@@ -633,11 +642,21 @@ pub fn preview_session_user_prompts(
     rollout_path: String,
 ) -> AppResult<UserPromptList> {
     match provider.as_deref().unwrap_or("codex") {
-        "codex" => user_prompts_impl(
-            &rollout_path,
-            |index, raw| Some(classify(index, raw)),
-            codex_event_is_agent_activity,
-        ),
+        "codex" => {
+            let history = crate::logical_history::read(Path::new(&rollout_path), None)?;
+            if history.paginated {
+                Ok(user_prompts_from_events(
+                    history.raw_events(),
+                    codex_event_is_agent_activity,
+                ))
+            } else {
+                user_prompts_impl(
+                    &rollout_path,
+                    |index, raw| Some(classify(index, raw)),
+                    codex_event_is_agent_activity,
+                )
+            }
+        }
         "claude" => user_prompts_impl(
             &rollout_path,
             crate::claude_sessions::classify_preview,

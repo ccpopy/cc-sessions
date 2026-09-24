@@ -902,6 +902,8 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
           setPreviewJump({
             eventIndex: match.event_index,
             eventOffset: match.event_offset,
+            eventKey: match.event_key,
+            rawEvent: match.raw_event,
             query: searchQuery,
           });
           setContentSearchOpen(false);

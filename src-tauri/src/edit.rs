@@ -82,6 +82,27 @@ pub(crate) fn codex_preview_page(
     // Events and revision must describe exactly the same bytes, even if the
     // native writer appends throughout all bounded observation attempts.
     let canonical = paginated::is_paginated(&loaded);
+    if loaded.parsed.iter().flatten().any(|v| {
+        v["type"] == "session_meta"
+            && v["payload"]
+                .get("history_base")
+                .is_some_and(|base| !base.is_null())
+    }) {
+        let history = crate::logical_history::from_records(
+            &path,
+            loaded.parsed.into_iter().flatten().collect(),
+            None,
+        )?;
+        return Ok(crate::models::PreviewPage {
+            events: history
+                .raw_events()
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .collect(),
+            capability: Some(capability),
+        });
+    }
     let events = loaded
         .parsed
         .into_iter()
