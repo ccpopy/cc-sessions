@@ -22,10 +22,18 @@ use crate::models::{
 };
 use crate::paths;
 
+mod recovery;
+pub use recovery::reconcile;
+
 const SNAPSHOT_VERSION: u32 = 1;
 const JOURNAL_VERSION: u32 = 1;
 const REASON_SELECTED: &str = "selected";
 const REASON_CONTEXT_MESSAGE: &str = "context_message";
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_JOURNAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct StoredMessage {
@@ -57,7 +65,7 @@ struct SessionSnapshot {
     hash: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct JournalEntry {
     op_id: String,
     ts: String,
@@ -297,6 +305,14 @@ fn read_journal(dir: &Path) -> AppResult<JournalFile> {
 }
 
 fn write_journal(dir: &Path, journal: &JournalFile) -> AppResult<()> {
+    #[cfg(test)]
+    if FAIL_JOURNAL.replace(false) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected journal failure",
+        )
+        .into());
+    }
     replace_json(&journal_path(dir), journal)
 }
 
@@ -679,6 +695,14 @@ fn part_diff(before: &SessionSnapshot, after: &SessionSnapshot) -> (u32, u32, u3
 }
 
 fn append_entry(dir: &Path, journal: &mut JournalFile, entry: JournalEntry) -> AppResult<()> {
+    if let Some(existing) = journal.entries.iter().find(|e| e.op_id == entry.op_id) {
+        if existing == &entry {
+            return Ok(());
+        }
+        return Err(AppError::Other(
+            "[EDIT_RECOVERY] 操作 ID 已存在但内容不匹配".into(),
+        ));
+    }
     journal.entries.push(entry);
     write_journal(dir, journal)
 }
@@ -766,6 +790,7 @@ pub fn apply_edit_text(
     }
 
     let dir = edit_dir(backup_dir, &session_id);
+    recovery::ensure_clear(&dir)?;
     let mut journal = read_journal(&dir)?;
     let public_snapshot = ensure_public_snapshot(&dir, &before, &journal)?;
     let op_id = new_op_id(journal.entries.len());
@@ -793,7 +818,6 @@ pub fn apply_edit_text(
         return Err(AppError::Other("消息文本没有变化".into()));
     }
     let after_snapshot = write_operation_snapshot(&dir, &op_id, "after", &after)?;
-    transaction.commit()?;
 
     let description = format!("改写 OpenCode 第 {} 个事件文本", line_no + 1);
     let entry = journal_entry(
@@ -810,10 +834,15 @@ pub fn apply_edit_text(
         after_snapshot,
         1,
     );
-    append_entry(&dir, &mut journal, entry)?;
+    let warning = recovery::commit(transaction, &dir, &mut journal, entry)?;
     Ok(EditApplyReport {
-        status: "committed_unverified".into(),
-        warning: None,
+        status: if warning.is_some() {
+            "needs_recovery"
+        } else {
+            "committed_unverified"
+        }
+        .into(),
+        warning,
         op_id,
         kind: "edit_text".into(),
         snapshot_created: public_snapshot,
@@ -859,6 +888,7 @@ pub fn apply_delete(
     }
 
     let dir = edit_dir(backup_dir, &session_id);
+    recovery::ensure_clear(&dir)?;
     let mut journal = read_journal(&dir)?;
     let public_snapshot = ensure_public_snapshot(&dir, &before, &journal)?;
     let op_id = new_op_id(journal.entries.len());
@@ -871,7 +901,6 @@ pub fn apply_delete(
     }
     let after = load_snapshot(&transaction, &database_path, &session_id)?;
     let after_snapshot = write_operation_snapshot(&dir, &op_id, "after", &after)?;
-    transaction.commit()?;
 
     let selected_count = line_nos.iter().copied().collect::<BTreeSet<_>>().len();
     let description = format!(
@@ -892,10 +921,15 @@ pub fn apply_delete(
         after_snapshot,
         expansion.part_count,
     );
-    append_entry(&dir, &mut journal, entry)?;
+    let warning = recovery::commit(transaction, &dir, &mut journal, entry)?;
     Ok(EditApplyReport {
-        status: "committed_unverified".into(),
-        warning: None,
+        status: if warning.is_some() {
+            "needs_recovery"
+        } else {
+            "committed_unverified"
+        }
+        .into(),
+        warning,
         op_id,
         kind: "delete_events".into(),
         snapshot_created: public_snapshot,
@@ -913,6 +947,7 @@ pub fn undo_last(
 ) -> AppResult<EditApplyReport> {
     let (database_path, session_id) = resolve_context(locator, session_id)?;
     let dir = edit_dir(backup_dir, &session_id);
+    recovery::ensure_clear(&dir)?;
     let mut journal = read_journal(&dir)?;
     let last = journal
         .entries
@@ -942,7 +977,6 @@ pub fn undo_last(
         return Err(AppError::Other("OpenCode 撤销后的会话校验失败".into()));
     }
     let after_snapshot = write_operation_snapshot(&dir, &op_id, "after", &after)?;
-    transaction.commit()?;
 
     let redo = last.kind == "undo";
     let base = last
@@ -969,10 +1003,15 @@ pub fn undo_last(
         after_snapshot,
         changed + deleted + restored,
     );
-    append_entry(&dir, &mut journal, entry)?;
+    let warning = recovery::commit(transaction, &dir, &mut journal, entry)?;
     Ok(EditApplyReport {
-        status: "committed_unverified".into(),
-        warning: None,
+        status: if warning.is_some() {
+            "needs_recovery"
+        } else {
+            "committed_unverified"
+        }
+        .into(),
+        warning,
         op_id,
         kind: "undo".into(),
         snapshot_created: None,
@@ -997,6 +1036,7 @@ pub fn restore_snapshot(
         return Err(AppError::Other("快照属于其他 OpenCode 会话".into()));
     }
 
+    recovery::ensure_clear(&dir)?;
     let mut journal = read_journal(&dir)?;
     let mut connection = open_writable(&database_path)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1012,7 +1052,6 @@ pub fn restore_snapshot(
         return Err(AppError::Other("OpenCode 快照还原后的会话校验失败".into()));
     }
     let after_snapshot = write_operation_snapshot(&dir, &op_id, "after", &after)?;
-    transaction.commit()?;
 
     let (changed, deleted, restored) = part_diff(&before, &after);
     let description =
@@ -1031,10 +1070,15 @@ pub fn restore_snapshot(
         after_snapshot,
         changed + deleted + restored,
     );
-    append_entry(&dir, &mut journal, entry)?;
+    let warning = recovery::commit(transaction, &dir, &mut journal, entry)?;
     Ok(EditApplyReport {
-        status: "committed_unverified".into(),
-        warning: None,
+        status: if warning.is_some() {
+            "needs_recovery"
+        } else {
+            "committed_unverified"
+        }
+        .into(),
+        warning,
         op_id,
         kind: "restore_snapshot".into(),
         snapshot_created: Some(pre_restore_name),
@@ -1060,7 +1104,9 @@ pub fn history(locator: &str, session_id: &str, backup_dir: &str) -> AppResult<E
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.ends_with(".json") || name == "journal.json" {
+            if !name.ends_with(".json")
+                || matches!(name.as_str(), "journal.json" | "pending-operation.json")
+            {
                 continue;
             }
             let metadata = entry.metadata()?;
@@ -1111,14 +1157,20 @@ pub fn history(locator: &str, session_id: &str, backup_dir: &str) -> AppResult<E
             changes: entry.changes,
         })
         .collect();
+    let pending_operation = recovery::summary(&dir, &current)?;
+    let ready = pending_operation.is_none();
     Ok(EditHistory {
-        pending_operation: None,
-        restore_available: true,
+        pending_operation,
+        restore_available: ready && !snapshots.is_empty(),
         revision: Some(revision(&current)),
         entries,
         snapshots,
-        undo_available,
-        undo_blocked_reason,
+        undo_available: ready && undo_available,
+        undo_blocked_reason: if ready {
+            undo_blocked_reason
+        } else {
+            Some("请先核对待恢复的操作".into())
+        },
     })
 }
 
@@ -1318,6 +1370,186 @@ mod tests {
 
     fn backup_dir(fixture: &Fixture) -> String {
         fixture.backup_dir.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn r03_committed_database_with_failed_journal_is_recoverable() -> AppResult<()> {
+        let fixture = fixture()?;
+        FAIL_JOURNAL.set(true);
+        let report = apply_edit_text(
+            &fixture.locator,
+            "ses_target",
+            &backup_dir(&fixture),
+            0,
+            "saved",
+        )?;
+        assert_eq!(report.status, "needs_recovery");
+        assert_eq!(
+            part_data(&open_connection(&fixture)?, "part_u1")?["text"],
+            "saved"
+        );
+        let history = history(&fixture.locator, "ses_target", &backup_dir(&fixture))?;
+        assert!(history.pending_operation.unwrap().can_reconcile);
+        assert!(apply_edit_text(
+            &fixture.locator,
+            "ses_target",
+            &backup_dir(&fixture),
+            0,
+            "retry"
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("EDIT_RECOVERY"));
+        reconcile(
+            &fixture.locator,
+            "ses_target",
+            &backup_dir(&fixture),
+            history.revision.as_deref(),
+        )?;
+        reconcile(
+            &fixture.locator,
+            "ses_target",
+            &backup_dir(&fixture),
+            history.revision.as_deref(),
+        )?;
+        assert_eq!(
+            read_journal(&edit_dir(&backup_dir(&fixture), "ses_target"))?
+                .entries
+                .len(),
+            1
+        );
+        undo_last(&fixture.locator, "ses_target", &backup_dir(&fixture))?;
+        assert_eq!(
+            part_data(&open_connection(&fixture)?, "part_u1")?["text"],
+            "hello"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn r03_process_exit_child() -> AppResult<()> {
+        let Ok(root) = std::env::var("CC_TEST_OPENCODE_ROOT") else {
+            return Ok(());
+        };
+        let database = Path::new(&root).join("opencode/opencode.db");
+        let locator = crate::opencode_sessions::encode_locator(&database, "ses_target")?;
+        apply_edit_text(
+            &locator,
+            "ses_target",
+            Path::new(&root).join("backups").to_str().unwrap(),
+            0,
+            "saved",
+        )?;
+        panic!("child must terminate at checkpoint");
+    }
+
+    #[test]
+    fn r03_restart_recovers_each_commit_boundary_exactly_once() -> AppResult<()> {
+        for phase in ["prepared", "committed", "journaled"] {
+            let fixture = fixture()?;
+            let before_other = session_rows(&open_connection(&fixture)?, "ses_other")?;
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "opencode_edit::tests::r03_process_exit_child",
+                    "--nocapture",
+                ])
+                .env("CC_TEST_OPENCODE_ROOT", &fixture.root)
+                .env("CC_TEST_OPENCODE_EXIT", phase)
+                .output()?;
+            assert_eq!(
+                output.status.code(),
+                Some(73),
+                "{phase}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let history = history(&fixture.locator, "ses_target", &backup_dir(&fixture))?;
+            let pending = history.pending_operation.unwrap();
+            assert!(pending.can_reconcile);
+            assert_eq!(
+                pending.status,
+                if phase == "prepared" {
+                    "not_committed"
+                } else {
+                    "committed_pending_journal"
+                }
+            );
+            for _ in 0..2 {
+                reconcile(
+                    &fixture.locator,
+                    "ses_target",
+                    &backup_dir(&fixture),
+                    history.revision.as_deref(),
+                )?;
+            }
+            assert_eq!(
+                read_journal(&edit_dir(&backup_dir(&fixture), "ses_target"))?
+                    .entries
+                    .len(),
+                usize::from(phase != "prepared")
+            );
+            if phase != "prepared" {
+                undo_last(&fixture.locator, "ses_target", &backup_dir(&fixture))?;
+            }
+            assert_eq!(
+                part_data(&open_connection(&fixture)?, "part_u1")?["text"],
+                "hello"
+            );
+            assert_eq!(
+                session_rows(&open_connection(&fixture)?, "ses_other")?,
+                before_other
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn r03_delete_undo_restore_failures_keep_recovery_and_external_changes() -> AppResult<()> {
+        for operation in ["delete", "undo", "restore"] {
+            let fixture = fixture()?;
+            let first = apply_edit_text(
+                &fixture.locator,
+                "ses_target",
+                &backup_dir(&fixture),
+                0,
+                "edited",
+            )?;
+            FAIL_JOURNAL.set(true);
+            let report = match operation {
+                "delete" => {
+                    apply_delete(&fixture.locator, "ses_target", &backup_dir(&fixture), &[0])?
+                }
+                "undo" => undo_last(&fixture.locator, "ses_target", &backup_dir(&fixture))?,
+                _ => restore_snapshot(
+                    &fixture.locator,
+                    "ses_target",
+                    &backup_dir(&fixture),
+                    first.snapshot_created.as_deref().unwrap(),
+                )?,
+            };
+            assert_eq!(report.status, "needs_recovery");
+            let connection = open_connection(&fixture)?;
+            connection.execute(
+                "UPDATE part SET data=json_set(data,'$.text','external') WHERE id='part_u2'",
+                [],
+            )?;
+            let current = session_rows(&connection, "ses_target")?;
+            drop(connection);
+            let history = history(&fixture.locator, "ses_target", &backup_dir(&fixture))?;
+            assert!(!history.pending_operation.unwrap().can_reconcile);
+            assert!(reconcile(
+                &fixture.locator,
+                "ses_target",
+                &backup_dir(&fixture),
+                history.revision.as_deref()
+            )
+            .is_err());
+            assert_eq!(
+                session_rows(&open_connection(&fixture)?, "ses_target")?,
+                current
+            );
+        }
+        Ok(())
     }
 
     fn selection(

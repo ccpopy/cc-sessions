@@ -2011,9 +2011,19 @@ pub fn reconcile_session_edit_with_lock(
     expected_revision: Option<String>,
     lock: &crate::family::FamilyLock,
 ) -> AppResult<()> {
-    provider_normalized(&provider)?;
+    if provider != "opencode" {
+        provider_normalized(&provider)?;
+    }
     let roots = mutation_roots(&provider, &rollout_path, &backup_dir, &session_id)?;
     crate::family::with_roots(lock, &roots, |_| {
+        if provider == "opencode" {
+            return crate::opencode_edit::reconcile(
+                &rollout_path,
+                &session_id,
+                &backup_dir,
+                expected_revision.as_deref(),
+            );
+        }
         transaction::reconcile(
             &provider,
             Path::new(&rollout_path),
