@@ -103,8 +103,10 @@ pub fn move_session_cwd_with_options(
     let sequence = MOVE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let recovery_root = claude_dir.join(".cc-sessions-moves");
     ensure_plain_directory_path(&recovery_root, "Claude 迁移恢复目录")?;
+    // Recovery directories outlive the process; PID and sequence alone repeat across runs.
     let stage_root = recovery_root.join(format!(
-        ".ccsm-move-stage-{}-{sequence}",
+        ".ccsm-move-stage-{}-{}-{sequence}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%9fZ"),
         std::process::id()
     ));
     if stage_root.exists() {
@@ -841,6 +843,81 @@ mod tests {
         )
         .is_err());
         assert_eq!(fs::read_to_string(extra)?, "NEW-B");
+        fs::remove_dir_all(claude.parent().unwrap())?;
+        Ok(())
+    }
+
+    #[test]
+    fn leftover_stage_from_an_earlier_process_does_not_block_a_move() -> AppResult<()> {
+        let (claude, old, new) = fixture()?;
+        let source = claude_sessions::project_dir_for_cwd(&claude, old.to_str().unwrap())
+            .join("session-1.jsonl");
+        // Recovery material is retained, and PIDs and sequences repeat across runs.
+        let next = MOVE_SEQUENCE.load(Ordering::Relaxed);
+        for sequence in next..next + 256 {
+            fs::create_dir_all(claude.join(".cc-sessions-moves").join(format!(
+                ".ccsm-move-stage-{}-{sequence}",
+                std::process::id()
+            )))?;
+        }
+        move_session_cwd(
+            &claude,
+            "session-1",
+            Some(source.to_str().unwrap()),
+            new.to_str().unwrap(),
+        )?;
+        fs::remove_dir_all(claude.parent().unwrap())?;
+        Ok(())
+    }
+
+    #[test]
+    fn old_recovery_material_and_late_writes_survive_the_next_move() -> AppResult<()> {
+        let (claude, old, new) = fixture()?;
+        let source = claude_sessions::project_dir_for_cwd(&claude, old.to_str().unwrap())
+            .join("session-1.jsonl");
+        let moves = claude.join(".cc-sessions-moves");
+        let old_time =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(14 * 24 * 60 * 60);
+        for (name, status, aged) in [
+            ("expired", Some("committed"), true),
+            ("recent", Some("committed"), false),
+            ("failed", None, true),
+            ("unknown", Some("prepared"), true),
+        ] {
+            let dir = moves.join(name);
+            fs::create_dir_all(&dir)?;
+            fs::write(dir.join("source-transcript"), "copy")?;
+            if let Some(status) = status {
+                let path = dir.join("status.json");
+                fs::write(&path, serde_json::json!({ "status": status }).to_string())?;
+                if aged {
+                    File::options()
+                        .write(true)
+                        .open(&path)?
+                        .set_modified(old_time)?;
+                }
+            }
+        }
+        fs::write(
+            moves.join("expired/source-transcript"),
+            "late native append",
+        )?;
+        move_session_cwd(
+            &claude,
+            "session-1",
+            Some(source.to_str().unwrap()),
+            new.to_str().unwrap(),
+        )?;
+        for kept in ["expired", "recent", "failed", "unknown"] {
+            assert!(
+                moves.join(kept).join("source-transcript").exists(),
+                "{kept}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(moves.join("expired/source-transcript"))?,
+            "late native append"
+        );
         fs::remove_dir_all(claude.parent().unwrap())?;
         Ok(())
     }

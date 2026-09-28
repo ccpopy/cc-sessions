@@ -23,7 +23,7 @@ use crate::models::{
 use crate::paths;
 
 mod recovery;
-pub use recovery::reconcile;
+pub use recovery::{dismiss_conflict, reconcile};
 
 const SNAPSHOT_VERSION: u32 = 1;
 const JOURNAL_VERSION: u32 = 1;
@@ -1370,6 +1370,76 @@ mod tests {
 
     fn backup_dir(fixture: &Fixture) -> String {
         fixture.backup_dir.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn dismiss_conflict_checks_version_and_snapshot_identity_without_changing_database(
+    ) -> AppResult<()> {
+        let fixture = fixture()?;
+        FAIL_JOURNAL.set(true);
+        let report = apply_edit_text(
+            &fixture.locator,
+            "ses_target",
+            &backup_dir(&fixture),
+            0,
+            "saved",
+        )?;
+        let old = history(&fixture.locator, "ses_target", &backup_dir(&fixture))?;
+        let db = open_connection(&fixture)?;
+        db.execute(
+            "UPDATE part SET data=json_set(data,'$.text','external') WHERE id='part_u2'",
+            [],
+        )?;
+        let before = session_rows(&db, "ses_target")?;
+        drop(db);
+        let current = history(&fixture.locator, "ses_target", &backup_dir(&fixture))?;
+        let dismiss = |op: &str, revision: Option<&str>| {
+            dismiss_conflict(
+                &fixture.locator,
+                "ses_target",
+                &backup_dir(&fixture),
+                op,
+                revision,
+            )
+        };
+        assert!(dismiss(&report.op_id, old.revision.as_deref()).is_err());
+        assert!(dismiss("other-op", current.revision.as_deref()).is_err());
+        let dir = edit_dir(&backup_dir(&fixture), "ses_target");
+        let manifest = dir.join("pending-operation.json");
+        let original = fs::read(&manifest)?;
+        let mut wrong: Value = serde_json::from_slice(&original)?;
+        wrong["entry"]["before_hash"] = json!("wrong snapshot hash");
+        fs::write(&manifest, serde_json::to_vec(&wrong)?)?;
+        assert!(dismiss(&report.op_id, current.revision.as_deref())
+            .unwrap_err()
+            .to_string()
+            .contains("EDIT_IDENTITY"));
+        assert!(manifest.exists());
+        fs::write(&manifest, original)?;
+        dismiss(&report.op_id, current.revision.as_deref())?;
+        assert!(!manifest.exists());
+        assert_eq!(
+            session_rows(&open_connection(&fixture)?, "ses_target")?,
+            before
+        );
+        assert_eq!(
+            history(&fixture.locator, "ses_target", &backup_dir(&fixture))?
+                .snapshots
+                .len(),
+            current.snapshots.len()
+        );
+        assert!(fs::read_dir(&dir)?.flatten().any(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("pending-operation.json.dismissed-")));
+        apply_edit_text(
+            &fixture.locator,
+            "ses_target",
+            &backup_dir(&fixture),
+            0,
+            "next",
+        )?;
+        Ok(())
     }
 
     #[test]

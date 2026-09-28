@@ -307,7 +307,9 @@ export function PreviewDialog({
     try {
       const page = await api.previewPage(provider, rolloutPath, offset, limit, revisionRef.current);
       if (generation !== generationRef.current) return null;
-      revisionRef.current = page.capability?.revision ?? null;
+      // Paging may cross native appends. Keep writes tied to the original preview
+      // until a full refresh, since earlier pages can contain superseded snapshots.
+      revisionRef.current ??= page.capability?.revision ?? null;
       setCapability(page.capability);
       return page.events;
     } catch (error) {
@@ -1139,6 +1141,25 @@ export function PreviewDialog({
     }
   };
 
+  const dismissEditConflict = async (opId: string) => {
+    if (!session || !backupDir || !editHistory || mutationInFlightRef.current) return;
+    mutationInFlightRef.current = true;
+    setMutating(true);
+    try {
+      await api.dismissSessionEditConflict({ provider, rollout_path: rolloutPath, session_id: session.id,
+        backup_dir: backupDir, op_id: opId, expected_revision: editHistory.revision });
+      setLastReport(null);
+      await loadEditHistory();
+      await reloadPreservingView();
+      toast.info("已放弃未完成的操作清单；会话内容未修改，快照仍保留");
+    } catch (error) {
+      toast.error("放弃操作清单失败", { description: String((error as Error)?.message ?? error) });
+    } finally {
+      mutationInFlightRef.current = false;
+      setMutating(false);
+    }
+  };
+
   const editActions: EditActions = {
     enabled: canMutateSession,
     pending: mutating,
@@ -1593,6 +1614,7 @@ export function PreviewDialog({
       mutating={mutating}
       blockedReason={capability?.blocked_reasons.join("；") || readError || null}
       onReconcile={() => void reconcileEdit()}
+      onDismissConflict={(opId) => void dismissEditConflict(opId)}
       onOpenChange={setHistoryOpen}
       onUndo={() => void undoLastEdit()}
       onRestore={(snapshotName) => void restoreSnapshot(snapshotName)}

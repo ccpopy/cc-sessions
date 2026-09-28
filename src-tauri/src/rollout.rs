@@ -535,31 +535,31 @@ pub fn preview_session_page(
             expected_revision.as_deref(),
         );
     }
-    let capability = if matches!(provider.as_str(), "codex" | "claude") {
-        let capability = crate::edit::inspect_edit_capability(&provider, &rollout_path)?;
-        if expected_revision
-            .as_ref()
-            .is_some_and(|expected| expected != &capability.revision)
-        {
-            return Err(crate::error::AppError::Other(
-                "[EDIT_CONFLICT] 会话已更新，请刷新预览后重新选择".into(),
-            ));
-        }
-        Some(capability)
-    } else {
-        None
-    };
-    let events = preview_session_range(Some(provider), rollout_path.clone(), offset, limit)?;
-    if let Some(capability) = &capability {
-        if crate::atomic_file::fingerprint(Path::new(&rollout_path))?.sha256_hex()
-            != capability.file_sha256
-        {
-            return Err(crate::error::AppError::Other(
-                "[EDIT_CONFLICT] 会话在读取期间更新，请刷新预览".into(),
-            ));
+    if provider != "claude" {
+        let events = preview_session_range(Some(provider), rollout_path, offset, limit)?;
+        return Ok(crate::models::PreviewPage {
+            events,
+            capability: None,
+        });
+    }
+    let path = PathBuf::from(crate::paths::strip_verbatim(&rollout_path));
+    // Events and capability must describe the same bytes; a live session may append
+    // while the range is read, so retry a bounded number of times.
+    for _ in 0..3 {
+        let (_, capability) =
+            crate::edit::preview_capability(&provider, &path, expected_revision.as_deref())?;
+        let events =
+            preview_session_range(Some(provider.clone()), rollout_path.clone(), offset, limit)?;
+        if crate::atomic_file::fingerprint(&path)?.sha256_hex() == capability.file_sha256 {
+            return Ok(crate::models::PreviewPage {
+                events,
+                capability: Some(capability),
+            });
         }
     }
-    Ok(crate::models::PreviewPage { events, capability })
+    Err(crate::error::AppError::Other(
+        "[EDIT_CONFLICT] 会话正在持续更新，请稍后刷新预览".into(),
+    ))
 }
 
 fn preview_range_by_provider(
@@ -1088,6 +1088,77 @@ mod tests {
     }
 
     #[test]
+    fn live_append_keeps_versioned_paging_but_rewrite_conflicts() -> AppResult<()> {
+        for provider in ["codex", "claude"] {
+            let path = temp_file(&format!("live-append-{provider}"));
+            let lines = if provider == "codex" {
+                vec![
+                    serde_json::json!({"type":"session_meta","payload":{"id":"live","cwd":"/w"}}),
+                    serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"one"}]}}),
+                    serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"two"}]}}),
+                ]
+            } else {
+                vec![
+                    serde_json::json!({"type":"user","sessionId":"live","uuid":"u1","message":{"role":"user","content":"one"}}),
+                    serde_json::json!({"type":"assistant","sessionId":"live","uuid":"a1","message":{"role":"assistant","content":"two"}}),
+                ]
+            };
+            let mut file = File::create(&path)?;
+            for line in &lines {
+                writeln!(file, "{line}")?;
+            }
+            drop(file);
+            let first =
+                preview_session_page(provider.into(), path.to_string_lossy().into(), 0, 1, None)?;
+            let revision = first.capability.unwrap().revision;
+            // A running native session appends complete records between pages.
+            let appended = if provider == "codex" {
+                serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"three"}]}})
+            } else {
+                serde_json::json!({"type":"user","sessionId":"live","uuid":"u2","message":{"role":"user","content":"three"}})
+            };
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&path)?
+                .write_all(format!("{appended}\n").as_bytes())?;
+            let next = preview_session_page(
+                provider.into(),
+                path.to_string_lossy().into(),
+                1,
+                50,
+                Some(revision.clone()),
+            )?;
+            assert!(!next.events.is_empty());
+            let latest = next.capability.unwrap().revision;
+            assert_ne!(latest, revision);
+            assert!(crate::edit::plan_delete(
+                provider,
+                path.to_str().unwrap(),
+                &[1],
+                Some(&revision)
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("EDIT_CONFLICT"));
+            // Rewriting already displayed records still invalidates the preview.
+            let text = fs::read_to_string(&path)?.replacen("one", "ONE", 1);
+            fs::write(&path, text)?;
+            for stale in [revision, latest] {
+                assert!(preview_session_page(
+                    provider.into(),
+                    path.to_string_lossy().into(),
+                    1,
+                    50,
+                    Some(stale)
+                )
+                .is_err());
+            }
+            fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn paginated_preview_uses_canonical_messages_and_keeps_failed_turns() -> AppResult<()> {
         let path = temp_file("canonical-preview");
         let mut file = File::create(&path)?;
@@ -1126,10 +1197,8 @@ mod tests {
             preview_session_user_prompts(Some("codex".into()), path.to_string_lossy().into())?;
         assert_eq!(prompts.prompts.len(), 3, "失败回合的重复提问也必须保留");
         assert_eq!(prompts.prompts[0].response.as_ref().unwrap().text, "answer");
-        fs::OpenOptions::new()
-            .append(true)
-            .open(&path)?
-            .write_all(b"\n")?;
+        let rewritten = fs::read_to_string(&path)?.replacen("question", "QUESTION", 1);
+        fs::write(&path, rewritten)?;
         assert!(preview_session_page(
             "codex".into(),
             path.to_string_lossy().into(),

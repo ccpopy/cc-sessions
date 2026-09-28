@@ -979,6 +979,31 @@ pub async fn preview_session_range(
 }
 
 #[tauri::command]
+pub async fn dismiss_session_edit_conflict(
+    provider: String,
+    rollout_path: String,
+    session_id: String,
+    backup_dir: String,
+    op_id: String,
+    expected_revision: Option<String>,
+    lock: SharedLock<'_>,
+) -> AppResult<()> {
+    let lock = lock.inner().clone();
+    run_blocking(move || {
+        crate::edit::dismiss_session_edit_conflict_with_lock(
+            provider,
+            rollout_path,
+            session_id,
+            backup_dir,
+            op_id,
+            expected_revision,
+            &lock,
+        )
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn reconcile_session_edit(
     provider: String,
     rollout_path: String,

@@ -110,11 +110,11 @@ pub fn export_snapshot(cursor_dir: &Path, session_id: &str) -> AppResult<CursorS
 
     let composer_data = read_text(&connection, &format!("composerData:{session_id}"))?;
     let mut bubbles = Vec::new();
-    let data = composer_index(composer_data.as_deref())?;
-    for bubble in index_ids(&data, session_id)? {
-        let text = read_text(&connection, &format!("bubbleId:{session_id}:{bubble}"))?
-            .ok_or_else(|| snapshot_error("索引引用的气泡正文缺失，不能生成完整快照"))?;
-        bubbles.push((bubble, text));
+    for bubble in index_ids(composer_data.as_deref(), session_id)? {
+        // Cursor 会清理旧气泡正文；与预览一致跳过缺失正文，而不是拒绝整个会话。
+        if let Some(text) = read_text(&connection, &format!("bubbleId:{session_id}:{bubble}"))? {
+            bubbles.push((bubble, text));
+        }
     }
 
     let source_cwd = header
@@ -263,6 +263,11 @@ pub fn import_snapshot(
             "INSERT OR REPLACE INTO cursorDiskKV (key, value) VALUES (?1, ?2)",
             rusqlite::params![format!("composerData:{}", snapshot.session_id), data],
         )?;
+    } else {
+        transaction.execute(
+            "DELETE FROM cursorDiskKV WHERE key = ?1",
+            [format!("composerData:{}", snapshot.session_id)],
+        )?;
     }
     for (bubble, raw) in &snapshot.bubbles {
         transaction.execute(
@@ -296,8 +301,7 @@ fn validate_snapshot(snapshot: &CursorSessionSnapshot) -> AppResult<()> {
         };
         validate_owner(&snapshot_object(&raw)?, &snapshot.session_id)?;
     }
-    let data = composer_index(snapshot.composer_data.as_deref())?;
-    let expected = index_ids(&data, &snapshot.session_id)?
+    let expected = index_ids(snapshot.composer_data.as_deref(), &snapshot.session_id)?
         .into_iter()
         .collect::<BTreeSet<_>>();
     let mut actual = BTreeSet::new();
@@ -315,10 +319,9 @@ fn validate_snapshot(snapshot: &CursorSessionSnapshot) -> AppResult<()> {
             return Err(snapshot_error("气泡正文 ID 与快照键不一致"));
         }
     }
-    if actual != expected {
-        return Err(snapshot_error(
-            "气泡正文与索引引用不闭合，存在缺失或未引用的内容",
-        ));
+    // 被 Cursor 清理的正文可以缺失；索引之外的正文不属于该会话。
+    if !actual.is_subset(&expected) {
+        return Err(snapshot_error("快照包含未被会话索引引用的气泡正文"));
     }
     Ok(())
 }
@@ -348,16 +351,19 @@ fn validate_owner(value: &serde_json::Value, session_id: &str) -> AppResult<()> 
     Ok(())
 }
 
-fn composer_index(raw: Option<&str>) -> AppResult<serde_json::Value> {
-    snapshot_object(raw.ok_or_else(|| snapshot_error("缺少 composerData 正文索引"))?)
-}
-
-fn index_ids(data: &serde_json::Value, session_id: &str) -> AppResult<Vec<String>> {
-    validate_owner(data, session_id)?;
-    let entries = data
-        .get("fullConversationHeadersOnly")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| snapshot_error("缺少可验证的气泡索引数组"))?;
+/// 仅有会话头、或旧版内联 `conversation` 的会话没有气泡索引，也就没有独立正文。
+fn index_ids(raw: Option<&str>, session_id: &str) -> AppResult<Vec<String>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let data = snapshot_object(raw)?;
+    validate_owner(&data, session_id)?;
+    let Some(entries) = data.get("fullConversationHeadersOnly") else {
+        return Ok(Vec::new());
+    };
+    let entries = entries
+        .as_array()
+        .ok_or_else(|| snapshot_error("气泡索引不是数组"))?;
     let mut seen = BTreeSet::new();
     let mut ids = Vec::new();
     for entry in entries {
@@ -614,7 +620,6 @@ mod tests {
             "bubble-owner",
             "bubble-id",
             "duplicate",
-            "missing",
             "extra",
         ] {
             let mut bad = good.clone();
@@ -624,7 +629,6 @@ mod tests {
                 "bubble-owner" => bad.bubbles[0].1 = json!({"composerId":"other","bubbleId":"b1"}).to_string(),
                 "bubble-id" => bad.bubbles[0].1 = json!({"bubbleId":"b2"}).to_string(),
                 "duplicate" => bad.bubbles.push(bad.bubbles[0].clone()),
-                "missing" => { bad.bubbles.pop(); }
                 "extra" => bad.bubbles.push(("unreferenced".into(), "{}".into())),
                 _ => unreachable!(),
             }
@@ -647,30 +651,16 @@ mod tests {
     }
 
     #[test]
-    fn r01_export_does_not_call_missing_or_malformed_content_a_complete_snapshot() -> AppResult<()>
-    {
-        for kind in [
-            "missing-data",
-            "invalid-data",
-            "missing-bubble",
-            "invalid-bubble",
-        ] {
+    fn r01_export_rejects_malformed_content() -> AppResult<()> {
+        for kind in ["invalid-data", "invalid-bubble"] {
             let fixture = fixture(kind)?;
             let connection = Connection::open(cursor_sessions::state_db_path(&fixture.root))?;
             match kind {
-                "missing-data" => {
-                    connection
-                        .execute("DELETE FROM cursorDiskKV WHERE key='composerData:s1'", [])?;
-                }
                 "invalid-data" => {
                     connection.execute(
                         "UPDATE cursorDiskKV SET value='broken' WHERE key='composerData:s1'",
                         [],
                     )?;
-                }
-                "missing-bubble" => {
-                    connection
-                        .execute("DELETE FROM cursorDiskKV WHERE key='bubbleId:s1:b1'", [])?;
                 }
                 "invalid-bubble" => {
                     connection.execute(
@@ -682,6 +672,72 @@ mod tests {
             }
             assert!(export_snapshot(&fixture.root, "s1").is_err(), "{kind}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn header_only_restore_removes_stale_composer_content() -> AppResult<()> {
+        let _probe = crate::cursor_mutate::CursorRunningProbe::not_running();
+        let fixture = fixture("header-only-overwrite")?;
+        let mut snapshot = export_snapshot(&fixture.root, "s1")?;
+        snapshot.composer_data = None;
+        snapshot.bubbles.clear();
+        import_snapshot(&fixture.root, &snapshot, true)?;
+        let restored = export_snapshot(&fixture.root, "s1")?;
+        assert_eq!(restored.composer_data, None);
+        assert!(restored.bubbles.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn pruned_header_only_and_inline_sessions_round_trip() -> AppResult<()> {
+        // Cursor prunes bubble bodies and older versions lack the header index; the
+        // reader tolerates both, so backup and restore must as well.
+        let _probe = crate::cursor_mutate::CursorRunningProbe::not_running();
+        for kind in ["pruned-bubble", "header-only", "inline-conversation"] {
+            let fixture = fixture(kind)?;
+            let connection = Connection::open(cursor_sessions::state_db_path(&fixture.root))?;
+            match kind {
+                "pruned-bubble" => {
+                    connection
+                        .execute("DELETE FROM cursorDiskKV WHERE key='bubbleId:s1:b1'", [])?;
+                }
+                "header-only" => {
+                    connection.execute("DELETE FROM cursorDiskKV WHERE key LIKE '%s1%'", [])?;
+                }
+                _ => {
+                    connection.execute(
+                        "UPDATE cursorDiskKV SET value=?1 WHERE key='composerData:s1'",
+                        [json!({"conversation":[{"bubbleId":"b1","text":"第一条"}]}).to_string()],
+                    )?;
+                }
+            }
+            drop(connection);
+            let snapshot = export_snapshot(&fixture.root, "s1")?;
+            let expected = match kind {
+                "pruned-bubble" => vec!["b2"],
+                _ => vec![],
+            };
+            assert_eq!(
+                snapshot
+                    .bubbles
+                    .iter()
+                    .map(|(id, _)| id.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{kind}"
+            );
+            import_snapshot(&fixture.root, &snapshot, true)?;
+            assert_eq!(
+                export_snapshot(&fixture.root, "s1")?.bubbles,
+                snapshot.bubbles
+            );
+        }
+        // A 0.6.9 backup of a pruned session only contains the surviving bodies.
+        let fixture = fixture("legacy-backup")?;
+        let mut legacy = export_snapshot(&fixture.root, "s1")?;
+        legacy.bubbles.remove(0);
+        import_snapshot(&fixture.root, &legacy, true)?;
         Ok(())
     }
 }

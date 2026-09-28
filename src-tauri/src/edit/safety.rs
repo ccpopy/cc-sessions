@@ -8,6 +8,30 @@ pub(super) fn revision(path: &Path, file_hash: &str) -> AppResult<String> {
     ))
 }
 
+/// Read-only paging may continue across native appends: `expected` stays valid when
+/// it names a complete-line prefix of the current file. Mutations never use this.
+pub(super) fn is_appended_revision(
+    path: &Path,
+    loaded: &LoadedFile,
+    expected: &str,
+) -> AppResult<bool> {
+    let prefix = format!("{}\0", path.canonicalize()?.display());
+    let mut hash = Sha256::new();
+    for line in loaded
+        .lines
+        .iter()
+        .take(loaded.lines.len().saturating_sub(1))
+    {
+        hash.update(line.as_bytes());
+        hash.update(b"\n");
+        let file_hash = hex::encode(hash.clone().finalize());
+        if sha_hex(format!("{prefix}{file_hash}").as_bytes()) == expected {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub(super) fn check_revision(
     path: &Path,
     loaded: &LoadedFile,
@@ -177,6 +201,30 @@ pub(super) fn inspect(
     Ok(result)
 }
 
+/// Preview inspection plus checks too costly for every page: descendants are found
+/// only by opening every rollout, so this runs when planning or writing.
+pub(super) fn inspect_for_write(
+    provider: &str,
+    path: &Path,
+    loaded: &LoadedFile,
+) -> AppResult<EditCapability> {
+    let mut result = inspect(provider, path, loaded)?;
+    if provider == "codex" && result.format == "legacy" && result.blocked_reasons.is_empty() {
+        if let Some(root) = codex_root(path) {
+            if let Err(error) = inspect_descendants(
+                &root,
+                result.thread_id.as_deref().unwrap(),
+                &mut result.blocked_reasons,
+            ) {
+                result
+                    .blocked_reasons
+                    .push(format!("无法确认历史依赖，消息写入已禁用：{error}"));
+            }
+        }
+    }
+    Ok(result)
+}
+
 pub(super) fn codex_root(path: &Path) -> Option<PathBuf> {
     path.ancestors()
         .find(|p| {
@@ -213,6 +261,10 @@ fn inspect_dependencies(root: &Path, id: &str, blocked: &mut Vec<String>) -> App
             }
         }
     }
+    Ok(())
+}
+
+fn inspect_descendants(root: &Path, id: &str, blocked: &mut Vec<String>) -> AppResult<()> {
     for directory in [root.join("sessions"), root.join("archived_sessions")] {
         if !directory.try_exists()? {
             continue;
@@ -244,7 +296,7 @@ pub(super) fn ensure_writable(
     loaded: &LoadedFile,
     id: &str,
 ) -> AppResult<()> {
-    let capability = inspect(provider, path, loaded)?;
+    let capability = inspect_for_write(provider, path, loaded)?;
     if provider == "codex" && capability.thread_id.as_deref() != Some(id) {
         return Err(AppError::Other(
             "[EDIT_IDENTITY] 会话 ID 与日志元数据不一致，未执行修改".into(),

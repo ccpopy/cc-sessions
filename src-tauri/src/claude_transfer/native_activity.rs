@@ -38,6 +38,7 @@ pub(super) fn ensure_stopped() -> AppResult<()> {
 
 fn native_executable(path: &str) -> bool {
     let path = Path::new(path);
+    // Desktop embeds Code; do not exempt it without verifying how it reopens assets.
     matches!(
         path.file_name().and_then(|v| v.to_str()),
         Some("claude" | "claude-code" | "Claude")
@@ -98,6 +99,7 @@ pub(super) fn ensure_no_writers(files: &[(PathBuf, File)]) -> AppResult<()> {
         .ok_or_else(|| unknown("未安装 lsof"))?;
     // Keep argv bounded for large sidecars. Our own read handles act as sentinels:
     // no output is an incomplete probe, never evidence that the files are unoccupied.
+    // Sentinels prove only our handles are visible; warnings may signal other omissions.
     for chunk in files.chunks(64) {
         let output = run(Command::new(lsof)
             .args(["-nP", "+w", "-S2", "-F0pfa", "--"])
@@ -193,6 +195,10 @@ mod tests {
             "node /project/node_modules/@anthropic-ai/claude-agent-sdk/cli.js"
         ));
         assert!(!native_executable("/tmp/claude-transcript-viewer"));
+        assert!(native_executable(
+            "/Applications/Claude.app/Contents/MacOS/Claude"
+        ));
+        assert!(!native_command("/Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer"));
         assert!(!native_command("/bin/echo claude"));
         assert!(!native_command("node /tmp/claude-code/cli.js"));
     }
@@ -207,6 +213,7 @@ mod tests {
         assert!(check_handles(&output("", 1, ""), &expected).is_err());
         let handles = format!("p{}\0\nf7\0ar\0\nf8\0ar\0\n", std::process::id());
         assert!(check_handles(&output(&handles, 0, ""), &expected).is_ok());
+        assert!(check_handles(&output(&handles, 0, "permission denied"), &expected).is_err());
         assert!(check_handles(&output(&handles.replace("f8", "f9"), 0, ""), &expected).is_err());
         assert!(check_handles(&output(&handles.replace("ar", "a "), 0, ""), &expected).is_err());
         assert!(check_handles(

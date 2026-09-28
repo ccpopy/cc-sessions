@@ -435,6 +435,17 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             string_arg(&args, "sessionId")?,
             string_arg(&args, "backupDir")?,
         )),
+        "dismiss_session_edit_conflict" => {
+            to_result_value(edit::dismiss_session_edit_conflict_with_lock(
+                string_arg(&args, "provider")?,
+                string_arg(&args, "rolloutPath")?,
+                string_arg(&args, "sessionId")?,
+                string_arg(&args, "backupDir")?,
+                string_arg(&args, "opId")?,
+                opt_string_arg(&args, "expectedRevision")?,
+                &state.family_lock,
+            ))
+        }
         "reconcile_session_edit" => to_result_value(edit::reconcile_session_edit_with_lock(
             string_arg(&args, "provider")?,
             string_arg(&args, "rolloutPath")?,
@@ -1261,9 +1272,17 @@ mod tests {
             json!({"provider":"codex","rolloutPath":rollout,"offset":0,"limit":20}),
         )?;
         let mut args = json!({"provider":"codex","rolloutPath":rollout,"sessionId":"s","backupDir":root.join("backup"),"lineNos":[1]});
+        args["opId"] = json!("missing-operation");
+        assert!(
+            dispatch_invoke(&state, "dismiss_session_edit_conflict", args.clone())
+                .unwrap_err()
+                .to_string()
+                .contains("EDIT_CONFLICT")
+        );
         assert!(dispatch_invoke(&state, "delete_session_events", args.clone()).is_err());
         assert_eq!(fs::read(&rollout)?, before.as_bytes());
         args["expectedRevision"] = page["capability"]["revision"].clone();
+        dispatch_invoke(&state, "dismiss_session_edit_conflict", args.clone())?;
         let plan = dispatch_invoke(&state, "plan_session_event_deletion", args.clone())?;
         assert_eq!(plan["revision"], args["expectedRevision"]);
         let report = dispatch_invoke(&state, "delete_session_events", args.clone())?;

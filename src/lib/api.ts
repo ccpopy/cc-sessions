@@ -195,6 +195,7 @@ export type ContentSearchStatus = {
   scanned_files: number;
   total_files: number;
   skipped_files: number;
+  unreadable_files: number;
   scanned_bytes: number;
   total_bytes: number;
   results: ContentSearchResult[];
@@ -1633,6 +1634,11 @@ export const api = {
     invokeCommand<void>("reconcile_session_edit", {
       provider: p.provider, rolloutPath: p.rollout_path, sessionId: p.session_id,
       backupDir: p.backup_dir, expectedRevision: p.expected_revision,
+    }),
+  dismissSessionEditConflict: (p: { provider: string; rollout_path: string; session_id: string; backup_dir: string; op_id: string; expected_revision: string | null }) =>
+    invokeCommand<void>("dismiss_session_edit_conflict", {
+      provider: p.provider, rolloutPath: p.rollout_path, sessionId: p.session_id,
+      backupDir: p.backup_dir, opId: p.op_id, expectedRevision: p.expected_revision,
     }),
   sessionEditHistory: (p: {
     provider: string;

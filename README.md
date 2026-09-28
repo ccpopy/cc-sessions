@@ -329,7 +329,7 @@ Codex 归档视图会按归档来源分组：我的归档（手动归档，以�
 
 可以。CC Sessions 会同步更新会话和项目之间的关联，并在完成后检查结果。Claude Code 的相关会话文件和历史记录会一起处理，OpenCode 的子会话也会跟随主会话移动。这个功能不会移动你的项目源码，只会调整会话数据。建议移动前先创建备份。
 
-Linux / macOS 上迁移 Claude 会话前，请退出 Claude Code，包括后台及 IDE 中的 Claude 会话，完成前不要重新启动。迁移会检查进程和全部相关文件的写入占用；无法完成检查时不会继续。Linux 需要安装 `lsof`（Debian / Ubuntu 可运行 `sudo apt install lsof`），macOS 使用系统自带工具。检查属于离线迁移的活动协调，不是 Claude 原生会遵守的排他锁；源副本和恢复清单仍会保留。活动会话可优先使用客户端支持的原生 `/cd` 功能。
+Linux / macOS 上迁移 Claude 会话前，请退出 Claude Code，包括后台及 IDE 中的 Claude 会话，完成前不要重新启动。迁移会检查进程和全部相关文件的写入占用；无法完成检查时不会继续。Linux 需要安装 `lsof`（Debian / Ubuntu 可运行 `sudo apt install lsof`），macOS 使用系统自带工具。检查属于离线迁移的活动协调，不是 Claude 原生会遵守的排他锁；源副本和恢复清单仍会保留，不按时间自动删除，以免丢失旧句柄的晚到写入。活动会话可优先使用客户端支持的原生 `/cd` 功能。
 
 </details>
 

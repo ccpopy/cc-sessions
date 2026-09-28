@@ -24,6 +24,7 @@ type Props = {
   onRestore: (snapshotName: string) => void;
   blockedReason: string | null;
   onReconcile: () => void;
+  onDismissConflict: (opId: string) => void;
 };
 
 export function PreviewEditHistoryDialog({
@@ -35,8 +36,10 @@ export function PreviewEditHistoryDialog({
   onRestore,
   blockedReason,
   onReconcile,
+  onDismissConflict,
 }: Props) {
   const [restoreTarget, setRestoreTarget] = useState<string | null>(null);
+  const [dismissTarget, setDismissTarget] = useState<string | null>(null);
   return (
     <>
     <Dialog open={open} onOpenChange={(nextOpen) => !mutating && onOpenChange(nextOpen)}>
@@ -57,7 +60,12 @@ export function PreviewEditHistoryDialog({
                 <div className="mt-1 break-all font-mono">{history.pending_operation.op_id}</div>
                 <div>{history.pending_operation.description}</div>
                 <div className="mt-1">{history.pending_operation.status === "conflict" ? "文件已有其他变化，保留操作清单和快照，请在独立副本中核对。" : "只补齐或清理操作记录，不会再次修改会话内容。"}</div>
-                <Button className="mt-2 h-7 text-xs" disabled={mutating || !history.pending_operation.can_reconcile} onClick={onReconcile}>核对提交状态</Button>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <Button className="h-7 text-xs" disabled={mutating || !history.pending_operation.can_reconcile} onClick={onReconcile}>核对提交状态</Button>
+                  {history.pending_operation.status === "conflict" && (
+                    <Button variant="outline" className="h-7 text-xs" disabled={mutating} onClick={() => setDismissTarget(history.pending_operation!.op_id)}>放弃此操作清单</Button>
+                  )}
+                </div>
               </div>
             )}
             {blockedReason && <div className="text-xs text-muted-foreground">{blockedReason}</div>}
@@ -143,6 +151,19 @@ export function PreviewEditHistoryDialog({
         <AlertDialogFooter>
           <AlertDialogCancel disabled={mutating}>取消</AlertDialogCancel>
           <AlertDialogAction disabled={mutating} onClick={() => { if (restoreTarget) onRestore(restoreTarget); setRestoreTarget(null); }}>还原快照</AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+    <AlertDialog open={open && dismissTarget !== null} onOpenChange={(next) => !next && !mutating && setDismissTarget(null)}>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>放弃未完成的操作清单</AlertDialogTitle>
+          <AlertDialogDescription>会话在该操作之后已有其他变化，无法自动核对。仅在身份、当前版本和原生历史通过检查后归档操作清单；会话内容不会修改，快照继续保留。正文或投影仍不一致时会保留保护，此操作不能修复历史。</AlertDialogDescription>
+        </AlertDialogHeader>
+        <div className="break-all font-mono text-xs">{dismissTarget}</div>
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={mutating}>取消</AlertDialogCancel>
+          <AlertDialogAction disabled={mutating} onClick={() => { if (dismissTarget) onDismissConflict(dismissTarget); setDismissTarget(null); }}>放弃清单</AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>

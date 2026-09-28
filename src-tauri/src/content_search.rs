@@ -91,6 +91,7 @@ impl SearchManager {
                 scanned_files: 0,
                 total_files: 0,
                 skipped_files: 0,
+                unreadable_files: 0,
                 scanned_bytes: 0,
                 total_bytes: 0,
                 results: Vec::new(),
@@ -254,7 +255,15 @@ fn execute_search(job: &SearchJob, request: &SearchRequest) -> AppResult<()> {
     if job.cancel.load(Ordering::Acquire) {
         return Ok(());
     }
+    scan_sessions(job, sessions, &request.query, request.raw_events)
+}
 
+fn scan_sessions(
+    job: &SearchJob,
+    sessions: Vec<SessionSummary>,
+    query: &str,
+    raw_events: bool,
+) -> AppResult<()> {
     // Cursor 的 Composer 会话拿不到便宜的体积估计（`rollout_bytes` 为 0），
     // 每个会话至少记 1，进度条就退化成"扫到第几个会话"而不是原地不动。
     let total_bytes = sessions
@@ -272,13 +281,22 @@ fn execute_search(job: &SearchJob, request: &SearchRequest) -> AppResult<()> {
         if job.cancel.load(Ordering::Acquire) {
             return Ok(());
         }
-        let outcome = scan_session_mode(
-            job,
-            &session,
-            &request.query,
-            completed_bytes,
-            request.raw_events,
-        )?;
+        // 单个会话读取失败（坏行、继承源缺失等）只跳过该会话，不中断整次搜索。
+        let outcome = match scan_session_mode(job, &session, query, completed_bytes, raw_events) {
+            Ok(outcome) => outcome,
+            Err(AppError::Cancelled) => return Err(AppError::Cancelled),
+            Err(error) => {
+                completed_bytes = completed_bytes.saturating_add(session.rollout_bytes.max(1));
+                let mut status = job.status.lock().unwrap_or_else(|error| error.into_inner());
+                if status.unreadable_files == 0 {
+                    eprintln!("内容搜索跳过无法读取的会话 {}: {error}", session.id);
+                }
+                status.scanned_files += 1;
+                status.unreadable_files += 1;
+                status.scanned_bytes = completed_bytes.min(status.total_bytes);
+                continue;
+            }
+        };
         if outcome.cancelled {
             return Ok(());
         }
@@ -673,6 +691,7 @@ mod tests {
                 scanned_files: 0,
                 total_files: 1,
                 skipped_files: 0,
+                unreadable_files: 0,
                 scanned_bytes: 0,
                 total_bytes: u64::MAX,
                 results: Vec::new(),
@@ -680,6 +699,41 @@ mod tests {
                 error: None,
             })),
         }
+    }
+
+    #[test]
+    fn unreadable_session_is_skipped_without_failing_the_search() {
+        // A fork whose inherited source was deleted cannot be read logically.
+        let broken = temp_file(
+            "orphan-fork",
+            &[
+                json!({"type":"session_meta","payload":{"id":"fork","history_mode":"paginated","history_base":{"thread_id":"deleted-parent","end_ordinal_exclusive":1,"end_byte_offset":1}}}),
+            ],
+        );
+        let good = temp_file(
+            "readable",
+            &[
+                json!({"type":"session_meta","payload":{"id":"good"}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"needle here"}]}}),
+            ],
+        );
+        for raw_events in [false, true] {
+            let job = test_job();
+            job.status.lock().unwrap().total_files = 2;
+            scan_sessions(
+                &job,
+                vec![session("codex", &broken), session("codex", &good)],
+                "needle",
+                raw_events,
+            )
+            .unwrap();
+            let status = job.status.lock().unwrap();
+            assert_eq!(status.scanned_files, 2);
+            assert_eq!(status.unreadable_files, 1);
+            assert_eq!(status.results.len(), 1);
+        }
+        fs::remove_dir_all(broken.parent().unwrap()).unwrap();
+        fs::remove_dir_all(good.parent().unwrap()).unwrap();
     }
 
     #[test]

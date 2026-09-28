@@ -208,9 +208,9 @@ export function ContentSearchDialog({
     if (!status || status.total_bytes === 0) return 0;
     return Math.min(100, Math.round((status.scanned_bytes / status.total_bytes) * 100));
   }, [status]);
-  const skippedLabel = status?.skipped_files
-    ? `，跳过 ${status.skipped_files} 个无正文记录`
-    : "";
+  const skippedLabel =
+    (status?.skipped_files ? `，跳过 ${status.skipped_files} 个无正文记录` : "") +
+    (status?.unreadable_files ? `，${status.unreadable_files} 个会话无法读取已跳过` : "");
 
   const startSearch = async (event: FormEvent) => {
     event.preventDefault();

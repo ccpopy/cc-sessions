@@ -74,6 +74,26 @@ fn load_inspected(
     unreachable!()
 }
 
+/// Capability for the next preview page. Appends after `expected` keep earlier
+/// pages valid; the returned revision always describes the current bytes.
+pub(crate) fn preview_capability(
+    provider: &str,
+    path: &Path,
+    expected: Option<&str>,
+) -> AppResult<(std::sync::Arc<LoadedFile>, crate::models::EditCapability)> {
+    let (loaded, capability) = load_inspected(provider, path)?;
+    if let Some(expected) = expected {
+        if expected != capability.revision
+            && !safety::is_appended_revision(path, &loaded, expected)?
+        {
+            return Err(AppError::Other(
+                "[EDIT_CONFLICT] 会话已更新，请刷新预览后重新选择".into(),
+            ));
+        }
+    }
+    Ok((loaded, capability))
+}
+
 pub(crate) fn codex_preview_page(
     path: &str,
     offset: usize,
@@ -81,12 +101,7 @@ pub(crate) fn codex_preview_page(
     expected: Option<&str>,
 ) -> AppResult<crate::models::PreviewPage> {
     let path = PathBuf::from(paths::strip_verbatim(path));
-    let (loaded, capability) = load_inspected("codex", &path)?;
-    if expected.is_some_and(|revision| revision != capability.revision) {
-        return Err(AppError::Other(
-            "[EDIT_CONFLICT] 会话已更新，请刷新预览后重新选择".into(),
-        ));
-    }
+    let (loaded, capability) = preview_capability("codex", &path, expected)?;
     // Events and revision must describe exactly the same bytes, even if the
     // native writer appends throughout all bounded observation attempts.
     let canonical = paginated::is_paginated(&loaded);
@@ -1146,7 +1161,7 @@ pub fn plan_delete(
     let path = paths::strip_verbatim(rollout_path);
     let loaded = load_file(Path::new(&path))?;
     safety::check_revision(Path::new(&path), &loaded, expected_revision)?;
-    let capability = safety::inspect(provider, Path::new(&path), &loaded)?;
+    let capability = safety::inspect_for_write(provider, Path::new(&path), &loaded)?;
     let required_turns = if provider == "codex"
         && paginated::is_paginated(&loaded)
         && capability.blocked_reasons.is_empty()
@@ -2059,6 +2074,66 @@ pub fn reconcile_session_edit_with_lock(
     })
 }
 
+/// 放弃无法核对（conflict）的未完成操作清单，解除写入阻塞。清单改名归档而不删除，
+/// 快照原样保留，供人工核对；会话内容不做任何修改。
+pub fn dismiss_session_edit_conflict_with_lock(
+    provider: String,
+    rollout_path: String,
+    session_id: String,
+    backup_dir: String,
+    op_id: String,
+    expected_revision: Option<String>,
+    lock: &crate::family::FamilyLock,
+) -> AppResult<()> {
+    if provider != "opencode" {
+        provider_normalized(&provider)?;
+    }
+    let roots = mutation_roots(&provider, &rollout_path, &backup_dir, &session_id)?;
+    crate::family::with_roots(lock, &roots, |_| {
+        if provider == "opencode" {
+            return crate::opencode_edit::dismiss_conflict(
+                &rollout_path,
+                &session_id,
+                &backup_dir,
+                &op_id,
+                expected_revision.as_deref(),
+            );
+        }
+        transaction::dismiss_conflict(
+            &provider,
+            Path::new(&rollout_path),
+            &session_id,
+            &edit_dir(&backup_dir, &provider, &session_id),
+            &op_id,
+            expected_revision.as_deref(),
+        )
+    })
+}
+
+pub(crate) fn archive_pending_conflict(
+    dir: &Path,
+    pending: &crate::models::EditPendingOperation,
+    op_id: &str,
+) -> AppResult<()> {
+    if pending.op_id != op_id {
+        return Err(AppError::Other(
+            "[EDIT_IDENTITY] 未完成操作已变化，请刷新编辑历史后重试".into(),
+        ));
+    }
+    if pending.status != "conflict" {
+        return Err(AppError::Other(
+            "[EDIT_RECOVERY_REQUIRED] 该操作仍可核对，请使用“核对提交状态”".into(),
+        ));
+    }
+    // 不以 .json/.jsonl 结尾，避免被编辑历史当作可还原快照列出。
+    let archived = dir.join(format!(
+        "pending-operation.json.dismissed-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%9fZ")
+    ));
+    atomic_file::rename_file_no_replace(&dir.join("pending-operation.json"), &archived)?;
+    Ok(())
+}
+
 // ========================= 测试 =========================
 
 #[cfg(test)]
@@ -2087,6 +2162,45 @@ mod tests {
             "unchanged second page reread the entire rollout"
         );
         assert!(cached.cache_hits > 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_preview_skips_descendant_scan_but_writes_still_check_it() {
+        let root = temp_dir("descendant-scan");
+        let path = root.join("sessions/2026/09/28/rollout-2026-09-28T00-00-00-sess-1.jsonl");
+        write_jsonl(&path, &codex_fixture());
+        let child = root.join("sessions/2026/09/28/rollout-2026-09-28T00-00-01-child.jsonl");
+        write_jsonl(
+            &child,
+            &[
+                json!({"type":"session_meta","payload":{"id":"child","history_mode":"paginated","history_base":{"thread_id":"sess-1","end_ordinal_exclusive":1,"end_byte_offset":1}}}),
+            ],
+        );
+        // Paging must not open every rollout in the data root; writes still do.
+        let page = codex_preview_page(path.to_str().unwrap(), 0, 2, None).unwrap();
+        let capability = page.capability.unwrap();
+        assert!(capability.blocked_reasons.is_empty());
+        let plan = super::plan_delete(
+            "codex",
+            path.to_str().unwrap(),
+            &[1],
+            Some(&capability.revision),
+        )
+        .unwrap();
+        assert!(plan.blocked.iter().any(|r| r.contains("共享历史")));
+        let before = read_bytes(&path);
+        let error = super::apply_delete(
+            "codex",
+            path.to_str().unwrap(),
+            "sess-1",
+            root.join("backup").to_str().unwrap(),
+            &[1],
+            Some(&capability.revision),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("共享历史"));
+        assert_eq!(read_bytes(&path), before);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2210,6 +2324,142 @@ mod tests {
     }
 
     #[test]
+    fn unreconcilable_pending_operation_can_be_dismissed_without_losing_material() {
+        let root = temp_dir("dismiss-pending");
+        let path = root.join("rollout.jsonl");
+        let backup = root.join("backup");
+        write_jsonl(&path, &codex_fixture());
+        transaction::FAIL_AFTER_ROLLOUT.with(|flag| flag.set(true));
+        let report = apply_delete(
+            "codex",
+            path.to_str().unwrap(),
+            "sess-1",
+            backup.to_str().unwrap(),
+            &[2],
+        )
+        .unwrap();
+        let dir = edit_dir(backup.to_str().unwrap(), "codex", "sess-1");
+        // A reconcilable manifest must go through reconcile, not be dismissed.
+        let initial_revision = safety::revision(&path, &load_file(&path).unwrap().hash).unwrap();
+        assert!(transaction::dismiss_conflict(
+            "codex",
+            &path,
+            "sess-1",
+            &dir,
+            &report.op_id,
+            Some(&initial_revision)
+        )
+        .is_err());
+        // The native session continues after the interrupted commit.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"type\":\"event_msg\",\"payload\":{\"type\":\"token_count\"}}\n")
+            .unwrap();
+        assert_eq!(
+            transaction::pending_summary(&dir, &path)
+                .unwrap()
+                .unwrap()
+                .status,
+            "conflict"
+        );
+        let snapshots = history(
+            "codex",
+            path.to_str().unwrap(),
+            "sess-1",
+            backup.to_str().unwrap(),
+        )
+        .unwrap()
+        .snapshots
+        .len();
+        let revision = safety::revision(&path, &load_file(&path).unwrap().hash).unwrap();
+        assert!(transaction::dismiss_conflict(
+            "codex",
+            &path,
+            "sess-1",
+            &dir,
+            &report.op_id,
+            Some(&initial_revision)
+        )
+        .is_err());
+        assert!(transaction::dismiss_conflict(
+            "codex",
+            &path,
+            "sess-1",
+            &dir,
+            "other-op",
+            Some(&revision)
+        )
+        .is_err());
+        assert!(transaction::dismiss_conflict(
+            "claude",
+            &path,
+            "sess-1",
+            &dir,
+            &report.op_id,
+            Some(&revision)
+        )
+        .is_err());
+        assert!(transaction::dismiss_conflict(
+            "codex",
+            &path,
+            "another",
+            &dir,
+            &report.op_id,
+            Some(&revision)
+        )
+        .is_err());
+        let other_path = root.join("other.jsonl");
+        write_jsonl(&other_path, &codex_fixture());
+        let other_revision =
+            safety::revision(&other_path, &load_file(&other_path).unwrap().hash).unwrap();
+        assert!(transaction::dismiss_conflict(
+            "codex",
+            &other_path,
+            "sess-1",
+            &dir,
+            &report.op_id,
+            Some(&other_revision)
+        )
+        .is_err());
+        let before = read_bytes(&path);
+        transaction::dismiss_conflict(
+            "codex",
+            &path,
+            "sess-1",
+            &dir,
+            &report.op_id,
+            Some(&revision),
+        )
+        .unwrap();
+        assert_eq!(read_bytes(&path), before);
+        assert!(!dir.join("pending-operation.json").exists());
+        assert!(fs::read_dir(&dir).unwrap().flatten().any(|entry| entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("pending-operation.json.dismissed-")));
+        let history = history(
+            "codex",
+            path.to_str().unwrap(),
+            "sess-1",
+            backup.to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(history.pending_operation.is_none());
+        assert_eq!(history.snapshots.len(), snapshots);
+        apply_delete(
+            "codex",
+            path.to_str().unwrap(),
+            "sess-1",
+            backup.to_str().unwrap(),
+            &[2],
+        )
+        .unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn codex_capability_blocks_metadata_modes_projection_and_shared_children() {
         for scenario in [
             "paginated",
@@ -2255,8 +2505,11 @@ mod tests {
             }
             let before = read_bytes(&path);
             let result = inspect_edit_capability("codex", path.to_str().unwrap());
+            // Descendants are only scanned when writing; preview stays per-file.
             assert!(
-                result.is_err() || !result.unwrap().blocked_reasons.is_empty(),
+                scenario == "child"
+                    || result.is_err()
+                    || !result.unwrap().blocked_reasons.is_empty(),
                 "{scenario}"
             );
             assert!(

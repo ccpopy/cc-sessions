@@ -82,12 +82,16 @@ pub(super) fn commit(
     Ok(finish.err().map(|error| format!("[EDIT_RECOVERY] 本地修改已提交，编辑记录或清理未完成：{error}。请核对提交状态，不要重复操作。")))
 }
 
-fn state(dir: &Path, current: &SessionSnapshot, entry: &JournalEntry) -> AppResult<&'static str> {
+fn matching_identity(
+    dir: &Path,
+    current: &SessionSnapshot,
+    entry: &JournalEntry,
+) -> AppResult<bool> {
     let (database, session) = resolve_context(&entry.rollout_path, &entry.session_id)?;
     if session != current.session_id
         || database.canonicalize()? != Path::new(&current.database_path).canonicalize()?
     {
-        return Ok("conflict");
+        return Ok(false);
     }
     for (relative, hash) in [
         (&entry.before_snapshot, &entry.before_hash),
@@ -98,8 +102,15 @@ fn state(dir: &Path, current: &SessionSnapshot, entry: &JournalEntry) -> AppResu
             || snapshot.hash != *hash
             || Path::new(&snapshot.database_path).canonicalize()? != database.canonicalize()?
         {
-            return Ok("conflict");
+            return Ok(false);
         }
+    }
+    Ok(true)
+}
+
+fn state(dir: &Path, current: &SessionSnapshot, entry: &JournalEntry) -> AppResult<&'static str> {
+    if !matching_identity(dir, current, entry)? {
+        return Ok("conflict");
     }
     let journal = read_journal(dir)?;
     if journal
@@ -158,4 +169,32 @@ pub fn reconcile(locator: &str, id: &str, backup: &str, expected: Option<&str>) 
     }
     fs::remove_file(dir.join(PENDING))?;
     Ok(())
+}
+
+/// Lift the write block of a manifest that can no longer be reconciled; never touches the database.
+pub fn dismiss_conflict(
+    locator: &str,
+    id: &str,
+    backup: &str,
+    op_id: &str,
+    expected: Option<&str>,
+) -> AppResult<()> {
+    let (database, session) = resolve_context(locator, id)?;
+    let connection = open_readonly(&database)?;
+    let tx = connection.unchecked_transaction()?;
+    let current = load_snapshot(&tx, &database, &session)?;
+    check_revision(&current, expected)?;
+    let dir = edit_dir(backup, id);
+    let Some(pending) = read(&dir)? else {
+        return Ok(());
+    };
+    if !matching_identity(&dir, &current, &pending.entry)? {
+        return Err(AppError::Other(
+            "[EDIT_IDENTITY] 操作清单或恢复快照与目标会话不一致，已保留".into(),
+        ));
+    }
+    match summary(&dir, &current)? {
+        Some(pending) => crate::edit::archive_pending_conflict(&dir, &pending, op_id),
+        None => Ok(()),
+    }
 }

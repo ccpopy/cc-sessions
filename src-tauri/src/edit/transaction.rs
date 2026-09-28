@@ -218,6 +218,57 @@ pub(super) fn reconcile(
     Ok(())
 }
 
+/// Lift the write block of a manifest that can no longer be reconciled.
+pub(super) fn dismiss_conflict(
+    provider: &str,
+    path: &Path,
+    id: &str,
+    dir: &Path,
+    op_id: &str,
+    expected: Option<&str>,
+) -> AppResult<()> {
+    let loaded = load_file(path)?;
+    safety::check_revision(path, &loaded, expected)?;
+    let Some(entry) = pending(dir)? else {
+        return Ok(());
+    };
+    if entry.provider != provider
+        || entry.session_id != id
+        || Path::new(&entry.rollout_path).canonicalize()? != path.canonicalize()?
+    {
+        return Err(AppError::Other(
+            "[EDIT_IDENTITY] 操作清单与目标会话不一致".into(),
+        ));
+    }
+    if let Some(history) = &entry.history {
+        validate_history_path(history, path)?;
+        let db = paginated::projection::open(&history.path, false)?;
+        history.capture_current(&db, id)?;
+    }
+    // Archiving intent does not repair content. In particular an interrupted JSONL/
+    // projection commit must remain blocked until native history agrees again.
+    safety::ensure_writable(provider, path, &loaded, id)?;
+    if provider == "codex"
+        && paginated::is_paginated(&loaded)
+        && paginated::diagnostics(&loaded)?
+            .iter()
+            .any(|d| d.status == "inconsistent")
+    {
+        return Err(AppError::Other(
+            "[EDIT_INCONSISTENT] 正文仍不一致，已保留操作清单；请先在独立副本核对".into(),
+        ));
+    }
+    if atomic_file::fingerprint(path)?.sha256_hex() != loaded.hash {
+        return Err(AppError::Other(
+            "[EDIT_CONFLICT] 会话在核对期间更新，请刷新编辑历史".into(),
+        ));
+    }
+    match pending_summary(dir, path)? {
+        Some(pending) => archive_pending_conflict(dir, &pending, op_id),
+        None => Ok(()),
+    }
+}
+
 fn validate_history_path(history: &paginated::HistoryChange, rollout: &Path) -> AppResult<()> {
     if history.path.canonicalize()? != paginated::projection::path(rollout)?.canonicalize()? {
         return Err(AppError::Other(

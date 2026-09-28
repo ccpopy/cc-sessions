@@ -1077,6 +1077,52 @@ fn paginated_user_and_assistant_rewrite_preserve_nontext_blocks() {
 }
 
 #[test]
+fn paginated_conflict_cannot_discard_uncommitted_projection() {
+    let f = Fixture::new();
+    let items = f.items();
+    transaction::FAIL_AFTER_ROLLOUT.with(|flag| flag.set(true));
+    let report = f.delete(&[9]).unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&f.path)
+        .unwrap()
+        .write_all(b"{\"ordinal\":19,\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_settings_applied\"}}\n")
+        .unwrap();
+    let dir = edit_dir(f.backup.to_str().unwrap(), "codex", "thread-1");
+    assert!(transaction::dismiss_conflict(
+        "codex",
+        &f.path,
+        "thread-1",
+        &dir,
+        &report.op_id,
+        Some(&f.revision())
+    )
+    .is_err());
+    assert!(dir.join("pending-operation.json").exists());
+    assert_eq!(f.items(), items);
+    // Simulate completed native synchronization on this isolated fixture. Keeping
+    // protection before that must not prevent explicit dismissal afterwards.
+    let entry: JournalEntry =
+        serde_json::from_slice(&fs::read(dir.join("pending-operation.json")).unwrap()).unwrap();
+    let history = entry.history.unwrap();
+    let loaded = load_file(&f.path).unwrap();
+    let synchronized = super::projection::project(&loaded, &history.after).unwrap();
+    let db = super::projection::open(&history.path, true).unwrap();
+    super::projection::replace(&db, "thread-1", &synchronized).unwrap();
+    transaction::dismiss_conflict(
+        "codex",
+        &f.path,
+        "thread-1",
+        &dir,
+        &report.op_id,
+        Some(&f.revision()),
+    )
+    .unwrap();
+    assert!(!dir.join("pending-operation.json").exists());
+    assert!(!f.items().contains("DELETE-B"));
+}
+
+#[test]
 fn paginated_append_lock_and_interruption_recovery_preserve_history() {
     let f = Fixture::new();
     let original = fs::read(&f.path).unwrap();

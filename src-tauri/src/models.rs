@@ -209,6 +209,8 @@ pub struct ContentSearchStatus {
     pub scanned_files: usize,
     pub total_files: usize,
     pub skipped_files: usize,
+    /// 读取失败（坏行、继承源缺失等）而跳过的会话数。
+    pub unreadable_files: usize,
     pub scanned_bytes: u64,
     pub total_bytes: u64,
     pub results: Vec<ContentSearchResult>,
