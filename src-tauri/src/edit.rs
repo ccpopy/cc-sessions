@@ -2158,9 +2158,10 @@ mod tests {
         assert!(!second.events.is_empty());
         assert!(initial.read_bytes > 0);
         assert_eq!(
-            cached.read_bytes, 0,
-            "unchanged second page reread the entire rollout"
+            cached.read_bytes, initial.read_bytes,
+            "unchanged second page verifies the current bytes once"
         );
+        assert_eq!(cached.parsed_lines, 0, "unchanged JSON is not reparsed");
         assert!(cached.cache_hits > 0);
         fs::remove_dir_all(root).unwrap();
     }

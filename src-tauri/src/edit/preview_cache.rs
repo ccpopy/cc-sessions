@@ -116,12 +116,6 @@ pub(super) fn read(path: &Path, cancel: Option<&AtomicBool>) -> AppResult<Arc<Lo
                 (e.stamp.clone(), e.loaded.clone())
             })
         };
-        if let Some((previous, loaded)) = &prior {
-            if *previous == before {
-                crate::operation_metrics::record(|c| c.cache_hits += 1);
-                return Ok(loaded.clone());
-            }
-        }
         let mut file = fs::File::open(&path)?;
         let mut raw = Vec::new();
         let mut chunk = [0u8; 64 * 1024];
@@ -138,6 +132,14 @@ pub(super) fn read(path: &Path, cancel: Option<&AtomicBool>) -> AppResult<Arc<Lo
             continue;
         }
         let hash = sha_hex(&raw);
+        // Size and mtime can stay identical across a rewrite (including rapid
+        // Windows writes). Reuse JSON parses only after checking the actual bytes.
+        if let Some((previous, loaded)) = &prior {
+            if *previous == before && loaded.hash == hash {
+                crate::operation_metrics::record(|c| c.cache_hits += 1);
+                return Ok(loaded.clone());
+            }
+        }
         let append = prior.as_ref().filter(|(previous, loaded)| {
             previous.identity == before.identity
                 && previous.len < before.len
@@ -245,6 +247,29 @@ mod tests {
             serde_json::to_vec_pretty(&report).unwrap(),
         )
         .unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn same_size_and_timestamp_rewrite_invalidates_cached_preview() {
+        let root = super::super::tests::temp_dir("cache-same-stamp");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout.jsonl");
+        fs::write(&path, "{\"text\":\"before\"}\n").unwrap();
+        let previous_stamp = stamp(&path).unwrap();
+        let first = read(&path, None).unwrap();
+        fs::write(&path, "{\"text\":\"edited\"}\n").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(previous_stamp.modified)
+            .unwrap();
+        assert_eq!(stamp(&path).unwrap().modified, previous_stamp.modified);
+        let next = read(&path, None).unwrap();
+        assert_ne!(next.hash, first.hash);
+        assert_eq!(next.parsed[0].as_ref().unwrap()["text"], "edited");
+        assert_eq!(first.parsed[0].as_ref().unwrap()["text"], "before");
         fs::remove_dir_all(root).unwrap();
     }
 
