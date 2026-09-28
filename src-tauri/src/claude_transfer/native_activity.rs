@@ -198,7 +198,9 @@ mod tests {
         assert!(native_executable(
             "/Applications/Claude.app/Contents/MacOS/Claude"
         ));
-        assert!(!native_command("/Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer"));
+        // ps args does not delimit an executable containing spaces. A native-name
+        // prefix stays busy rather than treating an ambiguous path as idle.
+        assert!(native_command("/Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer"));
         assert!(!native_command("/bin/echo claude"));
         assert!(!native_command("node /tmp/claude-code/cli.js"));
     }

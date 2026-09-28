@@ -26,6 +26,10 @@ export function useSessions(provider: SessionProvider, query: string) {
 
   const refresh = useCallback((options: { afterMutation?: boolean } = {}): Promise<void> => {
     if (scopeRef.current !== scope) return Promise.resolve();
+    if (timer.current !== null) {
+      window.clearTimeout(timer.current);
+      timer.current = null;
+    }
     if (options.afterMutation) generation.current += 1;
     const active = inFlight.current;
     if (active?.scope === scope) return active.promise;

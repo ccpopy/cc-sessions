@@ -18,6 +18,12 @@ async function fixture(t: TestContext) {
   const dom = new JSDOM("<div id='root'></div>", { url: "http://localhost" });
   const previous = { window: globalThis.window, document: globalThis.document };
   Object.assign(globalThis, { window: dom.window, document: dom.window.document, IS_REACT_ACT_ENVIRONMENT: true });
+  let timerId = 0;
+  const timers = new Map<number, () => void>();
+  t.mock.method(dom.window, "setTimeout", (callback: () => void) => {
+    timers.set(++timerId, callback); return timerId;
+  });
+  t.mock.method(dom.window, "clearTimeout", (id: number) => timers.delete(id));
   useSettings.setState({ settings: { codex_dir: "fixture", claude_dir: "claude" } as Settings });
   const requests: ReturnType<typeof deferred<SessionSummary[]>>[] = [];
   t.mock.method(api, "listSessions", () => {
@@ -35,11 +41,12 @@ async function fixture(t: TestContext) {
   await render("codex");
   // Explicit initial refresh avoids timer-based request races in the test itself.
   await act(async () => { void controller.refresh(); await Promise.resolve(); });
-  return { requests, render, current: () => controller, click: async () => { await act(async () => { document.querySelector("button")!.click(); }); } };
+  return { requests, render, timers, current: () => controller, click: async () => { await act(async () => { document.querySelector("button")!.click(); }); } };
 }
 
 test("a real click after mutation discards the old list and awaits a new request", async (t) => {
   const f = await fixture(t);
+  assert.equal(f.timers.size, 0, "manual refresh cancels the pending initial debounce");
   assert.equal(f.requests.length, 1);
   await f.click();
   await act(async () => { f.requests[0].resolve([row("before")]); });
