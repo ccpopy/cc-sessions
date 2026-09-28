@@ -735,6 +735,15 @@ mod tests {
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+    fn temp_directory() -> std::io::Result<PathBuf> {
+        // macOS TMPDIR commonly traverses /var -> /private/var. Use a plain
+        // physical fixture root so the move's symlink protection stays enabled.
+        #[cfg(unix)]
+        return std::env::temp_dir().canonicalize();
+        #[cfg(not(unix))]
+        Ok(std::env::temp_dir())
+    }
+
     #[test]
     fn r04_stage_append_cannot_be_lost_by_move() -> AppResult<()> {
         for sidecar in [false, true] {
@@ -858,7 +867,7 @@ mod tests {
     }
 
     pub(super) fn fixture() -> AppResult<(PathBuf, PathBuf, PathBuf)> {
-        let root = std::env::temp_dir().join(format!(
+        let root = temp_directory()?.join(format!(
             "cc-sessions-claude-move-{}-{}",
             std::process::id(),
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
@@ -913,7 +922,7 @@ mod tests {
 
     #[test]
     fn move_rewrites_in_place_when_only_the_recorded_cwd_needs_normalizing() -> AppResult<()> {
-        let root = std::env::temp_dir().join(format!(
+        let root = temp_directory()?.join(format!(
             "cc-sessions-claude-normalize-in-place-{}-{}",
             std::process::id(),
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
