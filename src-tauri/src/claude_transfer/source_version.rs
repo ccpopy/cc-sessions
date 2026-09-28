@@ -40,23 +40,48 @@ pub(super) fn conflict() -> AppError {
     )
 }
 
-/// Windows rejects existing and new writable handles during publication. On Unix a
-/// portable advisory lock cannot exclude native writers, so source backups are retained.
+pub(super) struct Guard {
+    // Hold read handles through publication. On Unix they also prove lsof coverage.
+    files: Vec<(PathBuf, File)>,
+}
+
+pub(super) enum Location {
+    Source,
+    Backup,
+    Destination,
+}
+
+impl Guard {
+    pub(super) fn recheck(&self) -> AppResult<()> {
+        #[cfg(unix)]
+        {
+            native_activity::ensure_stopped()?;
+            native_activity::ensure_no_writers(&self.files)?;
+        }
+        #[cfg(not(unix))]
+        let _ = &self.files;
+        Ok(())
+    }
+}
+
+/// Windows rejects writable handles; Unix requires Claude to be closed and probes
+/// all assets for writers at each publication boundary. Neither is a native session
+/// lock protocol: retain source backups, and never infer inactivity from timestamps.
 pub(super) fn guard(
     artifacts: &[MoveArtifact],
     versions: &[Version],
-    backed_up: bool,
-) -> AppResult<Vec<File>> {
+    location: Location,
+) -> AppResult<Guard> {
     let mut handles = Vec::new();
     for (asset, version) in artifacts.iter().zip(versions) {
         for (relative, hash) in version {
             if hash.is_none() {
                 continue;
             }
-            let root = if backed_up {
-                &asset.backup
-            } else {
-                &asset.source
+            let root = match location {
+                Location::Source => &asset.source,
+                Location::Backup => &asset.backup,
+                Location::Destination => &asset.destination,
             };
             let path = if relative.as_os_str().is_empty() {
                 root.clone()
@@ -70,12 +95,19 @@ pub(super) fn guard(
                 use std::os::windows::fs::OpenOptionsExt;
                 options.share_mode(0x1 | 0x4);
             }
-            handles.push(options.open(path).map_err(|_| {
-                AppError::Other(
-                    "[SESSION_BUSY] Claude 会话文件被写入进程占用，请停止对应会话后重试".into(),
-                )
-            })?);
+            let file = options.open(&path).map_err(|error| {
+                #[cfg(windows)]
+                if matches!(error.raw_os_error(), Some(32 | 33)) {
+                    return AppError::Other(
+                        "[SESSION_BUSY] Claude 会话文件被写入进程占用，请停止对应会话后重试".into(),
+                    );
+                }
+                AppError::Other(format!("无法打开 Claude 迁移资产进行占用检查：{error}"))
+            })?;
+            handles.push((path, file));
         }
     }
-    Ok(handles)
+    let guard = Guard { files: handles };
+    guard.recheck()?;
+    Ok(guard)
 }

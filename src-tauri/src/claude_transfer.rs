@@ -11,13 +11,19 @@ use crate::error::{AppError, AppResult};
 use crate::models::MoveSessionCwdReport;
 use crate::{claude_sessions, paths};
 
+#[cfg(unix)]
+mod native_activity;
 mod source_version;
+#[cfg(all(test, unix))]
+mod unix_tests;
 
 static MOVE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 thread_local! {
     static AFTER_STAGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static AFTER_DETACH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static AFTER_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Debug)]
@@ -90,6 +96,8 @@ pub fn move_session_cwd_with_options(
         });
     }
 
+    #[cfg(unix)]
+    native_activity::ensure_stopped()?;
     ensure_plain_directory(&paths::claude_projects_dir(claude_dir), "Claude projects")?;
     ensure_plain_directory_path(&destination_project, "Claude 目标项目目录")?;
     let sequence = MOVE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -189,6 +197,10 @@ pub fn move_session_cwd_with_options(
                 copy_regular_file(&artifact.source, &artifact.stage)?;
             }
         }
+        let staged_versions = artifacts
+            .iter()
+            .map(|asset| source_version::capture(&asset.stage))
+            .collect::<AppResult<Vec<_>>>()?;
 
         #[cfg(test)]
         AFTER_STAGE.with(|hook| {
@@ -196,7 +208,8 @@ pub fn move_session_cwd_with_options(
                 hook();
             }
         });
-        let _guards = source_version::guard(&artifacts, &versions, false)?;
+        let _guards =
+            source_version::guard(&artifacts, &versions, source_version::Location::Source)?;
         if path_exists(&source_sidecar)? != source_sidecar_existed
             || claude_sessions::companion_files_for(&source_transcript)? != companions
         {
@@ -217,10 +230,21 @@ pub fn move_session_cwd_with_options(
             }
         }
 
-        let mut backup_guards = Some(match source_version::guard(&artifacts, &versions, true) {
-            Ok(guards) => guards,
-            Err(error) => return Err(with_rollback(error, rollback_source_backups(&artifacts))),
+        #[cfg(test)]
+        AFTER_DETACH.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
         });
+
+        let mut backup_guards = Some(
+            match source_version::guard(&artifacts, &versions, source_version::Location::Backup) {
+                Ok(guards) => guards,
+                Err(error) => {
+                    return Err(with_rollback(error, rollback_source_backups(&artifacts)))
+                }
+            },
+        );
         for (asset, version) in artifacts.iter().zip(&versions) {
             if let Err(error) = source_version::check(&asset.backup, version) {
                 drop(backup_guards.take());
@@ -229,6 +253,21 @@ pub fn move_session_cwd_with_options(
         }
         let mut published = 0usize;
         for artifact in &artifacts {
+            let boundary = backup_guards.as_ref().unwrap().recheck().and_then(|_| {
+                check_detached_sources(
+                    &artifacts,
+                    published,
+                    &source_sidecar,
+                    source_sidecar_existed,
+                )
+            });
+            if let Err(error) = boundary {
+                drop(backup_guards.take());
+                return Err(with_rollback(
+                    error,
+                    rollback_published(&artifacts[..published], &artifacts),
+                ));
+            }
             if let Some(parent) = artifact.destination.parent() {
                 if let Err(error) = fs::create_dir_all(parent) {
                     drop(backup_guards.take());
@@ -245,6 +284,13 @@ pub fn move_session_cwd_with_options(
             }
             published += 1;
         }
+
+        #[cfg(test)]
+        AFTER_PUBLISH.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
 
         let verify_path = if transcript_stays_in_place {
             &source_transcript
@@ -275,20 +321,32 @@ pub fn move_session_cwd_with_options(
             ));
         }
 
-        for (asset, version) in artifacts.iter().zip(&versions) {
-            if let Err(error) = source_version::check(&asset.backup, version) {
-                drop(backup_guards.take());
-                return Err(with_rollback(
-                    error,
-                    rollback_published(&artifacts[..published], &artifacts),
-                ));
+        // Check both detached sources and the published files. A native process may
+        // have reopened either path. Drop destination handles before any rollback.
+        let final_check = (|| -> AppResult<u32> {
+            let _destination_guards = source_version::guard(
+                &artifacts,
+                &staged_versions,
+                source_version::Location::Destination,
+            )?;
+            backup_guards.as_ref().unwrap().recheck()?;
+            check_detached_sources(
+                &artifacts,
+                published,
+                &source_sidecar,
+                source_sidecar_existed,
+            )?;
+            for ((asset, source), staged) in artifacts.iter().zip(&versions).zip(&staged_versions) {
+                source_version::check(&asset.backup, source)?;
+                source_version::check(&asset.destination, staged)?;
             }
-        }
-        let history_rows = match crate::history::rewrite_project_for_session(
-            &paths::history_path(claude_dir),
-            session_id,
-            &target_cwd,
-        ) {
+            crate::history::rewrite_project_for_session(
+                &paths::history_path(claude_dir),
+                session_id,
+                &target_cwd,
+            )
+        })();
+        let history_rows = match final_check {
             Ok(updated) => updated,
             Err(error) => {
                 drop(backup_guards.take());
@@ -350,6 +408,37 @@ pub fn move_session_cwd_with_options(
         target_project_id: None,
         requires_project_open: false,
     })
+}
+
+fn check_detached_sources(
+    artifacts: &[MoveArtifact],
+    published: usize,
+    sidecar: &Path,
+    sidecar_existed: bool,
+) -> AppResult<()> {
+    for (index, asset) in artifacts.iter().enumerate() {
+        if path_exists(&asset.source)?
+            && (index >= published || !same_existing_entry(&asset.source, &asset.destination)?)
+        {
+            return Err(source_version::conflict());
+        }
+    }
+    if !sidecar_existed && path_exists(sidecar)? {
+        return Err(source_version::conflict());
+    }
+    for companion in claude_sessions::companion_files_for(&artifacts[0].source)? {
+        let mut expected = false;
+        for asset in &artifacts[..published] {
+            if same_existing_entry(&companion, &asset.destination)? {
+                expected = true;
+                break;
+            }
+        }
+        if !expected {
+            return Err(source_version::conflict());
+        }
+    }
+    Ok(())
 }
 
 fn normalize_target_cwd(raw: &str, preserve_path_case: bool) -> AppResult<String> {
@@ -684,24 +773,44 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(windows)]
     #[test]
     fn r04_open_native_writer_prevents_publication() -> AppResult<()> {
-        let (claude, old, new) = fixture()?;
-        let source = claude_sessions::project_dir_for_cwd(&claude, old.to_str().unwrap())
-            .join("session-1.jsonl");
-        let before = fs::read(&source)?;
-        let handle = fs::OpenOptions::new().append(true).open(&source)?;
-        let result = move_session_cwd(
-            &claude,
-            "session-1",
-            Some(source.to_str().unwrap()),
-            new.to_str().unwrap(),
-        );
-        assert!(result.unwrap_err().to_string().contains("SESSION_BUSY"));
-        assert_eq!(fs::read(&source)?, before);
-        drop(handle);
-        fs::remove_dir_all(claude.parent().unwrap())?;
+        for asset in [
+            "session-1.jsonl",
+            "session-1/subagents/agent-a.jsonl",
+            "session-1.claudinal.json",
+        ] {
+            let (claude, old, new) = fixture()?;
+            let project = claude_sessions::project_dir_for_cwd(&claude, old.to_str().unwrap());
+            let source = project.join("session-1.jsonl");
+            let occupied = project.join(asset);
+            let before = source_version::capture(&project)?;
+            let history_before = fs::read(claude.join("history.jsonl"))?;
+            let handle = fs::OpenOptions::new().append(true).open(&occupied)?;
+            let result = move_session_cwd(
+                &claude,
+                "session-1",
+                Some(source.to_str().unwrap()),
+                new.to_str().unwrap(),
+            );
+            assert!(result.unwrap_err().to_string().contains("SESSION_BUSY"));
+            assert_eq!(source_version::capture(&project)?, before);
+            assert_eq!(fs::read(claude.join("history.jsonl"))?, history_before);
+            drop(handle);
+            // Releasing the writer must restore the normal move path, including sidecars.
+            let reader = File::open(&source)?;
+            let report = move_session_cwd(
+                &claude,
+                "session-1",
+                Some(source.to_str().unwrap()),
+                new.to_str().unwrap(),
+            )?;
+            assert!(report.rollout_rewritten);
+            assert!(report.recovery_manifest.is_some());
+            assert!(!source.exists());
+            drop(reader);
+            fs::remove_dir_all(claude.parent().unwrap())?;
+        }
         Ok(())
     }
 
@@ -727,7 +836,28 @@ mod tests {
         Ok(())
     }
 
-    fn fixture() -> AppResult<(PathBuf, PathBuf, PathBuf)> {
+    #[cfg(windows)]
+    #[test]
+    fn r04_in_place_case_change_keeps_companion_identity() -> AppResult<()> {
+        let (claude, old, _) = fixture()?;
+        let source = claude_sessions::project_dir_for_cwd(&claude, old.to_str().unwrap())
+            .join("session-1.jsonl");
+        let target = old.to_str().unwrap().to_ascii_uppercase();
+        let report = move_session_cwd_with_options(
+            &claude,
+            "session-1",
+            Some(source.to_str().unwrap()),
+            &target,
+            true,
+        )?;
+        assert_eq!(report.artifacts_moved, 0);
+        assert_eq!(report.new_cwd, target);
+        assert_eq!(claude_sessions::companion_files_for(&source)?.len(), 1);
+        fs::remove_dir_all(claude.parent().unwrap())?;
+        Ok(())
+    }
+
+    pub(super) fn fixture() -> AppResult<(PathBuf, PathBuf, PathBuf)> {
         let root = std::env::temp_dir().join(format!(
             "cc-sessions-claude-move-{}-{}",
             std::process::id(),

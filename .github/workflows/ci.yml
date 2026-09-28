@@ -41,7 +41,8 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libgtk-3-dev \
             libayatana-appindicator3-dev \
-            librsvg2-dev
+            librsvg2-dev \
+            lsof
 
       - name: Install dependencies
         run: npm ci
@@ -57,6 +58,9 @@ jobs:
 
       - name: Check standalone CLI
         run: npm run cli:check
+
+      - name: Check Claude offline move process guard
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --lib r04_idle_native_process -- --ignored --test-threads=1
 
       - name: Check all Rust targets
         run: cargo check --manifest-path src-tauri/Cargo.toml --all-targets
@@ -96,6 +100,22 @@ jobs:
 
       - name: Check all Rust targets
         run: cargo check --manifest-path src-tauri/Cargo.toml --all-targets
+
+  claude-macos:
+    name: macOS Claude move checks
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check Claude moves with real child writers
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --lib claude_transfer
+
+      - name: Check Claude offline move process guard
+        run: cargo test --manifest-path src-tauri/Cargo.toml --no-default-features --lib r04_idle_native_process -- --ignored --test-threads=1
 
   native:
     name: Pinned native contract
