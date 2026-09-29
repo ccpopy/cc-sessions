@@ -8,7 +8,6 @@ import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { DatePicker } from "@/components/ui/date-picker";
@@ -60,6 +59,7 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
   const [messageError, setMessageError] = useState<string | null>(null);
   const [loadedSelection, setLoadedSelection] = useState(false);
   const messageGeneration = useRef(0);
+  const knownMessageIndices = useRef(new Set<number>());
   // Shift + 点击的锚点：上一次点击的消息 index
   const lastClickedRef = useRef<number | null>(null);
 
@@ -105,6 +105,7 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
     lastClickedRef.current = null;
     setMessages([]);
     setChecked(new Set());
+    knownMessageIndices.current.clear();
     setNextOffset(0);
     setHasMoreMessages(true);
     setLoadedSelection(false);
@@ -117,8 +118,8 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
   const multiDay = useMemo(() => spansMultipleDays(stamps), [stamps]);
   const rangeIsDefault = !rangeFrom.date && !rangeTo.date && !rangeFrom.time && !rangeTo.time;
   const range = useMemo<MessageTimeRange>(
-    () => (selectionMode ? messageTimeRange(rangeFrom, rangeTo) : {}),
-    [selectionMode, rangeFrom, rangeTo],
+    () => messageTimeRange(rangeFrom, rangeTo),
+    [rangeFrom, rangeTo],
   );
 
   // 列表只展示时间范围内的消息；勾选状态按消息保留，范围放宽后之前的取舍仍在
@@ -132,18 +133,16 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
     [visible, checked],
   );
   const selectedCount = selectionMode ? selectedIndices.length : messages.length;
-  const exportBlockReason = !selectionMode
+  const exportBlockReason = range.error ?? (!selectionMode
     ? null
     : loadingMessages || !loadedSelection
       ? messageError ?? "正在加载消息摘要"
-      : range.error
-      ? range.error
       : selectedIndices.length === 0
         ? "尚未勾选任何消息，无法导出"
-        : null;
+        : null);
 
   const buildOptions = useCallback((): MarkdownExportOptions => {
-    const timeFilter = selectionMode && !rangeIsDefault && !range.error;
+    const timeFilter = !rangeIsDefault && !range.error;
     return {
       include_front_matter: includeFrontMatter,
       include_reasoning: includeReasoning,
@@ -168,20 +167,23 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
   const latestRequestKey = useRef(requestKey);
   latestRequestKey.current = requestKey;
 
-  const loadMoreMessages = async () => {
-    if (!header || loadingMessages || !hasMoreMessages) return;
+  const loadMoreMessages = useCallback(async (offset: number, replace = false) => {
+    if (!header || range.error) return;
     const generation = messageGeneration.current;
     setLoadingMessages(true);
-    setMessageError(null);
     try {
       const page = await api.previewSessionMarkdown({
-        provider, rollout_path: rolloutPath, header, offset: nextOffset,
-        options: { include_front_matter: false, include_reasoning: false, include_tools: false, ai_handoff_preamble: false },
+        provider, rollout_path: rolloutPath, header, offset,
+        options: { include_front_matter: false, include_reasoning: false, include_tools: false, ai_handoff_preamble: false,
+          time_from: range.from ?? null, time_to: range.to ?? null },
       });
       if (generation !== messageGeneration.current) return;
+      setMessageError(null);
       const msgs = page.messages.map((m) => ({ ...m, ts: eventEpochSeconds(m.timestamp) }));
-      setMessages((previous) => [...previous, ...msgs]);
-      setChecked((previous) => new Set([...previous, ...msgs.map((m) => m.index)]));
+      const newIndices = msgs.filter((m) => !knownMessageIndices.current.has(m.index)).map((m) => m.index);
+      for (const message of msgs) knownMessageIndices.current.add(message.index);
+      setMessages((previous) => replace ? msgs : [...previous, ...msgs]);
+      setChecked((previous) => new Set([...previous, ...newIndices]));
       setNextOffset(page.next_offset);
       setHasMoreMessages(page.has_more);
       setLoadedSelection(true);
@@ -190,14 +192,28 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
     } finally {
       if (generation === messageGeneration.current) setLoadingMessages(false);
     }
-  };
+  }, [header, provider, rolloutPath, range.from, range.to, range.error]);
+
+  useEffect(() => {
+    messageGeneration.current += 1;
+    setMessages([]);
+    setNextOffset(0);
+    setHasMoreMessages(true);
+    setLoadedSelection(false);
+    setMessageError(null);
+    setLoadingMessages(false);
+    lastClickedRef.current = null;
+    if (open && selectionMode && !range.error) void loadMoreMessages(0, true);
+  }, [open, selectionMode, loadMoreMessages]);
 
   // 每次只请求受限预览；已发出的旧请求也不能更新预览或 loading 状态。
   useEffect(() => {
-    setReport(null);
     setPreviewError(null);
     setGenerating(false);
-    if (!open || !header || !rolloutPath || exportBlockReason) return;
+    if (!open || !header || !rolloutPath || range.error || (selectionMode && selectedIndices.length === 0)) {
+      setReport(null);
+      return;
+    }
     let cancelled = false;
     setGenerating(true);
     const timer = setTimeout(() => {
@@ -211,7 +227,7 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [open, header, rolloutPath, provider, buildOptions, exportBlockReason, requestKey, previewRetry]);
+  }, [open, header, rolloutPath, provider, buildOptions, range.error, selectionMode, selectedIndices.length, requestKey, previewRetry]);
 
   // 批量操作只作用于当前范围内可见的消息，范围外的勾选状态原样保留
   const applyToVisible = (decide: (m: ConversationMessage, prev: Set<number>) => boolean) =>
@@ -320,7 +336,7 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
             <FileText className="h-[18px] w-[18px] text-muted-foreground" />
             导出为 Markdown
           </DialogTitle>
-          <DialogDescription className="sr-only">设置导出内容，查看受限预览，保存全部对话或按页选择消息片段。</DialogDescription>
+          <DialogDescription className="sr-only">按完整会话或时间范围导出，也可勾选消息片段；预览仅展示部分内容。</DialogDescription>
           {session && (
             <p className="mt-1 truncate text-xs text-muted-foreground" title={session.title || "(无标题)"}>{session.title || "(无标题)"}</p>
           )}
@@ -374,13 +390,9 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
                     label="选择消息片段"
                     hint="按页加载短摘要，只导出已加载且勾选的对话"
                     checked={selectionMode}
-                    onChange={(value) => {
-                      setSelectionMode(value);
-                      if (value && !loadedSelection) void loadMoreMessages();
-                    }}
+                    onChange={setSelectionMode}
                   />
 
-                  {selectionMode && (
                     <div className="space-y-2">
                       <div className="flex items-center justify-between">
                         <span className="text-xs font-medium">时间范围</span>
@@ -414,11 +426,10 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
                         <p className="text-[11px] text-destructive">{range.error}</p>
                       ) : (
                         <p className="text-[11px] leading-snug text-muted-foreground">
-                          留空不限时间；筛选已加载摘要，范围内 {visible.length}/{messages.length} 条
+                          留空不限时间；时间范围作用于整个会话。{selectionMode && `当前已加载 ${visible.length} 条匹配摘要。`}
                         </p>
                       )}
                     </div>
-                  )}
 
                   {selectionMode && (
                     <div className="space-y-2">
@@ -469,7 +480,7 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
 
                 {selectionMode && (
                   <div className="min-w-0 max-w-full space-y-1 overflow-hidden">
-                    {loadingMessages ? (
+                    {loadingMessages && messages.length === 0 ? (
                       <div className="flex justify-center py-6">
                         <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
                       </div>
@@ -532,7 +543,7 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
                     <p className="text-[11px] text-muted-foreground">
                       已加载 {messages.length} 条对话摘要。{hasMoreMessages ? "还有更多消息；未加载消息不会进入片段导出。" : "已到会话末尾。"}
                     </p>
-                    {hasMoreMessages && <Button variant="outline" size="sm" disabled={loadingMessages} onClick={() => void loadMoreMessages()}>
+                    {hasMoreMessages && <Button variant="outline" size="sm" disabled={loadingMessages || Boolean(range.error)} onClick={() => void loadMoreMessages(nextOffset)}>
                       {loadingMessages ? "正在加载…" : messageError ? "重试加载" : "加载下一页摘要"}
                     </Button>}
                   </div>
@@ -544,15 +555,16 @@ export function MarkdownExportDialog({ open, onOpenChange, session }: Props) {
           {/* 右侧：预览 */}
           <div className="flex min-h-0 flex-col bg-muted/20">
             <div className="flex items-center gap-2 border-b border-border/60 px-4 py-2 text-xs text-muted-foreground">
-              <span>受限预览 · 开头最多 20 条对话 / 64 KiB</span>
+              <span>预览 · 当前范围前 20 条对话 / 64 KiB</span>
               {generating && <Loader2 className="h-3 w-3 animate-spin" />}
               <span className="ml-auto flex items-center gap-2">
-                <Badge variant="outline" className="h-5 px-1.5 font-normal tabular-nums">
-                  {selectionMode ? `已选 ${selectedCount} 条` : "导出全部对话"}
-                </Badge>
+                {selectionMode && <span className="tabular-nums">已选 {selectedCount} 条</span>}
+                <Button variant="outline" size="sm" className="h-6 px-2 text-xs" onClick={onExportFile} disabled={saving || !header || Boolean(exportBlockReason)}>
+                  {selectionMode ? "导出已选消息" : rangeIsDefault ? "导出全部对话" : "导出时间范围"}
+                </Button>
               </span>
             </div>
-            {(report?.truncated || selectionMode) && <p className="px-4 pt-3 text-xs text-muted-foreground">预览仅展示会话开头的部分内容，可能截断；保存和复制会按当前选项处理全部内容。</p>}
+            {(report?.truncated || selectionMode) && <p className="px-4 pt-3 text-xs text-muted-foreground">预览仅展示当前范围的部分内容；保存和复制不受预览条数限制。</p>}
             {previewError && <div className="space-y-2 px-4 pt-3"><p role="alert" className="text-xs text-destructive">{previewError}</p><Button variant="outline" size="sm" onClick={() => setPreviewRetry((value) => value + 1)}>重试预览</Button></div>}
             <ScrollArea className="min-h-0 flex-1" viewportClassName="[&>div]:!block">
               <pre className="whitespace-pre-wrap wrap-anywhere px-4 py-3 font-mono text-xs leading-relaxed text-foreground/90">

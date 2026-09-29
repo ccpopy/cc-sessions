@@ -1,5 +1,374 @@
 use super::*;
 
+#[test]
+fn projection_v7_preserves_lifecycle_timestamps_across_edit_delete_and_undo() {
+    let f = Fixture::new();
+    let db = rusqlite::Connection::open(f.root.join("thread_history_1.sqlite")).unwrap();
+    // openai/codex 0d9c7cb, native thread history migration 7.
+    db.execute_batch(
+        "ALTER TABLE thread_items ADD COLUMN started_at_ms INTEGER;
+        ALTER TABLE thread_items ADD COLUMN completed_at_ms INTEGER;
+        UPDATE thread_items SET started_at_ms=1790059469000+rollout_ordinal,
+            completed_at_ms=1790059470000+rollout_ordinal;
+        UPDATE thread_items SET completed_at_ms=NULL WHERE item_id='user-0';",
+    )
+    .unwrap();
+    drop(db);
+    let capability = inspect_edit_capability("codex", f.path.to_str().unwrap()).unwrap();
+    assert!(
+        capability.blocked_reasons.is_empty(),
+        "{:?}",
+        capability.blocked_reasons
+    );
+    let capture = || paginated::projection::read(&f.path, &load_file(&f.path).unwrap()).unwrap();
+    let original = capture();
+    let undo = || {
+        undo_last(
+            "codex",
+            f.path.to_str().unwrap(),
+            "thread-1",
+            f.backup.to_str().unwrap(),
+            Some(&f.revision()),
+        )
+        .unwrap()
+    };
+    let snapshot = f.rewrite(9, "REWRITTEN-B").snapshot_created.unwrap();
+    let edited = capture();
+    for (before, after) in original.rows["thread_items"]
+        .iter()
+        .zip(&edited.rows["thread_items"])
+    {
+        assert_eq!(before["started_at_ms"], after["started_at_ms"]);
+        assert_eq!(before["completed_at_ms"], after["completed_at_ms"]);
+    }
+    undo();
+    assert_eq!(capture(), original);
+    f.delete(&[9]).unwrap();
+    assert!(!f.items().contains("DELETE-B"));
+    undo();
+    assert_eq!(capture(), original);
+    undo(); // redo
+    restore_snapshot(
+        "codex",
+        f.path.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        &snapshot,
+        Some(&f.revision()),
+    )
+    .unwrap();
+    assert_eq!(capture(), original);
+}
+
+#[test]
+fn projection_added_columns_survive_edit_delete_undo_and_restore() {
+    let f = Fixture::new();
+    let db = rusqlite::Connection::open(f.root.join("thread_history_1.sqlite")).unwrap();
+    db.execute_batch("INSERT INTO thread_realtime_items VALUES('thread-1','realtime-1',20,1,'realtime_session_closed','{}')").unwrap();
+    let tables = [
+        "thread_items",
+        "thread_turns",
+        "thread_realtime_items",
+        "thread_history_projection_state",
+    ];
+    for table in tables {
+        db.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN \"future,field\" TEXT NOT NULL DEFAULT '{{\"keep\":true}}';
+             ALTER TABLE {table} ADD COLUMN future_real REAL;
+             ALTER TABLE {table} ADD COLUMN future_blob BLOB DEFAULT X'00FF80';
+             ALTER TABLE {table} ADD COLUMN future_null TEXT;
+             ALTER TABLE {table} ADD COLUMN future_integer INTEGER DEFAULT -9223372036854775808;
+             ALTER TABLE {table} ADD COLUMN future_generated TEXT GENERATED ALWAYS AS (thread_id || ':generated') VIRTUAL;"
+        )).unwrap();
+        db.execute(
+            &format!("UPDATE {table} SET future_real=?1"),
+            [0.10000000000000002_f64],
+        )
+        .unwrap();
+        let columns = db
+            .prepare(&format!("SELECT * FROM {table} LIMIT 0"))
+            .unwrap()
+            .column_names()
+            .iter()
+            .filter(|name| **name != "future_generated")
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>();
+        let mut other = columns.clone();
+        other[0] = "'untouched-thread'".into();
+        db.execute(
+            &format!(
+                "INSERT INTO {table} ({}) SELECT {} FROM {table}",
+                columns.join(","),
+                other.join(",")
+            ),
+            [],
+        )
+        .unwrap();
+    }
+    db.execute(
+        "UPDATE thread_realtime_items SET future_real=?1",
+        [f64::INFINITY],
+    )
+    .unwrap();
+    let extras = || {
+        tables.iter().map(|table| {
+        let mut query = db.prepare(&format!("SELECT thread_id,\"future,field\",future_real,future_blob,future_null,future_integer,future_generated FROM {table} ORDER BY thread_id,rowid")).unwrap();
+        query.query_map([], |row| (0..7).map(|i| row.get::<_,rusqlite::types::Value>(i)).collect::<Result<Vec<_>,_>>())
+            .unwrap().collect::<Result<Vec<_>,_>>().unwrap()
+    }).collect::<Vec<_>>()
+    };
+    let original_extras = extras();
+    let capability = inspect_edit_capability("codex", f.path.to_str().unwrap()).unwrap();
+    assert!(
+        capability.blocked_reasons.is_empty(),
+        "{:?}",
+        capability.blocked_reasons
+    );
+    assert_eq!(capability.projection.as_ref().unwrap().state, "ready");
+    assert!(capability.projection.unwrap().message.contains("扩展字段"));
+    let capture = || paginated::projection::read(&f.path, &load_file(&f.path).unwrap()).unwrap();
+    let original = capture();
+    let snapshot = f.rewrite(9, "EDITED-B").snapshot_created.unwrap();
+    assert_eq!(extras(), original_extras);
+    undo_last(
+        "codex",
+        f.path.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        Some(&f.revision()),
+    )
+    .unwrap();
+    assert_eq!(capture(), original);
+    assert_eq!(extras(), original_extras);
+    f.delete(&[9]).unwrap();
+    assert!(!f.items().contains("DELETE-B"));
+    let mut surviving = original_extras.clone();
+    surviving[0].remove(2); // Only user-1 is removed; other rows and threads retain their values.
+    assert_eq!(extras(), surviving);
+    undo_last(
+        "codex",
+        f.path.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        Some(&f.revision()),
+    )
+    .unwrap();
+    assert_eq!(capture(), original);
+    f.rewrite(9, "ANOTHER-B");
+    restore_snapshot(
+        "codex",
+        f.path.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        &snapshot,
+        Some(&f.revision()),
+    )
+    .unwrap();
+    assert_eq!(capture(), original);
+    assert_eq!(extras(), original_extras);
+}
+
+#[test]
+fn projection_old_snapshots_preserve_new_columns_and_use_native_defaults() {
+    let f = Fixture::new();
+    let snapshot = f.delete(&[9]).unwrap().snapshot_created.unwrap();
+    let db = rusqlite::Connection::open(f.root.join("thread_history_1.sqlite")).unwrap();
+    db.execute_batch(
+        "ALTER TABLE thread_items ADD COLUMN future_text TEXT NOT NULL DEFAULT 'native-default';
+        UPDATE thread_items SET future_text='current-value';
+        ALTER TABLE thread_history_projection_state ADD COLUMN future_blob BLOB DEFAULT X'00FF';",
+    )
+    .unwrap();
+    undo_last(
+        "codex",
+        f.path.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        Some(&f.revision()),
+    )
+    .unwrap();
+    let values = || {
+        db.prepare("SELECT item_id,future_text FROM thread_items ORDER BY item_id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let restored = values();
+    assert_eq!(restored.len(), 6);
+    for (id, value) in &restored {
+        assert_eq!(
+            value,
+            if id == "user-1" {
+                "native-default"
+            } else {
+                "current-value"
+            }
+        );
+    }
+    f.delete(&[9]).unwrap();
+    restore_snapshot(
+        "codex",
+        f.path.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        &snapshot,
+        Some(&f.revision()),
+    )
+    .unwrap();
+    assert_eq!(values(), restored);
+    assert_eq!(
+        db.query_row(
+            "SELECT future_blob FROM thread_history_projection_state",
+            [],
+            |r| r.get::<_, Vec<u8>>(0)
+        )
+        .unwrap(),
+        vec![0, 255]
+    );
+}
+
+#[test]
+fn projection_missing_required_columns_still_protect_writes() {
+    let f = Fixture::new();
+    let before = fs::read(&f.path).unwrap();
+    let db = rusqlite::Connection::open(f.root.join("thread_history_1.sqlite")).unwrap();
+    db.execute_batch("ALTER TABLE thread_items RENAME COLUMN item_json TO renamed_payload")
+        .unwrap();
+    let error = f.delete(&[9]).unwrap_err().to_string();
+    assert!(error.contains("item_json"), "{error}");
+    assert_eq!(fs::read(&f.path).unwrap(), before);
+}
+
+#[test]
+fn projection_only_checks_triggers_on_tables_it_writes() {
+    let f = Fixture::new();
+    let db = rusqlite::Connection::open(f.root.join("thread_history_1.sqlite")).unwrap();
+    db.execute_batch("CREATE TABLE unrelated(value TEXT); CREATE TRIGGER unrelated_insert AFTER INSERT ON unrelated BEGIN SELECT 1; END;").unwrap();
+    f.rewrite(9, "EDITED-B");
+    db.execute_batch("CREATE TRIGGER unknown_item_delete AFTER DELETE ON thread_items BEGIN DELETE FROM unrelated; END;").unwrap();
+    let before = fs::read(&f.path).unwrap();
+    let error = f.delete(&[9]).unwrap_err().to_string();
+    assert!(error.contains("触发器"), "{error}");
+    assert_eq!(fs::read(&f.path).unwrap(), before);
+}
+
+#[test]
+fn projection_extension_changes_still_conflict_with_undo_and_planned_write() {
+    let f = Fixture::new();
+    let db = rusqlite::Connection::open(f.root.join("thread_history_1.sqlite")).unwrap();
+    db.execute_batch("ALTER TABLE thread_items ADD COLUMN future_blob BLOB DEFAULT X'FF00'")
+        .unwrap();
+    f.rewrite(9, "EDITED-B");
+    let before = fs::read(&f.path).unwrap();
+    let loaded = load_file(&f.path).unwrap();
+    let planned = paginated::projection::prepare(&f.path, &loaded, &loaded, None).unwrap();
+    db.execute(
+        "UPDATE thread_items SET future_blob=X'0102' WHERE item_id='user-1'",
+        [],
+    )
+    .unwrap();
+    assert!(planned
+        .begin("thread-1")
+        .unwrap_err()
+        .to_string()
+        .contains("EDIT_CONFLICT"));
+    let error = undo_last(
+        "codex",
+        f.path.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        Some(&f.revision()),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("EDIT_CONFLICT"), "{error}");
+    assert_eq!(fs::read(&f.path).unwrap(), before);
+    assert_eq!(
+        db.query_row(
+            "SELECT future_blob FROM thread_items WHERE item_id='user-1'",
+            [],
+            |r| r.get::<_, Vec<u8>>(0)
+        )
+        .unwrap(),
+        vec![1, 2]
+    );
+}
+
+#[test]
+fn projection_added_constraint_failure_does_not_commit_rollout() {
+    let f = Fixture::new();
+    let db = rusqlite::Connection::open(f.root.join("thread_history_1.sqlite")).unwrap();
+    db.execute_batch("ALTER TABLE thread_items ADD COLUMN maximum_length INTEGER DEFAULT 10000 CHECK(length(item_json)<=maximum_length);
+        UPDATE thread_items SET maximum_length=length(item_json) WHERE item_id='user-1';").unwrap();
+    let before = fs::read(&f.path).unwrap();
+    let image = paginated::projection::read(&f.path, &load_file(&f.path).unwrap()).unwrap();
+    let error = apply_edit_text(
+        "codex",
+        f.path.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        9,
+        "THIS-EDIT-EXCEEDS-THE-NATIVE-CONSTRAINT",
+        Some(&f.revision()),
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("CHECK constraint failed"),
+        "{error}"
+    );
+    assert_eq!(fs::read(&f.path).unwrap(), before);
+    assert_eq!(
+        paginated::projection::read(&f.path, &load_file(&f.path).unwrap()).unwrap(),
+        image
+    );
+    assert!(!edit_dir(f.backup.to_str().unwrap(), "codex", "thread-1")
+        .join("pending-operation.json")
+        .exists());
+    // A constraint on this text edit does not disable unrelated valid operations.
+    f.delete(&[9]).unwrap();
+}
+
+#[test]
+fn projection_extensions_survive_interrupted_commit_and_recovery() {
+    let f = Fixture::new();
+    let db = rusqlite::Connection::open(f.root.join("thread_history_1.sqlite")).unwrap();
+    db.execute_batch("ALTER TABLE thread_items ADD COLUMN future_blob BLOB DEFAULT X'00FF80';
+        ALTER TABLE thread_history_projection_state ADD COLUMN future_real REAL DEFAULT 1.23456789;").unwrap();
+    let original = paginated::projection::read(&f.path, &load_file(&f.path).unwrap()).unwrap();
+    transaction::FAIL_AFTER_ROLLOUT.with(|flag| flag.set(true));
+    assert_eq!(f.delete(&[9]).unwrap().status, "needs_recovery");
+    let directory = edit_dir(f.backup.to_str().unwrap(), "codex", "thread-1");
+    assert!(
+        transaction::pending_summary(&directory, &f.path)
+            .unwrap()
+            .unwrap()
+            .can_reconcile
+    );
+    transaction::reconcile(
+        "codex",
+        &f.path,
+        "thread-1",
+        &directory,
+        Some(&f.revision()),
+    )
+    .unwrap();
+    undo_last(
+        "codex",
+        f.path.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        Some(&f.revision()),
+    )
+    .unwrap();
+    assert_eq!(
+        paginated::projection::read(&f.path, &load_file(&f.path).unwrap()).unwrap(),
+        original
+    );
+}
+
 fn status(f: &Fixture) -> Value {
     serde_json::to_value(inspect_edit_capability("codex", f.path.to_str().unwrap()).unwrap())
         .unwrap()["projection"]

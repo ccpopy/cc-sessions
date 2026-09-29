@@ -110,6 +110,7 @@ struct History {
 }
 
 fn model(loaded: &LoadedFile) -> AppResult<History> {
+    crate::operation_metrics::record(|c| c.mapping_record_visits += loaded.parsed.len() as u64);
     let thread = loaded
         .parsed
         .iter()
@@ -121,6 +122,10 @@ fn model(loaded: &LoadedFile) -> AppResult<History> {
     let mut active: Option<String> = None;
     let mut turns = Vec::new();
     let mut previous_ordinal = None;
+    let mut item_positions: BTreeMap<ItemKey, usize> = BTreeMap::new();
+    let mut contexts: BTreeMap<ItemKey, Vec<usize>> = BTreeMap::new();
+    let mut tool_calls: BTreeMap<ItemKey, Vec<usize>> = BTreeMap::new();
+    let mut user_inputs: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (i, v) in loaded.parsed.iter().enumerate() {
         let Some(v) = v else {
             return Err(unsupported(format!("第 {} 行无法解析", i + 1)));
@@ -142,6 +147,43 @@ fn model(loaded: &LoadedFile) -> AppResult<History> {
             .map(str::to_owned)
             .or_else(|| active.clone());
         turns.push(turn.clone());
+        // Index explicit identities once. A page must not rescan the entire log
+        // for every message (including every tool/reasoning item).
+        if codex_outer(v) == "response_item" {
+            if let Some(turn) = &turn {
+                if let Some(id) = p["id"].as_str() {
+                    contexts
+                        .entry(ItemKey {
+                            turn: turn.clone(),
+                            id: id.into(),
+                        })
+                        .or_default()
+                        .push(i);
+                }
+                if let Some(id) = p["call_id"]
+                    .as_str()
+                    .filter(|id| tool_message::is_call(v, id))
+                {
+                    tool_calls
+                        .entry(ItemKey {
+                            turn: turn.clone(),
+                            id: id.into(),
+                        })
+                        .or_default()
+                        .push(i);
+                }
+                if codex_msg_role(v) == "user"
+                    && p["internal_chat_message_metadata_passthrough"]["content_item_kinds"]
+                        .as_array()
+                        .is_some_and(|k| {
+                            k.iter()
+                                .any(|s| s.as_str().is_some_and(|s| s.starts_with("user.")))
+                        })
+                {
+                    user_inputs.entry(turn.clone()).or_default().push(i);
+                }
+            }
+        }
         if codex_ptype(v) == "item_completed" {
             if p["thread_id"].as_str() != Some(thread) {
                 return Err(unsupported("正式消息 thread_id 与会话身份不一致"));
@@ -160,12 +202,14 @@ fn model(loaded: &LoadedFile) -> AppResult<History> {
                 .as_str()
                 .ok_or_else(|| unsupported("正式消息缺少类型"))?
                 .to_owned();
-            if let Some(item) = items.iter_mut().find(|it| it.key == key) {
+            if let Some(&position) = item_positions.get(&key) {
+                let item = &mut items[position];
                 if item.kind != kind {
                     return Err(unsupported("同一 item 的快照类型发生变化"));
                 }
                 item.records.push(i);
             } else {
+                item_positions.insert(key.clone(), items.len());
                 items.push(Item {
                     key,
                     kind,
@@ -180,59 +224,33 @@ fn model(loaded: &LoadedFile) -> AppResult<History> {
     }
     // User response IDs differ from canonical IDs. Match the ordered, explicit user-input
     // records within a turn, never their text or an unbounded nearest-line heuristic.
-    let user_order: Vec<(ItemKey, usize)> = items
-        .iter()
-        .filter(|it| it.kind == "UserMessage")
-        .map(|it| (it.key.clone(), it.records[0]))
-        .collect();
+    let mut previous_user: BTreeMap<String, usize> = BTreeMap::new();
     for item in &mut items {
         if item.kind == "UserMessage" {
             let first = item.records[0];
-            let previous = user_order
-                .iter()
-                .filter(|(key, i)| key.turn == item.key.turn && *i < first)
-                .map(|(_, i)| *i + 1)
-                .max()
+            let previous = previous_user
+                .insert(item.key.turn.clone(), first + 1)
                 .unwrap_or(0);
-            let candidates: Vec<usize> = (previous..first)
-                .filter(|&i| {
-                    let v = loaded.parsed[i].as_ref().unwrap();
-                    codex_outer(v) == "response_item"
-                        && codex_msg_role(v) == "user"
-                        && turns[i].as_deref() == Some(&item.key.turn)
-                        && v["payload"]["internal_chat_message_metadata_passthrough"]
-                            ["content_item_kinds"]
-                            .as_array()
-                            .is_some_and(|k| {
-                                k.iter()
-                                    .any(|s| s.as_str().is_some_and(|s| s.starts_with("user.")))
-                            })
-                })
-                .collect();
+            let inputs = user_inputs
+                .get(&item.key.turn)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let candidates = &inputs
+                [inputs.partition_point(|&i| i < previous)..inputs.partition_point(|&i| i < first)];
+            crate::operation_metrics::record(|c| {
+                c.mapping_record_visits += candidates.len() as u64
+            });
             if candidates.len() == 1 {
-                item.contexts = candidates;
+                item.contexts = candidates.to_vec();
             }
         } else {
-            item.contexts = (0..loaded.parsed.len())
-                .filter(|&i| {
-                    let v = loaded.parsed[i].as_ref().unwrap();
-                    codex_outer(v) == "response_item"
-                        && turns[i].as_deref() == Some(&item.key.turn)
-                        && v["payload"]["id"].as_str() == Some(&item.key.id)
-                })
-                .collect();
+            item.contexts = contexts.remove(&item.key).unwrap_or_default();
             if item.kind == "AgentMessage" && item.contexts.is_empty() {
-                item.contexts = loaded
-                    .parsed
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, v)| {
-                        (turns[i].as_deref() == Some(&item.key.turn)
-                            && tool_message::is_call(v.as_ref().unwrap(), &item.key.id))
-                        .then_some(i)
-                    })
-                    .collect();
+                item.contexts = tool_calls.remove(&item.key).unwrap_or_default();
             }
+            crate::operation_metrics::record(|c| {
+                c.mapping_record_visits += item.contexts.len() as u64
+            });
         }
     }
     Ok(History { items, turns })

@@ -4,6 +4,46 @@ use serde_json::json;
 mod projection_read_tests;
 
 #[test]
+fn message_association_work_scales_with_records_not_messages_times_records() {
+    let mut rows =
+        vec![json!({"type":"session_meta","payload":{"id":"fixture","history_mode":"paginated"}})];
+    for turn in 0..256 {
+        let turn = format!("turn-{turn}");
+        rows.extend([
+            json!({"type":"event_msg","payload":{"type":"task_started","turn_id":turn}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"继续"}],"internal_chat_message_metadata_passthrough":{"turn_id":turn,"content_item_kinds":["user.text"]}}}),
+            json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":"fixture","turn_id":turn,"item":{"id":"user","type":"UserMessage","content":[{"type":"text","text":"继续"}]}}}),
+            json!({"type":"response_item","payload":{"id":"agent","type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}}),
+            json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":"fixture","turn_id":turn,"item":{"id":"agent","type":"AgentMessage","content":[{"type":"Text","text":"answer"}]}}}),
+            json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":"fixture","turn_id":turn,"item":{"id":"agent","type":"AgentMessage","content":[{"type":"Text","text":"answer"}]}}}),
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":turn}}),
+        ]);
+    }
+    let lines = rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut v)| {
+            v["ordinal"] = json!(i);
+            v.to_string()
+        })
+        .collect::<Vec<_>>();
+    let loaded = paginated::from_lines(&lines, true);
+    let (history, work) = crate::operation_metrics::measured(|| super::model(&loaded).unwrap());
+    assert_eq!(history.items.len(), 512);
+    for (turn, items) in history.items.chunks(2).enumerate() {
+        assert_eq!(items[0].contexts, vec![turn * 7 + 2]);
+        assert_eq!(items[1].contexts, vec![turn * 7 + 4]);
+        assert_eq!(items[1].records, vec![turn * 7 + 5, turn * 7 + 6]);
+    }
+    assert!(
+        work.mapping_record_visits <= 5 * lines.len() as u64,
+        "association walked {} records for a {}-record history",
+        work.mapping_record_visits,
+        lines.len()
+    );
+}
+
+#[test]
 #[ignore = "read-only audit of explicitly supplied rollout paths; structural output only"]
 fn paginated_mapping_readonly_audit() {
     let inventory: Value = serde_json::from_slice(
@@ -1931,4 +1971,35 @@ fn paginated_range_delete_removes_completion_copy_and_supports_redo_and_snapshot
     .unwrap();
     assert_eq!(fs::read(&f.path).unwrap(), original);
     assert_eq!(f.items(), items);
+}
+
+#[test]
+fn later_preview_pages_reuse_capability_only_for_unchanged_bytes() {
+    let f = Fixture::new();
+    let path = f.path.to_str().unwrap();
+    let page = |offset, expected: Option<&str>| {
+        crate::operation_metrics::measured(|| codex_preview_page(path, offset, 2, expected))
+    };
+    let (first, initial) = page(0, None);
+    let capability = first.unwrap().capability.unwrap();
+    assert_eq!(capability.projection.as_ref().unwrap().state, "ready");
+    assert!(initial.mapping_record_visits > 0);
+    let (second, reused) = page(2, Some(&capability.revision));
+    assert_eq!(
+        reused.mapping_record_visits, 0,
+        "later pages of the same bytes skip model and projection checks"
+    );
+    assert_eq!(
+        serde_json::to_value(second.unwrap().capability).unwrap(),
+        serde_json::to_value(&capability).unwrap()
+    );
+    // A refresh passes no revision and inspects again.
+    let (_, refreshed) = page(0, None);
+    assert!(refreshed.mapping_record_visits > 0);
+    // Changed bytes are never served from the earlier inspection.
+    f.rewrite(9, "REWRITTEN-B");
+    let (stale, _) = page(2, Some(&capability.revision));
+    assert!(stale.unwrap_err().to_string().contains("EDIT_CONFLICT"));
+    let (current, inspected) = page(2, Some(&f.revision()));
+    assert!(current.is_ok() && inspected.mapping_record_visits > 0);
 }

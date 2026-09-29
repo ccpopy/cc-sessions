@@ -1,5 +1,5 @@
-//! Schema v6, observed in Codex 0.155.0-alpha.9.2 and alpha.16. Preserve native
-//! item encodings; update only the target thread and recompute its byte checkpoints.
+//! Native history's required editing fields, with additive columns preserved.
+//! Update only the target thread and recompute its byte checkpoints.
 use super::*;
 use rusqlite::OptionalExtension;
 use rusqlite::{types::Value as SqlValue, Connection, OpenFlags};
@@ -22,6 +22,76 @@ const TABLES: &[(&str,&str)] = &[
     ("thread_history_projection_state","thread_id,next_rollout_byte_offset,next_rollout_ordinal"),
 ];
 
+struct Column {
+    name: String,
+    default: Option<String>,
+}
+
+fn quoted(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn table_columns(conn: &Connection, table: &str, base: &str) -> AppResult<Vec<Column>> {
+    let mut q = conn.prepare(&format!("PRAGMA table_xinfo({})", quoted(table)))?;
+    let columns = q
+        .query_map([], |r| {
+            // SQLite recomputes generated columns; never insert their values.
+            let column = Column {
+                name: r.get(1)?,
+                default: r.get(4)?,
+            };
+            Ok((r.get::<_, i64>(6)? == 0).then_some(column))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let missing = base
+        .split(',')
+        .filter(|name| !columns.iter().any(|c| c.name == *name))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(unsupported(format!(
+            "历史库 {table} 缺少编辑必需的可写字段：{}；仍可浏览和导出",
+            missing.join(",")
+        )));
+    }
+    Ok(columns)
+}
+
+fn sql_to_json(value: SqlValue) -> Value {
+    match value {
+        SqlValue::Null => Value::Null,
+        SqlValue::Integer(n) => Value::from(n),
+        // Keep SQLite storage classes and all float bits, including infinity.
+        // Text remains a string, even if it happens to contain one of these tags.
+        SqlValue::Real(n) => serde_json::json!({"$sqlite_real_bits": n.to_bits()}),
+        SqlValue::Text(s) => Value::from(s),
+        SqlValue::Blob(bytes) => serde_json::json!({"$sqlite_blob": hex::encode(bytes)}),
+    }
+}
+
+fn json_to_sql(value: &Value) -> AppResult<SqlValue> {
+    match value {
+        Value::Null => Ok(SqlValue::Null),
+        Value::String(s) => Ok(SqlValue::Text(s.clone())),
+        Value::Number(n) if n.is_i64() => Ok(SqlValue::Integer(n.as_i64().unwrap())),
+        Value::Number(n) if n.is_f64() => Ok(SqlValue::Real(n.as_f64().unwrap())),
+        Value::Object(v) if v.len() == 1 => {
+            if let Some(bits) = v.get("$sqlite_real_bits").and_then(Value::as_u64) {
+                return Ok(SqlValue::Real(f64::from_bits(bits)));
+            }
+            if let Some(hex) = v.get("$sqlite_blob").and_then(Value::as_str) {
+                return hex::decode(hex)
+                    .map(SqlValue::Blob)
+                    .map_err(|_| unsupported("投影快照含无效的二进制字段"));
+            }
+            Err(unsupported("投影快照字段编码无效"))
+        }
+        _ => Err(unsupported("投影快照字段编码无效")),
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub(in crate::edit) struct HistoryImage {
     pub rows: BTreeMap<String, Vec<Value>>,
@@ -35,6 +105,93 @@ pub(in crate::edit) struct HistoryChange {
     pub path: PathBuf,
     pub before: HistoryImage,
     pub after: HistoryImage,
+}
+
+impl HistoryImage {
+    pub(in crate::edit) fn matches_recorded(&self, recorded: &Self) -> bool {
+        // Older snapshots cannot know newly added columns. Compare every saved
+        // value, including all required fields, and preserve new values on restore.
+        self.summary == recorded.summary
+            && self.identity == recorded.identity
+            && self.rows.len() == recorded.rows.len()
+            && TABLES.iter().all(|(table, base)| {
+                self.rows
+                    .get(*table)
+                    .zip(recorded.rows.get(*table))
+                    .is_some_and(|(current, saved)| {
+                        current.len() == saved.len()
+                            && current.iter().zip(saved).all(|(current, saved)| {
+                                base.split(',').all(|name| saved.get(name).is_some())
+                                    && saved.as_object().is_some_and(|fields| {
+                                        fields
+                                            .iter()
+                                            .all(|(name, value)| current.get(name) == Some(value))
+                                    })
+                            })
+                    })
+            })
+    }
+}
+
+fn fill_snapshot_columns(
+    conn: &Connection,
+    snapshot: &mut HistoryImage,
+    current: &HistoryImage,
+) -> AppResult<()> {
+    for (table, base) in TABLES {
+        let columns = table_columns(conn, table, base)?;
+        let existing_rows: BTreeMap<_, _> = current.rows[*table]
+            .iter()
+            .map(|row| {
+                (
+                    [
+                        row["thread_id"].as_str(),
+                        row["turn_id"].as_str(),
+                        row["item_id"].as_str(),
+                    ],
+                    row,
+                )
+            })
+            .collect();
+        let rows = snapshot
+            .rows
+            .get_mut(*table)
+            .ok_or_else(|| unsupported("恢复快照缺少投影表"))?;
+        for row in rows {
+            let existing = existing_rows
+                .get(&[
+                    row["thread_id"].as_str(),
+                    row["turn_id"].as_str(),
+                    row["item_id"].as_str(),
+                ])
+                .copied();
+            let fields = row
+                .as_object_mut()
+                .ok_or_else(|| unsupported("恢复快照行无效"))?;
+            if base.split(',').any(|name| !fields.contains_key(name))
+                || fields
+                    .keys()
+                    .any(|name| !columns.iter().any(|c| c.name == *name))
+            {
+                return Err(unsupported(format!(
+                    "恢复快照的 {table} 字段与当前结构不兼容"
+                )));
+            }
+            for column in &columns {
+                if !fields.contains_key(&column.name) {
+                    let value = if let Some(value) = existing.and_then(|r| r.get(&column.name)) {
+                        value.clone()
+                    } else if let Some(default) = &column.default {
+                        sql_to_json(conn.query_row(&format!("SELECT {default}"), [], |r| r.get(0))?)
+                    } else {
+                        Value::Null
+                    };
+                    fields.insert(column.name.clone(), value);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(in crate::edit) fn path(rollout: &Path) -> AppResult<PathBuf> {
@@ -62,18 +219,9 @@ pub(in crate::edit) fn open(path: &Path, write: bool) -> AppResult<Connection> {
     )?;
     conn.busy_timeout(std::time::Duration::from_millis(250))?;
     for (table, columns) in TABLES {
-        let mut q = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-        let found = q
-            .query_map([], |r| r.get::<_, String>(1))?
-            .collect::<Result<BTreeSet<_>, _>>()?;
-        let expected = columns.split(',').map(str::to_owned).collect();
-        if found != expected {
-            return Err(unsupported(format!(
-                "历史库 {table} 不是已验证的 schema v6；本次不迁移数据库"
-            )));
-        }
+        table_columns(&conn, table, columns)?;
     }
-    let unknown_triggers:i64=conn.query_row("SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name!='thread_realtime_items_projection_cleanup'",[],|r|r.get(0))?;
+    let unknown_triggers:i64=conn.query_row("SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND tbl_name IN ('thread_items','thread_turns','thread_realtime_items','thread_history_projection_state') AND name!='thread_realtime_items_projection_cleanup'",[],|r|r.get(0))?;
     if unknown_triggers > 0 {
         return Err(unsupported("历史库含未知触发器，无法确认受影响线程范围"));
     }
@@ -148,9 +296,14 @@ fn capture_rows(
 ) -> AppResult<HistoryImage> {
     let mut rows = BTreeMap::new();
     for (table, columns) in TABLES {
-        let names: Vec<&str> = columns.split(',').collect();
+        let columns = table_columns(conn, table, columns)?;
+        let names = columns
+            .iter()
+            .map(|c| quoted(&c.name))
+            .collect::<Vec<_>>()
+            .join(",");
         let mut q = conn.prepare(&format!(
-            "SELECT {columns} FROM {table} WHERE thread_id=?1 ORDER BY {}",
+            "SELECT {names} FROM {table} WHERE thread_id=?1 ORDER BY {}",
             if *table == "thread_history_projection_state" {
                 "thread_id"
             } else {
@@ -160,15 +313,8 @@ fn capture_rows(
         let values = q
             .query_map([id], |r| {
                 let mut value = serde_json::Map::new();
-                for (i, name) in names.iter().enumerate() {
-                    let v = match r.get::<_, SqlValue>(i)? {
-                        SqlValue::Null => Value::Null,
-                        SqlValue::Integer(n) => Value::from(n),
-                        SqlValue::Real(n) => Value::from(n),
-                        SqlValue::Text(s) => Value::from(s),
-                        SqlValue::Blob(_) => return Err(rusqlite::Error::InvalidQuery),
-                    };
-                    value.insert((*name).into(), v);
+                for (i, column) in columns.iter().enumerate() {
+                    value.insert(column.name.clone(), sql_to_json(r.get(i)?));
                 }
                 Ok(Value::Object(value))
             })?
@@ -250,6 +396,7 @@ pub(in crate::edit) fn prepare(
                 "恢复快照来自不同 rollout 或旧身份格式，请在隔离副本核对；未覆盖当前投影",
             ));
         }
+        fill_snapshot_columns(&open(&path(rollout)?, false)?, seed, &before_image)?;
     }
     let mut after_image = project(after, seed.as_ref().unwrap_or(&before_image))?;
     // A suffix after revert/fork is not the first user message of the logical
@@ -435,7 +582,16 @@ pub(super) fn project(loaded: &LoadedFile, seed: &HistoryImage) -> AppResult<His
             .map(|item| Value::String(item.key.id.clone()))
             .unwrap_or(Value::Null);
     }
-    image.rows.insert("thread_history_projection_state".into(),vec![serde_json::json!({"thread_id":id,"next_rollout_byte_offset":offset,"next_rollout_ordinal":next})]);
+    let mut checkpoint = seed.rows["thread_history_projection_state"]
+        .first()
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    checkpoint["thread_id"] = Value::from(id);
+    checkpoint["next_rollout_byte_offset"] = Value::from(offset);
+    checkpoint["next_rollout_ordinal"] = Value::from(next);
+    image
+        .rows
+        .insert("thread_history_projection_state".into(), vec![checkpoint]);
     Ok(image)
 }
 
@@ -456,23 +612,27 @@ pub(in crate::edit) fn replace(conn: &Connection, id: &str, image: &HistoryImage
         conn.execute(&format!("DELETE FROM {table} WHERE thread_id=?1"), [id])?;
     }
     for (table, columns) in TABLES {
-        let names: Vec<&str> = columns.split(',').collect();
-        let placeholders = vec!["?"; names.len()].join(",");
+        let columns = table_columns(conn, table, columns)?;
+        let names = columns
+            .iter()
+            .map(|c| quoted(&c.name))
+            .collect::<Vec<_>>()
+            .join(",");
+        let placeholders = vec!["?"; columns.len()].join(",");
         for row in &image.rows[*table] {
             if row["thread_id"] != id {
                 return Err(unsupported("投影快照包含其他线程"));
             }
-            let values: Vec<SqlValue> = names
+            let values = columns
                 .iter()
-                .map(|n| match &row[*n] {
-                    Value::Null => SqlValue::Null,
-                    Value::String(s) => SqlValue::Text(s.clone()),
-                    Value::Number(n) => SqlValue::Integer(n.as_i64().unwrap_or_default()),
-                    _ => SqlValue::Null,
+                .map(|c| {
+                    row.get(&c.name)
+                        .ok_or_else(|| unsupported(format!("投影快照缺少字段 {table}.{}", c.name)))
+                        .and_then(json_to_sql)
                 })
-                .collect();
+                .collect::<AppResult<Vec<_>>>()?;
             conn.execute(
-                &format!("INSERT INTO {table} ({columns}) VALUES ({placeholders})"),
+                &format!("INSERT INTO {table} ({names}) VALUES ({placeholders})"),
                 rusqlite::params_from_iter(values),
             )?;
         }

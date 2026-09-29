@@ -37,16 +37,45 @@ pub fn preview_session_markdown(
         provider,
         &rollout_path,
     );
-    let (mut events, has_more) = if matches!(provider, "codex" | "claude") {
-        jsonl_page(provider, &rollout_path, offset)?
+    let filtered = options.time_from.is_some()
+        || options.time_to.is_some()
+        || options.selected_indices.is_some();
+    let paginated =
+        provider == "codex" && crate::logical_history::is_paginated(Path::new(&rollout_path))?;
+    let (mut events, has_more, next_offset) = if filtered || paginated {
+        // The display budget applies after selection. A date range or a selected
+        // message can be anywhere in the history, including inherited rollouts.
+        let events = if paginated {
+            crate::logical_history::read(Path::new(&rollout_path), None)?.events()
+        } else {
+            preview_session_range(Some(provider.into()), rollout_path.clone(), 0, usize::MAX)?
+        };
+        let segments: Vec<_> = events.iter().map(segment).collect();
+        let (included, _) = plan_inclusion(&events, &segments, &options);
+        let mut events: Vec<_> = events
+            .into_iter()
+            .zip(segments)
+            .zip(included)
+            .filter_map(|((event, segment), keep)| {
+                (keep && visible_segment(&segment, &options)).then_some(event)
+            })
+            .skip(offset)
+            .take(PAGE_EVENTS + 1)
+            .collect();
+        let more = events.len() > PAGE_EVENTS;
+        events.truncate(PAGE_EVENTS);
+        let next = offset.saturating_add(events.len());
+        (events, more, next)
+    } else if matches!(provider, "codex" | "claude") {
+        jsonl_page(provider, &rollout_path, offset, &options)?
     } else {
         let mut events =
             preview_session_range(Some(provider.into()), rollout_path, offset, PAGE_EVENTS + 1)?;
         let more = events.len() > PAGE_EVENTS;
         events.truncate(PAGE_EVENTS);
-        (events, more)
+        let next = offset.saturating_add(events.len());
+        (events, more, next)
     };
-    let next_offset = offset.saturating_add(events.len());
     let messages = events
         .iter()
         .filter_map(|event| {
@@ -92,7 +121,23 @@ pub fn preview_session_markdown(
     Ok(page)
 }
 
-fn jsonl_page(provider: &str, path: &str, offset: usize) -> AppResult<(Vec<PreviewEvent>, bool)> {
+fn visible_segment(segment: &Segment, options: &MarkdownExportOptions) -> bool {
+    match segment {
+        Segment::Message { .. } => true,
+        Segment::Reasoning(_) => options.include_reasoning,
+        Segment::ToolCalls(_) | Segment::ToolResults(_) | Segment::PatchApplied(_) => {
+            options.include_tools
+        }
+        Segment::Skip => false,
+    }
+}
+
+fn jsonl_page(
+    provider: &str,
+    path: &str,
+    offset: usize,
+    options: &MarkdownExportOptions,
+) -> AppResult<(Vec<PreviewEvent>, bool, usize)> {
     let mut reader = BufReader::new(fs::File::open(path)?);
     let mut events = Vec::new();
     let mut line = Vec::new();
@@ -102,7 +147,7 @@ fn jsonl_page(provider: &str, path: &str, offset: usize) -> AppResult<(Vec<Previ
     let mut canonical = false;
     loop {
         if events.len() >= PAGE_EVENTS || page_bytes >= PAGE_SOURCE_BYTES {
-            return Ok((events, !reader.fill_buf()?.is_empty()));
+            return Ok((events, !reader.fill_buf()?.is_empty(), event_offset));
         }
         line.clear();
         // A single native record may exceed the page budget; never allocate without a limit.
@@ -112,7 +157,7 @@ fn jsonl_page(provider: &str, path: &str, offset: usize) -> AppResult<(Vec<Previ
             .take(MAX_EVENT_BYTES + 1)
             .read_until(b'\n', &mut line)?;
         if count == 0 {
-            return Ok((events, false));
+            return Ok((events, false, event_offset));
         }
         crate::operation_metrics::record(|c| {
             c.read_bytes += count as u64;
@@ -138,7 +183,7 @@ fn jsonl_page(provider: &str, path: &str, offset: usize) -> AppResult<(Vec<Previ
         };
         if let Some(event) = event {
             event_offset += 1;
-            if event_offset <= offset {
+            if event_offset <= offset || !visible_segment(&segment(&event), options) {
                 continue;
             }
             page_bytes += count;
@@ -150,6 +195,113 @@ fn jsonl_page(provider: &str, path: &str, offset: usize) -> AppResult<(Vec<Previ
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filtered_preview_does_not_spend_message_page_on_hidden_process_records() -> AppResult<()> {
+        let path = super::super::tests::temp_file("filtered-process-preview");
+        let mut file = fs::File::create(&path)?;
+        for _ in 0..200 {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({"type":"event_msg", "payload":{"type":"token_count"}})
+            )?;
+        }
+        for i in 0..100 {
+            let mut raw = super::super::tests::user(&format!("LATEST-AFTER-PROCESS-{i}"));
+            raw["timestamp"] = serde_json::json!("2026-09-28T10:00:00Z");
+            writeln!(file, "{raw}")?;
+        }
+        drop(file);
+        for time_from in [None, Some(1)] {
+            let mut options = super::super::tests::default_options();
+            options.time_from = time_from;
+            let page = preview_session_markdown(
+                Some("codex".into()),
+                path.to_string_lossy().into_owned(),
+                super::super::tests::header(),
+                options.clone(),
+                0,
+            )?;
+            assert!(page.markdown.contains("LATEST-AFTER-PROCESS"));
+            assert_eq!(page.messages.len(), 80);
+            assert!(page.has_more);
+            let next = preview_session_markdown(
+                Some("codex".into()),
+                path.to_string_lossy().into_owned(),
+                super::super::tests::header(),
+                options,
+                page.next_offset,
+            )?;
+            assert_eq!(next.messages.len(), 20);
+            assert_eq!(next.messages[0].index, 280);
+            assert!(!next.has_more);
+        }
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn filtered_preview_finds_recent_messages_beyond_the_first_page() -> AppResult<()> {
+        let path = super::super::tests::temp_file("filtered-preview");
+        let mut file = fs::File::create(&path)?;
+        for i in 0..450 {
+            let mut raw = super::super::tests::user(&format!("message-{i}"));
+            raw["timestamp"] = serde_json::json!(if i < 200 {
+                "2026-09-01T10:00:00Z"
+            } else {
+                "2026-09-28T10:00:00Z"
+            });
+            writeln!(file, "{raw}")?;
+        }
+        drop(file);
+        let mut options = super::super::tests::default_options();
+        options.time_from = Some(
+            chrono::DateTime::parse_from_rfc3339("2026-09-28T00:00:00Z")
+                .unwrap()
+                .timestamp(),
+        );
+        let page = preview_session_markdown(
+            Some("codex".into()),
+            path.to_string_lossy().into_owned(),
+            super::super::tests::header(),
+            options.clone(),
+            0,
+        )?;
+        assert_eq!(page.messages.first().map(|m| m.index), Some(200));
+        assert!(page.markdown.contains("message-200"));
+        assert!(!page.markdown.contains("message-0\n"));
+        assert!(page.markdown.len() <= PREVIEW_BYTES);
+        assert!(page.has_more);
+        let next = preview_session_markdown(
+            Some("codex".into()),
+            path.to_string_lossy().into_owned(),
+            super::super::tests::header(),
+            options.clone(),
+            page.next_offset,
+        )?;
+        assert_eq!(next.messages.first().map(|m| m.index), Some(280));
+        let full = export_session_markdown(
+            Some("codex".into()),
+            path.to_string_lossy().into_owned(),
+            None,
+            super::super::tests::header(),
+            options.clone(),
+        )?;
+        assert_eq!(full.message_count, 250);
+        assert!(full.markdown.contains("message-449"));
+        options.selected_indices = Some(vec![249]);
+        let selected = preview_session_markdown(
+            Some("codex".into()),
+            path.to_string_lossy().into_owned(),
+            super::super::tests::header(),
+            options,
+            0,
+        )?;
+        assert!(selected.markdown.contains("message-249"));
+        fs::remove_file(path)?;
+        Ok(())
+    }
 
     #[test]
     fn performance_preview_is_bounded_and_summaries_have_no_payload() -> AppResult<()> {

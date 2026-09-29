@@ -58,8 +58,15 @@ fn load_inspected(
     provider: &str,
     path: &Path,
 ) -> AppResult<(std::sync::Arc<LoadedFile>, crate::models::EditCapability)> {
+    inspect_snapshot(provider, path, read_preview_snapshot(path, None)?)
+}
+
+fn inspect_snapshot(
+    provider: &str,
+    path: &Path,
+    mut loaded: std::sync::Arc<LoadedFile>,
+) -> AppResult<(std::sync::Arc<LoadedFile>, crate::models::EditCapability)> {
     for attempt in 0..3 {
-        let loaded = read_preview_snapshot(path, None)?;
         let capability = safety::inspect(provider, path, &loaded)?;
         if attempt == 2
             || !capability
@@ -70,6 +77,7 @@ fn load_inspected(
             return Ok((loaded, capability));
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
+        loaded = read_preview_snapshot(path, None)?;
     }
     unreachable!()
 }
@@ -81,7 +89,15 @@ pub(crate) fn preview_capability(
     path: &Path,
     expected: Option<&str>,
 ) -> AppResult<(std::sync::Arc<LoadedFile>, crate::models::EditCapability)> {
-    let (loaded, capability) = load_inspected(provider, path)?;
+    let loaded = read_preview_snapshot(path, None)?;
+    // Later pages of unchanged bytes need only the byte check above. First pages
+    // and refreshes pass no revision, and every write inspects again.
+    if let Some(capability) =
+        expected.and_then(|expected| preview_cache::reusable_capability(path, &loaded, expected))
+    {
+        return Ok((loaded, capability));
+    }
+    let (loaded, capability) = inspect_snapshot(provider, path, loaded)?;
     if let Some(expected) = expected {
         if expected != capability.revision
             && !safety::is_appended_revision(path, &loaded, expected)?
@@ -91,6 +107,7 @@ pub(crate) fn preview_capability(
             ));
         }
     }
+    preview_cache::remember_capability(path, &loaded, &capability, expected);
     Ok((loaded, capability))
 }
 
@@ -111,11 +128,7 @@ pub(crate) fn codex_preview_page(
                 .get("history_base")
                 .is_some_and(|base| !base.is_null())
     }) {
-        let history = crate::logical_history::from_records(
-            &path,
-            loaded.parsed.iter().flatten().cloned().collect(),
-            None,
-        )?;
+        let history = crate::logical_history::view(&path, loaded, None)?;
         return Ok(crate::models::PreviewPage {
             events: history.raw_events_range(offset, limit).collect(),
             capability: Some(capability),
@@ -1513,7 +1526,7 @@ pub fn undo_last(
 
     let expected = last.before_hash.clone();
     if let Some(history) = &last.history {
-        if paginated::projection::read(&ctx.path, &ctx.loaded)? != history.after {
+        if !paginated::projection::read(&ctx.path, &ctx.loaded)?.matches_recorded(&history.after) {
             return Err(AppError::Other(
                 "[EDIT_CONFLICT] 原生历史已发生外部修改，未执行撤销".into(),
             ));
@@ -1603,8 +1616,7 @@ pub fn restore_snapshot(
             .is_none_or(|history| {
                 paginated::projection::read(&ctx.path, &ctx.loaded)
                     .ok()
-                    .as_ref()
-                    != Some(&history.after)
+                    .is_none_or(|current| !current.matches_recorded(&history.after))
             })
         {
             return Err(AppError::Other(
@@ -2163,6 +2175,58 @@ mod tests {
         );
         assert_eq!(cached.parsed_lines, 0, "unchanged JSON is not reparsed");
         assert!(cached.cache_hits > 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inherited_preview_pages_match_the_full_logical_history() {
+        let root = temp_dir("inherited-pages");
+        let day = root.join("sessions/2026/09/28");
+        let message = |turn: &str, text: &str| json!({"type":"event_msg","payload":{"type":"item_completed","thread_id":"child-1","turn_id":turn,"item":{"type":"UserMessage","id":turn,"content":[{"type":"text","text":text}]}}});
+        let base = day.join("rollout-2026-09-28T00-00-00-base-1.jsonl");
+        write_jsonl(
+            &base,
+            &[
+                json!({"type":"session_meta","payload":{"id":"base-1","history_mode":"paginated"}}),
+                message("a", "BASE-A"),
+                message("b", "BASE-B"),
+            ],
+        );
+        let end = fs::metadata(&base).unwrap().len();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&base)
+            .unwrap()
+            .write_all(format!("{}\n", message("x", "OUTSIDE-PREFIX")).as_bytes())
+            .unwrap();
+        let child = day.join("rollout-2026-09-28T00-00-01-child-1.jsonl");
+        write_jsonl(
+            &child,
+            &[
+                json!({"type":"session_meta","payload":{"id":"child-1","history_mode":"paginated","history_base":{"thread_id":"base-1","end_ordinal_exclusive":3,"end_byte_offset":end}}}),
+                message("c", "CHILD-C"),
+            ],
+        );
+        let full: Vec<_> = crate::logical_history::read(&child, None)
+            .unwrap()
+            .raw_events()
+            .into_iter()
+            .map(|e| (e.index, e.raw))
+            .collect();
+        let paged: Vec<_> = (0..5)
+            .flat_map(|offset| {
+                codex_preview_page(child.to_str().unwrap(), offset, 1, None)
+                    .unwrap()
+                    .events
+            })
+            .map(|e| (e.index, e.raw))
+            .collect();
+        assert_eq!(paged, full);
+        let texts: Vec<_> = paged
+            .iter()
+            .filter_map(|(_, raw)| raw["payload"]["item"]["content"][0]["text"].as_str())
+            .collect();
+        assert_eq!(texts, ["BASE-A", "BASE-B", "CHILD-C"]);
         fs::remove_dir_all(root).unwrap();
     }
 

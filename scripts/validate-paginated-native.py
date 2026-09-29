@@ -73,7 +73,7 @@ def main():
     args = parser.parse_args()
     binary = args.codex.resolve()
     version = subprocess.check_output([str(binary), '--version'], text=True).strip()
-    assert version == 'codex-cli 0.155.0-alpha.16', f'Unverified native version: {version}'
+    assert version in ('codex-cli 0.155.0-alpha.16', 'codex-cli 0.158.0-alpha.2.1'), f'Unverified native version: {version}'
     home = args.output.resolve()
     home.mkdir(parents=True, exist_ok=False)
     native = Native(binary, home)
@@ -90,7 +90,7 @@ def main():
     rows = [{'type': 'session_meta', 'payload': {
         'id': tid, 'session_id': tid, 'timestamp': '2026-09-23T10:00:00Z',
         'cwd': str(home), 'runtime_workspace_roots': [str(home)],
-        'originator': 'cc_sessions_fixture', 'cli_version': '0.155.0-alpha.16',
+        'originator': 'cc_sessions_fixture', 'cli_version': version.removeprefix('codex-cli '),
         'source': 'cli', 'model_provider': 'openai', 'history_mode': 'paginated',
         'base_instructions': {'text': 'Synthetic edit regression. Do not execute tools.'},
     }}]
@@ -176,6 +176,7 @@ def main():
     all_ids = ['user-0', 'agent-0', 'user-1', 'agent-1', 'user-2', 'agent-2']
     if args.with_tools:
         all_ids.insert(3, 'tool-1')
+    baseline_lifecycle = {}
 
     def read_stage(stage, expected_ids, preview='KEEP-A', texts=None, resume=False):
         nonlocal original
@@ -206,6 +207,13 @@ def main():
                 evidence[method] = data
             items = [v['item'] for v in evidence['thread/items/list']]
             assert [v['id'] for v in items] == expected_ids
+            lifecycle = {v['item']['id']: [v.get('startedAtMs'), v.get('completedAtMs')]
+                         for v in evidence['thread/items/list'] if 'startedAtMs' in v}
+            if stage == 'baseline':
+                baseline_lifecycle.update(lifecycle)
+            else:
+                assert lifecycle == {key: value for key, value in baseline_lifecycle.items()
+                                     if key in expected_ids}, f'Lifecycle timestamps changed: {stage}'
             if args.with_blocks:
                 user = next(v for v in items if v['id'] == 'user-0')
                 assert [b['type'] for b in user['content']] == ['text', 'localImage', 'text']
@@ -288,6 +296,7 @@ def main():
         'desktopColdStartup': 'NOT VERIFIED', 'modelGeneration': False, 'toolReplay': False,
         'toolsAndTerminalStates': args.with_tools,
         'interleavedContentBlocks': args.with_blocks,
+        'lifecycleTimestamps': bool(baseline_lifecycle),
     }, indent=2), encoding='utf-8')
     print(str(home / 'result.json'), flush=True)
 

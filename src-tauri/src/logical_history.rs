@@ -1,16 +1,28 @@
 //! Read-only Codex history. Lineage follows the alpha.16 rollout_lineage contract:
 //! history_base names a physical rollout and bounds it by both byte offset and ordinal.
+use crate::edit::LoadedFile;
 use crate::error::{ensure_not_cancelled, AppError, AppResult};
 use crate::models::PreviewEvent;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 pub(crate) struct History {
     pub records: Vec<Value>,
     pub paginated: bool,
     pub inherited_records: usize,
+}
+
+/// Logical records as positions in shared, verified snapshots. A page clones only
+/// its own records instead of the whole history.
+pub(crate) struct View {
+    files: Vec<Arc<LoadedFile>>,
+    /// (file, line) of every logical record; each line is a parsed record.
+    order: Vec<(usize, usize)>,
+    paginated: bool,
+    inherited_records: usize,
 }
 
 fn invalid(reason: &str) -> AppError {
@@ -43,7 +55,7 @@ pub(crate) fn read(path: &Path, cancel: Option<&AtomicBool>) -> AppResult<Histor
             )
         })
         .and_then(Path::parent);
-    read_segment(path, root, None, &mut seen, cancel)
+    Ok(read_segment(path, root, None, &mut seen, cancel)?.into_history())
 }
 
 fn read_segment(
@@ -52,7 +64,7 @@ fn read_segment(
     end: Option<(u64, u64)>,
     seen: &mut HashSet<PathBuf>,
     cancel: Option<&AtomicBool>,
-) -> AppResult<History> {
+) -> AppResult<View> {
     ensure_not_cancelled(cancel)?;
     let physical = path.canonicalize()?;
     if !seen.insert(physical.clone()) || seen.len() > 128 {
@@ -65,7 +77,7 @@ fn read_segment(
     if length > total {
         return Err(invalid("继承字节边界越界"));
     }
-    let mut records = Vec::new();
+    let mut order = Vec::new();
     let mut offset = 0;
     for (i, (line, value)) in loaded.lines.iter().zip(&loaded.parsed).enumerate() {
         ensure_not_cancelled(cancel)?;
@@ -78,21 +90,22 @@ fn read_segment(
             return Err(invalid("继承字节边界未落在完整记录边界"));
         }
         if !line.trim().is_empty() {
-            records.push(
-                value
-                    .clone()
-                    .ok_or_else(|| invalid("历史包含不完整或无法解析的记录"))?,
-            );
+            if value.is_none() {
+                return Err(invalid("历史包含不完整或无法解析的记录"));
+            }
+            order.push((0, i));
         }
     }
-    resolve_records(records, root, end, seen, cancel)
+    resolve_records(View::new(loaded, order), root, end, seen, cancel)
 }
 
-pub(crate) fn from_records(
+/// Logical history of an already verified snapshot. Like the physical preview,
+/// lines that cannot be parsed are skipped rather than rejected.
+pub(crate) fn view(
     path: &Path,
-    records: Vec<Value>,
+    loaded: Arc<LoadedFile>,
     cancel: Option<&AtomicBool>,
-) -> AppResult<History> {
+) -> AppResult<View> {
     let root = path
         .ancestors()
         .find(|p| {
@@ -103,32 +116,36 @@ pub(crate) fn from_records(
         })
         .and_then(Path::parent);
     let mut seen = HashSet::from([path.canonicalize()?]);
-    resolve_records(records, root, None, &mut seen, cancel)
+    let order = (0..loaded.parsed.len())
+        .filter(|&i| loaded.parsed[i].is_some())
+        .map(|i| (0, i))
+        .collect();
+    resolve_records(View::new(loaded, order), root, None, &mut seen, cancel)
 }
 
 fn resolve_records(
-    mut records: Vec<Value>,
+    mut records: View,
     root: Option<&Path>,
     end: Option<(u64, u64)>,
     seen: &mut HashSet<PathBuf>,
     cancel: Option<&AtomicBool>,
-) -> AppResult<History> {
-    let Some(meta) = records.first().filter(|v| v["type"] == "session_meta") else {
+) -> AppResult<View> {
+    let Some(meta) = (!records.order.is_empty())
+        .then(|| records.record(0))
+        .filter(|v| v["type"] == "session_meta")
+    else {
         // Legacy read-only exports may lack metadata.
         if end.is_some() {
             return Err(invalid("继承源缺少会话元数据"));
         }
-        return Ok(History {
-            records,
-            paginated: false,
-            inherited_records: 0,
-        });
+        return Ok(records);
     };
     let paginated = meta["payload"]["history_mode"] == "paginated";
     let base = meta["payload"]
         .get("history_base")
         .filter(|v| !v.is_null())
         .cloned();
+    records.paginated = paginated;
     let start = base
         .as_ref()
         .and_then(|v| v["end_ordinal_exclusive"].as_u64())
@@ -136,28 +153,24 @@ fn resolve_records(
     if let Some((ordinal, _)) = end {
         if !paginated
             || ordinal == 0
-            || records
-                .iter()
-                .enumerate()
-                .skip(1)
-                .any(|(i, v)| v["ordinal"].as_u64().unwrap_or(start + i as u64) >= ordinal)
+            || (1..records.len()).any(|i| {
+                records.record(i)["ordinal"]
+                    .as_u64()
+                    .unwrap_or(start + i as u64)
+                    >= ordinal
+            })
         {
             return Err(invalid("继承 ordinal 与字节边界不一致"));
         }
-        let last = records
-            .last()
-            .and_then(|v| v["ordinal"].as_u64())
+        let last = records.record(records.len() - 1)["ordinal"]
+            .as_u64()
             .unwrap_or(start + records.len() as u64 - 1);
         if last.checked_add(1) != Some(ordinal) {
             return Err(invalid("继承范围记录缺失"));
         }
     }
     let Some(base) = base else {
-        return Ok(History {
-            records,
-            paginated,
-            inherited_records: 0,
-        });
+        return Ok(records);
     };
     if !paginated {
         return Err(invalid("非分页历史携带继承指针"));
@@ -207,18 +220,15 @@ fn resolve_records(
         seen,
         cancel,
     )?;
-    let prefix: Vec<_> = inherited
-        .records
-        .into_iter()
-        .filter(|v| v["type"] != "session_meta")
+    let shift = records.files.len();
+    let prefix: Vec<_> = (0..inherited.len())
+        .filter(|&i| inherited.record(i)["type"] != "session_meta")
+        .map(|i| (inherited.order[i].0 + shift, inherited.order[i].1))
         .collect();
-    let count = prefix.len();
-    records.splice(1..1, prefix);
-    Ok(History {
-        records,
-        paginated,
-        inherited_records: count,
-    })
+    records.inherited_records = prefix.len();
+    records.files.extend(inherited.files);
+    records.order.splice(1..1, prefix);
+    Ok(records)
 }
 
 pub(crate) fn item_key(value: &Value) -> Option<(String, String, String)> {
@@ -249,6 +259,41 @@ pub(crate) fn latest(records: &[Value]) -> Vec<(usize, &Value)> {
         out.push((i, record));
     }
     out
+}
+
+impl View {
+    fn new(loaded: Arc<LoadedFile>, order: Vec<(usize, usize)>) -> Self {
+        Self {
+            files: vec![loaded],
+            order,
+            paginated: false,
+            inherited_records: 0,
+        }
+    }
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+    fn record(&self, position: usize) -> &Value {
+        let (file, line) = self.order[position];
+        self.files[file].parsed[line]
+            .as_ref()
+            .expect("logical positions refer only to parsed records")
+    }
+    fn into_history(self) -> History {
+        History {
+            records: (0..self.len()).map(|i| self.record(i).clone()).collect(),
+            paginated: self.paginated,
+            inherited_records: self.inherited_records,
+        }
+    }
+    pub fn raw_events_range(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> impl Iterator<Item = PreviewEvent> + '_ {
+        (offset..self.len().min(offset.saturating_add(limit)))
+            .map(|i| crate::rollout::classify_history(i, self.record(i).clone(), self.paginated))
+    }
 }
 
 impl History {

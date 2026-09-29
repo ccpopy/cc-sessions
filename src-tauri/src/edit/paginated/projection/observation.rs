@@ -142,6 +142,10 @@ fn observe_snapshot(
     status.next_rollout_byte_offset =
         checkpoint.and_then(|r| r["next_rollout_byte_offset"].as_u64());
     status.next_rollout_ordinal = checkpoint.and_then(|r| r["next_rollout_ordinal"].as_u64());
+    let projected_items: BTreeSet<_> = image.rows["thread_items"]
+        .iter()
+        .filter_map(|r| Some((r["turn_id"].as_str()?, r["item_id"].as_str()?)))
+        .collect();
     let mut offset = 0;
     for (i, line) in loaded.lines.iter().enumerate() {
         let end = offset
@@ -149,10 +153,10 @@ fn observe_snapshot(
             + u64::from(i + 1 < loaded.lines.len() || loaded.trailing_newline);
         if let Some(v) = &loaded.parsed[i] {
             if codex_ptype(v) == "item_completed"
-                && !image.rows["thread_items"].iter().any(|r| {
-                    r["turn_id"] == v["payload"]["turn_id"]
-                        && r["item_id"] == v["payload"]["item"]["id"]
-                })
+                && !projected_items.contains(&(
+                    v["payload"]["turn_id"].as_str().unwrap_or(""),
+                    v["payload"]["item"]["id"].as_str().unwrap_or(""),
+                ))
             {
                 let ordinal = v["ordinal"].as_u64().unwrap_or(u64::MAX);
                 status.item = Some(ProjectionItemEvidence {
@@ -189,8 +193,8 @@ fn observe_snapshot(
     if bytes < status.file_bytes || !loaded.trailing_newline {
         return Err(failure(status.clone(), "updating", "PROJECTION_BEHIND", "正在更新：日志已落盘，投影检查点尚未追上；停止生成并完成原生历史读取后刷新。尚无证据认定原生投影持续失败"));
     }
-    model(loaded)?;
     if let Some(item) = &status.item {
+        model(loaded)?;
         let meta = loaded
             .parsed
             .iter()
@@ -243,6 +247,24 @@ fn observe_snapshot(
     }
     if project(loaded, &image)? != image {
         return Err(failure(status.clone(), "inconsistent", "PROJECTION_CONTENT_MISMATCH", "已确认异常：稳定读取下，当前 rollout 与其投影的消息、回合或检查点不一致；写入已保护，请在隔离副本核对原生读取结果"));
+    }
+    let extensions: usize = TABLES
+        .iter()
+        .map(|(table, base)| {
+            image.rows[*table]
+                .first()
+                .and_then(Value::as_object)
+                .map_or(0, |row| {
+                    row.keys()
+                        .filter(|name| !base.split(',').any(|required| required == *name))
+                        .count()
+                })
+        })
+        .sum();
+    if extensions > 0 {
+        status.message = format!(
+            "日志与当前原生投影已同步；历史库含 {extensions} 个扩展字段，将按原值保留，不影响编辑"
+        );
     }
     Ok(image)
 }

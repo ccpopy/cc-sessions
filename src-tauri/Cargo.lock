@@ -483,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "cc-session-manager"
-version = "0.6.10"
+version = "0.6.11"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

@@ -1,14 +1,20 @@
 //! Display-only immutable parses. Mutations always use load_file and full hashes.
 use super::*;
 use crate::error::ensure_not_cancelled;
+use crate::models::EditCapability;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io::Read;
-use std::sync::{atomic::AtomicBool, Arc, Mutex, OnceLock};
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 
 const MAX_ENTRIES: usize = 8;
 const MAX_BYTES: usize = 96 * 1024 * 1024;
+/// A rollout being paged and its base rollout may stay cached together above
+/// MAX_BYTES, up to this limit, until paging has been idle for ACTIVE_IDLE.
+const MAX_ACTIVE_BYTES: usize = 384 * 1024 * 1024;
+const ACTIVE_IDLE: Duration = Duration::from_secs(120);
 
 #[derive(Clone, PartialEq, Eq)]
 struct Stamp {
@@ -34,6 +40,14 @@ struct Entry {
     loaded: Arc<LoadedFile>,
     bytes: usize,
     used: u64,
+    inspected: Option<Inspected>,
+}
+
+/// Display capability of exactly the cached bytes, for later pages of a preview.
+struct Inspected {
+    capability: EditCapability,
+    /// An earlier revision already proven to be a complete-line prefix of these bytes.
+    appended_from: Option<String>,
 }
 
 #[derive(Default)]
@@ -48,29 +62,118 @@ impl Cache {
         if let Some(old) = self.entries.remove(&path) {
             self.bytes -= old.bytes;
         }
-        if entry.bytes > MAX_BYTES {
+        if entry.bytes > MAX_ACTIVE_BYTES {
             return;
         }
-        while self.entries.len() >= MAX_ENTRIES || self.bytes + entry.bytes > MAX_BYTES {
-            let oldest = self
-                .entries
-                .iter()
-                .min_by_key(|(_, e)| e.used)
-                .unwrap()
-                .0
-                .clone();
-            self.bytes -= self.entries.remove(&oldest).unwrap().bytes;
-        }
+        // Paging reads a rollout and then its base, so keep the most recently used
+        // entry beside the new one even above MAX_BYTES.
+        let partner = self
+            .entries
+            .iter()
+            .max_by_key(|(_, e)| e.used)
+            .map(|(p, _)| p.clone());
+        self.evict(entry.bytes, partner.as_ref());
         self.clock += 1;
         entry.used = self.clock;
         self.bytes += entry.bytes;
         self.entries.insert(path, entry);
+    }
+
+    /// Least recently used first; `keep` is exempt from MAX_BYTES only.
+    fn evict(&mut self, incoming: usize, keep: Option<&PathBuf>) {
+        while self.entries.len() >= MAX_ENTRIES || self.bytes + incoming > MAX_BYTES {
+            let over_active = self.bytes + incoming > MAX_ACTIVE_BYTES;
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .filter(|(p, _)| over_active || Some(*p) != keep)
+                .min_by_key(|(_, e)| e.used)
+                .map(|(p, _)| p.clone())
+            else {
+                break;
+            };
+            self.bytes -= self.entries.remove(&oldest).unwrap().bytes;
+        }
     }
 }
 
 fn cache() -> &'static Mutex<Cache> {
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(Cache::default()))
+}
+
+/// Called with the cache locked. Returns the cache to MAX_BYTES once no preview
+/// has read it for ACTIVE_IDLE.
+fn trim_when_idle(clock: u64) {
+    static TRIMMING: AtomicBool = AtomicBool::new(false);
+    if TRIMMING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let mut last = clock;
+        loop {
+            std::thread::sleep(ACTIVE_IDLE);
+            let mut cache = cache().lock().unwrap_or_else(|e| e.into_inner());
+            if cache.clock == last {
+                cache.evict(0, None);
+            }
+            if cache.bytes <= MAX_BYTES {
+                // Still locked: a later oversized insert starts a new trim.
+                TRIMMING.store(false, Ordering::Release);
+                return;
+            }
+            last = cache.clock;
+        }
+    });
+}
+
+/// Capability of these exact bytes when a later page asks for `expected`: their
+/// own revision, or an earlier revision already verified as their prefix.
+pub(super) fn reusable_capability(
+    path: &Path,
+    loaded: &Arc<LoadedFile>,
+    expected: &str,
+) -> Option<EditCapability> {
+    let path = path.canonicalize().ok()?;
+    let cache = cache().lock().unwrap_or_else(|e| e.into_inner());
+    let inspected = cache
+        .entries
+        .get(&path)
+        .filter(|e| Arc::ptr_eq(&e.loaded, loaded))?
+        .inspected
+        .as_ref()?;
+    (inspected.capability.revision == expected
+        || inspected.appended_from.as_deref() == Some(expected))
+    .then(|| inspected.capability.clone())
+}
+
+pub(super) fn remember_capability(
+    path: &Path,
+    loaded: &Arc<LoadedFile>,
+    capability: &EditCapability,
+    expected: Option<&str>,
+) {
+    let Ok(path) = path.canonicalize() else {
+        return;
+    };
+    let mut cache = cache().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = cache
+        .entries
+        .get_mut(&path)
+        .filter(|e| Arc::ptr_eq(&e.loaded, loaded))
+    {
+        // Other projection states can change without new rollout bytes.
+        entry.inspected = capability
+            .projection
+            .as_ref()
+            .is_none_or(|p| p.state == "ready")
+            .then(|| Inspected {
+                capability: capability.clone(),
+                appended_from: expected
+                    .filter(|e| *e != capability.revision)
+                    .map(str::to_owned),
+            });
+    }
 }
 
 // Conservative accounting of owned buffers and JSON containers, excluding shared callers.
@@ -172,15 +275,20 @@ pub(super) fn read(path: &Path, cancel: Option<&AtomicBool>) -> AppResult<Arc<Lo
         }
         let bytes = retained_bytes(&loaded);
         let loaded = Arc::new(loaded);
-        cache().lock().unwrap_or_else(|e| e.into_inner()).insert(
+        let mut cache = cache().lock().unwrap_or_else(|e| e.into_inner());
+        cache.insert(
             path.clone(),
             Entry {
                 stamp: before,
                 loaded: loaded.clone(),
                 bytes,
                 used: 0,
+                inspected: None,
             },
         );
+        if cache.bytes > MAX_BYTES {
+            trim_when_idle(cache.clock);
+        }
         return Ok(loaded);
     }
     Err(AppError::Other(
@@ -191,6 +299,53 @@ pub(super) fn read(path: &Path, cancel: Option<&AtomicBool>) -> AppResult<Arc<Lo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "read-only local preview profiling; requires explicit input and output paths"]
+    fn profile_preview_read_only() {
+        let path = PathBuf::from(std::env::var("CC_PREVIEW_PERF_INPUT").unwrap());
+        let mut measurements = Vec::new();
+        let started = std::time::Instant::now();
+        let (loaded, work) = crate::operation_metrics::measured(|| read(&path, None).unwrap());
+        measurements.push(serde_json::json!({"phase":"read_parse","elapsed_us":started.elapsed().as_micros(),"retained_bytes":retained_bytes(&loaded),"counters":work}));
+        eprintln!("{}", measurements.last().unwrap());
+        let started = std::time::Instant::now();
+        let details = paginated::diagnostics(&loaded);
+        measurements.push(serde_json::json!({"phase":"diagnostics","elapsed_us":started.elapsed().as_micros(),"ok":details.is_ok(),"mappings":details.as_ref().map(Vec::len).unwrap_or(0)}));
+        eprintln!("{}", measurements.last().unwrap());
+        let started = std::time::Instant::now();
+        let (observation, work) =
+            crate::operation_metrics::measured(|| paginated::projection::observe(&path, &loaded));
+        measurements.push(serde_json::json!({"phase":"projection","elapsed_us":started.elapsed().as_micros(),"ok":observation.is_ok(),"counters":work}));
+        eprintln!("{}", measurements.last().unwrap());
+        let mut revision = None;
+        for (name, offset) in [("first_page", 0), ("second_page", 80), ("third_page", 160)] {
+            let started = std::time::Instant::now();
+            let (page, work) = crate::operation_metrics::measured(|| {
+                crate::rollout::preview_session_page(
+                    "codex".into(),
+                    path.to_string_lossy().into(),
+                    offset,
+                    80,
+                    revision.clone(),
+                )
+            });
+            let ipc_bytes = page
+                .as_ref()
+                .ok()
+                .map(|p| serde_json::to_vec(p).unwrap().len());
+            if let Ok(page) = &page {
+                revision = page.capability.as_ref().map(|c| c.revision.clone());
+            }
+            measurements.push(serde_json::json!({"phase":name,"elapsed_us":started.elapsed().as_micros(),"ok":page.is_ok(),"ipc_bytes":ipc_bytes,"counters":work}));
+            eprintln!("{}", measurements.last().unwrap());
+        }
+        fs::write(
+            std::env::var("CC_PREVIEW_PERF_REPORT").unwrap(),
+            serde_json::to_vec_pretty(&measurements).unwrap(),
+        )
+        .unwrap();
+    }
 
     #[test]
     #[ignore = "isolated fixed-size performance measurement; writes only an explicitly supplied report"]
@@ -314,10 +469,44 @@ mod tests {
                     loaded: first.clone(),
                     bytes: MAX_BYTES / 3,
                     used: 0,
+                    inspected: None,
                 },
             );
             assert!(bounded.bytes <= MAX_BYTES && bounded.entries.len() <= MAX_ENTRIES);
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn paged_rollout_and_its_base_stay_cached_above_the_shared_budget() {
+        let root = super::super::tests::temp_dir("cache-working-set");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout.jsonl");
+        fs::write(&path, "{\"a\":1}\n").unwrap();
+        let loaded = read(&path, None).unwrap();
+        let entry = |bytes| Entry {
+            stamp: stamp(&path).unwrap(),
+            loaded: loaded.clone(),
+            bytes,
+            used: 0,
+            inspected: None,
+        };
+        let cached = |cache: &Cache, name: &str| cache.entries.contains_key(Path::new(name));
+        let mut cache = Cache::default();
+        cache.insert("other".into(), entry(MAX_BYTES / 4));
+        cache.insert("rollout".into(), entry(MAX_BYTES + 1));
+        cache.insert("base".into(), entry(MAX_BYTES));
+        // A native append replaces the rollout while its base stays cached.
+        cache.insert("rollout".into(), entry(MAX_BYTES + 1));
+        assert!(cached(&cache, "rollout") && cached(&cache, "base"));
+        assert!(!cached(&cache, "other"));
+        cache.insert("huge".into(), entry(MAX_ACTIVE_BYTES + 1));
+        assert!(!cached(&cache, "huge"));
+        cache.insert("large".into(), entry(MAX_ACTIVE_BYTES - MAX_BYTES));
+        assert!(cached(&cache, "large") && cache.bytes <= MAX_ACTIVE_BYTES);
+        // Idle trimming restores the shared budget.
+        cache.evict(0, None);
+        assert!(cache.bytes <= MAX_BYTES);
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -24,6 +24,7 @@ pub(crate) struct Counters {
     pub local_thread_queries: u64,
     pub local_index_checks: u64,
     pub hash_bytes: u64,
+    pub mapping_record_visits: u64,
     pub observation_windows: u64,
     pub lock_wait_us: u64,
     pub lock_hold_us: u64,
