@@ -836,21 +836,52 @@ fn claude_block_ids(v: &Value, block_type: &str, id_field: &str) -> Vec<String> 
         .collect()
 }
 
+/// System notices and attachments are links of the same parentUuid chain as
+/// messages, so deleting one relinks its children to its parent.
+fn claude_is_chain_notice(v: &Value) -> bool {
+    matches!(claude_type(v), "system" | "attachment")
+}
+
+/// A compaction boundary marks where the resumed context starts.
+fn claude_is_compaction_marker(v: &Value) -> bool {
+    ["compactMetadata", "logicalParentUuid"]
+        .iter()
+        .any(|key| v.get(*key).is_some_and(|value| !value.is_null()))
+        || v.get("subtype")
+            .and_then(Value::as_str)
+            .is_some_and(|subtype| subtype.contains("compact"))
+}
+
 fn claude_delete_blocked(v: &Value) -> Option<String> {
-    if claude_is_message_line(v) {
-        if claude_uuid(v).is_none() {
-            return Some("该行缺少 uuid，无法安全重连链路".into());
-        }
-        return None;
+    let notice = claude_is_chain_notice(v);
+    if !claude_is_message_line(v) && !notice {
+        return Some(format!(
+            "{} 类型行暂不允许删除（仅支持 user/assistant 消息及 system/attachment 记录）",
+            claude_type(v)
+        ));
     }
-    Some(format!(
-        "{} 类型行暂不允许删除（仅支持 user/assistant 消息）",
-        claude_type(v)
-    ))
+    if claude_uuid(v).is_none() {
+        return Some("该行缺少 uuid，无法安全重连链路".into());
+    }
+    if notice && claude_is_compaction_marker(v) {
+        return Some("压缩边界决定续聊上下文的起点，不能删除".into());
+    }
+    None
 }
 
 fn claude_line_brief(v: &Value) -> (String, String, String) {
     let t = claude_type(v).to_string();
+    if claude_is_chain_notice(v) {
+        let detail = v
+            .get("subtype")
+            .or_else(|| v.get("attachment").and_then(|a| a.get("type")))
+            .and_then(Value::as_str);
+        let summary = crate::claude_sessions::classify_preview(0, v.clone())
+            .map(|event| event.text_summary)
+            .unwrap_or_default();
+        let kind = detail.map_or_else(|| t.clone(), |detail| format!("{t}/{detail}"));
+        return (t, kind, summary);
+    }
     let role = v
         .get("message")
         .and_then(|m| m.get("role"))
@@ -3154,6 +3185,55 @@ mod tests {
             backup.to_str().unwrap(),
         )
         .unwrap();
+        assert_eq!(read_bytes(&rollout), original);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn claude_system_and_attachment_records_delete_with_relink_but_boundaries_stay() {
+        let root = temp_dir("claude-del-notice");
+        let rollout = root.join("s.jsonl");
+        let backup = root.join("backup");
+        let mut rows = claude_fixture();
+        rows[4]["parentUuid"] = json!("n2");
+        rows.insert(4, json!({"type":"system","subtype":"api_error","uuid":"n1","parentUuid":"u3","sessionId":"s","level":"error","error":{"status":429}}));
+        rows.insert(5, json!({"type":"attachment","uuid":"n2","parentUuid":"n1","sessionId":"s","attachment":{"type":"edited_text_file","filename":"a.ts"}}));
+        rows.push(json!({"type":"system","subtype":"compact_boundary","uuid":"c1","parentUuid":null,"logicalParentUuid":"u4","sessionId":"s","content":"Conversation compacted","compactMetadata":{"trigger":"manual"}}));
+        rows.push(json!({"type":"last-prompt","lastPrompt":"hi","leafUuid":"c1","sessionId":"s"}));
+        write_jsonl(&rollout, &rows);
+        let original = read_bytes(&rollout);
+        let path = rollout.to_str().unwrap();
+
+        let plan = plan_delete("claude", path, &[4, 5]).unwrap();
+        assert!(plan.blocked.is_empty(), "{:?}", plan.blocked);
+        assert_eq!(
+            plan.lines
+                .iter()
+                .map(|l| l.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["system/api_error", "attachment/edited_text_file"]
+        );
+        for (line, reason) in [(7, "压缩边界"), (8, "last-prompt")] {
+            let blocked = plan_delete("claude", path, &[line]).unwrap().blocked;
+            assert!(blocked.iter().any(|r| r.contains(reason)), "{blocked:?}");
+        }
+
+        apply_delete("claude", path, "s", backup.to_str().unwrap(), &[4, 5]).unwrap();
+        let loaded = load_file(&rollout).unwrap();
+        let records: Vec<_> = loaded.parsed.iter().flatten().collect();
+        assert!(records
+            .iter()
+            .all(|v| !matches!(claude_uuid(v), Some("n1" | "n2"))));
+        let u4 = records
+            .iter()
+            .find(|v| claude_uuid(v) == Some("u4"))
+            .unwrap();
+        assert_eq!(
+            u4.get("parentUuid").and_then(Value::as_str),
+            Some("u3"),
+            "deleted notices relink their children to the surviving ancestor"
+        );
+        undo_last("claude", path, "s", backup.to_str().unwrap()).unwrap();
         assert_eq!(read_bytes(&rollout), original);
         fs::remove_dir_all(&root).ok();
     }

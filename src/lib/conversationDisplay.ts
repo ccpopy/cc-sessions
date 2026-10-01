@@ -11,6 +11,22 @@ export type ConversationPreviewRow =
 
 export type ProcessGroupExpansionState = "collapsed" | "expanded" | "mixed";
 
+export type ExpandedConversationPreviewRow =
+  | { type: "event"; event: PreviewEvent; process?: boolean }
+  | Extract<ConversationPreviewRow, { type: "process" }>;
+
+/** Keep process headers and their expanded messages independently virtualizable. */
+export function expandConversationPreviewRows(
+  rows: readonly ConversationPreviewRow[],
+  isExpanded: (row: Extract<ConversationPreviewRow, { type: "process" }>) => boolean,
+): ExpandedConversationPreviewRow[] {
+  return rows.flatMap((row): ExpandedConversationPreviewRow[] =>
+    row.type === "process" && isExpanded(row)
+      ? [row, ...row.events.map((event) => ({ type: "event" as const, event, process: true }))]
+      : [row],
+  );
+}
+
 /** Claude 的一条 assistant 记录可同时包含文字和 tool_use；对话视图需要保留文字。 */
 export function isAssistantTextToolUseEvent(event: PreviewEvent): boolean {
   if (event.role !== "tool_call") return false;

@@ -543,23 +543,24 @@ pub fn preview_session_page(
         });
     }
     let path = PathBuf::from(crate::paths::strip_verbatim(&rollout_path));
-    // Events and capability must describe the same bytes; a live session may append
-    // while the range is read, so retry a bounded number of times.
-    for _ in 0..3 {
-        let (_, capability) =
-            crate::edit::preview_capability(&provider, &path, expected_revision.as_deref())?;
-        let events =
-            preview_session_range(Some(provider.clone()), rollout_path.clone(), offset, limit)?;
-        if crate::atomic_file::fingerprint(&path)?.sha256_hex() == capability.file_sha256 {
-            return Ok(crate::models::PreviewPage {
-                events,
-                capability: Some(capability),
-            });
-        }
-    }
-    Err(crate::error::AppError::Other(
-        "[EDIT_CONFLICT] 会话正在持续更新，请稍后刷新预览".into(),
-    ))
+    let (loaded, capability) =
+        crate::edit::preview_capability(&provider, &path, expected_revision.as_deref())?;
+    // Classify the exact immutable bytes already validated for this revision.
+    // Reopening the range reparses its entire prefix and requires another full
+    // hash to reconcile two observations of a live file.
+    let events = loaded
+        .parsed
+        .iter()
+        .enumerate()
+        .filter_map(|(index, raw)| raw.as_ref().map(|raw| (index, raw)))
+        .skip(offset)
+        .take(limit)
+        .filter_map(|(index, raw)| crate::claude_sessions::classify_preview(index, raw.clone()))
+        .collect();
+    Ok(crate::models::PreviewPage {
+        events,
+        capability: Some(capability),
+    })
 }
 
 fn preview_range_by_provider(
@@ -1085,6 +1086,94 @@ mod tests {
         assert_eq!(prompts.prompts[0].index, 0);
         assert_eq!(prompts.prompts[0].offset, 0);
         assert_eq!(prompts.total_events, 3);
+    }
+
+    #[test]
+    fn claude_versioned_pages_reuse_parses_and_preserve_line_indexes() -> AppResult<()> {
+        let path = temp_file("claude-cached-pages");
+        fs::write(&path, "\n{broken}\n{\"type\":\"user\",\"uuid\":\"u1\",\"message\":{\"role\":\"user\",\"content\":\"one\"}}\n{\"type\":\"assistant\",\"uuid\":\"a1\",\"message\":{\"role\":\"assistant\",\"content\":\"two\"}}\n")?;
+        let locator = path.to_string_lossy().into_owned();
+        let reference = crate::claude_sessions::preview_range(&locator, 0, usize::MAX)?;
+        let first = preview_session_page("claude".into(), locator.clone(), 0, 1, None)?;
+        let (second, work) = crate::operation_metrics::measured(|| {
+            preview_session_page(
+                "claude".into(),
+                locator.clone(),
+                1,
+                1,
+                Some(first.capability.as_ref().unwrap().revision.clone()),
+            )
+        });
+        let second = second?;
+        assert_eq!(
+            serde_json::to_value(&first.events[0])?,
+            serde_json::to_value(&reference[0])?
+        );
+        assert_eq!(
+            serde_json::to_value(&second.events[0])?,
+            serde_json::to_value(&reference[1])?
+        );
+        assert_eq!(second.events[0].index, 3);
+        assert_eq!(
+            work.parsed_lines, 0,
+            "later Claude pages must not reparse the prefix"
+        );
+        assert_eq!(
+            work.read_bytes,
+            fs::metadata(&path)?.len(),
+            "one byte validation per page"
+        );
+        assert!(preview_session_page("claude".into(), locator, 0, 0, None)?
+            .events
+            .is_empty());
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "synthetic long Claude preview benchmark; requires CC_PREVIEW_PERF_REPORT"]
+    fn claude_long_preview_measurement() -> AppResult<()> {
+        let path = temp_file("claude-long-preview");
+        let mut file = File::create(&path)?;
+        for index in 0..35_801 {
+            let role = if index % 2 == 0 { "user" } else { "assistant" };
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({"type":role,"uuid":format!("synthetic-{index}"),"sessionId":"synthetic","message":{"role":role,"content":format!("message {index} {}", "synthetic ".repeat(100))}})
+            )?;
+        }
+        drop(file);
+        let locator = path.to_string_lossy().into_owned();
+        let mut revision = None;
+        let mut measurements = Vec::new();
+        for (name, offset, limit) in [
+            ("first_page", 0, 200),
+            ("middle_page", 18_000, 200),
+            ("last_page", 35_600, 201),
+            ("full_history", 0, usize::MAX),
+        ] {
+            let start = std::time::Instant::now();
+            let (page, work) = crate::operation_metrics::measured(|| {
+                preview_session_page(
+                    "claude".into(),
+                    locator.clone(),
+                    offset,
+                    limit,
+                    revision.clone(),
+                )
+            });
+            let page = page?;
+            revision = page.capability.map(|c| c.revision);
+            measurements.push(serde_json::json!({"scenario":name,"elapsed_us":start.elapsed().as_micros(),"events":page.events.len(),"counters":work}));
+        }
+        let report = serde_json::json!({"records":35_801,"file_bytes":fs::metadata(&path)?.len(),"measurements":measurements,"scope":"synthetic Claude versioned preview; no private conversations"});
+        fs::write(
+            std::env::var("CC_PREVIEW_PERF_REPORT").unwrap(),
+            serde_json::to_vec_pretty(&report)?,
+        )?;
+        fs::remove_file(path)?;
+        Ok(())
     }
 
     #[test]

@@ -94,6 +94,28 @@ test("full event records and separate process groups keep distinct stable keys",
   assert.notEqual(previewProcessKey([a]), previewProcessKey([b]));
 });
 
+test("Claude chain notices are deletable while metadata and compaction boundaries stay", () => {
+  const claude = (raw: object) => event({ uuid: "n1", parentUuid: "u1", ...raw }, "other");
+  assert.equal(canDeleteEvent("claude", claude({ type: "system", subtype: "api_error" })), true);
+  assert.equal(canDeleteEvent("claude", claude({ type: "attachment", attachment: { type: "edited_text_file" } })), true);
+  assert.equal(canEditEventText("claude", claude({ type: "system", subtype: "away_summary", content: "recap" })), false);
+  assert.equal(canDeleteEvent("claude", claude({ type: "system", subtype: "compact_boundary", logicalParentUuid: "u0" })), false);
+  assert.equal(canDeleteEvent("claude", claude({ type: "system", subtype: "informational", compactMetadata: {} })), false);
+  assert.equal(canDeleteEvent("claude", event({ type: "last-prompt", leafUuid: "u1" }, "other")), false);
+  assert.equal(canDeleteEvent("claude", event({ type: "system", subtype: "api_error" }, "other")), false);
+  assert.equal(canDeleteEvent("claude", claude({ type: "user", message: { role: "user", content: "hi" } })), true);
+});
+
+test("legacy record keys serialize each raw record once, including display copies", () => {
+  let serializations = 0;
+  const legacy = event({ type: "event_msg", payload: { type: "token_count" }, toJSON() { serializations++; return { type: "event_msg" }; } });
+  const key = previewEventKey(legacy, true);
+  assert.equal(key, previewEventKey({ ...legacy, index: 7 }, true));
+  assert.equal(key, previewEventKey(legacy));
+  assert.equal(serializations, 1, "virtualized lists ask for every row key after each measurement");
+  assert.notEqual(key, previewEventKey(event({ type: "event_msg", payload: { type: "token_count" } }), true));
+});
+
 test("canonical paginated messages support identified edits without changing fork semantics", () => {
   const user = event({ type: "event_msg", payload: { type: "item_completed", item: {
     type: "UserMessage", id: "user-1", content: [{ type: "text", text: "继续" }, { type: "local_image", path: "C:/fixture/image.png" }],

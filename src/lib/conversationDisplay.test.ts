@@ -3,12 +3,26 @@ import test from "node:test";
 import type { PreviewEvent } from "./api";
 import {
   buildConversationPreviewRows,
+  expandConversationPreviewRows,
   isAssistantTextToolUseEvent,
   isProcessGroupExpanded,
   isVisibleConversationEvent,
   summarizeProcessGroupExpansion,
   toConversationDisplayEvent,
 } from "./conversationDisplay.ts";
+
+test("long expanded process runs become individually virtualizable rows", () => {
+  const messages = Array.from({ length: 35_800 }, (_, i) => event(i + 1, "assistant", "commentary"));
+  const final = event(35_801, "assistant", "final_answer");
+  const source = buildConversationPreviewRows([event(0, "user"), ...messages, final]);
+  const collapsed = expandConversationPreviewRows(source, () => false);
+  assert.equal(collapsed.length, 3);
+  const expanded = expandConversationPreviewRows(source, () => true);
+  assert.equal(expanded.length, 35_803);
+  assert.equal(expanded[1].type, "process");
+  assert.deepEqual(expanded[2], { type: "event", event: messages[0], process: true });
+  assert.deepEqual(expanded.at(-1), { type: "event", event: final });
+});
 
 function event(
   index: number,

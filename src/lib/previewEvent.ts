@@ -11,6 +11,8 @@ export type DiffCommentPrompt = {
 };
 
 const previewEventSearchTextCache = new WeakMap<PreviewEvent, string>();
+// Keys depend only on the immutable raw record; legacy keys serialize all of it.
+const previewEventKeyCache = new WeakMap<object, string>();
 
 export function contentMappingCounts(mappings: Pick<ContentMappingDetail, "thread_id" | "turn_id" | "item_id" | "status">[]) {
   const rank = { matched: 0, unsupported: 1, inconsistent: 2 };
@@ -131,6 +133,14 @@ export function paginatedTargets(events: PreviewEvent[]): PaginatedItemTarget[] 
 export function previewEventKey(event: PreviewEvent, record = false): string {
   const raw = event.raw as any;
   if (record && typeof raw?.ordinal === "number") return `ordinal:${raw.ordinal}`;
+  if (raw === null || typeof raw !== "object") return nativePreviewEventKey(event);
+  let key = previewEventKeyCache.get(raw);
+  if (key === undefined) previewEventKeyCache.set(raw, (key = nativePreviewEventKey(event)));
+  return key;
+}
+
+function nativePreviewEventKey(event: PreviewEvent): string {
+  const raw = event.raw as any;
   const target = paginatedTargets([event])[0];
   if (target) return `item:${JSON.stringify(target)}`;
   if (raw?.opencode?.part_id) return `part:${raw.opencode.message_id}:${raw.opencode.part_id}`;
@@ -476,11 +486,14 @@ export function canDeleteEvent(provider: string, event: PreviewEvent): boolean {
     );
   }
   const raw = event.raw as any;
-  return (
-    !!raw?.message &&
-    typeof raw?.uuid === "string" &&
-    (raw?.type === "user" || raw?.type === "assistant")
-  );
+  if (typeof raw?.uuid !== "string") return false;
+  if (raw.type === "user" || raw.type === "assistant") return !!raw.message;
+  // System notices and attachments share the message parentUuid chain; a compaction
+  // boundary marks where the resumed context starts and stays.
+  return (raw.type === "system" || raw.type === "attachment")
+    && raw.compactMetadata == null
+    && raw.logicalParentUuid == null
+    && !String(raw.subtype ?? "").includes("compact");
 }
 
 export function editableText(event: PreviewEvent): string {

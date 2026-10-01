@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { JsonView, defaultStyles } from "react-json-view-lite";
 import "react-json-view-lite/dist/index.css";
 
@@ -74,6 +75,7 @@ import {
 import { parseEmbeddedTranscriptPrompt, type EmbeddedTranscriptPrompt } from "@/lib/sessionText";
 import {
   buildConversationPreviewRows,
+  expandConversationPreviewRows,
   isProcessGroupExpanded,
   isVisibleConversationEvent,
   summarizeProcessGroupExpansion,
@@ -216,6 +218,7 @@ export function PreviewDialog({
   const doneRef = useRef(false);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const pendingJumpRef = useRef<number | null>(null);
+  const completedTimelineJumpRef = useRef<number | null>(null);
   const pendingReadingRef = useRef<{ keys: string[]; anchor: string; offset: number; scrollTop: number } | null>(null);
   const scrollSpyRafRef = useRef(0);
   const preferenceSaveRef = useRef<Promise<void>>(Promise.resolve());
@@ -400,15 +403,19 @@ export function PreviewDialog({
     cancelLoadAllRef.current = false;
     try {
       while (!cancelLoadAllRef.current && generation === generationRef.current) {
-        const next = await readPage(offsetRef.current, PAGE);
+        const limit = PAGE * 5;
+        const next = await readPage(offsetRef.current, limit);
         if (!next) break;
         offsetRef.current += next.length;
         setEvents((prev) => [...prev, ...next]);
-        if (next.length < PAGE) {
+        if (next.length < limit) {
           doneRef.current = true;
           setDone(true);
           break;
         }
+        // Yield between bounded batches so stop/close remains responsive even
+        // when a local page resolves immediately.
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
       }
     } finally {
       if (generation === generationRef.current) {
@@ -461,6 +468,7 @@ export function PreviewDialog({
     loadingRef.current = false;
     offsetRef.current = 0;
     pendingJumpRef.current = null;
+    completedTimelineJumpRef.current = null;
     setActiveTimelineIndex(null);
     setPrompts(null);
     setTotalEvents(0);
@@ -477,7 +485,7 @@ export function PreviewDialog({
     const nodes = viewport ? [...viewport.querySelectorAll<HTMLElement>("[data-reading-key]")] : [];
     const top = viewport?.getBoundingClientRect().top ?? 0;
     const anchor = nodes.find((node) => node.getBoundingClientRect().bottom > top) ?? nodes[0];
-    const reading = anchor ? { keys: nodes.map((node) => node.dataset.readingKey!), anchor: anchor.dataset.readingKey!,
+    const reading = anchor ? { keys: rowKeys, anchor: anchor.dataset.readingKey!,
       offset: anchor.getBoundingClientRect().top - top, scrollTop: viewport?.scrollTop ?? 0 } : null;
     const needed = Math.max(PAGE, offsetRef.current + PAGE);
     const generation = ++generationRef.current;
@@ -493,6 +501,7 @@ export function PreviewDialog({
     setSelectionFirstIndex(null);
     setSelectionSecondIndex(null);
     pendingJumpRef.current = null;
+    completedTimelineJumpRef.current = null;
     loadingRef.current = true;
     setLoading(true);
     try {
@@ -550,13 +559,13 @@ export function PreviewDialog({
   const deferredFilter = useDeferredValue(filter);
   const normalizedFilter = deferredFilter.trim().toLowerCase();
   const searchableEvents = useMemo(
-    () => (onlyMsg ? latestCanonicalEvents(events) : events).map((event) => ({ event, searchText: previewEventSearchText(event) })),
+    () => onlyMsg ? latestCanonicalEvents(events) : events,
     [events, onlyMsg],
   );
 
   const jumpTargetIndex = initialJump?.eventKey ? events.find((e) => previewEventKey(e, initialJump.rawEvent) === initialJump.eventKey)?.index ?? null : initialJump?.eventIndex ?? null;
   const filtered = useMemo(() => {
-    return searchableEvents.flatMap(({ event, searchText }) => {
+    return searchableEvents.filter((event) => {
       if (
         onlyMsg &&
         (!isConversationMessage(event)
@@ -566,10 +575,9 @@ export function PreviewDialog({
             jumpTargetIndex,
           ))
       ) {
-        return [];
+        return false;
       }
-      if (normalizedFilter && !searchText.includes(normalizedFilter) && !(initialJump?.query.toLowerCase() === normalizedFilter && event.index === jumpTargetIndex)) return [];
-      return [event];
+      return !normalizedFilter || previewEventSearchText(event).includes(normalizedFilter) || (initialJump?.query.toLowerCase() === normalizedFilter && event.index === jumpTargetIndex);
     });
   }, [jumpTargetIndex, initialJump?.query, normalizedFilter, onlyMsg, searchableEvents, timelineIndexSet]);
 
@@ -612,16 +620,55 @@ export function PreviewDialog({
     [rows],
   );
 
+  const displayRows = useMemo(() => expandConversationPreviewRows(rows, (row) =>
+    isProcessGroupExpanded(previewProcessKey(row.events), processDefaultCollapsed, processExpansionOverrides),
+  ), [rows, processDefaultCollapsed, processExpansionOverrides]);
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const [listOffset, setListOffset] = useState(24);
+  // The virtualizer asks for every key after each measurement; look them up instead.
+  const rowKeys = useMemo(() => displayRows.map((row) =>
+    row.type === "process" ? previewProcessKey(row.events) : previewEventKey(row.event, !onlyMsg),
+  ), [displayRows, onlyMsg]);
+  const getRowKey = useCallback((index: number) => rowKeys[index], [rowKeys]);
+  const virtualizer = useVirtualizer({
+    count: displayRows.length,
+    getScrollElement: () => viewportRef.current,
+    getItemKey: getRowKey,
+    estimateSize: (index) => displayRows[index].type === "process" ? 32 : 180,
+    overscan: 5,
+    gap: 16,
+    scrollMargin: listOffset,
+    enabled: open,
+  });
+  const virtualItems = virtualizer.getVirtualItems();
+  useLayoutEffect(() => {
+    const list = listRef.current;
+    const viewport = viewportRef.current;
+    if (!list || !viewport) return;
+    const update = () => setListOffset(list.getBoundingClientRect().top - viewport.getBoundingClientRect().top + viewport.scrollTop);
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(list.parentElement!);
+    return () => observer.disconnect();
+  }, [open]);
+  useLayoutEffect(() => {
+    completedTimelineJumpRef.current = null;
+    viewportRef.current?.scrollTo({ top: 0 });
+  }, [normalizedFilter, onlyMsg, rolloutPath]);
+
   useLayoutEffect(() => {
     const saved = pendingReadingRef.current;
     const viewport = viewportRef.current;
     if (!saved || !viewport) return;
+    const key = survivingPreviewAnchor(saved.keys, saved.anchor, rowKeys);
+    const rowIndex = rowKeys.indexOf(key ?? "");
+    if (rowIndex >= 0) virtualizer.scrollToIndex(rowIndex, { align: "start" });
     const nodes = [...viewport.querySelectorAll<HTMLElement>("[data-reading-key]")];
-    const key = survivingPreviewAnchor(saved.keys, saved.anchor, nodes.map((node) => node.dataset.readingKey!));
     const anchor = nodes.find((node) => node.dataset.readingKey === key);
+    if (!anchor && rowIndex >= 0) return;
     viewport.scrollTop = anchor ? viewport.scrollTop + anchor.getBoundingClientRect().top - viewport.getBoundingClientRect().top - saved.offset : saved.scrollTop;
     pendingReadingRef.current = null;
-  }, [rows]);
+  }, [rowKeys, virtualizer, virtualItems]);
   const processExpansionState = useMemo(
     () =>
       summarizeProcessGroupExpansion(
@@ -636,21 +683,33 @@ export function PreviewDialog({
   const completedSearchJumpRef = useRef(false);
   const scrollPendingIntoView = useCallback(() => {
     const target = pendingJumpRef.current;
-    if (target === null) return;
+    if (target === null || filter !== deferredFilter) return;
     const viewport = viewportRef.current;
     if (!viewport) return;
     const el = viewport.querySelector<HTMLElement>(`[data-event-index="${target}"]`);
-    if (!el) return;
+    if (!el) {
+      const rowIndex = displayRows.findIndex((row) => row.type === "event" ? row.event.index === target : row.events.some((event) => event.index === target));
+      if (rowIndex >= 0) {
+        const row = displayRows[rowIndex];
+        if (row.type === "process") changeProcessGroupExpanded(previewProcessKey(row.events), true);
+        virtualizer.scrollToIndex(rowIndex, { align: "start" });
+      }
+      return;
+    }
     pendingJumpRef.current = null;
     const viewportRect = viewport.getBoundingClientRect();
     const elRect = el.getBoundingClientRect();
     viewport.scrollTo({ top: viewport.scrollTop + (elRect.top - viewportRect.top) - 16 });
+    completedTimelineJumpRef.current = timelineIndexSet?.has(target) ? target : null;
     el.classList.remove("preview-jump-flash");
     // 强制 reflow 以便重复跳转同一条时也能重新触发动画
     void el.offsetWidth;
     el.classList.add("preview-jump-flash");
     window.setTimeout(() => el.classList.remove("preview-jump-flash"), 1700);
-  }, []);
+  }, [displayRows, virtualizer, changeProcessGroupExpanded, timelineIndexSet, filter, deferredFilter]);
+
+  const scrollPendingIntoViewRef = useRef(scrollPendingIntoView);
+  useLayoutEffect(() => { scrollPendingIntoViewRef.current = scrollPendingIntoView; }, [scrollPendingIntoView]);
 
   useEffect(() => {
     if (!open || !rolloutPath || !initialJump) return;
@@ -658,8 +717,8 @@ export function PreviewDialog({
     setFilter(initialJump.query);
     if (initialJump.rawEvent) setOnlyMsg(false);
     pendingJumpRef.current = initialJump.eventKey ? null : initialJump.eventIndex;
-    void loadUpTo(initialJump.eventOffset).then(() => scrollPendingIntoView());
-  }, [initialJump, loadUpTo, open, rolloutPath, scrollPendingIntoView]);
+    void loadUpTo(initialJump.eventOffset).then(() => scrollPendingIntoViewRef.current());
+  }, [initialJump, loadUpTo, open, rolloutPath]);
 
   useEffect(() => {
     if (!open || !initialJump?.eventKey || loading || readError || completedSearchJumpRef.current) return;
@@ -679,19 +738,37 @@ export function PreviewDialog({
   /** 滚动跟随：视口上沿 1/3 处上方最近的一条用户提问视为当前时间线位置。 */
   const updateActiveFromScroll = useCallback(() => {
     const viewport = viewportRef.current;
-    if (!viewport) return;
+    if (!viewport || pendingJumpRef.current !== null) return;
+    const jump = completedTimelineJumpRef.current;
+    // Keep explicit jumps selected through virtualizer measurement corrections.
+    // User scroll input releases the selection back to scroll tracking.
+    if (jump !== null) {
+      setActiveTimelineIndex(jump);
+      return;
+    }
     const anchors = viewport.querySelectorAll<HTMLElement>("[data-timeline-anchor]");
-    if (anchors.length === 0) return;
+    // The browser clamps a tail jump before its prompt reaches the usual threshold.
+    // At the bottom, include prompts in the rest of the visible viewport as well.
+    const atBottom = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= 2;
     const threshold =
-      viewport.getBoundingClientRect().top + viewport.clientHeight * 0.33;
+      viewport.getBoundingClientRect().top + viewport.clientHeight * (atBottom ? 1 : 0.33);
+    // Virtualized DOM contains only nearby anchors. Keep the earlier prompt active
+    // when a long reply fills the viewport without its user bubble mounted.
+    const firstRow = virtualItems.find((item) => item.end >= viewport.scrollTop);
+    const first = firstRow ? displayRows[firstRow.index] : null;
+    const eventIndex = first?.type === "event" ? first.event.index : first?.events[0].index;
     let current: number | null = null;
+    for (const prompt of prompts ?? []) {
+      if (eventIndex === undefined || prompt.index > eventIndex) break;
+      current = prompt.index;
+    }
     for (const node of anchors) {
       if (node.getBoundingClientRect().top > threshold) break;
       current = Number(node.dataset.eventIndex);
     }
-    if (current === null) current = Number(anchors[0].dataset.eventIndex);
-    if (Number.isFinite(current)) setActiveTimelineIndex(current);
-  }, []);
+    if (current === null && anchors[0]) current = Number(anchors[0].dataset.eventIndex);
+    if (current !== null && Number.isFinite(current)) setActiveTimelineIndex(current);
+  }, [displayRows, prompts, virtualItems]);
 
   const jumpToTimelineMessage = useCallback(
     (prompt: UserPromptBrief) => {
@@ -699,9 +776,12 @@ export function PreviewDialog({
       pendingJumpRef.current = prompt.index;
       // 文本过滤可能把目标消息隐藏，跳转时清空
       setFilter("");
-      void loadUpTo(prompt.offset).then(() => scrollPendingIntoView());
+      void loadUpTo(prompt.offset).then(() => {
+        // A filtered target must wait for the full list before completing the jump.
+        if (!filter) scrollPendingIntoViewRef.current();
+      });
     },
-    [loadUpTo, scrollPendingIntoView],
+    [loadUpTo, filter],
   );
 
   // 加载/过滤变化后：完成待跳转的定位。搜索期间无需扫描整段 DOM 更新时间线。
@@ -710,7 +790,7 @@ export function PreviewDialog({
     if (normalizedFilter) return;
     if (scrollSpyRafRef.current) cancelAnimationFrame(scrollSpyRafRef.current);
     scrollSpyRafRef.current = requestAnimationFrame(updateActiveFromScroll);
-  }, [filtered, normalizedFilter, scrollPendingIntoView, updateActiveFromScroll]);
+  }, [filtered, normalizedFilter, scrollPendingIntoView, updateActiveFromScroll, virtualItems]);
 
   useEffect(() => {
     return () => {
@@ -740,6 +820,11 @@ export function PreviewDialog({
       let keepAtBottomAfterLoad = false;
 
       switch (e.key) {
+        case "ArrowUp":
+        case "ArrowDown":
+        case " ":
+          completedTimelineJumpRef.current = null;
+          return;
         case "Home":
           nextScrollTop = 0;
           break;
@@ -758,6 +843,7 @@ export function PreviewDialog({
       }
 
       e.preventDefault();
+      completedTimelineJumpRef.current = null;
 
       const clampedScrollTop = Math.max(0, Math.min(nextScrollTop, maxScrollTop));
       viewport.scrollTo({ top: clampedScrollTop });
@@ -1386,6 +1472,8 @@ export function PreviewDialog({
             className="h-full bg-muted/30"
             viewportRef={viewportRef}
             onViewportScroll={onScroll}
+            onWheelCapture={() => { completedTimelineJumpRef.current = null; }}
+            onPointerDownCapture={() => { completedTimelineJumpRef.current = null; }}
           >
             <div className="mx-auto w-full max-w-3xl min-w-0 space-y-4 overflow-x-hidden px-6 py-6">
               {!onlyMsg && relatedSubagents.length > 0 && (
@@ -1401,73 +1489,18 @@ export function PreviewDialog({
                 </div>
               )}
 
-              {rows.map((row) =>
-                row.type === "process" ? (
+              <div ref={listRef} className="relative w-full min-w-0" style={{ height: virtualizer.getTotalSize() }}>
+              {virtualItems.map((virtualRow) => {
+                const row = displayRows[virtualRow.index];
+                return <div key={virtualRow.key} ref={virtualizer.measureElement} data-index={virtualRow.index}
+                  className="absolute left-0 top-0 w-full min-w-0"
+                  style={{ transform: `translateY(${virtualRow.start - listOffset}px)` }}>
+                {row.type === "process" ? (
                   <ProcessTurnGroup
-                    key={previewProcessKey(row.events)}
                     events={row.events}
-                    expanded={isProcessGroupExpanded(
-                      previewProcessKey(row.events),
-                      processDefaultCollapsed,
-                      processExpansionOverrides,
-                    )}
-                    onExpandedChange={(expanded) =>
-                      changeProcessGroupExpanded(previewProcessKey(row.events), expanded)
-                    }
-                  >
-                    {(event) => {
-                      const inRange =
-                        isSelecting &&
-                        selectionFirstIndex !== null &&
-                        selectionSecondIndex !== null &&
-                        event.index >= Math.min(selectionFirstIndex, selectionSecondIndex) &&
-                        event.index <= Math.max(selectionFirstIndex, selectionSecondIndex);
-                      const isStart =
-                        isSelecting &&
-                        selectionFirstIndex !== null &&
-                        selectionSecondIndex === null &&
-                        event.index === selectionFirstIndex;
-                      return (
-                      <div
-                        key={previewEventKey(event)}
-                        data-event-index={event.index}
-                        data-reading-key={previewEventKey(event)}
-                        className={cn(
-                          isSelecting && "cursor-pointer",
-                          inRange && "bg-destructive/10 ring-1 ring-destructive/30",
-                          isStart && "bg-primary/10 ring-1 ring-primary/30",
-                        )}
-                        onClick={
-                          isSelecting
-                            ? () => {
-                                if (selectionFirstIndex === null) {
-                                  setSelectionFirstIndex(event.index);
-                                } else if (selectionSecondIndex === null) {
-                                  setSelectionSecondIndex(event.index);
-                                } else {
-                                  setSelectionFirstIndex(event.index);
-                                  setSelectionSecondIndex(null);
-                                }
-                              }
-                            : undefined
-                        }
-                      >
-                        <EventBubble
-                          e={event}
-                          actions={{
-                            fork: {
-                              enabled: canForkSession && isStableForkNode(event, provider),
-                              label: forkLabel,
-                              pending: forking,
-                              onSelect: requestForkAt,
-                            },
-                            edit: editActions,
-                          }}
-                        />
-                      </div>
-                      );
-                    }}
-                  </ProcessTurnGroup>
+                    expanded={isProcessGroupExpanded(previewProcessKey(row.events), processDefaultCollapsed, processExpansionOverrides)}
+                    onExpandedChange={(expanded) => changeProcessGroupExpanded(previewProcessKey(row.events), expanded)}
+                  />
                 ) : (
                   <div
                     key={previewEventKey(row.event, !onlyMsg)}
@@ -1475,6 +1508,7 @@ export function PreviewDialog({
                     data-reading-key={previewEventKey(row.event, !onlyMsg)}
                     data-timeline-anchor={timelineIndexSet?.has(row.event.index) || undefined}
                     className={cn(
+                      row.process && "border-l-2 border-border/50 pl-3 opacity-90",
                       isSelecting && "cursor-pointer",
                       isSelecting &&
                         selectionFirstIndex !== null &&
@@ -1516,8 +1550,10 @@ export function PreviewDialog({
                       }}
                     />
                   </div>
-                ),
-              )}
+                )}
+                </div>;
+              })}
+              </div>
 
               {loading && (
                 <div className="flex justify-center py-4 text-xs text-muted-foreground">加载中…</div>
@@ -1635,12 +1671,10 @@ function ProcessTurnGroup({
   events,
   expanded,
   onExpandedChange,
-  children,
 }: {
   events: PreviewEvent[];
   expanded: boolean;
   onExpandedChange: (expanded: boolean) => void;
-  children: (event: PreviewEvent) => React.ReactNode;
 }) {
   return (
     <div className="space-y-4" data-reading-key={previewProcessKey(events)}>
@@ -1660,11 +1694,6 @@ function ProcessTurnGroup({
           className={cn("h-3 w-3 transition-transform", expanded && "rotate-180")}
         />
       </button>
-      {expanded && (
-        <div className="space-y-4 border-l-2 border-border/50 pl-3 opacity-90">
-          {events.map((event) => children(event))}
-        </div>
-      )}
     </div>
   );
 }
@@ -1695,9 +1724,9 @@ function EventBubble({ e, actions }: { e: PreviewEvent; actions: NodeActionSet }
     return <ToolBubble e={e} ts={ts} actions={actions} />;
   }
   if (e.role === "meta") {
-    return <MetaLine e={e} ts={ts} />;
+    return <MetaLine e={e} ts={ts} actions={actions} />;
   }
-  return <DefaultBubble e={e} ts={ts} />;
+  return <DefaultBubble e={e} ts={ts} actions={actions} />;
 }
 
 function SubagentOverview({ items }: { items: RelatedSubagentSession[] }) {
@@ -2116,9 +2145,9 @@ function ToolBubble({ e, ts, actions }: { e: PreviewEvent; ts: string; actions: 
   );
 }
 
-function MetaLine({ e, ts }: { e: PreviewEvent; ts: string }) {
+function MetaLine({ e, ts, actions }: { e: PreviewEvent; ts: string; actions: NodeActionSet }) {
   return (
-    <div className="my-2 flex items-center gap-3">
+    <div className="group my-2 flex items-center gap-3">
       <div className="h-px flex-1 bg-border" />
       <div className="flex min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground">
         <Badge variant="outline" className="h-5 font-normal">
@@ -2126,31 +2155,35 @@ function MetaLine({ e, ts }: { e: PreviewEvent; ts: string }) {
         </Badge>
         {e.text_summary && <span className="truncate">{e.text_summary}</span>}
         {ts && <span className="font-mono">{ts}</span>}
+        <NodeActionButtons event={e} actions={actions} />
       </div>
       <div className="h-px flex-1 bg-border" />
     </div>
   );
 }
 
-function DefaultBubble({ e, ts }: { e: PreviewEvent; ts: string }) {
+function DefaultBubble({ e, ts, actions }: { e: PreviewEvent; ts: string; actions: NodeActionSet }) {
   const [open, setOpen] = useState(false);
   return (
-    <div className="flex gap-3">
+    <div className="group flex gap-3">
       <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-slate-500/15 text-slate-600 dark:text-slate-400">
         <FileJson className="h-4 w-4" />
       </div>
       <div className="min-w-0 flex-1">
-        <button
-          onClick={() => setOpen((x) => !x)}
-          className="flex w-full items-center gap-2 rounded-md border bg-card px-3 py-2 text-left text-xs shadow-sm hover:bg-accent"
-        >
-          <ChevronDown className={cn("h-3.5 w-3.5 shrink-0 transition-transform", open && "rotate-180")} />
-          <Badge variant="outline" className="h-5 font-normal capitalize">
-            {e.role}
-          </Badge>
-          <span className="truncate font-mono text-muted-foreground">{e.kind}</span>
-          {ts && <span className="ml-auto shrink-0 font-mono text-muted-foreground/70">{ts}</span>}
-        </button>
+        <div className="flex w-full items-center gap-2 rounded-md border bg-card px-3 py-2 text-left text-xs shadow-sm hover:bg-accent">
+          <button
+            onClick={() => setOpen((x) => !x)}
+            className="flex min-w-0 flex-1 items-center gap-2 text-left"
+          >
+            <ChevronDown className={cn("h-3.5 w-3.5 shrink-0 transition-transform", open && "rotate-180")} />
+            <Badge variant="outline" className="h-5 font-normal capitalize">
+              {e.role}
+            </Badge>
+            <span className="truncate font-mono text-muted-foreground">{e.kind}</span>
+            {ts && <span className="ml-auto shrink-0 font-mono text-muted-foreground/70">{ts}</span>}
+          </button>
+          <NodeActionButtons event={e} actions={actions} />
+        </div>
         {open && (
           <div className="mt-1.5 overflow-auto rounded-md border bg-card p-3 text-xs">
             <JsonView
