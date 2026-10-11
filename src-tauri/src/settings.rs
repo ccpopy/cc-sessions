@@ -3,10 +3,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(feature = "desktop")]
-use crate::error::AppError;
-use crate::error::AppResult;
-use crate::models::{DirValidation, Settings};
+use crate::error::{AppError, AppResult};
+use crate::models::{DirValidation, Settings, UpdateNetworkSettings};
 use crate::paths;
 use crate::state_db;
 
@@ -33,6 +31,7 @@ pub fn read_settings_file(file: &Path) -> AppResult<Settings> {
 }
 
 pub fn write_settings_file(file: &Path, settings: &Settings) -> AppResult<()> {
+    validate_update_network(&settings.update_network)?;
     let parent = file
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -55,6 +54,46 @@ pub fn write_settings_file(file: &Path, settings: &Settings) -> AppResult<()> {
     }
 
     sync_settings_parent(parent)?;
+    Ok(())
+}
+
+pub(crate) fn validate_update_network(network: &UpdateNetworkSettings) -> AppResult<()> {
+    for (value, label, proxy) in [
+        (network.proxy_url.trim(), "更新代理地址", true),
+        (network.download_mirror.trim(), "下载加速地址", false),
+    ] {
+        if value.is_empty() {
+            continue;
+        }
+        let url = url::Url::parse(value)
+            .map_err(|_| AppError::Other(format!("{label}格式无效，请填写包含协议的完整地址")))?;
+        let supported = matches!(url.scheme(), "http" | "https")
+            || (proxy && matches!(url.scheme(), "socks5" | "socks5h"));
+        if !supported || url.host_str().is_none() {
+            return Err(AppError::Other(format!(
+                "{label}需使用 {} 地址",
+                if proxy {
+                    "HTTP、HTTPS 或 SOCKS5"
+                } else {
+                    "HTTP 或 HTTPS"
+                }
+            )));
+        }
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(AppError::Other(format!(
+                "{label}请勿包含账号密码、查询参数或片段"
+            )));
+        }
+        if proxy && !matches!(url.path(), "" | "/") {
+            return Err(AppError::Other(
+                "更新代理地址只能包含协议、主机和端口".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -334,6 +373,109 @@ mod tests {
             settings.opencode_dir,
             paths::default_opencode_dir().to_string_lossy()
         );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn update_network_accepts_supported_protocols_and_rejects_ambiguous_addresses() {
+        for proxy in [
+            "",
+            "http://127.0.0.1:7890",
+            "https://proxy.example:443",
+            "socks5://[::1]:1080",
+            "socks5h://localhost:1080",
+        ] {
+            let network = UpdateNetworkSettings {
+                proxy_url: proxy.into(),
+                ..Default::default()
+            };
+            assert!(validate_update_network(&network).is_ok());
+        }
+        for proxy in [
+            "127.0.0.1:7890",
+            "file:///tmp/proxy",
+            "http://localhost/proxy",
+            "http://localhost:7890?token=secret",
+        ] {
+            let network = UpdateNetworkSettings {
+                proxy_url: proxy.into(),
+                ..Default::default()
+            };
+            let error = validate_update_network(&network).unwrap_err().to_string();
+            assert!(error.contains("更新代理地址"));
+            assert!(!error.contains("secret"));
+        }
+        for mirror in [
+            "socks5://localhost:1080",
+            "https://mirror.example/?url=",
+            "https://user:secret@mirror.example/",
+        ] {
+            let network = UpdateNetworkSettings {
+                download_mirror: mirror.into(),
+                ..Default::default()
+            };
+            let error = validate_update_network(&network).unwrap_err().to_string();
+            assert!(error.contains("下载加速地址"));
+            assert!(!error.contains("secret"));
+        }
+    }
+
+    #[test]
+    fn update_network_settings_roundtrip_and_legacy_defaults() -> AppResult<()> {
+        let root = temp_dir("update-network-roundtrip");
+        fs::create_dir_all(&root)?;
+        let file = root.join("settings.json");
+        assert_eq!(
+            read_settings_file(&file)?.update_network.download_mirror,
+            "https://ghproxy.net/"
+        );
+        let mut value = serde_json::to_value(Settings::default())?;
+        for mirror in ["https://mirror.example/gh/", ""] {
+            let network = serde_json::json!({
+                "proxy_url": "http://127.0.0.1:7890",
+                "download_mirror": mirror
+            });
+            value["update_network"] = network.clone();
+            let settings: Settings = serde_json::from_value(value.clone())?;
+            write_settings_file(&file, &settings)?;
+            let restored = serde_json::to_value(read_settings_file(&file)?)?;
+            assert_eq!(restored["update_network"], network);
+        }
+
+        value.as_object_mut().unwrap().remove("update_network");
+        fs::write(&file, serde_json::to_vec(&value)?)?;
+        let legacy = serde_json::to_value(read_settings_file(&file)?)?;
+        assert_eq!(legacy["update_network"]["proxy_url"], "");
+        assert_eq!(
+            legacy["update_network"]["download_mirror"],
+            "https://ghproxy.net/"
+        );
+
+        value["update_network"] = serde_json::json!({"proxy_url": "http://127.0.0.1:7890"});
+        fs::write(&file, serde_json::to_vec(&value)?)?;
+        let partial = read_settings_file(&file)?.update_network;
+        assert_eq!(partial.proxy_url, "http://127.0.0.1:7890");
+        assert_eq!(partial.download_mirror, "https://ghproxy.net/");
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_update_network_does_not_replace_saved_settings() -> AppResult<()> {
+        let root = temp_dir("update-network-invalid");
+        fs::create_dir_all(&root)?;
+        let file = root.join("settings.json");
+        write_settings_file(&file, &Settings::default())?;
+        let before = fs::read(&file)?;
+        let mut value = serde_json::to_value(Settings::default())?;
+        value["update_network"] = serde_json::json!({
+            "proxy_url": "file:///not-a-proxy",
+            "download_mirror": ""
+        });
+        let invalid: Settings = serde_json::from_value(value)?;
+        assert!(write_settings_file(&file, &invalid).is_err());
+        assert_eq!(fs::read(&file)?, before);
         fs::remove_dir_all(root)?;
         Ok(())
     }

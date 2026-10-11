@@ -3,6 +3,22 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateNetworkSettings {
+    pub proxy_url: String,
+    pub download_mirror: String,
+}
+
+impl Default for UpdateNetworkSettings {
+    fn default() -> Self {
+        Self {
+            proxy_url: String::new(),
+            download_mirror: "https://ghproxy.net/".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub codex_dir: String,
     #[serde(default = "default_claude_dir")]
@@ -21,6 +37,8 @@ pub struct Settings {
     /// true = 过程消息默认全部收起；false = 默认全部展开。
     #[serde(default = "default_true")]
     pub preview_collapse_process: bool,
+    #[serde(default)]
+    pub update_network: UpdateNetworkSettings,
 }
 
 fn default_open_cmd() -> String {
@@ -66,6 +84,7 @@ impl Default for Settings {
             refresh_interval_ms: 5000,
             preview_only_messages: true,
             preview_collapse_process: true,
+            update_network: UpdateNetworkSettings::default(),
         }
     }
 }

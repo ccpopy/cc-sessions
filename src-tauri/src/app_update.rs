@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::error::{AppError, AppResult};
+use crate::models::UpdateNetworkSettings;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -80,14 +81,22 @@ struct InstallContext {
 }
 
 #[tauri::command]
-pub async fn check_app_update() -> AppResult<AppUpdateInfo> {
-    let release = fetch_latest_release().await?;
+pub async fn check_app_update(
+    app: tauri::AppHandle,
+    network: Option<UpdateNetworkSettings>,
+) -> AppResult<AppUpdateInfo> {
+    let network = configured_update_network(&app, network)?;
+    let release = fetch_latest_release(&network).await?;
     build_update_info(&release, &install_context()?)
 }
 
 #[tauri::command]
-pub async fn install_app_update(app: tauri::AppHandle) -> AppResult<()> {
-    let release = fetch_latest_release().await?;
+pub async fn install_app_update(
+    app: tauri::AppHandle,
+    network: Option<UpdateNetworkSettings>,
+) -> AppResult<()> {
+    let network = configured_update_network(&app, network)?;
+    let release = fetch_latest_release(&network).await?;
     let context = install_context()?;
     let current_version = env!("CARGO_PKG_VERSION");
     let latest_version = normalize_version(&release.tag_name);
@@ -112,7 +121,7 @@ pub async fn install_app_update(app: tauri::AppHandle) -> AppResult<()> {
 
     let update_dir = update_temp_dir(&latest_version);
     fs::create_dir_all(&update_dir)?;
-    let download_path = download_asset(asset, &update_dir).await?;
+    let download_path = download_asset(asset, &update_dir, &network).await?;
 
     #[cfg(target_os = "windows")]
     windows::launch_update_helper(
@@ -238,34 +247,79 @@ fn build_update_info(
     })
 }
 
-async fn fetch_latest_release() -> AppResult<GithubRelease> {
-    let client = reqwest::Client::builder()
+fn configured_update_network(
+    app: &tauri::AppHandle,
+    network: Option<UpdateNetworkSettings>,
+) -> AppResult<UpdateNetworkSettings> {
+    match network {
+        Some(network) => Ok(network),
+        None => Ok(crate::settings::get_settings(app.clone())?.update_network),
+    }
+}
+
+fn update_client(network: &UpdateNetworkSettings, timeout: Duration) -> AppResult<reqwest::Client> {
+    crate::settings::validate_update_network(network)?;
+    let mut builder = reqwest::Client::builder()
         .user_agent(format!("cc-sessions/{}", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(30))
+        .timeout(timeout);
+    if !network.proxy_url.trim().is_empty() {
+        let proxy = reqwest::Proxy::all(network.proxy_url.trim()).map_err(|error| {
+            AppError::Other(format!("创建更新代理失败: {}", error.without_url()))
+        })?;
+        builder = builder.proxy(proxy);
+    }
+    builder
         .build()
-        .map_err(|error| AppError::Other(format!("创建更新请求失败: {error}")))?;
+        .map_err(|error| AppError::Other(format!("创建更新请求失败: {}", error.without_url())))
+}
+
+async fn fetch_latest_release(network: &UpdateNetworkSettings) -> AppResult<GithubRelease> {
+    let client = update_client(network, Duration::from_secs(30))?;
+    fetch_release(&client, LATEST_RELEASE_API).await
+}
+
+async fn fetch_release(client: &reqwest::Client, api_url: &str) -> AppResult<GithubRelease> {
     let response = client
-        .get(LATEST_RELEASE_API)
+        .get(api_url)
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
-        .map_err(|error| AppError::Other(format!("检查 GitHub Release 失败: {error}")))?;
+        .map_err(|error| {
+            AppError::Other(format!(
+                "检查 GitHub Release 失败，请检查网络或更新代理设置: {}",
+                error.without_url()
+            ))
+        })?;
     let status = response.status();
-    let text = response
-        .text()
-        .await
-        .map_err(|error| AppError::Other(format!("读取 GitHub Release 响应失败: {error}")))?;
     if !status.is_success() {
-        return Err(AppError::Other(format!(
-            "GitHub Release 返回 {status}: {}",
-            text.trim()
-        )));
+        return Err(AppError::Other(format!("GitHub Release 返回 {status}")));
     }
+    let text = response.text().await.map_err(|error| {
+        AppError::Other(format!(
+            "读取 GitHub Release 响应失败: {}",
+            error.without_url()
+        ))
+    })?;
     serde_json::from_str(&text)
         .map_err(|error| AppError::Other(format!("解析 GitHub Release 响应失败: {error}")))
 }
 
-async fn download_asset(asset: &GithubAsset, update_dir: &Path) -> AppResult<PathBuf> {
+fn update_download_url(original: &str, network: &UpdateNetworkSettings) -> AppResult<String> {
+    crate::settings::validate_update_network(network)?;
+    let mirror = network.download_mirror.trim().trim_end_matches('/');
+    if mirror.is_empty() {
+        Ok(original.to_string())
+    } else {
+        // Prefix-style GitHub mirrors expect the complete original URL, including its scheme.
+        Ok(format!("{mirror}/{original}"))
+    }
+}
+
+async fn download_asset(
+    asset: &GithubAsset,
+    update_dir: &Path,
+    network: &UpdateNetworkSettings,
+) -> AppResult<PathBuf> {
     let expected_name = Path::new(&asset.name)
         .file_name()
         .filter(|name| *name == std::ffi::OsStr::new(&asset.name))
@@ -277,16 +331,14 @@ async fn download_asset(asset: &GithubAsset, update_dir: &Path) -> AppResult<Pat
         .filter(|digest| digest.len() == 64)
         .ok_or_else(|| AppError::Other("Release 更新包缺少 SHA-256 校验值".to_string()))?;
 
-    let client = reqwest::Client::builder()
-        .user_agent(format!("cc-sessions/{}", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(5 * 60))
-        .build()
-        .map_err(|error| AppError::Other(format!("创建下载请求失败: {error}")))?;
-    let response = client
-        .get(&asset.browser_download_url)
-        .send()
-        .await
-        .map_err(|error| AppError::Other(format!("下载更新包失败: {error}")))?;
+    let client = update_client(network, Duration::from_secs(5 * 60))?;
+    let download_url = update_download_url(&asset.browser_download_url, network)?;
+    let response = client.get(download_url).send().await.map_err(|error| {
+        AppError::Other(format!(
+            "下载更新包失败，请检查下载加速地址或更新代理设置: {}",
+            error.without_url()
+        ))
+    })?;
     let status = response.status();
     if !status.is_success() {
         return Err(AppError::Other(format!("下载更新包返回 {status}")));
@@ -294,7 +346,7 @@ async fn download_asset(asset: &GithubAsset, update_dir: &Path) -> AppResult<Pat
     let bytes = response
         .bytes()
         .await
-        .map_err(|error| AppError::Other(format!("读取更新包失败: {error}")))?;
+        .map_err(|error| AppError::Other(format!("读取更新包失败: {}", error.without_url())))?;
     if bytes.len() as u64 != asset.size {
         return Err(AppError::Other(format!(
             "更新包大小不匹配：预期 {}，实际 {}",
@@ -398,6 +450,174 @@ mod tests {
             size: 1,
             digest: Some(format!("sha256:{}", "0".repeat(64))),
         }
+    }
+
+    fn mock_update_server(
+        responses: Vec<(u16, Vec<u8>)>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let address = format!("http://{}", server.server_addr());
+        let worker = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, bytes) in responses {
+                let request = server
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap()
+                    .expect("update request must reach the configured local endpoint");
+                requests.push(format!("{} {}", request.method(), request.url()));
+                request
+                    .respond(tiny_http::Response::from_data(bytes).with_status_code(status))
+                    .unwrap();
+            }
+            requests
+        });
+        (address, worker)
+    }
+
+    #[test]
+    fn update_network_mirror_preserves_the_complete_download_url() {
+        let original =
+            "https://github.com/ccpopy/cc-sessions/releases/download/v9.0.0/test%20x64.exe";
+        assert_eq!(
+            update_download_url(original, &UpdateNetworkSettings::default()).unwrap(),
+            format!("https://ghproxy.net/{original}")
+        );
+        let direct = UpdateNetworkSettings {
+            download_mirror: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(update_download_url(original, &direct).unwrap(), original);
+        for mirror in ["https://mirror.example/gh", " https://mirror.example/gh/ "] {
+            let network = UpdateNetworkSettings {
+                download_mirror: mirror.into(),
+                ..Default::default()
+            };
+            assert_eq!(
+                update_download_url(original, &network).unwrap(),
+                format!("https://mirror.example/gh/{original}")
+            );
+        }
+    }
+
+    #[test]
+    fn update_network_proxy_carries_metadata_and_verified_mirror_download() {
+        let payload = b"verified synthetic update".to_vec();
+        let original = "https://github.com/ccpopy/cc-sessions/releases/download/v9.0.0/test.exe";
+        let metadata = serde_json::json!({
+            "tag_name": "v9.0.0",
+            "html_url": "https://github.com/ccpopy/cc-sessions/releases/tag/v9.0.0",
+            "assets": [{
+                "name": "test.exe", "browser_download_url": original,
+                "size": payload.len(), "digest": format!("sha256:{}", hex::encode(Sha256::digest(&payload)))
+            }]
+        });
+        let (proxy, worker) = mock_update_server(vec![
+            (200, serde_json::to_vec(&metadata).unwrap()),
+            (200, payload.clone()),
+        ]);
+        let network = UpdateNetworkSettings {
+            proxy_url: proxy,
+            download_mirror: "http://mirror.invalid/gh/".into(),
+        };
+        let root = update_temp_dir("network-proxy");
+        fs::create_dir_all(&root).unwrap();
+        tauri::async_runtime::block_on(async {
+            let client = update_client(&network, Duration::from_secs(5)).unwrap();
+            let release = fetch_release(&client, "http://api.invalid/releases/latest")
+                .await
+                .unwrap();
+            assert_eq!(release.tag_name, "v9.0.0");
+            let path = download_asset(&release.assets[0], &root, &network)
+                .await
+                .unwrap();
+            assert_eq!(fs::read(path).unwrap(), payload);
+        });
+        assert_eq!(
+            worker.join().unwrap(),
+            vec![
+                "GET http://api.invalid/releases/latest".to_string(),
+                format!("GET http://mirror.invalid/gh/{original}"),
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn update_network_direct_and_mirror_only_downloads_succeed() {
+        let payload = b"verified update without an explicit proxy".to_vec();
+        for mirror_only in [false, true] {
+            let (server, worker) = mock_update_server(vec![(200, payload.clone())]);
+            let mut update = asset("test.exe");
+            update.size = payload.len() as u64;
+            update.digest = Some(format!("sha256:{}", hex::encode(Sha256::digest(&payload))));
+            let mut network = UpdateNetworkSettings {
+                download_mirror: String::new(),
+                ..Default::default()
+            };
+            let expected_path;
+            if mirror_only {
+                network.download_mirror = format!("{server}/gh/");
+                expected_path = format!("GET /gh/{}", update.browser_download_url);
+            } else {
+                update.browser_download_url = format!("{server}/test.exe");
+                expected_path = "GET /test.exe".into();
+            }
+            let root = update_temp_dir(if mirror_only {
+                "network-mirror-only"
+            } else {
+                "network-direct"
+            });
+            fs::create_dir_all(&root).unwrap();
+            let result = tauri::async_runtime::block_on(download_asset(&update, &root, &network));
+            assert_eq!(fs::read(result.unwrap()).unwrap(), payload);
+            assert_eq!(worker.join().unwrap(), vec![expected_path]);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn update_network_mirror_failures_do_not_replace_a_download() {
+        let valid = b"trusted-update";
+        for (name, status, bytes, reason) in [
+            ("digest", 200, b"changed-update".to_vec(), "SHA-256"),
+            ("size", 200, b"short".to_vec(), "大小不匹配"),
+            ("status", 503, b"private response body".to_vec(), "503"),
+        ] {
+            let (proxy, worker) = mock_update_server(vec![(status, bytes)]);
+            let network = UpdateNetworkSettings {
+                proxy_url: proxy,
+                download_mirror: "http://mirror.invalid/".into(),
+            };
+            let mut update = asset("test.exe");
+            update.size = valid.len() as u64;
+            update.digest = Some(format!("sha256:{}", hex::encode(Sha256::digest(valid))));
+            let root = update_temp_dir(&format!("network-{name}"));
+            fs::create_dir_all(&root).unwrap();
+            let destination = root.join("test.exe");
+            fs::write(&destination, b"keep-existing-file").unwrap();
+            let error = tauri::async_runtime::block_on(download_asset(&update, &root, &network))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(reason), "{error}");
+            assert!(!error.contains("private response body"));
+            assert_eq!(fs::read(destination).unwrap(), b"keep-existing-file");
+            assert_eq!(worker.join().unwrap().len(), 1);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn update_network_proxy_failure_on_github_https_is_reported_without_fallback() {
+        let (proxy, worker) = mock_update_server(vec![(502, Vec::new())]);
+        let network = UpdateNetworkSettings {
+            proxy_url: proxy,
+            ..Default::default()
+        };
+        let error = tauri::async_runtime::block_on(fetch_latest_release(&network))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("更新代理设置"), "{error}");
+        assert_eq!(worker.join().unwrap(), vec!["CONNECT api.github.com:443"]);
     }
 
     #[test]

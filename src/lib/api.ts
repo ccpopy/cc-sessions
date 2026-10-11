@@ -50,6 +50,11 @@ export type CoreSessionProvider = "codex" | "claude";
 export type SessionProvider = CoreSessionProvider | "opencode" | "cursor";
 export type StatsProvider = "all" | SessionProvider;
 
+export type UpdateNetworkSettings = {
+  proxy_url: string;
+  download_mirror: string;
+};
+
 export type Settings = {
   codex_dir: string;
   claude_dir: string;
@@ -61,6 +66,7 @@ export type Settings = {
   preview_only_messages: boolean;
   /** true = 过程消息默认全部收起；false = 默认全部展开。 */
   preview_collapse_process: boolean;
+  update_network: UpdateNetworkSettings;
 };
 
 export type DirValidation = {
@@ -1013,9 +1019,9 @@ export type PreviewImageData = {
 
 export const api = {
   appVersion: () => invokeCommand<string>("app_version"),
-  checkAppUpdate: async (): Promise<AppUpdateInfo> => {
+  checkAppUpdate: async (network?: UpdateNetworkSettings): Promise<AppUpdateInfo> => {
     if (isTauriRuntime()) {
-      return invokeCommand<AppUpdateInfo>("check_app_update");
+      return invokeCommand<AppUpdateInfo>("check_app_update", { network });
     }
 
     const [currentVersion, response] = await Promise.all([
@@ -1049,11 +1055,11 @@ export const api = {
         : null,
     };
   },
-  installAppUpdate: async () => {
+  installAppUpdate: async (network?: UpdateNetworkSettings) => {
     if (!isTauriRuntime()) {
       throw new Error("CLI WebUI 无法自动安装桌面更新，请打开下载页面。");
     }
-    return invokeCommand<void>("install_app_update");
+    return invokeCommand<void>("install_app_update", { network });
   },
   getSettings: () => invokeCommand<Settings>("get_settings"),
   saveSettings: (settings: Settings) => invokeCommand<void>("save_settings", { settings }),

@@ -28,6 +28,7 @@ import { Separator } from "@/components/ui/separator";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { api, type DirValidation, type UpdateCheckResult } from "@/lib/api";
 import { pickDirectoryPath } from "@/lib/dialog";
+import { isTauriRuntime } from "@/lib/runtime";
 import { useSettings } from "@/stores/settings";
 import { useMemoryDraft } from "@/stores/memoryDraft";
 import { toast } from "sonner";
@@ -35,6 +36,8 @@ import { toast } from "sonner";
 type Props = {
   trigger?: ReactNode;
 };
+
+const DEFAULT_DOWNLOAD_MIRROR = "https://ghproxy.net/";
 
 export function SettingsSheet({ trigger }: Props) {
   const settings = useSettings((s) => s.settings);
@@ -46,6 +49,8 @@ export function SettingsSheet({ trigger }: Props) {
   const [opencode, setOpenCode] = useState("");
   const [cursor, setCursor] = useState("");
   const [backup, setBackup] = useState("");
+  const [updateProxy, setUpdateProxy] = useState("");
+  const [updateMirror, setUpdateMirror] = useState(DEFAULT_DOWNLOAD_MIRROR);
   const [codexValidation, setCodexValidation] = useState<DirValidation | null>(null);
   const [claudeValidation, setClaudeValidation] = useState<DirValidation | null>(null);
   const [opencodeValidation, setOpenCodeValidation] = useState<DirValidation | null>(null);
@@ -54,6 +59,8 @@ export function SettingsSheet({ trigger }: Props) {
   const [currentVersion, setCurrentVersion] = useState("");
   const [currentVersionError, setCurrentVersionError] = useState("");
   const [confirmClaudeDirChange, setConfirmClaudeDirChange] = useState(false);
+  const updating = updateState.state === "checking" || updateState.state === "installing";
+  const updateNetwork = () => ({ proxy_url: updateProxy.trim(), download_mirror: updateMirror.trim() });
 
   useEffect(() => {
     if (!settings) return;
@@ -62,6 +69,8 @@ export function SettingsSheet({ trigger }: Props) {
     setOpenCode(settings.opencode_dir);
     setCursor(settings.cursor_dir);
     setBackup(settings.backup_dir);
+    setUpdateProxy(settings.update_network?.proxy_url ?? "");
+    setUpdateMirror(settings.update_network?.download_mirror ?? DEFAULT_DOWNLOAD_MIRROR);
   }, [settings]);
 
   useEffect(() => {
@@ -154,6 +163,7 @@ export function SettingsSheet({ trigger }: Props) {
       opencode_dir: opencode,
       cursor_dir: cursor,
       backup_dir: backup,
+      update_network: updateNetwork(),
     });
     toast.success("设置已保存");
     await load();
@@ -170,10 +180,10 @@ export function SettingsSheet({ trigger }: Props) {
   };
 
   const checkUpdate = async () => {
-    if (updateState.state === "installing") return;
+    if (updating) return;
     setUpdateState({ state: "checking" });
     try {
-      const update = await api.checkAppUpdate();
+      const update = await api.checkAppUpdate(updateNetwork());
       setCurrentVersion(update.current_version);
       setCurrentVersionError("");
       setUpdateState({
@@ -190,7 +200,7 @@ export function SettingsSheet({ trigger }: Props) {
     const update = updateState;
     setUpdateState({ ...update, state: "installing" });
     try {
-      await api.installAppUpdate();
+      await api.installAppUpdate(updateNetwork());
       toast.success("更新安装已开始");
     } catch (e: any) {
       setUpdateState({ ...update, state: "available" });
@@ -230,7 +240,7 @@ export function SettingsSheet({ trigger }: Props) {
         <SheetHeader className="shrink-0 space-y-1 border-b px-6 pb-4 pt-6 pr-12">
           <SheetTitle>设置</SheetTitle>
           <SheetDescription>
-            本地运行，只有手动检查更新时会请求 GitHub；路径配置以当前运行环境为准。
+            本地运行，手动更新时按网络设置联网；路径配置以当前运行环境为准。
           </SheetDescription>
         </SheetHeader>
 
@@ -312,13 +322,56 @@ export function SettingsSheet({ trigger }: Props) {
                 variant="outline"
                 size="sm"
                 className="h-8 shrink-0 gap-1.5"
-                disabled={updateState.state === "checking" || updateState.state === "installing"}
+                disabled={updating || !settings}
                 onClick={checkUpdate}
               >
                 <RefreshCw className={updateState.state === "checking" ? "h-3.5 w-3.5 animate-spin" : "h-3.5 w-3.5"} />
                 检查更新
               </Button>
             </div>
+            {isTauriRuntime() ? (
+              <div className="space-y-3 rounded-md border bg-muted/20 p-3">
+                <div className="space-y-1.5">
+                  <Label htmlFor="update-proxy" className="text-xs">更新代理地址（可选）</Label>
+                  <Input
+                    id="update-proxy"
+                    aria-label="更新代理地址"
+                    aria-describedby="update-proxy-help"
+                    value={updateProxy}
+                    onChange={(event) => { setUpdateProxy(event.target.value); setUpdateState({ state: "idle" }); }}
+                    placeholder="http://127.0.0.1:7890"
+                    className="font-mono text-xs"
+                    disabled={updating || !settings}
+                    spellCheck={false}
+                  />
+                  <p id="update-proxy-help" className="text-xs leading-5 text-muted-foreground">
+                    用于检查版本和下载。支持 HTTP、HTTPS、SOCKS5（含 socks5h）；留空使用默认网络。
+                  </p>
+                </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="update-mirror" className="text-xs">下载加速地址（可选）</Label>
+                  <Input
+                    id="update-mirror"
+                    aria-label="下载加速地址"
+                    aria-describedby="update-mirror-help"
+                    value={updateMirror}
+                    onChange={(event) => { setUpdateMirror(event.target.value); setUpdateState({ state: "idle" }); }}
+                    placeholder="https://你的加速服务地址/"
+                    className="font-mono text-xs"
+                    disabled={updating || !settings}
+                    spellCheck={false}
+                  />
+                  <p id="update-mirror-help" className="text-xs leading-5 text-muted-foreground">
+                    默认使用 ghproxy.net，可改为其他支持拼接 GitHub 完整下载链接的服务前缀，清空后直接下载。仅加速应用内更新包下载，版本信息仍从 GitHub 获取。
+                  </p>
+                </div>
+                <p className="text-xs leading-5 text-muted-foreground">
+                  检查和下载使用当前填写值；点击“保存设置”后，下次打开仍会保留。
+                </p>
+              </div>
+            ) : (
+              <p className="text-xs text-muted-foreground">网页版使用浏览器的网络和代理设置。</p>
+            )}
             <UpdateStatus
               state={updateState}
               currentVersion={currentVersion}
@@ -331,7 +384,7 @@ export function SettingsSheet({ trigger }: Props) {
         </div>
 
         <SheetFooter className="shrink-0 border-t bg-background px-6 py-4">
-          <Button onClick={onSave} className="w-full">
+          <Button onClick={onSave} className="w-full" disabled={updating || !settings}>
             保存设置
           </Button>
         </SheetFooter>
@@ -437,7 +490,7 @@ function UpdateStatus({
   }
   if (state.state === "error") {
     return (
-      <Badge variant="outline" className="gap-1 border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400">
+      <Badge variant="outline" className="items-start gap-1 whitespace-normal break-words text-left border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400">
         <AlertTriangle className="h-3 w-3" />
         检查失败：{state.message}
       </Badge>
