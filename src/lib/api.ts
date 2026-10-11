@@ -1064,6 +1064,13 @@ export const api = {
     }
     return invokeCommand<void>("open_latest_release_page");
   },
+  openRepositoryPage: async () => {
+    if (isWebRuntime()) {
+      window.open("https://github.com/ccpopy/cc-sessions", "_blank", "noopener,noreferrer");
+      return;
+    }
+    return invokeCommand<void>("open_repository_page");
+  },
   defaultCodexDir: () => invokeCommand<string>("default_codex_dir"),
   defaultClaudeDir: () => invokeCommand<string>("default_claude_dir"),
   defaultOpenCodeDir: () => invokeCommand<string>("default_opencode_dir"),

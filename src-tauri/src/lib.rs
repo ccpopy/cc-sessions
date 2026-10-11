@@ -92,6 +92,7 @@ pub fn run() {
             settings::validate_cursor_dir,
             fs_ops::reveal_cwd,
             fs_ops::open_latest_release_page,
+            fs_ops::open_repository_page,
             fs_ops::copy_resume_command,
             commands::list_sessions,
             commands::group_sessions_by_project,

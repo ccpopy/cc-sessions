@@ -535,6 +535,7 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
         )),
         "reveal_cwd" => to_result_value(fs_ops::reveal_cwd(string_arg(&args, "cwd")?)),
         "open_latest_release_page" => to_result_value(fs_ops::open_latest_release_page()),
+        "open_repository_page" => to_result_value(fs_ops::open_repository_page()),
         "copy_resume_command" => to_result_value(fs_ops::resume_command_text(
             opt_string_arg(&args, "provider")?,
             string_arg(&args, "sessionId")?,

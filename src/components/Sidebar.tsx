@@ -7,6 +7,7 @@ import {
   Braces,
   Check,
   ChevronDown,
+  Github,
   MessageSquare,
   MousePointer2,
   NotebookText,
@@ -16,6 +17,7 @@ import {
   Terminal,
   Wrench,
 } from "lucide-react";
+import { toast } from "sonner";
 
 import { SettingsSheet } from "@/components/SettingsSheet";
 import { ThemeToggle } from "@/components/ThemeToggle";
@@ -36,7 +38,7 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
 } from "@/components/ui/sidebar";
-import type { SessionProvider } from "@/lib/api";
+import { api, type SessionProvider } from "@/lib/api";
 import {
   accentActiveBar,
   accentActiveIcon,
@@ -209,15 +211,25 @@ export function Sidebar() {
         {providerPath && <DirCard label={`${provider.label} 目录`} path={providerPath} accent={provider.id} />}
         <div className="mt-0.5 flex items-center gap-1">
           <ThemeToggle className="flex-1" />
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label="GitHub 项目主页"
+            title="GitHub 项目主页"
+            onClick={openRepositoryPage}
+            className="h-9 w-9 shrink-0 rounded-lg border border-border/70 bg-muted/40 text-muted-foreground shadow-[inset_0_1px_0_0_hsl(var(--background)/0.6)] hover:border-border hover:bg-muted/60 hover:text-foreground dark:bg-muted/30 dark:shadow-[inset_0_1px_0_0_hsl(var(--background)/0.2)]"
+          >
+            <Github className="h-4 w-4" />
+          </Button>
           <SettingsSheet
             trigger={
               <Button
                 variant="ghost"
                 size="icon"
                 aria-label="设置"
-                className="group/settings h-9 w-9 shrink-0 rounded-lg border border-border/70 bg-muted/40 text-muted-foreground shadow-[inset_0_1px_0_0_hsl(var(--background)/0.6)] hover:border-border hover:bg-muted/60 hover:text-foreground dark:bg-muted/30 dark:shadow-[inset_0_1px_0_0_hsl(var(--background)/0.2)]"
+                className="h-9 w-9 shrink-0 rounded-lg border border-border/70 bg-muted/40 text-muted-foreground shadow-[inset_0_1px_0_0_hsl(var(--background)/0.6)] hover:border-border hover:bg-muted/60 hover:text-foreground dark:bg-muted/30 dark:shadow-[inset_0_1px_0_0_hsl(var(--background)/0.2)]"
               >
-                <Settings className="h-4 w-4 transition-transform duration-500 ease-out group-hover/settings:rotate-90" />
+                <Settings className="h-4 w-4" />
               </Button>
             }
           />
@@ -225,6 +237,14 @@ export function Sidebar() {
       </SidebarFooter>
     </SidebarPrimitive>
   );
+}
+
+async function openRepositoryPage() {
+  try {
+    await api.openRepositoryPage();
+  } catch (e: any) {
+    toast.error("打开 GitHub 项目主页失败: " + String(e?.message ?? e));
+  }
 }
 
 function ProviderMark({ provider }: { provider: ProviderDefinition }) {

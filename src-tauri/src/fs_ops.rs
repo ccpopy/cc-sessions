@@ -154,6 +154,11 @@ pub fn open_latest_release_page() -> AppResult<()> {
     open_external("https://github.com/ccpopy/cc-sessions/releases/latest")
 }
 
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn open_repository_page() -> AppResult<()> {
+    open_external("https://github.com/ccpopy/cc-sessions")
+}
+
 fn open_external(url: &str) -> AppResult<()> {
     #[cfg(target_os = "windows")]
     {
