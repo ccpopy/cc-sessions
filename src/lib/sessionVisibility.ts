@@ -89,11 +89,9 @@ type FamilyCandidate = {
 /**
  * Collapse normal (non-archived) Codex rows into one card per logical family.
  *
- * Scatter provider switches deliberately leave multiple branches usable in
- * `sessions/`. The manager-owned `active_id` can therefore become stale when
- * the user later resumes another branch directly in Codex. The current
- * provider's usable branch is the least surprising representative; only when
- * that branch does not exist do we fall back to the stored active branch.
+ * Keep the explicitly selected thread visible when the configured provider changes.
+ * Otherwise a provider switch silently selects a different copy before the user can
+ * migrate the original. Only fall back when the selected branch is unavailable.
  */
 export function selectNormalFamilySessions(
   sessions: readonly SessionSummary[],
@@ -136,10 +134,10 @@ function selectFamilyRepresentative(
     : [];
   const activeCandidates = candidates.filter((candidate) => candidate.overlay.is_active_branch);
   const pool =
-    currentProviderCandidates.length > 0
-      ? currentProviderCandidates
-      : activeCandidates.length > 0
-        ? activeCandidates
+    activeCandidates.length > 0
+      ? activeCandidates
+      : currentProviderCandidates.length > 0
+        ? currentProviderCandidates
         : candidates;
 
   return pool.reduce((preferred, candidate) =>

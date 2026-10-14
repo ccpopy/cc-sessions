@@ -611,10 +611,14 @@ pub struct BranchSyncReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct BranchSyncState {
     pub branch_id: String,
-    /// current / same / branch_ahead / active_ahead / diverged / missing
+    /// 当前 rollout 核实的 provider；不改写 family 登记信息或会话文件。
+    pub provider: Option<String>,
+    pub rollout_relpath: Option<String>,
+    /// current / same / branch_ahead / active_ahead / diverged / missing / unavailable
     pub relation: String,
     pub active_lines: Option<u64>,
     pub branch_lines: Option<u64>,
+    /// 只有旧格式的物理行前缀同步可用时才非零；分页历史关系不授权行追加。
     pub appendable_lines_to_active: u32,
     pub appendable_lines_to_branch: u32,
     pub error: Option<String>,
@@ -641,6 +645,7 @@ pub struct CloneReport {
     pub new_id: Option<String>,
     pub new_rollout_path: Option<String>,
     pub new_provider: String,
+    pub backup_path: Option<String>,
     /// Desktop 私有项目状态因应用运行中或探测不确定而未同步；重启后刷新 Core 会话列表。
     pub desktop_restart_required: bool,
     pub ok: bool,
@@ -699,7 +704,7 @@ pub enum SwitchStrategy {
     Continuous,
     /// 每个 provider 下独立副本，互不干扰
     Scatter,
-    /// 直接改 rollout 的 provider 字段，不克隆
+    /// 通过原生 resume 原地迁移，保留 ID 和历史，不创建分支
     Follow,
 }
 
@@ -1221,11 +1226,14 @@ pub struct FamilyOverlay {
     pub session_id: String,
     /// threads 表中记录的 model_provider
     pub provider: Option<String>,
+    /// 原生 session_meta 中记录的直接 Fork 来源，与 provider 分支无关。
+    pub forked_from_id: Option<String>,
+    pub fork_count: u32,
     pub family_id: Option<String>,
     pub branch_count: u32,
     pub is_active_branch: bool,
     pub archive_origin: Option<ArchiveOrigin>,
-    /// "matches" / "resync" / "clonable" / "has_clone" / "unknown"
+    /// "matches" / "resync" / "clonable" / "subagent" / "unknown"
     pub clone_state: String,
 }
 

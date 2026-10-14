@@ -653,6 +653,7 @@ struct RolloutIdentity {
     id: String,
     model_provider: String,
     source: Option<String>,
+    forked_from_id: Option<String>,
     is_paginated: bool,
 }
 
@@ -694,10 +695,24 @@ fn read_rollout_identity(path: &Path) -> AppResult<Option<RolloutIdentity>> {
             id: id.to_string(),
             model_provider,
             source: metadata_string_field(payload, "source"),
+            forked_from_id: payload
+                .get("forked_from_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|parent| !parent.is_empty() && *parent != id)
+                .map(String::from),
             is_paginated: payload.get("history_mode").and_then(Value::as_str) == Some("paginated"),
         }));
     }
     Ok(None)
+}
+
+/// Only the explicit native Fork marker establishes this relationship; a shared
+/// history_base or subagent parent alone does not make a session a user Fork.
+pub(crate) fn read_rollout_fork_source(path: &Path, session_id: &str) -> AppResult<Option<String>> {
+    Ok(read_rollout_identity(path)?
+        .filter(|identity| identity.id == session_id)
+        .and_then(|identity| identity.forked_from_id))
 }
 
 fn scan_active_rollout_identities(codex: &Path) -> AppResult<Vec<(PathBuf, RolloutIdentity)>> {
@@ -815,7 +830,7 @@ fn read_rollout_brief_impl(
     let f = fs::File::open(path)?;
     let reader = BufReader::new(f);
     let mut id: Option<String> = None;
-    let mut model_provider: Option<String> = None;
+    let mut provider_tracker = crate::codex_rollout_provider::EffectiveProviderTracker::default();
     let mut history_mode: Option<String> = None;
     let mut source: Option<String> = None;
     let mut cwd_tracker = crate::codex_rollout_cwd::EffectiveCwdTracker::default();
@@ -839,6 +854,7 @@ fn read_rollout_brief_impl(
             Err(_) => continue,
         };
         cwd_tracker.observe(&v);
+        provider_tracker.observe(&v);
         // 时间戳（顶层可能是 ISO8601 字符串）
         if let Some(ts) = v.get("timestamp").and_then(|x| x.as_str()) {
             if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
@@ -859,12 +875,6 @@ fn read_rollout_brief_impl(
                 id = id.or_else(|| {
                     payload
                         .and_then(|p| p.get("id"))
-                        .and_then(|x| x.as_str())
-                        .map(String::from)
-                });
-                model_provider = model_provider.or_else(|| {
-                    payload
-                        .and_then(|p| p.get("model_provider"))
                         .and_then(|x| x.as_str())
                         .map(String::from)
                 });
@@ -911,6 +921,7 @@ fn read_rollout_brief_impl(
         None => return Ok(None), // 没有有效 session_meta.id 直接跳过
     };
     let cwd = cwd_tracker.effective_for(&id);
+    let model_provider = provider_tracker.effective_for(&id);
     let relpath = path
         .strip_prefix(codex_dir)
         .map(|p| p.to_path_buf())
@@ -2807,8 +2818,10 @@ fn thread_values_from_rollout(
                 ),
                 "source" => Value::String(desktop_visible_source(&payload)),
                 "model_provider" => Value::String(
-                    metadata_string_field(&payload, "model_provider")
-                        .or_else(|| brief.model_provider.clone())
+                    brief
+                        .model_provider
+                        .clone()
+                        .or_else(|| metadata_string_field(&payload, "model_provider"))
                         .unwrap_or_else(|| DEFAULT_PROVIDER.to_string()),
                 ),
                 "sandbox_policy" => Value::String(
@@ -3095,7 +3108,8 @@ fn read_thread_states_for_ids<'a>(
         return Ok(states);
     }
     let conn = state_db::open_ro(codex)?;
-    let mut stmt = conn.prepare("SELECT rollout_path, model_provider, source, COALESCE(archived,0) FROM threads WHERE id=?1")?;
+    let snapshot = conn.unchecked_transaction()?;
+    let mut stmt = snapshot.prepare("SELECT rollout_path, model_provider, source, COALESCE(archived,0) FROM threads WHERE id=?1")?;
     for id in ids {
         crate::operation_metrics::record(|c| c.local_thread_queries += 1);
         if let Some(state) = stmt
@@ -3313,7 +3327,8 @@ pub(crate) fn rollout_record_is_usable_provider(
     let Some(identity) = read_rollout_identity(rollout)? else {
         return Ok(false);
     };
-    Ok(identity.id == id && identity.model_provider == expected_provider)
+    // The verified threads row is current; session_meta retains the creation provider.
+    Ok(identity.id == id)
 }
 
 fn thread_state_is_subagent(states: &BTreeMap<String, ThreadRepairState>, id: &str) -> bool {
@@ -4702,7 +4717,21 @@ pub fn clone_session_for_provider_with_lock(
     })
 }
 
+#[path = "repair/provider_migration.rs"]
+mod provider_migration;
+
 trait ProviderThreadForker {
+    fn read_provider_thread(
+        &mut self,
+        thread_id: &str,
+    ) -> AppResult<crate::codex_app_server::ForkedThread>;
+    fn resume_provider_thread(
+        &mut self,
+        thread_id: &str,
+        provider: &str,
+    ) -> AppResult<crate::codex_app_server::ForkedThread>;
+    fn close_provider_thread(&mut self) {}
+
     fn fork_paginated_thread(
         &mut self,
         thread_id: &str,
@@ -4745,6 +4774,25 @@ impl OfficialProviderThreadForker {
 }
 
 impl ProviderThreadForker for OfficialProviderThreadForker {
+    fn read_provider_thread(
+        &mut self,
+        thread_id: &str,
+    ) -> AppResult<crate::codex_app_server::ForkedThread> {
+        self.app_server()?.read_thread(thread_id)
+    }
+
+    fn resume_provider_thread(
+        &mut self,
+        thread_id: &str,
+        provider: &str,
+    ) -> AppResult<crate::codex_app_server::ForkedThread> {
+        self.app_server()?.resume_for_provider(thread_id, provider)
+    }
+
+    fn close_provider_thread(&mut self) {
+        self.app_server.take();
+    }
+
     fn fork_paginated_thread(
         &mut self,
         thread_id: &str,
@@ -4828,6 +4876,19 @@ fn clone_session_for_provider_with_activity(
     observed_activity: Option<ProviderSyncActivity>,
 ) -> AppResult<CloneReport> {
     let codex = PathBuf::from(&codex_dir);
+    if matches!(strategy, SwitchStrategy::Follow) {
+        let result = provider_migration::migrate(
+            &codex,
+            &session_id,
+            target_provider,
+            dry_run,
+            source_rollout_hint,
+            provider_forker,
+            observed_activity,
+        );
+        provider_forker.close_provider_thread();
+        return result;
+    }
     let defer_desktop_state =
         !dry_run && crate::codex_projects::should_defer_desktop_state_mutation();
     let configured_provider = effective_current_provider(&codex)?;
@@ -4847,6 +4908,7 @@ fn clone_session_for_provider_with_activity(
         new_id: None,
         new_rollout_path: None,
         new_provider: provider.clone(),
+        backup_path: None,
         desktop_restart_required: false,
         ok: false,
         skipped_reason: None,
@@ -5130,13 +5192,6 @@ fn clone_session_for_provider_with_activity(
                 .into(),
         ));
     }
-    if src_brief.history_mode == "paginated" && matches!(&strategy, SwitchStrategy::Follow) {
-        return Err(AppError::Other(
-            "分页会话不支持跟随（follow）模式：就地改写只会命中存根或延续文件之一，且会按单文件回写 threads 索引；请选择散点模式（scatter），通过 Codex 官方派生保留完整历史"
-                .into(),
-        ));
-    }
-
     if src_brief.history_mode == "paginated" && matches!(&strategy, SwitchStrategy::Scatter) {
         if dry_run {
             report.ok = true;
@@ -5159,77 +5214,7 @@ fn clone_session_for_provider_with_activity(
     }
 
     match strategy {
-        SwitchStrategy::Follow => {
-            // 直接改 src 文件第一行的 model_provider（不克隆）
-            if dry_run {
-                report.ok = true;
-                report.skipped_reason = Some("dry_run: follow 模式将就地改写 provider".into());
-                return Ok(report);
-            }
-            ensure_state_db_exists(&codex)?;
-            let state = state_db::open(&codex)?;
-            let transaction = rusqlite::Transaction::new_unchecked(
-                &state,
-                rusqlite::TransactionBehavior::Immediate,
-            )?;
-            let mut journal = MutationJournal::default();
-            let operation = (|| -> AppResult<()> {
-                if let Some(activity) = &activity {
-                    activity.ensure_unchanged()?;
-                }
-                if !defer_desktop_state {
-                    if let Some(record) = project_assignment_record(&codex, &src_brief) {
-                        if let Some(receipt) = crate::codex_projects::sync_missing_thread_project_assignment_records_with_receipt(
-                            &codex,
-                            &[record],
-                        )? {
-                            journal.register_project_state_receipt(receipt);
-                        }
-                    }
-                }
-                journal.mutate_file(&src_brief.path, || {
-                    rewrite_provider_inplace(&src_brief.path, &provider)
-                })?;
-                inject_repair_fault("follow_after_rollout")?;
-                sync_thread_from_rollout(&codex, &transaction, &src_brief.path)?;
-                inject_repair_fault("follow_after_thread")?;
-                let index_path = paths::session_index_path(&codex);
-                journal.mutate_file(&index_path, || {
-                    append_index_line(
-                        &codex,
-                        &src_brief.id,
-                        &src_brief.first_user_message,
-                        &src_brief.path,
-                    )
-                })?;
-                inject_repair_fault("follow_after_index")?;
-
-                // 家族记录：更新当前 active 分支的 provider
-                if let Some(f) = store.families.get_mut(&family_id) {
-                    if let Some(b) = f.chain.iter_mut().find(|b| b.id == f.active_id) {
-                        b.provider = provider.clone();
-                    }
-                    f.updated_at = chrono::Utc::now().to_rfc3339();
-                }
-                let family_path = paths::family_store_path(&codex);
-                journal.mutate_file(&family_path, || family::save(&codex, &store))?;
-                inject_repair_fault("follow_after_family_save")?;
-                Ok(())
-            })();
-            if let Err(error) = operation {
-                return Err(rollback_transaction_with_compensation(
-                    transaction,
-                    journal,
-                    error,
-                ));
-            }
-            commit_transaction_with_compensation(transaction, journal)?;
-            report.new_id = Some(src_brief.id.clone());
-            report.new_rollout_path = Some(src_brief.path.to_string_lossy().into_owned());
-            report.desktop_restart_required = defer_desktop_state;
-            report.ok = true;
-            Ok(report)
-        }
+        SwitchStrategy::Follow => unreachable!("handled by native provider migration"),
         SwitchStrategy::Scatter | SwitchStrategy::Continuous => {
             // 从 active 分支对应的最新 rollout 文件深拷一份（保证内容连续）
             let source_rollout: PathBuf = match active_branch.as_ref() {
@@ -5658,44 +5643,6 @@ fn compensate_official_provider_fork(
     }
 }
 
-fn rewrite_provider_inplace(path: &Path, new_provider: &str) -> AppResult<()> {
-    let expected = atomic_file::fingerprint(path)?;
-    let raw = fs::read_to_string(path)?;
-    let mut rewritten = false;
-    let mut output = Vec::new();
-    for line in raw.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if !rewritten {
-            if let Ok(mut v) = serde_json::from_str::<Value>(line) {
-                if v.get("type").and_then(|x| x.as_str()) == Some("session_meta") {
-                    if let Some(payload) = v.get_mut("payload").and_then(|p| p.as_object_mut()) {
-                        payload.insert("model_provider".into(), Value::String(new_provider.into()));
-                    }
-                    output.push(serde_json::to_string(&v)?);
-                    rewritten = true;
-                    continue;
-                }
-            }
-        }
-        output.push(line.to_string());
-    }
-    if !rewritten {
-        return Err(AppError::InvalidCodexDir(format!(
-            "rollout 缺少 session_meta，无法改写 provider: {}",
-            path.to_string_lossy()
-        )));
-    }
-    atomic_file::replace_with_writer_if_unchanged(path, &expected, |file| {
-        for line in output {
-            writeln!(file, "{line}")?;
-        }
-        Ok(())
-    })?;
-    Ok(())
-}
-
 pub(crate) fn append_index_line(
     codex: &Path,
     id: &str,
@@ -5923,19 +5870,12 @@ fn list_mismatched_sessions_from_scan(
             if thread_state_is_subagent(&thread_states, &active.id) {
                 continue;
             }
-            let mut has_target_branch = false;
-            for branch in &f.chain {
-                if branch.provider == target_provider && branch_is_usable(branch, target_provider)?
-                {
-                    has_target_branch = true;
-                    break;
-                }
-            }
-            if active.provider != target_provider && has_target_branch {
-                continue;
-            }
-            let state_drift = !branch_is_usable(active, &active.provider)?;
-            if (active.provider != target_provider || state_drift) && seen.insert(active.id.clone())
+            let active_provider = thread_states
+                .get(&active.id)
+                .and_then(|s| s.model_provider.as_deref())
+                .unwrap_or(&active.provider);
+            let state_drift = !branch_is_usable(active, active_provider)?;
+            if (active_provider != target_provider || state_drift) && seen.insert(active.id.clone())
             {
                 out.push(ProviderSyncTarget {
                     session_id: active.id.clone(),
@@ -5953,7 +5893,10 @@ fn list_mismatched_sessions_from_scan(
         if is_subagent_source(identity.source.as_deref()) {
             continue;
         }
-        let provider = identity.model_provider.as_str();
+        let provider = thread_states
+            .get(&identity.id)
+            .and_then(|s| s.model_provider.as_deref())
+            .unwrap_or(identity.model_provider.as_str());
         let state_drift = !rollout_is_usable_provider_session(
             codex,
             &thread_states,
@@ -6027,6 +5970,7 @@ where
 
     let targets = list_mismatched_sessions(&codex, &cur)?;
     let total = targets.len();
+    let migrate_in_place = matches!(strategy, SwitchStrategy::Follow);
     on_progress(0, total, None, None);
     let mut activity = if dry_run {
         Vec::new()
@@ -6035,7 +5979,7 @@ where
             &codex,
             targets
                 .iter()
-                .filter(|target| !target.is_paginated)
+                .filter(|target| migrate_in_place || !target.is_paginated)
                 .map(|target| (target.session_id.clone(), vec![target.rollout_path.clone()]))
                 .collect(),
         )?
@@ -6049,7 +5993,7 @@ where
         on_progress(out.len(), total, Some(id.clone()), None);
         let observed = if dry_run {
             Ok(None)
-        } else if target.is_paginated {
+        } else if target.is_paginated && !migrate_in_place {
             Ok(Some(ProviderSyncActivity::Paginated))
         } else {
             activity
@@ -6077,6 +6021,7 @@ where
                 new_id: None,
                 new_rollout_path: None,
                 new_provider: cur.clone(),
+                backup_path: None,
                 desktop_restart_required: false,
                 ok: false,
                 skipped_reason: None,
@@ -6138,8 +6083,16 @@ fn rollback_family_active_locked(
             ))
         })?;
 
-    let cur_rel = paths::checked_relative_path(&cur_active.rollout_relpath)?;
-    let cur_abs = codex.join(&cur_rel);
+    let thread_states =
+        read_thread_states_for_ids(&codex, [cur_active.id.as_str(), target.id.as_str()])?;
+    let cur_abs =
+        resolve_current_branch_rollout(&codex, &cur_active, thread_states.get(&cur_active.id))?;
+    let cur_rel = paths::rollout_relpath(&cur_abs.to_string_lossy(), &codex);
+    if !cur_rel.starts_with("sessions") {
+        return Err(AppError::Other(
+            "当前分支的 rollout 已归档，请刷新后重试".into(),
+        ));
+    }
     if !cur_abs.is_file() {
         return Err(AppError::NotFound(format!(
             "当前 active rollout 不存在，不能归档: {}",
@@ -6156,7 +6109,37 @@ fn rollback_family_active_locked(
         )));
     }
 
-    let target_rel = paths::checked_relative_path(&target.rollout_relpath)?;
+    let target_source_abs =
+        resolve_current_branch_rollout(&codex, &target, thread_states.get(&target.id)).map_err(
+            |e| match e {
+                AppError::NotFound(message) => {
+                    AppError::NotFound(format!("目标分支 rollout 丢失: {message}"))
+                }
+                other => other,
+            },
+        )?;
+    let target_actual_rel = paths::rollout_relpath(&target_source_abs.to_string_lossy(), &codex);
+    let target_rel = if target_actual_rel.starts_with("sessions") {
+        target_actual_rel
+    } else {
+        let recorded = paths::checked_relative_path(&target.rollout_relpath)?;
+        let filename = target_source_abs
+            .file_name()
+            .ok_or_else(|| AppError::Path("分支路径缺少文件名".into()))?;
+        if recorded.starts_with("sessions") && recorded.file_name() == Some(filename) {
+            recorded
+        } else {
+            let (y, m, d) = crate::sessions::active_rollout_date(
+                &target_source_abs,
+                &filename.to_string_lossy(),
+            );
+            PathBuf::from("sessions")
+                .join(y)
+                .join(m)
+                .join(d)
+                .join(filename)
+        }
+    };
     let expected_abs = codex.join(&target_rel);
     let archived_target_abs = archived_dir.join(target_rel.file_name().unwrap_or_default());
     let target_already_active = expected_abs.is_file();
@@ -6173,16 +6156,6 @@ fn rollback_family_active_locked(
             expected_abs.to_string_lossy()
         )));
     }
-    let target_source_abs = if target_already_active {
-        expected_abs.clone()
-    } else if archived_target_abs.is_file() {
-        archived_target_abs.clone()
-    } else {
-        return Err(AppError::NotFound(format!(
-            "目标分支 rollout 丢失: {}",
-            expected_abs.to_string_lossy()
-        )));
-    };
     let target_brief = read_rollout_brief(&codex, &target_source_abs)?.ok_or_else(|| {
         AppError::Other(format!(
             "目标分支 rollout 缺少有效 session_meta.id: {}",
@@ -6202,13 +6175,18 @@ fn rollback_family_active_locked(
             (target_branch_id.clone(), vec![target_source_abs.clone()]),
         ],
     )?;
-    let current_lines = read_rollout_lines(&cur_abs)?;
-    let target_lines = read_rollout_lines(&target_source_abs)?;
-    let (relation, _, appendable_to_target) = compare_rollout_lines(&current_lines, &target_lines);
-    if relation == "active_ahead" {
-        return Err(AppError::Other(format!(
-            "目标分支落后当前 active {appendable_to_target} 行；请先把当前分支增量同步到目标分支，再设为当前"
-        )));
+    // 分页分支切换保留各自历史，不把增量存根当作可逐行同步的完整文件。
+    if !crate::logical_history::is_paginated(&cur_abs)? && target_brief.history_mode != "paginated"
+    {
+        let current_lines = read_rollout_lines(&cur_abs)?;
+        let target_lines = read_rollout_lines(&target_source_abs)?;
+        let (relation, _, appendable_to_target) =
+            compare_rollout_lines(&current_lines, &target_lines);
+        if relation == "active_ahead" {
+            return Err(AppError::Other(format!(
+                "目标分支落后当前 active {appendable_to_target} 行；请先把当前分支增量同步到目标分支，再设为当前"
+            )));
+        }
     }
     let current_snapshot = atomic_file::fingerprint(&cur_abs)?;
     let target_snapshot = atomic_file::fingerprint(&target_source_abs)?;
@@ -6217,6 +6195,21 @@ fn rollback_family_active_locked(
     let mut journal = MutationJournal::default();
     let operation = (|| -> AppResult<()> {
         activity.ensure_unchanged()?;
+        // 原生 resume/revert 可能在预检与静默观察之间更换当前 rollout。
+        // 事务内核对本次选取的路径，不让旧 family 路径覆盖新的 threads 指针。
+        use rusqlite::OptionalExtension;
+        for id in [&cur_active.id, &target.id] {
+            let now: Option<Option<String>> = transaction
+                .query_row(
+                    "SELECT rollout_path FROM threads WHERE id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if now != thread_states.get(id).map(|s| s.rollout_path.clone()) {
+                return Err(AppError::SessionBusy(id.clone()));
+            }
+        }
         if let Some(record) = project_assignment_record(&codex, &target_brief) {
             if let Some(receipt) =
                 crate::codex_projects::sync_missing_thread_project_assignment_records_with_receipt(
@@ -6230,6 +6223,19 @@ fn rollback_family_active_locked(
 
         // 当前 active 归档，并在同一 SQLite 事务内更新 threads。
         require_unchanged_snapshot(&cur_abs, &current_snapshot, "当前 active rollout ")?;
+        if let Some(f) = store.families.get_mut(&family_id) {
+            for branch in &mut f.chain {
+                if branch.id == cur_active.id {
+                    branch.rollout_relpath = cur_rel.to_string_lossy().into_owned();
+                } else if branch.id == target.id {
+                    branch.rollout_relpath = target_rel.to_string_lossy().into_owned();
+                    branch.provider = target_brief
+                        .model_provider
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_PROVIDER.into());
+                }
+            }
+        }
         family::archive_with_integrity(&mut store, &codex, &family_id, &cur_active.id)?;
         require_unchanged_snapshot(&cur_abs, &current_snapshot, "当前 active rollout ")?;
         fs::create_dir_all(&archived_dir)?;
@@ -6360,7 +6366,7 @@ fn delete_family_branch_locked(
 }
 
 /// 读取每个非 active 分支相对当前 active 分支的可同步状态。
-/// 比较时跳过第 1 行 session_meta，因为 clone 后 id/provider 不同是正常的。
+/// 分页分支按有界继承链比较历史；旧格式保留物理行前缀同步口径。
 pub fn get_family_branch_sync_states_with_lock(
     codex_dir: String,
     family_id: String,
@@ -6382,72 +6388,167 @@ fn get_family_branch_sync_states_locked(
         .get(&family_id)
         .cloned()
         .ok_or_else(|| AppError::NotFound(format!("family: {}", family_id)))?;
-    let active_branch = family
+    let active_index = family
         .chain
         .iter()
-        .find(|b| b.id == family.active_id)
-        .cloned()
+        .position(|b| b.id == family.active_id)
         .ok_or_else(|| AppError::NotFound("active 分支缺失".into()))?;
-    let active_abs = resolve_branch_rollout(&codex, &active_branch)?;
-    let active_lines = read_rollout_lines(&active_abs)?;
-    if active_lines.is_empty() {
-        return Err(AppError::Other("当前 active 分支为空 rollout".into()));
-    }
-
+    let thread_states =
+        read_thread_states_for_ids(&codex, family.chain.iter().map(|b| b.id.as_str()))?;
+    let histories: Vec<_> = family
+        .chain
+        .iter()
+        .map(|branch| read_branch_history(&codex, branch, thread_states.get(&branch.id)))
+        .collect();
+    let active = &histories[active_index];
     let mut states = Vec::with_capacity(family.chain.len());
-    for branch in family.chain.iter() {
-        if branch.id == family.active_id {
-            states.push(BranchSyncState {
-                branch_id: branch.id.clone(),
-                relation: "current".into(),
-                active_lines: Some(active_lines.len() as u64),
-                branch_lines: Some(active_lines.len() as u64),
-                appendable_lines_to_active: 0,
-                appendable_lines_to_branch: 0,
-                error: None,
-            });
-            continue;
-        }
-
-        let state =
-            match resolve_branch_rollout(&codex, branch).and_then(|p| read_rollout_lines(&p)) {
-                Ok(branch_lines) if branch_lines.is_empty() => BranchSyncState {
-                    branch_id: branch.id.clone(),
-                    relation: "missing".into(),
-                    active_lines: Some(active_lines.len() as u64),
-                    branch_lines: Some(0),
-                    appendable_lines_to_active: 0,
-                    appendable_lines_to_branch: 0,
-                    error: Some("分支为空 rollout".into()),
-                },
-                Ok(branch_lines) => {
-                    let (relation, to_active, to_branch) =
-                        compare_rollout_lines(&active_lines, &branch_lines);
-                    let error = (relation == "diverged")
-                        .then(|| describe_rollout_divergence(&active_lines, &branch_lines));
-                    BranchSyncState {
-                        branch_id: branch.id.clone(),
-                        relation,
-                        active_lines: Some(active_lines.len() as u64),
-                        branch_lines: Some(branch_lines.len() as u64),
-                        appendable_lines_to_active: to_active,
-                        appendable_lines_to_branch: to_branch,
-                        error,
+    for (branch, history) in family.chain.iter().zip(&histories) {
+        let mut state = BranchSyncState {
+            branch_id: branch.id.clone(),
+            provider: history.as_ref().ok().map(|h| h.provider.clone()),
+            rollout_relpath: history.as_ref().ok().map(|h| h.relpath.clone()),
+            relation: "unavailable".into(),
+            active_lines: active.as_ref().ok().map(|h| h.lines),
+            branch_lines: history.as_ref().ok().map(|h| h.lines),
+            appendable_lines_to_active: 0,
+            appendable_lines_to_branch: 0,
+            error: None,
+        };
+        match (active, history) {
+            (Ok(a), Ok(b)) if a.paginated == b.paginated => {
+                let (relation, to_active, to_branch) = compare_bodies(&a.body, &b.body);
+                if branch.id == family.active_id {
+                    state.relation = "current".into();
+                } else {
+                    state.relation = relation;
+                    if !a.paginated {
+                        state.appendable_lines_to_active = to_active;
+                        state.appendable_lines_to_branch = to_branch;
+                    }
+                    if state.relation == "diverged" {
+                        state.error =
+                            Some(describe_rollout_divergence(&a.body, &b.body, a.paginated));
                     }
                 }
-                Err(e) => BranchSyncState {
-                    branch_id: branch.id.clone(),
-                    relation: "missing".into(),
-                    active_lines: Some(active_lines.len() as u64),
-                    branch_lines: None,
-                    appendable_lines_to_active: 0,
-                    appendable_lines_to_branch: 0,
-                    error: Some(e.to_string()),
-                },
-            };
+            }
+            (Ok(_), Ok(_)) => state.error = Some("两个分支的历史格式不同，暂不能比较".into()),
+            (_, Err(e)) | (Err(e), _) => {
+                if matches!(e, AppError::NotFound(_)) {
+                    state.relation = "missing".into();
+                }
+                state.error = Some(e.to_string());
+            }
+        }
         states.push(state);
     }
     Ok(states)
+}
+
+struct BranchHistory {
+    provider: String,
+    relpath: String,
+    paginated: bool,
+    lines: u64,
+    body: Vec<[u8; 32]>,
+}
+
+fn read_branch_history(
+    codex: &Path,
+    branch: &FamilyBranch,
+    thread: Option<&ThreadRepairState>,
+) -> AppResult<BranchHistory> {
+    use sha2::{Digest, Sha256};
+    let path = resolve_current_branch_rollout(codex, branch, thread)?;
+    let identity = read_rollout_identity(&path)?
+        .ok_or_else(|| AppError::Other("分支缺少 session_meta".into()))?;
+    let (lines, body) = if identity.is_paginated {
+        let history = crate::logical_history::read_view(&path, None)?;
+        let mut body = Vec::new();
+        let mut lines = 0;
+        for record in history.records() {
+            lines += 1;
+            // 原生 fork/resume 写入分支自己的设置快照，不代表新增对话。
+            // 保留所有正文、工具、上下文和未知记录的完整值，不做模糊匹配。
+            if record["type"] == "session_meta"
+                || (record["type"] == "event_msg"
+                    && matches!(
+                        record["payload"]["type"].as_str(),
+                        Some("thread_settings_applied" | "session_cloned")
+                    ))
+            {
+                continue;
+            }
+            body.push(Sha256::digest(serde_json::to_vec(record)?).into());
+        }
+        (lines, body)
+    } else {
+        let lines = read_rollout_lines(&path)?;
+        let body = comparable_body(&lines)
+            .iter()
+            .map(|line| Sha256::digest(line.as_bytes()).into())
+            .collect();
+        (lines.len() as u64, body)
+    };
+    Ok(BranchHistory {
+        provider: thread
+            .and_then(|s| s.model_provider.clone())
+            .unwrap_or(identity.model_provider),
+        relpath: paths::rollout_relpath(&path.to_string_lossy(), codex)
+            .to_string_lossy()
+            .into_owned(),
+        paginated: identity.is_paginated,
+        lines,
+        body,
+    })
+}
+
+fn resolve_current_branch_rollout(
+    codex: &Path,
+    branch: &FamilyBranch,
+    thread: Option<&ThreadRepairState>,
+) -> AppResult<PathBuf> {
+    let path = match thread
+        .and_then(|t| t.rollout_path.as_deref())
+        .filter(|p| !p.is_empty())
+    {
+        Some(raw) => {
+            let path = paths::host_path_from_codex_record(codex, raw);
+            if path.is_absolute() {
+                path
+            } else {
+                codex.join(path)
+            }
+        }
+        None => resolve_branch_rollout(codex, branch)?,
+    };
+    let relative = paths::rollout_relpath(&path.to_string_lossy(), codex);
+    let root = relative.components().next().map(|c| c.as_os_str());
+    if !matches!(
+        root.and_then(|r| r.to_str()),
+        Some("sessions" | "archived_sessions")
+    ) {
+        return Err(AppError::Path(
+            "分支 rollout 不在当前数据根的会话目录内".into(),
+        ));
+    }
+    crate::path_safety::validate_descendant(
+        codex,
+        &path,
+        crate::path_safety::EntryKind::File,
+        false,
+        "分支 rollout",
+    )?;
+    if read_rollout_identity(&path)?
+        .as_ref()
+        .map(|m| m.id.as_str())
+        != Some(branch.id.as_str())
+    {
+        return Err(AppError::Other(format!(
+            "分支 rollout 身份与会话 {} 不一致",
+            branch.id
+        )));
+    }
+    Ok(path)
 }
 
 /// 把某个非 active 分支的新增内容安全合并到当前 active 分支。
@@ -6533,15 +6634,30 @@ fn append_branch_extras_locked(
         .find(|b| b.id == source_branch_id)
         .cloned()
         .ok_or_else(|| AppError::NotFound(format!("branch: {}", source_branch_id)))?;
-    let target_branch = family
+    let mut target_branch = family
         .chain
         .iter()
         .find(|b| b.id == target_branch_id)
         .cloned()
         .ok_or_else(|| AppError::NotFound(format!("branch: {}", target_branch_id)))?;
 
-    let source_abs = resolve_branch_rollout(&codex, &source_branch)?;
-    let target_abs = resolve_branch_rollout(&codex, &target_branch)?;
+    let thread_states = read_thread_states_for_ids(
+        &codex,
+        [source_branch.id.as_str(), target_branch.id.as_str()],
+    )?;
+    let source_abs = resolve_current_branch_rollout(
+        &codex,
+        &source_branch,
+        thread_states.get(&source_branch.id),
+    )?;
+    let target_abs = resolve_current_branch_rollout(
+        &codex,
+        &target_branch,
+        thread_states.get(&target_branch.id),
+    )?;
+    target_branch.provider = read_rollout_identity(&target_abs)?
+        .ok_or_else(|| AppError::Other("目标分支缺少 session_meta".into()))?
+        .model_provider;
     let target_archived = target_abs.starts_with(paths::archived_sessions_dir(&codex));
     let activity = crate::codex_activity::SessionActivityGuard::observe(
         &codex,
@@ -6730,6 +6846,10 @@ fn comparable_body(lines: &[String]) -> Vec<&String> {
 fn compare_rollout_lines(active_lines: &[String], branch_lines: &[String]) -> (String, u32, u32) {
     let active_body = comparable_body(active_lines);
     let branch_body = comparable_body(branch_lines);
+    compare_bodies(&active_body, &branch_body)
+}
+
+fn compare_bodies<T: PartialEq>(active_body: &[T], branch_body: &[T]) -> (String, u32, u32) {
     if branch_body == active_body {
         ("same".into(), 0, 0)
     } else if branch_body.len() > active_body.len() && branch_body.starts_with(&active_body[..]) {
@@ -6749,23 +6869,38 @@ fn compare_rollout_lines(active_lines: &[String], branch_lines: &[String]) -> (S
     }
 }
 
-fn describe_rollout_divergence(active_lines: &[String], branch_lines: &[String]) -> String {
-    let active_body = comparable_body(active_lines);
-    let branch_body = comparable_body(branch_lines);
+fn describe_rollout_divergence<T: PartialEq>(
+    active_body: &[T],
+    branch_body: &[T],
+    paginated: bool,
+) -> String {
     let common_lines = active_body
         .iter()
         .zip(branch_body.iter())
         .take_while(|(active, branch)| active == branch)
         .count();
-    format!(
-        "两份 rollout 在共同前缀 {common_lines} 行后均有不同记录，无法安全做前缀同步；模型切换本身不会创建会话分支"
-    )
+    if paginated {
+        format!("两个分支在共同历史 {common_lines} 条后有不同记录；切换分支不会自动合并历史")
+    } else {
+        format!("两份 rollout 在共同前缀 {common_lines} 行后均有不同记录，无法安全做前缀同步；模型切换本身不会创建会话分支")
+    }
 }
 
 fn validate_source_has_target_prefix(
     source_lines: &[String],
     target_lines: &[String],
 ) -> AppResult<()> {
+    if [source_lines, target_lines].iter().any(|lines| {
+        lines
+            .first()
+            .and_then(|line| serde_json::from_str::<Value>(line).ok())
+            .is_some_and(|v| v["payload"]["history_mode"] == "paginated")
+    }) {
+        return Err(AppError::Other(
+            "分页分支通过继承链共享历史，不能使用旧格式的逐行追加同步；可切换到所需分支继续对话"
+                .into(),
+        ));
+    }
     if source_lines.is_empty() || target_lines.is_empty() {
         return Err(AppError::Other("源或目标分支为空 rollout".into()));
     }
@@ -6913,6 +7048,8 @@ mod tests {
         codex: PathBuf,
         fork_count: usize,
         delete_count: usize,
+        resume_count: usize,
+        resume_outcome: &'static str,
     }
 
     impl FakeProviderThreadForker {
@@ -6921,6 +7058,8 @@ mod tests {
                 codex,
                 fork_count: 0,
                 delete_count: 0,
+                resume_count: 0,
+                resume_outcome: "ok",
             }
         }
     }
@@ -6976,6 +7115,69 @@ mod tests {
     }
 
     impl ProviderThreadForker for FakeProviderThreadForker {
+        fn read_provider_thread(
+            &mut self,
+            id: &str,
+        ) -> AppResult<crate::codex_app_server::ForkedThread> {
+            let states = read_thread_states_for_ids(&self.codex, [id])?;
+            let state = &states[id];
+            let provider = if self.resume_outcome == "legacy_creation_provider" {
+                Some("custom".into())
+            } else {
+                state.model_provider.clone()
+            };
+            Ok(crate::codex_app_server::ForkedThread {
+                id: id.into(),
+                model_provider: provider,
+                path: state.rollout_path.as_ref().map(PathBuf::from),
+            })
+        }
+
+        fn resume_provider_thread(
+            &mut self,
+            id: &str,
+            provider: &str,
+        ) -> AppResult<crate::codex_app_server::ForkedThread> {
+            self.resume_count += 1;
+            if self.resume_outcome == "before_write" {
+                return Err(AppError::Other("native resume unavailable".into()));
+            }
+            let before = self.read_provider_thread(id)?;
+            let path = before.path.as_ref().unwrap();
+            let mut file = fs::OpenOptions::new().append(true).open(path)?;
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({"type": "event_msg", "payload": {
+                    "type": "thread_settings_applied", "thread_id": id,
+                    "thread_settings": {"model_provider_id": provider}
+                }})
+            )?;
+            if self.resume_outcome == "concurrent_history" {
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({"type": "event_msg", "payload": {
+                        "type": "user_message", "message": "new user content"
+                    }})
+                )?;
+            }
+            let state = state_db::open(&self.codex)?;
+            state.execute(
+                "UPDATE threads SET model_provider=?1 WHERE id=?2",
+                [provider, id],
+            )?;
+            if self.resume_outcome == "lost_reply" {
+                return Err(AppError::Other("response lost".into()));
+            }
+            let mut result = self.read_provider_thread(id)?;
+            result.model_provider = Some(provider.into());
+            if self.resume_outcome == "wrong_id" {
+                result.id = "wrong-id".into();
+            }
+            Ok(result)
+        }
+
         fn fork_paginated_thread(
             &mut self,
             thread_id: &str,
@@ -8222,12 +8424,342 @@ mod tests {
     }
 
     #[test]
+    fn provider_migration_uses_latest_owned_settings() -> AppResult<()> {
+        let codex = temp_codex_dir("provider-migration-effective-settings");
+        let source = prepare_paginated_provider_switch_fixture(&codex, "same-id")?;
+        let mut file = fs::OpenOptions::new().append(true).open(&source)?;
+        for (owner, provider) in [("same-id", "openai"), ("other-thread", "foreign")] {
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({
+                    "type": "event_msg", "payload": {
+                        "type": "thread_settings_applied", "thread_id": owner,
+                        "thread_settings": {"model_provider_id": provider}
+                    }
+                })
+            )?;
+        }
+        let brief = read_rollout_brief(&codex, &source)?.unwrap();
+        assert_eq!(brief.model_provider.as_deref(), Some("openai"));
+        fs::remove_dir_all(codex)?;
+        Ok(())
+    }
+
+    #[test]
+    fn provider_migration_preview_keeps_original_id() -> AppResult<()> {
+        let codex = temp_codex_dir("provider-migration-preview");
+        let source = prepare_paginated_provider_switch_fixture(&codex, "same-id")?;
+        let before = fs::read(&source)?;
+        let mut native = FakeProviderThreadForker::new(codex.clone());
+        let report = clone_session_for_provider_locked_with_hint(
+            codex.to_string_lossy().into_owned(),
+            "same-id".into(),
+            Some("openai".into()),
+            SwitchStrategy::Follow,
+            true,
+            Some(&source),
+            &mut native,
+        )?;
+        assert!(report.ok);
+        assert_eq!(report.new_id.as_deref(), Some("same-id"));
+        assert_eq!(native.fork_count, 0);
+        assert_eq!(fs::read(source)?, before);
+        assert!(!paths::family_store_path(&codex).exists());
+        fs::remove_dir_all(codex)?;
+        Ok(())
+    }
+
+    #[test]
+    fn provider_migration_round_trip_preserves_history_and_identity() -> AppResult<()> {
+        for (paginated, cli_version) in [
+            (false, "0.155.0-alpha.16"),
+            (true, "0.162.0-alpha.17.2"),
+            (true, "future-client"),
+        ] {
+            let codex = temp_codex_dir("provider-migration-roundtrip");
+            let id = "01a1362e-9b85-7672-ab8f-d17e68b2cc0e";
+            let source = if paginated {
+                prepare_paginated_provider_switch_fixture(&codex, id)?
+            } else {
+                prepare_provider_switch_fixture(&codex, id)?
+            };
+            let mut meta: Value =
+                serde_json::from_str(fs::read_to_string(&source)?.lines().next().unwrap())?;
+            meta["payload"]["cli_version"] = Value::String(cli_version.into());
+            fs::write(&source, format!("{meta}\n"))?;
+            let mut file = fs::OpenOptions::new().append(true).open(&source)?;
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({"type": "response_item", "payload": {
+                    "type": "message", "role": "user", "content": [
+                        {"type": "input_text", "text": "KEEP-A"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,fixture"},
+                        {"type": "input_text", "text": "KEEP-C"}
+                    ]
+                }})
+            )?;
+            drop(file);
+            let initial = fs::read(&source)?;
+            let index_before = fs::read(paths::session_index_path(&codex))?;
+            let desktop_before = fs::read(paths::codex_global_state_json_path(&codex))?;
+            let mut native = FakeProviderThreadForker::new(codex.clone());
+            if !paginated {
+                native.resume_outcome = "legacy_creation_provider";
+            }
+            for provider in ["openai", "custom", "openai"] {
+                let report = clone_session_for_provider_locked_with_hint(
+                    codex.to_string_lossy().into_owned(),
+                    id.into(),
+                    Some(provider.into()),
+                    SwitchStrategy::Follow,
+                    false,
+                    Some(&source),
+                    &mut native,
+                )?;
+                assert!(report.ok, "{:?}", report.error);
+                assert_eq!(report.new_id.as_deref(), Some(id));
+                assert_eq!(
+                    read_rollout_brief(&codex, &source)?
+                        .unwrap()
+                        .model_provider
+                        .as_deref(),
+                    Some(provider)
+                );
+                let backup = PathBuf::from(report.backup_path.unwrap());
+                assert!(backup.join("manifest.json").is_file());
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&fs::read(
+                        backup.join("provider-migration.json")
+                    )?)?["status"],
+                    "completed"
+                );
+                assert!(list_mismatched_session_ids(&codex, provider)?.is_empty());
+                assert!(fs::read(&source)?.starts_with(&initial));
+            }
+            assert_eq!(native.resume_count, 3);
+            assert_eq!(native.fork_count, 0);
+            assert_eq!(native.delete_count, 0);
+            assert_eq!(family::scan_rollouts(&codex)?, vec![source]);
+            assert!(!paths::family_store_path(&codex).exists());
+            assert_eq!(fs::read(paths::session_index_path(&codex))?, index_before);
+            assert_eq!(
+                fs::read(paths::codex_global_state_json_path(&codex))?,
+                desktop_before
+            );
+            assert_eq!(read_thread_state_map(&codex)?.len(), 1);
+            fs::remove_dir_all(codex)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn provider_migration_verifies_interrupted_and_failed_native_writes() -> AppResult<()> {
+        for (outcome, ok, status) in [
+            ("before_write", false, "failed_unchanged"),
+            ("lost_reply", true, "completed"),
+            ("wrong_id", false, "needs_recovery"),
+            ("concurrent_history", false, "needs_recovery"),
+        ] {
+            let codex = temp_codex_dir("provider-migration-failure");
+            let id = "01a1362e-9b85-7672-ab8f-d17e68b2cc0e";
+            let source = prepare_paginated_provider_switch_fixture(&codex, id)?;
+            let before = fs::read(&source)?;
+            let mut native = FakeProviderThreadForker::new(codex.clone());
+            native.resume_outcome = outcome;
+            let report = clone_session_for_provider_locked_with_hint(
+                codex.to_string_lossy().into_owned(),
+                id.into(),
+                Some("openai".into()),
+                SwitchStrategy::Follow,
+                false,
+                Some(&source),
+                &mut native,
+            )?;
+            assert_eq!(report.ok, ok, "{outcome}: {:?}", report.error);
+            let backup = PathBuf::from(report.backup_path.unwrap());
+            assert_eq!(
+                serde_json::from_slice::<Value>(&fs::read(
+                    backup.join("provider-migration.json")
+                )?)?["status"],
+                status
+            );
+            assert_eq!(
+                fs::read(backup.join(source.strip_prefix(&codex).unwrap()))?,
+                before
+            );
+            assert!(fs::read(&source)?.starts_with(&before));
+            assert_eq!(native.fork_count, 0);
+            assert_eq!(native.delete_count, 0);
+            fs::remove_dir_all(codex)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn provider_migration_backup_failure_and_external_append_prevent_writes() -> AppResult<()> {
+        for append in [false, true] {
+            let codex = temp_codex_dir("provider-migration-preflight");
+            let id = "01a1362e-9b85-7672-ab8f-d17e68b2cc0e";
+            let source = prepare_paginated_provider_switch_fixture(&codex, id)?;
+            if append {
+                let path = source.clone();
+                crate::codex_activity::during_observation(move || {
+                    let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+                    writeln!(file, "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"new\"}}}}").unwrap();
+                });
+            } else {
+                fs::write(codex.join("backups"), b"blocked")?;
+            }
+            let mut native = FakeProviderThreadForker::new(codex.clone());
+            assert!(clone_session_for_provider_locked_with_hint(
+                codex.to_string_lossy().into_owned(),
+                id.into(),
+                Some("openai".into()),
+                SwitchStrategy::Follow,
+                false,
+                Some(&source),
+                &mut native,
+            )
+            .is_err());
+            assert_eq!(native.resume_count, 0);
+            assert_eq!(
+                read_thread_state_map(&codex)?[id].model_provider.as_deref(),
+                Some("custom")
+            );
+            fs::remove_dir_all(codex)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn provider_migration_repairs_selected_missing_index_without_repeating_prompt() -> AppResult<()>
+    {
+        let codex = temp_codex_dir("provider-migration-index");
+        let id = "01a1362e-9b85-7672-ab8f-d17e68b2cc0e";
+        let source = prepare_paginated_provider_switch_fixture(&codex, id)?;
+        fs::remove_file(paths::session_index_path(&codex))?;
+        let mut native = FakeProviderThreadForker::new(codex.clone());
+        let report = clone_session_for_provider_locked_with_hint(
+            codex.to_string_lossy().into_owned(),
+            id.into(),
+            Some("openai".into()),
+            SwitchStrategy::Follow,
+            false,
+            Some(&source),
+            &mut native,
+        )?;
+        assert!(report.ok, "{:?}", report.error);
+        assert!(list_mismatched_session_ids(&codex, "openai")?.is_empty());
+        assert!(read_session_index_ids(&codex)?.contains(id));
+        fs::remove_dir_all(codex)?;
+        Ok(())
+    }
+
+    #[test]
+    fn provider_migration_reconciles_process_interruption_without_losing_later_turns(
+    ) -> AppResult<()> {
+        for damage in [false, true] {
+            let codex = temp_codex_dir("provider-migration-interruption");
+            let id = "01a1362e-9b85-7672-ab8f-d17e68b2cc0e";
+            let source = prepare_paginated_provider_switch_fixture(&codex, id)?;
+            let mut file = fs::OpenOptions::new().append(true).open(&source)?;
+            writeln!(
+                file,
+                "{}",
+                serde_json::json!({"type": "event_msg", "payload": {"type":"user_message", "message":"original-body"}})
+            )?;
+            drop(file);
+            let mut native = FakeProviderThreadForker::new(codex.clone());
+            let report = clone_session_for_provider_locked_with_hint(
+                codex.to_string_lossy().into_owned(),
+                id.into(),
+                Some("openai".into()),
+                SwitchStrategy::Follow,
+                false,
+                Some(&source),
+                &mut native,
+            )?;
+            assert!(report.ok);
+            let receipt =
+                PathBuf::from(report.backup_path.unwrap()).join("provider-migration.json");
+            let mut value: Value = serde_json::from_slice(&fs::read(&receipt)?)?;
+            value["status"] = Value::String("prepared".into());
+            fs::write(&receipt, serde_json::to_vec(&value)?)?;
+            if damage {
+                fs::write(
+                    &source,
+                    fs::read_to_string(&source)?.replace("original-body", "damaged-body"),
+                )?;
+            } else {
+                let mut file = fs::OpenOptions::new().append(true).open(&source)?;
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({"type":"event_msg", "payload":{"type":"user_message", "message":"later-turn"}})
+                )?;
+            }
+            let before_retry = fs::read(&source)?;
+            let retried = clone_session_for_provider_locked_with_hint(
+                codex.to_string_lossy().into_owned(),
+                id.into(),
+                Some("openai".into()),
+                SwitchStrategy::Follow,
+                false,
+                Some(&source),
+                &mut native,
+            );
+            if damage {
+                assert!(retried.unwrap_err().to_string().contains("needs_recovery"));
+            } else {
+                assert!(retried?.ok);
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&fs::read(&receipt)?)?["status"],
+                    "completed"
+                );
+            }
+            assert_eq!(native.resume_count, 1);
+            assert_eq!(fs::read(&source)?, before_retry);
+            fs::remove_dir_all(codex)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn provider_migration_keeps_existing_branches_and_uses_original_id() -> AppResult<()> {
+        let codex = temp_codex_dir("provider-migration-existing-branches");
+        let id = "019ff1a2-b3c4-7d5e-8f60-112233445500";
+        let other_id = "019ff1a2-b3c4-7d5e-8f60-112233445566";
+        let (source, _, other) = prepare_paginated_target_family(&codex, id, other_id)?;
+        let other_before = fs::read(&other)?;
+        let mut native = FakeProviderThreadForker::new(codex.clone());
+        let report = clone_session_for_provider_locked_with_hint(
+            codex.to_string_lossy().into_owned(),
+            id.into(),
+            Some("openai".into()),
+            SwitchStrategy::Follow,
+            false,
+            Some(&source),
+            &mut native,
+        )?;
+        assert!(report.ok, "{:?}", report.error);
+        assert_eq!(report.new_id.as_deref(), Some(id));
+        let store = family::load(&codex)?;
+        assert_eq!(store.families[id].chain.len(), 2);
+        assert_eq!(store.families[id].active_id, id);
+        assert_eq!(fs::read(other)?, other_before);
+        assert!(list_mismatched_session_ids(&codex, "openai")?.is_empty());
+        assert_eq!(native.fork_count, 0);
+        fs::remove_dir_all(codex)?;
+        Ok(())
+    }
+
+    #[test]
     fn paginated_in_place_sync_reports_supported_strategy_before_writes() -> AppResult<()> {
         for (dry_run, strategy) in [
             (true, SwitchStrategy::Continuous),
             (false, SwitchStrategy::Continuous),
-            (true, SwitchStrategy::Follow),
-            (false, SwitchStrategy::Follow),
         ] {
             let codex = temp_codex_dir("cc-session-manager-paginated-continuous-preflight");
             let source_id = "paginated-continuous-source";
@@ -8449,7 +8981,6 @@ mod tests {
     #[test]
     fn provider_switch_strategies_compensate_after_family_save_failure() -> AppResult<()> {
         let cases = [
-            (SwitchStrategy::Follow, "follow_after_family_save", "follow"),
             (
                 SwitchStrategy::Scatter,
                 "clone_after_family_save",
@@ -8661,10 +9192,7 @@ mod tests {
 
     #[test]
     fn provider_source_mutating_strategies_work_while_desktop_runs() -> AppResult<()> {
-        for (strategy, label) in [
-            (SwitchStrategy::Follow, "follow"),
-            (SwitchStrategy::Continuous, "continuous"),
-        ] {
+        for (strategy, label) in [(SwitchStrategy::Continuous, "continuous")] {
             let codex = temp_codex_dir(&format!(
                 "cc-session-manager-provider-running-{label}-guard-test"
             ));
@@ -8706,7 +9234,6 @@ mod tests {
     #[test]
     fn provider_switch_strategies_commit_consistent_state_and_rollback() -> AppResult<()> {
         for (strategy, label) in [
-            (SwitchStrategy::Follow, "follow"),
             (SwitchStrategy::Scatter, "scatter"),
             (SwitchStrategy::Continuous, "continuous"),
         ] {
@@ -8884,6 +9411,222 @@ mod tests {
         Ok(())
     }
 
+    fn write_paginated_branch(
+        path: &Path,
+        id: &str,
+        base: Option<(&Path, &str)>,
+        body: &[Value],
+    ) -> AppResult<()> {
+        let mut meta = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"id": id, "model_provider": "openai", "history_mode": "paginated"}
+        });
+        if let Some((base_path, base_id)) = base {
+            let base_lines = read_rollout_lines(base_path)?;
+            let base_meta: Value = serde_json::from_str(&base_lines[0])?;
+            let start = base_meta["payload"]["history_base"]["end_ordinal_exclusive"]
+                .as_u64()
+                .unwrap_or(0);
+            meta["payload"]["history_base"] = serde_json::json!({
+                "thread_id": base_id,
+                "end_ordinal_exclusive": start + base_lines.len() as u64,
+                "end_byte_offset": fs::metadata(base_path)?.len()
+            });
+        }
+        fs::create_dir_all(path.parent().unwrap())?;
+        let mut lines = vec![meta.to_string()];
+        lines.extend(body.iter().map(Value::to_string));
+        fs::write(path, format!("{}\n", lines.join("\n")))?;
+        Ok(())
+    }
+
+    fn branch_message(id: &str) -> Value {
+        serde_json::json!({"type":"event_msg","payload":{
+            "type":"item_completed","thread_id":"parent","turn_id":id,
+            "item":{"type":"UserMessage","id":id,"content":[{"type":"text","text":id}]}
+        }})
+    }
+
+    #[test]
+    fn paginated_branch_comparison_reads_inherited_content_and_detects_real_forks() -> AppResult<()>
+    {
+        let codex = temp_codex_dir("paginated-branch-comparison");
+        let source_rel = "sessions/2026/10/14/rollout-parent.jsonl";
+        let child_rel = "sessions/2026/10/14/rollout-child.jsonl";
+        let source = codex.join(source_rel);
+        let child = codex.join(child_rel);
+        write_paginated_branch(&source, "parent", None, &[branch_message("shared")])?;
+        let settings = serde_json::json!({"type":"event_msg","payload":{
+            "type":"thread_settings_applied","thread_id":"child",
+            "thread_settings":{"model_provider_id":"openai","model":"different-model"}
+        }});
+        write_paginated_branch(&child, "child", Some((&source, "parent")), &[settings])?;
+        save_two_branch_family(
+            &codex, "parent", "custom", source_rel, "child", "openai", child_rel,
+        )?;
+        let source_before = fs::read(&source)?;
+        let child_before = fs::read(&child)?;
+        let states =
+            get_family_branch_sync_states_locked(codex.to_string_lossy().into(), "parent".into())?;
+        assert_eq!(
+            states[1].relation, "same",
+            "native fork settings do not fork conversation history"
+        );
+        assert_eq!(serde_json::to_value(&states[0])?["provider"], "openai");
+        assert_eq!(fs::read(&source)?, source_before);
+        assert_eq!(fs::read(&child)?, child_before);
+
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&source)?,
+            "{}",
+            branch_message("parent-next")
+        )?;
+        let states =
+            get_family_branch_sync_states_locked(codex.to_string_lossy().into(), "parent".into())?;
+        assert_eq!(states[1].relation, "active_ahead");
+        assert_eq!(
+            states[1].appendable_lines_to_branch, 0,
+            "logical inheritance is not physical append permission"
+        );
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&child)?,
+            "{}",
+            branch_message("child-next")
+        )?;
+        let states =
+            get_family_branch_sync_states_locked(codex.to_string_lossy().into(), "parent".into())?;
+        assert_eq!(states[1].relation, "diverged");
+        assert!(states[1]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("共同历史 1 条"));
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn paginated_branch_comparison_uses_current_rollout_and_reports_unreadable_base(
+    ) -> AppResult<()> {
+        let codex = temp_codex_dir("paginated-branch-current-rollout");
+        let old_rel = "sessions/2026/10/14/rollout-parent.jsonl";
+        let current = codex.join("sessions/2026/10/14/rollout-parent_continuation.jsonl");
+        let child_rel = "sessions/2026/10/14/rollout-child.jsonl";
+        let old = codex.join(old_rel);
+        let child = codex.join(child_rel);
+        write_paginated_branch(&old, "parent", None, &[branch_message("shared")])?;
+        write_paginated_branch(
+            &current,
+            "parent",
+            Some((&old, "parent")),
+            &[branch_message("after-revert")],
+        )?;
+        write_paginated_branch(&child, "child", Some((&current, "continuation")), &[])?;
+        save_two_branch_family(
+            &codex, "parent", "custom", old_rel, "child", "openai", child_rel,
+        )?;
+        let state = create_minimal_state(&codex)?;
+        state.execute(
+            "INSERT INTO threads (id, rollout_path) VALUES (?1,?2)",
+            rusqlite::params!["parent", current.to_string_lossy()],
+        )?;
+        let states =
+            get_family_branch_sync_states_locked(codex.to_string_lossy().into(), "parent".into())?;
+        assert_eq!(
+            states[1].relation, "same",
+            "the registered original is not the current logical history"
+        );
+        fs::remove_file(&old)?;
+        let states =
+            get_family_branch_sync_states_locked(codex.to_string_lossy().into(), "parent".into())?;
+        assert_eq!(states[1].relation, "unavailable");
+        assert!(states[1].error.as_deref().unwrap().contains("继承源缺失"));
+        drop(state);
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn paginated_branch_sync_never_appends_physical_lines() {
+        let meta =
+            serde_json::json!({"type":"session_meta","payload":{"history_mode":"paginated"}})
+                .to_string();
+        let target = vec![meta.clone(), branch_message("shared").to_string()];
+        let source = vec![
+            meta,
+            branch_message("shared").to_string(),
+            branch_message("extra").to_string(),
+        ];
+        let error = validate_source_has_target_prefix(&source, &target)
+            .expect_err("paginated records need their native lineage and projection");
+        assert!(error.to_string().contains("分页"));
+    }
+
+    #[test]
+    fn paginated_branch_switch_preserves_current_continuation_in_both_directions() -> AppResult<()>
+    {
+        let codex = temp_codex_dir("paginated-branch-switch-continuation");
+        let source_rel = "sessions/2026/10/14/rollout-parent.jsonl";
+        let current_rel = "sessions/2026/10/14/rollout-parent_continuation.jsonl";
+        let child_rel = "sessions/2026/10/14/rollout-child.jsonl";
+        let source = codex.join(source_rel);
+        let current = codex.join(current_rel);
+        let child = codex.join(child_rel);
+        write_paginated_branch(&source, "parent", None, &[branch_message("shared")])?;
+        write_paginated_branch(
+            &current,
+            "parent",
+            Some((&source, "parent")),
+            &[branch_message("continued")],
+        )?;
+        write_paginated_branch(&child, "child", Some((&current, "continuation")), &[])?;
+        save_two_branch_family(
+            &codex, "parent", "custom", source_rel, "child", "openai", child_rel,
+        )?;
+        let state = create_full_state(&codex)?;
+        sync_thread_from_rollout(&codex, &state, &current)?;
+        sync_thread_from_rollout(&codex, &state, &child)?;
+        drop(state);
+        let source_before = fs::read(&source)?;
+        let current_before = fs::read(&current)?;
+        let child_before = fs::read(&child)?;
+        rollback_family_active_locked(
+            codex.to_string_lossy().into(),
+            "parent".into(),
+            "child".into(),
+        )?;
+        assert!(
+            source.is_file(),
+            "the inherited original must not be archived in place of the current continuation"
+        );
+        assert!(!current.exists());
+        let archived_current =
+            paths::archived_sessions_dir(&codex).join(current.file_name().unwrap());
+        assert_eq!(fs::read(&archived_current)?, current_before);
+        assert_eq!(
+            read_thread_location(&codex, "parent")?.0,
+            archived_current.to_string_lossy()
+        );
+        rollback_family_active_locked(
+            codex.to_string_lossy().into(),
+            "parent".into(),
+            "parent".into(),
+        )?;
+        assert_eq!(
+            PathBuf::from(read_thread_location(&codex, "parent")?.0),
+            current
+        );
+        assert_eq!(fs::read(&source)?, source_before);
+        assert_eq!(fs::read(&current)?, current_before);
+        let archived_child = paths::archived_sessions_dir(&codex).join(child.file_name().unwrap());
+        assert_eq!(fs::read(&archived_child)?, child_before);
+        let states =
+            get_family_branch_sync_states_locked(codex.to_string_lossy().into(), "parent".into())?;
+        assert_eq!(states[1].relation, "same");
+        fs::remove_dir_all(&codex).ok();
+        Ok(())
+    }
+
     #[test]
     fn model_switch_on_one_side_is_ahead_not_diverged() {
         let active = vec![
@@ -8932,7 +9675,12 @@ mod tests {
             compare_rollout_lines(&active, &history),
             ("diverged".to_string(), 0, 0)
         );
-        assert!(describe_rollout_divergence(&active, &history).contains("共同前缀 1 行"));
+        assert!(describe_rollout_divergence(
+            &comparable_body(&active),
+            &comparable_body(&history),
+            false
+        )
+        .contains("共同前缀 1 行"));
     }
 
     #[test]
@@ -10134,6 +10882,7 @@ mod tests {
                 id: id.to_string(),
                 model_provider: provider.to_string(),
                 source: Some(DEFAULT_THREAD_SOURCE.to_string()),
+                forked_from_id: None,
                 is_paginated: false,
             }
         );
@@ -10368,7 +11117,10 @@ mod tests {
             if !old_file_exists {
                 fs::remove_file(&older)?;
             }
-            assert!(list_mismatched_session_ids(&codex, DEFAULT_PROVIDER)?.is_empty());
+            assert_eq!(
+                list_mismatched_session_ids(&codex, DEFAULT_PROVIDER)?,
+                vec![source_id.to_string()]
+            );
             let overlay = family::get_session_family_overlay_with_lock(
                 codex.to_string_lossy().into_owned(),
                 &family::FamilyLock::default(),
@@ -10379,7 +11131,7 @@ mod tests {
                     .find(|item| item.session_id == source_id)
                     .unwrap()
                     .clone_state,
-                "has_clone",
+                "clonable",
                 "family path exists: {old_file_exists}"
             );
             assert_eq!(
@@ -10423,7 +11175,6 @@ mod tests {
     fn paginated_existing_provider_branch_rejects_unusable_current_record() -> AppResult<()> {
         for failure in [
             "file_id",
-            "file_provider",
             "recorded_provider",
             "missing_file",
             "missing_thread",
@@ -10439,7 +11190,6 @@ mod tests {
             let state = state_db::open(&codex)?;
             match failure {
                 "file_id" => write_sync_rollout(&current, "another-thread", DEFAULT_PROVIDER, &[])?,
-                "file_provider" => write_sync_rollout(&current, target_id, "wrong-provider", &[])?,
                 "recorded_provider" => {
                     state.execute(
                         "UPDATE threads SET model_provider = 'wrong-provider' WHERE id = ?",

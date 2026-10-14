@@ -34,13 +34,6 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -96,7 +89,7 @@ function CodexRepairRoute() {
   const [checkedAt, setCheckedAt] = useState<Partial<Record<"project" | "integrity" | "origins", string>>>({});
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  const [strategy, setStrategy] = useState<SwitchStrategy>("scatter");
+  const strategy: SwitchStrategy = "follow";
   const [confirmBatch, setConfirmBatch] = useState(false);
   const [confirmProjectConfigRepair, setConfirmProjectConfigRepair] = useState(false);
   const [confirmPrune, setConfirmPrune] = useState<
@@ -795,20 +788,20 @@ function CodexRepairRoute() {
                 <CardHeader className="pb-3">
                   <CardTitle className="flex min-w-0 flex-wrap items-center gap-2 text-base">
                     <Wand2 className="h-4 w-4" />
-                    服务商 (Provider) 适配
+                    服务商 (Provider) 迁移
                     <Tooltip>
                       <TooltipTrigger asChild>
                         <Info className="h-3.5 w-3.5 text-muted-foreground" />
                       </TooltipTrigger>
                       <TooltipContent className="max-w-sm text-xs">
-                        切换 model_provider 后，旧会话可能因为 provider、source 或数据库状态不同步而不可见。
-                        这里会把需要处理的会话同步到当前 provider，让官方 App 能继续列出和恢复。
+                        切换服务商后，可把原会话迁移到当前 provider，保留会话 ID 和历史。
+                        迁移前自动备份，不再创建需要分别维护的副本。
                       </TooltipContent>
                     </Tooltip>
                   </CardTitle>
                 </CardHeader>
                 <CardContent className="min-w-0 space-y-3">
-                  <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+                  <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
                     <Stat
                       label="当前服务商 (provider)"
                       value={
@@ -825,54 +818,14 @@ function CodexRepairRoute() {
                       }
                     />
                     <Stat
-                      label="需要同步的对话"
+                      label="需要迁移的对话"
                       value={diag?.provider_mismatched_families ?? 0}
                       warn={(diag?.provider_mismatched_families ?? 0) > 0}
                     />
-                    <div className="flex min-w-0 flex-col gap-1 rounded-md border bg-muted/20 p-3 text-xs">
-                      <span className="text-muted-foreground">切换策略</span>
-                      <Select
-                        value={strategy}
-                        onValueChange={(v) => setStrategy(v as SwitchStrategy)}
-                      >
-                        <SelectTrigger className="h-8 min-w-0">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="scatter">
-                            散点模式（推荐，保留独立副本）
-                          </SelectItem>
-                          <SelectItem value="continuous">
-                            连续模式（自动归档旧节点）
-                          </SelectItem>
-                          <SelectItem value="follow">
-                            跟随模式（就地改写，不克隆）
-                          </SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
                   </div>
                   <div className="min-w-0 rounded-md bg-muted/30 p-3 text-xs text-muted-foreground [overflow-wrap:anywhere]">
-                    {strategy === "continuous" && (
-                      <>
-                        为当前服务商（provider）创建一份最新的会话副本，原记录会立即自动归档备用至 <code>archived_sessions/</code>，
-                        在应用中每条会话始终只会显示一个最新入口，保持整洁。归档时固化 sha256 + 行数用于完整性校验。
-                        此模式仅支持旧格式会话；分页会话请选择散点模式。
-                      </>
-                    )}
-                    {strategy === "scatter" && (
-                      <>
-                        每个服务商下都保留一份独立的会话副本。
-                        不归档旧会话，它们会随着你在不同服务商下的使用各自独立发展。
-                        支持分页会话，也可在 Codex App 运行时执行。
-                      </>
-                    )}
-                    {strategy === "follow" && (
-                      <>
-                        直接修改原会话文件中的服务商标记，由于没有克隆新副本，
-                        切换后该会话将只在新服务商下可见。
-                      </>
-                    )}
+                    自动备份后，将原会话迁移到当前服务商，保留会话 ID 和历史，不新增分支。
+                    请先停止目标会话生成；迁移后重新打开该会话。需要独立副本时可使用会话列表中的“完整 Fork”。
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
                     <Tooltip>
@@ -894,7 +847,7 @@ function CodexRepairRoute() {
                                 if (r.length === 0) {
                                   toast.info("预览：当前没有需要同步的会话");
                                 } else if (ok > 0) {
-                                  toast.success(`预览：${ok}/${r.length} 将执行（策略：${strategy}）`);
+                                  toast.success(`预览：${ok}/${r.length} 条将原地迁移`);
                                 }
                                 if (failed.length > 0) {
                                   const detail = failed
@@ -915,12 +868,12 @@ function CodexRepairRoute() {
                           className="gap-1.5"
                         >
                           <Wand2 className="h-3.5 w-3.5" />
-                          {dryRun ? "预览批量同步" : "批量同步到当前服务商"}
+                          {dryRun ? "预览批量迁移" : "批量迁移到当前服务商"}
                         </Button>
                       </TooltipTrigger>
                       <TooltipContent className="max-w-sm text-xs">
-                        把 provider、source 或数据库状态与当前 Codex App 不兼容的会话同步到当前
-                        provider，让它们在 Codex App 里可以继续使用。切换策略见上方。
+                        将原会话迁移到当前服务商，自动备份并保留原 ID 和历史。
+                        迁移后请重新打开该会话。
                         {!provider?.current && (
                           <div className="mt-1 text-muted-foreground">
                             需要 config.toml 里设置 model_provider 才能批量执行。
@@ -1234,15 +1187,9 @@ function CodexRepairRoute() {
           <AlertDialogHeader>
             <AlertDialogTitle>批量同步 {diag?.provider_mismatched_families ?? 0} 条对话记录</AlertDialogTitle>
             <AlertDialogDescription>
-              目标服务商 (provider)：<b>{provider?.current}</b>；策略：
-              <b>{strategy}</b>
-              。{strategy === "follow" ? (
-                "操作会直接修改原会话的服务商标记。"
-              ) : strategy === "continuous" ? (
-                <>操作会创建新副本，并将旧会话归档到 <code>archived_sessions/</code>。</>
-              ) : (
-                "操作会为目标服务商创建独立副本，原会话文件会保留。"
-              )}
+              目标服务商 (provider)：<b>{provider?.current}</b>。
+              自动备份后原地迁移，保留原会话 ID、历史和已有分支，不创建新副本。
+              请先停止目标会话生成，并在迁移后重新打开该会话。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

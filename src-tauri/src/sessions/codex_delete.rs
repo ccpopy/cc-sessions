@@ -430,7 +430,7 @@ fn preflight_history_base_references(
         if deletion_ids.contains(base_id) {
             let child_id = reference.payload_thread_id.as_deref().unwrap_or("未知会话");
             return Err(AppError::Other(format!(
-                "无法删除会话：未选中的派生会话 {child_id} 仍通过 history_base 引用 {base_id}"
+                "无法单独删除此分支：会话 {child_id} 仍使用它的历史，删除会导致该会话历史缺失。请保留此分支；只有关联会话也不再需要时，才一起选择删除（history_base: {base_id}）。本次未删除任何记录"
             )));
         }
     }

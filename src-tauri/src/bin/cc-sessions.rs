@@ -1657,7 +1657,7 @@ fn explicit_backup_root(path: &str) -> CliResult<String> {
 }
 
 fn parse_switch_strategy(value: Option<String>) -> CliResult<SwitchStrategy> {
-    match value.as_deref().unwrap_or("scatter") {
+    match value.as_deref().unwrap_or("follow") {
         "continuous" => Ok(SwitchStrategy::Continuous),
         "scatter" => Ok(SwitchStrategy::Scatter),
         "follow" => Ok(SwitchStrategy::Follow),
@@ -1970,10 +1970,10 @@ mod tests {
     }
 
     #[test]
-    fn provider_sync_defaults_to_scatter_and_preserves_explicit_strategies() {
+    fn provider_sync_defaults_to_follow_and_preserves_explicit_strategies() {
         assert!(matches!(
             parse_switch_strategy(None).unwrap(),
-            SwitchStrategy::Scatter
+            SwitchStrategy::Follow
         ));
         assert!(matches!(
             parse_switch_strategy(Some("continuous".into())).unwrap(),

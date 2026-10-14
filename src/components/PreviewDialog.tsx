@@ -31,7 +31,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { LocalImageAttachments } from "@/components/LocalImageAttachments";
+import { UserMessageContent } from "@/components/UserMessageContent";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -64,7 +64,6 @@ import {
 import { copyText } from "@/lib/clipboard";
 import { absoluteTime, formatTimeString, humanTokens } from "@/lib/format";
 import { shouldIgnoreTextEditingHotkey } from "@/lib/keyboard";
-import { parseUserMessageAttachments } from "@/lib/messageAttachments";
 import { PromptTimeline } from "@/components/PromptTimeline";
 import { PreviewToolbarActions } from "@/components/PreviewToolbarActions";
 import {
@@ -1904,9 +1903,6 @@ function UserBubble({ e, ts, actions }: { e: PreviewEvent; ts: string; actions: 
     return <DiffCommentBubble e={e} ts={ts} prompt={diffComments} actions={actions} />;
   }
 
-  const message = parseUserMessageAttachments(text);
-  const images = [...new Map([...message.images, ...canonicalMessageImages(e)].map((image) => [image.path, image])).values()];
-
   return (
     <div className="group flex justify-end gap-3">
       <div className="flex min-w-0 max-w-[85%] flex-col items-end overflow-hidden">
@@ -1917,10 +1913,7 @@ function UserBubble({ e, ts, actions }: { e: PreviewEvent; ts: string; actions: 
           {ts && <span className="font-mono">· {ts}</span>}
         </div>
         <div className="chat-md max-w-full rounded-2xl rounded-tr-sm bg-primary px-4 py-2.5 text-primary-foreground">
-          {message.markdown ? <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.markdown}</ReactMarkdown> : images.length === 0 ? (
-            <span className="italic opacity-70">(空消息)</span>
-          ) : null}
-          <LocalImageAttachments images={images} />
+          <UserMessageContent text={text} nativeImages={canonicalMessageImages(e)} />
         </div>
       </div>
       <Avatar role="user" />

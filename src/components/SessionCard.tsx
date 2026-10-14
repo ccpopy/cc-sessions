@@ -2,7 +2,6 @@ import { memo } from "react";
 import {
   Archive,
   ArrowLeftRight,
-  CheckCircle2,
   Copy,
   Eye,
   FileText,
@@ -63,6 +62,7 @@ type Props = {
   onClone?: (s: SessionSummary) => void;
   onDuplicate?: (s: SessionSummary) => void;
   onOpenFamily?: (s: SessionSummary) => void;
+  onOpenForkSource?: (sourceId: string) => void;
   onExportMarkdown?: (s: SessionSummary) => void;
   onConvert?: (s: SessionSummary) => void;
   onRename?: (s: SessionSummary) => void;
@@ -90,6 +90,7 @@ export const SessionCard = memo(function SessionCard({
   onClone,
   onDuplicate,
   onOpenFamily,
+  onOpenForkSource,
   onExportMarkdown,
   onConvert,
   onRename,
@@ -109,6 +110,8 @@ export const SessionCard = memo(function SessionCard({
   const syncBlocked = syncing || syncDisabled;
   const isSubagent = isSubagentSession(s, overlay);
   const subagent = subagentLabel(s, isSubagent);
+  const forkSourceId = overlay?.forked_from_id;
+  const forkCount = overlay?.fork_count ?? 0;
   const isUsableCurrentProviderBranch =
     !s.archived && overlay?.clone_state === "matches";
   const requiresActivation = Boolean(
@@ -187,6 +190,34 @@ export const SessionCard = memo(function SessionCard({
             )}
             <ProviderBadge provider={s.provider} />
             {s.conversion_origin && <ConversionOriginBadge origin={s.conversion_origin} />}
+            {forkSourceId && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label={`查看源会话 ${forkSourceId}`}
+                    disabled={!onOpenForkSource}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onOpenForkSource?.(forkSourceId);
+                    }}
+                    className="inline-flex h-5 items-center gap-1 rounded-md border border-blue-500/30 bg-blue-500/5 px-1.5 text-[11px] font-medium text-blue-600 transition-colors hover:bg-blue-500/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default dark:text-blue-400"
+                  >
+                    <GitBranch className="h-3 w-3" />
+                    Fork · 来自 <span className="font-mono">{shortId(forkSourceId)}</span>
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent className="space-y-1">
+                  <div>点击查看源会话</div>
+                  <div className="font-mono text-[11px]">{forkSourceId}</div>
+                </TooltipContent>
+              </Tooltip>
+            )}
+            {forkCount > 0 && (
+              <Badge variant="outline" className="h-5 px-1.5 text-[11px] font-normal text-muted-foreground">
+                已派生 {forkCount} 个 Fork
+              </Badge>
+            )}
             {overlay?.provider && (
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -265,15 +296,6 @@ export const SessionCard = memo(function SessionCard({
               >
                 <RotateCw className={cn("h-3 w-3", syncing && "animate-spin")} />
                 {syncing ? "同步中…" : syncAction}
-              </Badge>
-            )}
-            {overlay?.clone_state === "has_clone" && (
-              <Badge
-                variant="outline"
-                className="h-5 gap-1 border-emerald-500/30 px-1.5 text-[11px] font-normal text-emerald-600"
-              >
-                <CheckCircle2 className="h-3 w-3" />
-                已克隆
               </Badge>
             )}
             {s.has_backup && (
@@ -468,7 +490,7 @@ function Hl({ text, q }: { text: string; q: string }) {
 
 function syncActionLabel(cloneState: string | undefined, currentProvider: string | null | undefined): string {
   if (cloneState === "resync") return "修复本地索引";
-  if (cloneState === "clonable" && currentProvider) return `同步到 ${currentProvider}`;
+  if (cloneState === "clonable" && currentProvider) return `迁移到 ${currentProvider}`;
   return "";
 }
 

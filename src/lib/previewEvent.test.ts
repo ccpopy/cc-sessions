@@ -21,7 +21,35 @@ import {
   isSessionWideMutationFailure,
   openCodeForkPoint,
   parseDiffCommentPrompt,
+  parseUserQuestionReply,
 } from "./previewEvent.ts";
+
+test("question replies expose each question and answer without changing editable source", () => {
+  const answers = [
+    { questionItemId: '["request_user_input_async","call_fixture",0]', question: "继续使用哪个服务商？", answer: "改用 OpenAI 官方接口" },
+    { questionItemId: "second", question: "还有补充吗？", answer: "第一行\n第二行" },
+  ];
+  const text = `<send_user_message_question_reply>\n${JSON.stringify(answers)}\n</send_user_message_question_reply>`;
+  assert.deepEqual(parseUserQuestionReply(text), answers.map(({ question, answer }) => ({ question, answer })));
+  const e = { index: 3, role: "user", kind: "message", timestamp: "", text_summary: text,
+    raw: { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text }] } } } as PreviewEvent;
+  assert.equal(editableText(e), text);
+  assert.equal(extractPreviewEventText(e), text);
+  assert.ok(canEditEventText("codex", e));
+  assert.ok(canDeleteEvent("codex", e));
+});
+
+test("invalid or quoted question envelopes fall back without dropping any content", () => {
+  const valid = '<send_user_message_question_reply>[{"question":"Q","answer":"A"}]</send_user_message_question_reply>';
+  for (const text of [
+    "普通消息", `示例：\n${valid}`, `\u0060\u0060\u0060xml\n${valid}\n\u0060\u0060\u0060`,
+    "<send_user_message_question_reply>bad JSON</send_user_message_question_reply>",
+    '<send_user_message_question_reply>[{"question":"Q","answer":"A"}, {"answer":"missing question"}]</send_user_message_question_reply>',
+    '<send_user_message_question_reply>[{"question":"Q","answer":["A"]}]</send_user_message_question_reply>',
+    "<send_user_message_question_reply>[]</send_user_message_question_reply>",
+    `${valid}\n保留后续正文`,
+  ]) assert.equal(parseUserQuestionReply(text), null);
+});
 
 test("mapping counters count logical messages separately and merge duplicate contexts", () => {
   const base = { thread_id: "thread", turn_id: "turn" };

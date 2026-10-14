@@ -12,6 +12,7 @@ pub(crate) mod codex_activity;
 pub(crate) mod codex_app_server;
 pub mod codex_projects;
 pub mod codex_rollout_cwd;
+pub(crate) mod codex_rollout_provider;
 #[cfg(feature = "desktop")]
 pub mod commands;
 pub mod content_search;

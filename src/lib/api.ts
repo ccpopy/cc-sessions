@@ -711,6 +711,7 @@ export type ThreadsRebuildReport = {
 };
 
 export type CloneReport = {
+  backup_path?: string | null;
   source_id: string;
   new_id: string | null;
   new_rollout_path: string | null;
@@ -770,10 +771,13 @@ export type BranchSyncRelation =
   | "branch_ahead"
   | "active_ahead"
   | "diverged"
-  | "missing";
+  | "missing"
+  | "unavailable";
 
 export type BranchSyncState = {
   branch_id: string;
+  provider: string | null;
+  rollout_relpath: string | null;
   relation: BranchSyncRelation;
   active_lines: number | null;
   branch_lines: number | null;
@@ -953,11 +957,13 @@ export type ImportReport = {
   sha_mismatch: boolean;
 };
 
-export type CloneState = "matches" | "resync" | "clonable" | "has_clone" | "subagent" | "unknown";
+export type CloneState = "matches" | "resync" | "clonable" | "subagent" | "unknown";
 
 export type FamilyOverlay = {
   session_id: string;
   provider: string | null;
+  forked_from_id?: string | null;
+  fork_count?: number;
   family_id: string | null;
   branch_count: number;
   is_active_branch: boolean;

@@ -35,7 +35,13 @@ impl CodexAppServer {
         let mut command = Command::new(&executable);
         command
             .args(["app-server", "--stdio"])
-            .env("CODEX_HOME", codex_dir)
+            .env("CODEX_HOME", codex_dir);
+        Self::start_command(command)
+    }
+
+    fn start_command(mut command: Command) -> AppResult<Self> {
+        let executable = command.get_program().to_string_lossy().into_owned();
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -48,8 +54,7 @@ impl CodexAppServer {
 
         let mut child = command.spawn().map_err(|error| {
             AppError::Other(format!(
-                "无法启动 Codex app-server（{}）：{error}；请确认已安装当前 Codex App 或 CLI",
-                executable.to_string_lossy()
+                "无法启动 Codex app-server（{executable}）：{error}；请确认已安装当前 Codex App 或 CLI"
             ))
         })?;
         let stdin = child
@@ -83,7 +88,8 @@ impl CodexAppServer {
                     "title": "CC Sessions",
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "capabilities": {}
+                // Some releases gate fork/resume.excludeTurns behind this opt-in.
+                "capabilities": { "experimentalApi": true }
             }),
         )?;
         server.notify("initialized", json!({}))?;
@@ -119,6 +125,27 @@ impl CodexAppServer {
     pub(crate) fn delete_thread(&mut self, thread_id: &str) -> AppResult<()> {
         self.request("thread/delete", json!({"threadId": thread_id}))?;
         Ok(())
+    }
+
+    pub(crate) fn read_thread(&mut self, thread_id: &str) -> AppResult<ForkedThread> {
+        let result = self.request("thread/read", json!({"threadId": thread_id}))?;
+        parse_thread_result(&result, "thread/read")
+    }
+
+    pub(crate) fn resume_for_provider(
+        &mut self,
+        thread_id: &str,
+        provider: &str,
+    ) -> AppResult<ForkedThread> {
+        // Let Core preserve the thread's cwd, permissions, history and logical identity.
+        // No turn/start and no resident routing process are needed for this operation.
+        let result = self.request(
+            "thread/resume",
+            json!({
+                "threadId": thread_id, "modelProvider": provider, "excludeTurns": true
+            }),
+        )?;
+        parse_thread_result(&result, "thread/resume")
     }
 
     pub(crate) fn set_thread_name(&mut self, thread_id: &str, name: &str) -> AppResult<()> {
@@ -218,16 +245,20 @@ impl Drop for CodexAppServer {
 }
 
 fn parse_fork_result(result: &Value) -> AppResult<ForkedThread> {
+    parse_thread_result(result, "thread/fork")
+}
+
+fn parse_thread_result(result: &Value, method: &str) -> AppResult<ForkedThread> {
     let thread = result
         .get("thread")
         .and_then(Value::as_object)
-        .ok_or_else(|| AppError::Other("Codex thread/fork 响应缺少 thread".into()))?;
+        .ok_or_else(|| AppError::Other(format!("Codex {method} 响应缺少 thread")))?;
     let id = thread
         .get("id")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|id| !id.is_empty())
-        .ok_or_else(|| AppError::Other("Codex thread/fork 响应缺少新会话 ID".into()))?;
+        .ok_or_else(|| AppError::Other(format!("Codex {method} 响应缺少会话 ID")))?;
     let path = thread
         .get("path")
         .and_then(Value::as_str)
@@ -295,6 +326,54 @@ fn windows_desktop_codex_executable() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn negotiates_experimental_capability_before_fork_and_resume() -> AppResult<()> {
+        // Exercise the actual stdio initialization and requests against a capability-gated peer.
+        // Node is also required by the frontend build and is installed in the CI test jobs.
+        let mut command = Command::new("node");
+        command.args([
+            "--input-type=commonjs",
+            "-e",
+            r#"
+const readline = require('node:readline');
+let experimentalApi = false, initialized = false;
+readline.createInterface({ input: process.stdin }).on('line', line => {
+    const { id, method, params } = JSON.parse(line);
+    const reply = value => process.stdout.write(JSON.stringify({ id, ...value }) + '\n');
+    if (method === 'initialize') {
+        experimentalApi = params.capabilities?.experimentalApi === true;
+        reply({ result: { userAgent: 'capability-gated-fixture' } });
+    } else if (method === 'initialized') {
+        initialized = true;
+    } else if (!initialized) {
+        reply({ error: { code: -32002, message: 'Not initialized' } });
+    } else if (['thread/fork', 'thread/resume'].includes(method)) {
+        if (!experimentalApi && Object.hasOwn(params, 'excludeTurns')) {
+            reply({ error: { code: -32600, message: method + '.excludeTurns requires experimentalApi capability' } });
+        } else {
+            const threadId = method === 'thread/resume' ? params.threadId : (params.excludeTurns ? 'fork-metadata' : 'fork-full');
+            reply({ result: { thread: { id: threadId, modelProvider: params.modelProvider } } });
+        }
+    } else {
+        reply({ error: { code: -32601, message: 'Unknown method' } });
+    }
+});
+"#,
+        ]);
+        let mut server = CodexAppServer::start_command(command)?;
+        let fork = server.fork_thread_for_provider("source-thread", "openai")?;
+        assert_eq!(fork.id, "fork-metadata");
+        assert_eq!(fork.model_provider.as_deref(), Some("openai"));
+        assert_eq!(
+            server.fork_thread("source-thread", "custom", false)?.id,
+            "fork-full"
+        );
+        let resumed = server.resume_for_provider("source-thread", "custom")?;
+        assert_eq!(resumed.id, "source-thread");
+        assert_eq!(resumed.model_provider.as_deref(), Some("custom"));
+        Ok(())
+    }
 
     #[test]
     fn parses_official_fork_response() -> AppResult<()> {

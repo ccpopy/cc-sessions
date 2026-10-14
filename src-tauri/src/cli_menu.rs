@@ -2369,13 +2369,13 @@ fn choose_dry_run(action: &str) -> MenuResult<bool> {
 }
 
 fn choose_switch_strategy() -> MenuResult<SwitchStrategy> {
-    println!("1. continuous：活跃分支 + 归档旧节点");
+    println!("1. follow：原地迁移服务商，保留 ID 和历史（默认）");
     println!("2. scatter：每个 provider 独立副本");
-    println!("3. follow：就地改写 provider");
-    match prompt("请选择策略: ")?.as_str() {
-        "1" => Ok(SwitchStrategy::Continuous),
+    println!("3. continuous：活跃分支 + 归档旧节点");
+    match prompt("请选择策略（回车为原地迁移）: ")?.as_str() {
+        "" | "1" => Ok(SwitchStrategy::Follow),
         "2" => Ok(SwitchStrategy::Scatter),
-        "3" => Ok(SwitchStrategy::Follow),
+        "3" => Ok(SwitchStrategy::Continuous),
         _ => Err("无效策略。".to_string()),
     }
 }

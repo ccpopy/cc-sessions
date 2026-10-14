@@ -1,3 +1,6 @@
+import { parseUserMessageAttachments } from "./messageAttachments.ts";
+import { parseUserQuestionReply } from "./previewEvent.ts";
+
 const AUTO_REVIEW_PREFIX =
   "The following is the Codex agent history whose request action you are assessing.";
 
@@ -25,7 +28,13 @@ export function parseEmbeddedTranscriptPrompt(text: string): EmbeddedTranscriptP
 
 export function sessionDisplayPreview(text: string): string {
   const embedded = parseEmbeddedTranscriptPrompt(text);
-  return embedded?.request || text;
+  if (embedded) return embedded.request || text;
+  const replies = parseUserQuestionReply(text);
+  if (replies) return replies.map(reply => reply.answer || "（未填写回答）").join("；");
+  const message = parseUserMessageAttachments(text);
+  return message.hasWrapper
+    ? message.markdown || [...message.images, ...message.files].map(file => file.name).join("、") || text
+    : text;
 }
 
 export function sessionDisplayTitle(title: string, firstUserMessage: string): string {

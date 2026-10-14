@@ -1425,7 +1425,7 @@ fn select_usable_family_representative<'a>(
 
 /// 从 rollout 文件名（rollout-YYYY-MM-DDTHH-MM-SS-<uuid>.jsonl）推导归属日期；
 /// 文件名不规范时回退到 session_meta 时间戳，再回退到文件修改时间。
-fn active_rollout_date(current: &Path, file_name: &str) -> (String, String, String) {
+pub(crate) fn active_rollout_date(current: &Path, file_name: &str) -> (String, String, String) {
     if let Some(rest) = file_name.strip_prefix("rollout-") {
         let b = rest.as_bytes();
         let digits = |range: std::ops::Range<usize>| b[range].iter().all(|c| c.is_ascii_digit());

@@ -13,6 +13,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 
 import type { UserPromptBrief } from "@/lib/api";
 import { formatTimeString } from "@/lib/format";
+import { sessionDisplayPreview } from "@/lib/sessionText";
 import { cn } from "@/lib/utils";
 
 type Props = {
@@ -329,7 +330,7 @@ export function PromptTimeline({ prompts, activeIndex, onJump }: Props) {
             <div className="flex gap-2 px-2 py-1">
               <User className="mt-0.5 h-3.5 w-3.5 shrink-0 text-foreground/60" />
               <TimelineMarkdownExcerpt
-                text={messageText(hovered.prompt)}
+                text={messageText(hovered.prompt, true)}
                 className="line-clamp-2 min-w-0 text-[12px] font-medium leading-[1.45] text-popover-foreground"
               />
             </div>
@@ -429,7 +430,7 @@ export function PromptTimeline({ prompts, activeIndex, onJump }: Props) {
                   >
                     <User className="mt-0.5 h-3.5 w-3.5 shrink-0 text-foreground/60" />
                     <TimelineMarkdownExcerpt
-                      text={messageText(prompt)}
+                      text={messageText(prompt, true)}
                       className="line-clamp-2 min-w-0 text-xs font-medium leading-relaxed text-popover-foreground"
                     />
                   </button>
@@ -444,8 +445,8 @@ export function PromptTimeline({ prompts, activeIndex, onJump }: Props) {
   );
 }
 
-function messageText(message: { text: string }): string {
-  const text = message.text.trim();
+function messageText(message: { text: string }, user = false): string {
+  const text = (user ? sessionDisplayPreview(message.text) : message.text).trim();
   return text.replace(/^\s{0,3}#{1,6}\s+/, "") || "(无文本内容)";
 }
 

@@ -843,6 +843,13 @@ fn get_session_family_overlay_locked(codex: &Path) -> AppResult<Vec<FamilyOverla
         let recorded_rollout_available = rollout
             .as_ref()
             .is_some_and(|path| path.starts_with(&sessions_root) && path.is_file());
+        // Optional presentation metadata, read from the header only. Missing or
+        // unreadable provenance must not change migration or editing capabilities.
+        let forked_from_id = rollout.as_deref().and_then(|path| {
+            crate::repair::read_rollout_fork_source(path, id)
+                .ok()
+                .flatten()
+        });
         let record_usable =
             if let (Some(provider), Some(rollout)) = (provider.as_deref(), rollout.as_deref()) {
                 crate::repair::rollout_record_is_usable_provider(
@@ -880,9 +887,7 @@ fn get_session_family_overlay_locked(codex: &Path) -> AppResult<Vec<FamilyOverla
             None => {
                 let cs = compute_clone_state(
                     provider.as_deref(),
-                    None,
                     cur.as_deref(),
-                    false,
                     source.as_deref(),
                     *archived,
                     record_usable,
@@ -894,43 +899,9 @@ fn get_session_family_overlay_locked(codex: &Path) -> AppResult<Vec<FamilyOverla
                 let family = store.families.get(fid);
                 let branch_count = family.map(|f| f.chain.len() as u32).unwrap_or(0);
                 let is_active = family.map(|f| f.active_id == *id).unwrap_or(false);
-                let mut has_clone_in_current = false;
-                if let (Some(family), Some(current_provider)) = (family, cur.as_deref()) {
-                    for branch in &family.chain {
-                        if branch.provider != current_provider {
-                            continue;
-                        }
-                        let Some((branch_rollout, branch_provider, branch_source, branch_archived)) =
-                            thread_state_of.get(&branch.id)
-                        else {
-                            continue;
-                        };
-                        let relative = paths::checked_relative_path(&branch.rollout_relpath)?;
-                        if !relative.starts_with("sessions") {
-                            continue;
-                        }
-                        if crate::repair::usable_recorded_provider_rollout(
-                            &codex,
-                            &branch.id,
-                            current_provider,
-                            branch_rollout.as_deref(),
-                            branch_provider.as_deref(),
-                            branch_source.as_deref(),
-                            *branch_archived,
-                            index_ids.contains(&branch.id),
-                        )?
-                        .is_some()
-                        {
-                            has_clone_in_current = true;
-                            break;
-                        }
-                    }
-                }
                 let cs = compute_clone_state(
                     provider.as_deref(),
-                    family,
                     cur.as_deref(),
-                    has_clone_in_current,
                     source.as_deref(),
                     *archived,
                     record_usable,
@@ -942,6 +913,8 @@ fn get_session_family_overlay_locked(codex: &Path) -> AppResult<Vec<FamilyOverla
         out.push(FamilyOverlay {
             session_id: id.clone(),
             provider: provider.clone(),
+            forked_from_id,
+            fork_count: 0,
             family_id,
             branch_count,
             is_active_branch,
@@ -949,14 +922,21 @@ fn get_session_family_overlay_locked(codex: &Path) -> AppResult<Vec<FamilyOverla
             clone_state,
         });
     }
+    let mut fork_counts = std::collections::BTreeMap::<String, u32>::new();
+    for item in &out {
+        if let Some(source_id) = &item.forked_from_id {
+            *fork_counts.entry(source_id.clone()).or_default() += 1;
+        }
+    }
+    for item in &mut out {
+        item.fork_count = fork_counts.get(&item.session_id).copied().unwrap_or(0);
+    }
     Ok(out)
 }
 
 fn compute_clone_state(
     provider: Option<&str>,
-    _family: Option<&Family>,
     current: Option<&str>,
-    has_clone_in_current: bool,
     source: Option<&str>,
     archived: bool,
     record_usable: bool,
@@ -979,7 +959,6 @@ fn compute_clone_state(
                 "resync".into()
             }
         }
-        (Some(_), Some(_)) if has_clone_in_current => "has_clone".into(),
         (Some(_), Some(_)) => "clonable".into(),
         _ => "unknown".into(),
     }
@@ -1541,7 +1520,113 @@ mod tests {
     }
 
     #[test]
-    fn overlay_counts_only_unarchived_visible_target_clone() -> AppResult<()> {
+    fn overlay_exposes_fork_sources_and_direct_child_counts_without_writing_history(
+    ) -> AppResult<()> {
+        let codex = temp_codex_dir("cc-session-manager-overlay-fork-test");
+        let sessions = paths::sessions_dir(&codex);
+        fs::create_dir_all(&sessions)?;
+        let conn = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        conn.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, model_provider TEXT, source TEXT, archived INTEGER)",
+            [],
+        )?;
+        let mut originals = Vec::new();
+        for (id, meta_id, parent, history_base, archived) in [
+            ("source", "source", None, None, true),
+            ("legacy-fork", "legacy-fork", Some("source"), None, false),
+            (
+                "native-fork",
+                "native-fork",
+                Some("source"),
+                Some("source"),
+                false,
+            ),
+            (
+                "nested-fork",
+                "nested-fork",
+                Some("native-fork"),
+                None,
+                false,
+            ),
+            (
+                "missing-source",
+                "missing-source",
+                Some("deleted-source"),
+                None,
+                false,
+            ),
+            ("shared-only", "shared-only", None, Some("source"), false),
+            (
+                "wrong-identity",
+                "other-thread",
+                Some("source"),
+                None,
+                false,
+            ),
+            (
+                "self-reference",
+                "self-reference",
+                Some("self-reference"),
+                None,
+                false,
+            ),
+        ] {
+            let directory = if archived {
+                paths::archived_sessions_dir(&codex)
+            } else {
+                sessions.clone()
+            };
+            fs::create_dir_all(&directory)?;
+            let path = directory.join(format!("rollout-{id}.jsonl"));
+            let content = format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "session_meta", "payload": {
+                        "id": meta_id, "model_provider": "openai", "source": "cli",
+                        "forked_from_id": parent,
+                        "history_mode": if history_base.is_some() { "paginated" } else { "legacy" },
+                        "history_base": history_base.map(|id| serde_json::json!({"thread_id": id}))
+                    }
+                })
+            );
+            fs::write(&path, &content)?;
+            conn.execute(
+                "INSERT INTO threads VALUES (?1, ?2, 'openai', 'cli', ?3)",
+                rusqlite::params![id, path.to_string_lossy(), archived],
+            )?;
+            originals.push((path, content));
+        }
+        drop(conn);
+        let overlay = get_session_family_overlay_with_lock(
+            codex.to_string_lossy().into_owned(),
+            &FamilyLock::default(),
+        )?;
+        let json = serde_json::to_value(&overlay)?;
+        let item = |id: &str| {
+            json.as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["session_id"] == id)
+                .unwrap()
+        };
+        assert_eq!(item("native-fork")["forked_from_id"], "source");
+        assert_eq!(item("legacy-fork")["forked_from_id"], "source");
+        assert_eq!(item("source")["fork_count"], 2);
+        assert_eq!(item("native-fork")["fork_count"], 1);
+        assert_eq!(item("missing-source")["forked_from_id"], "deleted-source");
+        for id in ["source", "shared-only", "wrong-identity", "self-reference"] {
+            assert!(item(id)["forked_from_id"].is_null(), "{id}");
+        }
+        for (path, content) in originals {
+            assert_eq!(fs::read_to_string(path)?, content);
+        }
+        assert!(!paths::family_store_path(&codex).exists());
+        fs::remove_dir_all(&codex)?;
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_keeps_original_thread_migratable_with_another_provider_branch() -> AppResult<()> {
         let codex = temp_codex_dir("cc-session-manager-overlay-clone-test");
         let sessions = codex.join("sessions");
         fs::create_dir_all(&sessions)?;
@@ -1665,7 +1750,7 @@ mod tests {
             .iter()
             .find(|item| item.session_id == "overlay-source")
             .expect("source overlay");
-        assert_eq!(source.clone_state, "has_clone");
+        assert_eq!(source.clone_state, "clonable");
 
         fs::remove_dir_all(&codex).ok();
         Ok(())

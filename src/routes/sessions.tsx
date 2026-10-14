@@ -449,14 +449,15 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         const r = await api.cloneSessionForProvider({
           codex_dir: settings.codex_dir,
           session_id: s.id,
-          strategy: "scatter",
+          strategy: "follow",
           dry_run: false,
         });
         if (r.ok) {
           toast.success(
             r.skipped_reason
               ? `已跳过：${r.skipped_reason}`
-              : `已克隆到 ${r.new_provider}`,
+              : `已迁移到 ${r.new_provider}，会话 ID 保持不变`,
+            { description: r.backup_path ? "迁移前已自动备份；已在 Codex App 打开的会话请关闭后重新打开。" : undefined },
           );
           if (r.desktop_restart_required) {
             toast.warning("同步已完成，重启 Codex App 后刷新会话列表");
@@ -464,7 +465,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
           await refresh({ afterMutation: true });
           await refreshOverlay(true);
         } else {
-          toast.error(r.error ?? "克隆失败");
+          toast.error(r.error ?? "迁移失败");
         }
       } catch (e) {
         toast.error(String((e as Error)?.message ?? e));
@@ -484,7 +485,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
       setProviderSyncProgress(null);
       const r = await api.runProviderSync({
         codex_dir: settings.codex_dir,
-        strategy: "scatter",
+        strategy: "follow",
         dry_run: false,
       }, setProviderSyncProgress);
       const ok = r.filter((x) => x.ok).length;
@@ -544,6 +545,16 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     setPreviewJump(null);
     setPreview(session);
   }, []);
+
+  const onOpenForkSource = useCallback((sourceId: string) => {
+    // Use the unfiltered list so archived sources and sources hidden by search remain reachable.
+    const source = allSessions.find((session) => session.provider === "codex" && session.id === sourceId);
+    if (!source) {
+      toast.info("未找到源会话", { description: `源 ID：${sourceId}，可能已删除或不在当前数据目录中。` });
+      return;
+    }
+    onPreview(source);
+  }, [allSessions, onPreview]);
 
   const onBackup = useCallback((session: SessionSummary) => {
     setBackupTargets([session]);
@@ -879,6 +890,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             onClone={isCodex ? onCloneOne : undefined}
             onDuplicate={isCodex || provider === "claude" || provider === "opencode" ? setDuplicateTarget : undefined}
             onOpenFamily={isCodex ? onOpenFamily : undefined}
+            onOpenForkSource={isCodex ? onOpenForkSource : undefined}
             onExportMarkdown={setExportTarget}
             onConvert={isOpenCode ? undefined : setConvertTarget}
             onRename={setRenameTarget}

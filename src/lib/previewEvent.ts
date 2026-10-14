@@ -188,6 +188,21 @@ export function latestCanonicalEvents(events: PreviewEvent[]): PreviewEvent[] {
   return result;
 }
 
+export type UserQuestionAnswer = { question: string; answer: string };
+
+export function parseUserQuestionReply(text: string): UserQuestionAnswer[] | null {
+  const envelope = /^\s*<send_user_message_question_reply>\s*([\s\S]*?)\s*<\/send_user_message_question_reply>\s*$/.exec(text);
+  if (!envelope) return null;
+  try {
+    const entries: unknown = JSON.parse(envelope[1]);
+    if (!Array.isArray(entries) || entries.length === 0 || entries.some(entry =>
+      !entry || typeof entry.question !== "string" || typeof entry.answer !== "string")) return null;
+    return entries.map(({ question, answer }) => ({ question, answer }));
+  } catch {
+    return null;
+  }
+}
+
 export function parseDiffCommentPrompt(text: string): DiffCommentPrompt | null {
   const normalized = normalizeDiffCommentPrompt(text);
   if (!/^Diff comments\s*:/i.test(normalized)) return null;

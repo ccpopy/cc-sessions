@@ -51,11 +51,11 @@ function familyOverlay(
     branch_count: 2,
     is_active_branch: active,
     archive_origin: null,
-    clone_state: provider === "openai" ? "matches" : "has_clone",
+    clone_state: provider === "openai" ? "matches" : "clonable",
   };
 }
 
-test("current provider branch represents a family even when the stored active branch is stale", () => {
+test("changing provider keeps the selected thread instead of choosing its older provider copy", () => {
   const staleActive = session("custom-active", 100);
   const currentBranch = session("openai-current", 500);
   const overlay = new Map<string, FamilyOverlay>([
@@ -67,11 +67,11 @@ test("current provider branch represents a family even when the stored active br
     selectNormalFamilySessions([staleActive, currentBranch], overlay, "openai").map(
       (item) => item.id,
     ),
-    ["openai-current"],
+    ["custom-active"],
   );
 });
 
-test("current provider branch wins before activity time so one family has one usable card", () => {
+test("selected branch remains the migration target when another provider copy exists", () => {
   const newerOtherProvider = session("custom-active", 500);
   const olderCurrentProvider = session("openai-current", 100);
   const overlay = new Map<string, FamilyOverlay>([
@@ -91,7 +91,7 @@ test("current provider branch wins before activity time so one family has one us
       overlay,
       "openai",
     ).map((item) => item.id),
-    ["openai-current"],
+    ["custom-active"],
   );
 });
 
@@ -111,7 +111,7 @@ test("stored active branch remains visible when the current provider has no fami
   );
 });
 
-test("duplicate current-provider branches use the most recently updated branch", () => {
+test("selected branch stays current when multiple branches share the same provider", () => {
   const older = session("openai-old", 100);
   const newer = session("openai-new", 500);
   const overlay = new Map<string, FamilyOverlay>([
@@ -121,7 +121,7 @@ test("duplicate current-provider branches use the most recently updated branch",
 
   assert.deepEqual(
     selectNormalFamilySessions([older, newer], overlay, "openai").map((item) => item.id),
-    ["openai-new"],
+    ["openai-old"],
   );
 });
 
@@ -143,7 +143,7 @@ test("selected family representatives and standalone sessions are sorted by last
   );
 });
 
-test("content search scope uses the same normal-family representative as the page", () => {
+test("content search scope uses the same selected thread as the page", () => {
   const staleActive = session("custom-active", 500);
   const currentBranch = session("openai-current", 100);
   const overlay = new Map<string, FamilyOverlay>([
@@ -157,7 +157,7 @@ test("content search scope uses the same normal-family representative as the pag
       showSubagentSessions: false,
       showArchivedSessions: false,
     }).map((item) => item.id),
-    ["openai-current"],
+    ["custom-active"],
   );
 });
 

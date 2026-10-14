@@ -419,11 +419,15 @@ xattr -d com.apple.quarantine "/Applications/CC Sessions.app"
 </details>
 
 <details>
-<summary>Codex 分页会话同步应选择哪种策略？</summary>
+<summary>Codex 如何迁移到当前服务商？</summary>
 
-选择默认的“散点模式”：它通过当前 Codex App / CLI 的官方派生功能同步分页会话并保留完整历史，可在 Codex App 运行时执行。连续模式会克隆并归档原会话，目前仅支持旧格式会话；分页会话在预览阶段就会提示改用散点模式。
+会话列表和修复页默认原地迁移：自动备份后调用已安装 Codex App / CLI 的原生恢复接口，保留会话 ID、消息和已有分支，不再自动 Fork，也不需要常驻路由服务。旧格式与分页会话使用相同入口，按实际接口能力和迁移结果校验，不限制特定客户端版本号。
 
-CLI 的 `repair clone` 和 `repair batch-clone` 未指定 `--strategy` 时也默认使用 `scatter`；显式指定的策略仍按原选择执行。
+请先停止目标会话生成，迁移后重新打开该会话；如果 Codex App 仍缓存旧服务商连接，再退出并重开 App。迁移不会修正服务商地址、登录状态或模型兼容性。已有分支不会自动合并或删除，共享历史的删除保护继续保留。
+
+迁移前备份保存在所选 Codex 目录的 `backups/provider-migrations/`，结果中返回具体备份路径；需要时可在备份页选择该目录恢复。失败时保留备份和迁移状态，响应中断后会重新读取确认，不覆盖期间新增的历史。
+
+CLI 的 `repair clone` 和 `repair batch-clone` 未指定 `--strategy` 时默认使用 `follow`（原地迁移）。显式指定 `scatter` 或 `continuous` 仍沿用分支策略；需要独立副本可使用“完整 Fork”。
 
 </details>
 

@@ -100,7 +100,21 @@ export function FamilyHistorySheet({
         if (nextFamily) {
           const states = await api.getFamilyBranchSyncStates(codexDir, nextFamily.family_id);
           if (requestSeq.current !== requestId) return;
-          setSyncStates(Object.fromEntries(states.map((s) => [s.branch_id, s])));
+          const byId = Object.fromEntries(states.map((s) => [s.branch_id, s]));
+          setSyncStates(byId);
+          setFamily({
+            ...nextFamily,
+            chain: nextFamily.chain.map((branch) => {
+              const path = byId[branch.id]?.rollout_relpath ?? branch.rollout_relpath;
+              return {
+                ...branch,
+                provider: byId[branch.id]?.provider ?? branch.provider,
+                rollout_relpath: path,
+                // 登记的校验值属于原文件，不能移用到续写文件。
+                ...(path !== branch.rollout_relpath ? { sha256: null, line_count: null } : {}),
+              };
+            }),
+          });
         } else {
           setSyncStates({});
         }
@@ -136,7 +150,7 @@ export function FamilyHistorySheet({
     try {
       const syncState = syncStates[rollbackTarget.id];
       let synchronizedLines = 0;
-      if (syncState?.relation === "active_ahead") {
+      if (canSyncIntoBranch(syncState)) {
         const result = await api.syncActiveIntoBranch(
           codexDir,
           family.family_id,
@@ -227,7 +241,7 @@ export function FamilyHistorySheet({
             )}
           </SheetTitle>
           <SheetDescription className="break-words">
-            同一条会话在不同 provider 下会形成多个分支。任意时刻只有一个“当前分支”
+            这里管理已有的历史分支。迁移服务商会保留原会话，不再自动创建分支。任意时刻只有一个“当前分支”
             对 Codex App 和主会话列表可见，历史分支只在这里查看和切换。
           </SheetDescription>
         </SheetHeader>
@@ -246,7 +260,7 @@ export function FamilyHistorySheet({
             <div className="py-8 text-center text-xs text-muted-foreground">
               此会话尚未进入分支记录。
               <br />
-              （首次克隆或修复后会自动建档）
+              （原地迁移服务商不会创建分支）
             </div>
           ) : (
             <div className="min-w-0 max-w-full space-y-3 overflow-hidden">
@@ -372,7 +386,7 @@ export function FamilyHistorySheet({
                       </div>
                       {!isActive && (
                         <div className="mt-2 flex flex-wrap justify-end gap-2">
-                          {syncState?.relation === "branch_ahead" && (
+                          {syncState?.relation === "branch_ahead" && syncState.appendable_lines_to_active > 0 && (
                             <Button
                               variant="ghost"
                               size="sm"
@@ -383,7 +397,7 @@ export function FamilyHistorySheet({
                               合并到当前
                             </Button>
                           )}
-                          {syncState?.relation === "active_ahead" && (
+                          {canSyncIntoBranch(syncState) && (
                             <Button
                               variant="ghost"
                               size="sm"
@@ -430,7 +444,7 @@ export function FamilyHistorySheet({
             <AlertDialogHeader>
               <AlertDialogTitle>切换当前分支</AlertDialogTitle>
               <AlertDialogDescription className="break-words">
-                {rollbackTarget && syncStates[rollbackTarget.id]?.relation === "active_ahead" ? (
+                {rollbackTarget && canSyncIntoBranch(syncStates[rollbackTarget.id]) ? (
                   <>
                     目标分支落后当前分支 {syncStates[rollbackTarget.id].appendable_lines_to_branch} 行。
                     确认后会先同步这些增量，再归档当前分支并恢复 <b>{rollbackTarget.provider}</b>
@@ -450,6 +464,13 @@ export function FamilyHistorySheet({
                     两个分支都已有不同的新记录，无法自动合并；切换只会改变当前可见分支，不会消除“已分叉”状态。
                   </>
                 )}
+                {rollbackTarget && syncStates[rollbackTarget.id]?.relation === "active_ahead"
+                  && !canSyncIntoBranch(syncStates[rollbackTarget.id]) && (
+                  <>
+                    <br />
+                    目标分支未包含当前分支的全部历史。切换会保留各自的历史，不会自动合并。
+                  </>
+                )}
                 <br />
                 此操作不会删除任何文件，随时可再切回。
               </AlertDialogDescription>
@@ -459,7 +480,7 @@ export function FamilyHistorySheet({
               <AlertDialogAction disabled={running} onClick={doRollback}>
                 {running
                   ? "执行中…"
-                  : rollbackTarget && syncStates[rollbackTarget.id]?.relation === "active_ahead"
+                  : rollbackTarget && canSyncIntoBranch(syncStates[rollbackTarget.id])
                     ? "同步并切换"
                     : rollbackTarget && syncStates[rollbackTarget.id]?.relation === "diverged"
                       ? "仍要切换"
@@ -480,6 +501,8 @@ export function FamilyHistorySheet({
                 将彻底删除 <b>{deleteTarget?.provider}</b> 分支：
                 包括其 rollout 文件、threads 记录、logs 与 session_index
                 条目；如果此分支已在归档目录中，归档副本也会一并删除。
+                <br />
+                若其他会话仍继承此分支的历史，将停止删除并指出依赖的会话。切换当前分支不会解除这种依赖。
                 <br />
                 此操作不可撤销，且不会创建备份。
               </AlertDialogDescription>
@@ -549,6 +572,10 @@ function safeDate(iso: string): string {
   }
 }
 
+function canSyncIntoBranch(state?: BranchSyncState): boolean {
+  return state?.relation === "active_ahead" && state.appendable_lines_to_branch > 0;
+}
+
 function BranchSyncBadge({ state }: { state: BranchSyncState }) {
   switch (state.relation) {
     case "same":
@@ -560,13 +587,13 @@ function BranchSyncBadge({ state }: { state: BranchSyncState }) {
     case "branch_ahead":
       return (
         <Badge variant="outline" className="h-5 px-1.5 font-normal text-blue-600">
-          此分支领先 {state.appendable_lines_to_active} 行
+          {state.appendable_lines_to_active > 0 ? `此分支领先 ${state.appendable_lines_to_active} 行` : "此分支有新增历史"}
         </Badge>
       );
     case "active_ahead":
       return (
         <Badge variant="outline" className="h-5 px-1.5 font-normal text-blue-600">
-          此分支落后 {state.appendable_lines_to_branch} 行
+          {state.appendable_lines_to_branch > 0 ? `此分支落后 ${state.appendable_lines_to_branch} 行` : "当前分支有新增历史"}
         </Badge>
       );
     case "diverged":
@@ -583,6 +610,12 @@ function BranchSyncBadge({ state }: { state: BranchSyncState }) {
       return (
         <Badge variant="outline" className="h-5 px-1.5 font-normal text-destructive" title={state.error ?? undefined}>
           文件缺失
+        </Badge>
+      );
+    case "unavailable":
+      return (
+        <Badge variant="outline" className="h-5 px-1.5 font-normal text-muted-foreground" title={state.error ?? undefined}>
+          暂无法比较
         </Badge>
       );
     default:

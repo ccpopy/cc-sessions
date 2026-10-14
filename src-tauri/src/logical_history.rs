@@ -45,6 +45,10 @@ pub(crate) fn is_paginated(path: &Path) -> AppResult<bool> {
 }
 
 pub(crate) fn read(path: &Path, cancel: Option<&AtomicBool>) -> AppResult<History> {
+    Ok(read_view(path, cancel)?.into_history())
+}
+
+pub(crate) fn read_view(path: &Path, cancel: Option<&AtomicBool>) -> AppResult<View> {
     let mut seen = HashSet::new();
     let root = path
         .ancestors()
@@ -55,7 +59,7 @@ pub(crate) fn read(path: &Path, cancel: Option<&AtomicBool>) -> AppResult<Histor
             )
         })
         .and_then(Path::parent);
-    Ok(read_segment(path, root, None, &mut seen, cancel)?.into_history())
+    read_segment(path, root, None, &mut seen, cancel)
 }
 
 fn read_segment(
@@ -262,6 +266,10 @@ pub(crate) fn latest(records: &[Value]) -> Vec<(usize, &Value)> {
 }
 
 impl View {
+    pub fn records(&self) -> impl Iterator<Item = &Value> {
+        (0..self.len()).map(|i| self.record(i))
+    }
+
     fn new(loaded: Arc<LoadedFile>, order: Vec<(usize, usize)>) -> Self {
         Self {
             files: vec![loaded],

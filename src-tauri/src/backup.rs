@@ -747,7 +747,11 @@ pub fn create_backup_with_dirs(
         serde_json::to_vec_pretty(&manifest)?,
     )?;
 
-    fs::rename(&tmp, &final_path)?;
+    // Windows also needs extended paths when a short directory contains long paths.
+    fs::rename(
+        tmp.canonicalize()?,
+        backup_root.canonicalize()?.join(&final_name),
+    )?;
 
     summarize_backup(&final_path)
 }
@@ -4349,6 +4353,56 @@ mod tests {
             [],
         )?;
         Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn codex_backup_publishes_directory_with_long_descendant_paths() -> AppResult<()> {
+        let root = temp_dir("cc-backup-long");
+        assert!(!root.exists());
+        let codex = root.join("codex");
+        let backups = root.join("backups");
+        let id = "00000000-0000-4000-8000-000000000052";
+        let relative = format!("sessions/2026/10/14/rollout-2026-10-14T00-00-00-{id}.jsonl");
+        create_minimal_codex_restore_state(&codex)?;
+        let rollout = codex.join(&relative);
+        fs::create_dir_all(rollout.parent().unwrap())?;
+        let original = format!(
+            "{}\n",
+            serde_json::json!({"type": "session_meta", "payload": {"id": id, "model_provider": "openai"}})
+        );
+        fs::write(&rollout, &original)?;
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        state.execute(
+            "INSERT INTO threads VALUES (?1, ?2, '', 'Long path fixture')",
+            rusqlite::params![id, rollout.to_string_lossy().as_ref()],
+        )?;
+        drop(state);
+        // The directory itself is short, but its rollout exceeds MAX_PATH. Windows
+        // needs extended paths for the directory rename too, not only file creation.
+        let name = "x".repeat(210 - backups.as_os_str().len());
+        let partial = backups.join(format!(".{name}.partial"));
+        assert!(partial.as_os_str().len() < 260);
+        assert!(partial.join(&relative).as_os_str().len() > 260);
+        let result = (|| -> AppResult<()> {
+            let summary = create_backup(
+                Some(PROVIDER_CODEX.into()),
+                codex.to_string_lossy().into_owned(),
+                None,
+                backups.to_string_lossy().into_owned(),
+                vec![id.into()],
+                None,
+                Some(name),
+                None,
+            )?;
+            assert!(!partial.exists());
+            assert_eq!(fs::read_to_string(&rollout)?, original);
+            assert!(verify_backup(backups.to_string_lossy().into_owned(), summary.path)?.all_ok);
+            Ok(())
+        })();
+        assert!(root.starts_with(std::env::temp_dir()));
+        fs::remove_dir_all(root.canonicalize()?)?;
+        result
     }
 
     fn create_codex_thread_history_fixture(codex: &Path) -> AppResult<rusqlite::Connection> {

@@ -15,6 +15,7 @@ export type SessionCardHandlers = {
   onClone?: (session: SessionSummary) => void;
   onDuplicate?: (session: SessionSummary) => void;
   onOpenFamily?: (session: SessionSummary) => void;
+  onOpenForkSource?: (sourceId: string) => void;
   onExportMarkdown?: (session: SessionSummary) => void;
   onConvert?: (session: SessionSummary) => void;
   onRename?: (session: SessionSummary) => void;
