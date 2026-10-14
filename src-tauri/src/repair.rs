@@ -11365,7 +11365,7 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_scan_skips_only_usable_target_branch() -> AppResult<()> {
+    fn mismatched_scan_migrates_original_even_with_usable_target_branch() -> AppResult<()> {
         let codex = temp_codex_dir("cc-session-manager-usable-provider-clone-test");
         fs::create_dir_all(&codex)?;
         let source_rollout = codex.join("sessions/2026/04/24/rollout-provider-source.jsonl");
@@ -11407,7 +11407,11 @@ mod tests {
             ),
         )?;
 
-        assert!(list_mismatched_session_ids(&codex, DEFAULT_PROVIDER)?.is_empty());
+        assert_eq!(
+            list_mismatched_session_ids(&codex, DEFAULT_PROVIDER)?,
+            vec!["provider-source".to_string()],
+            "原地迁移应保留所选原会话，而不是因已有目标服务商副本就跳过"
+        );
 
         conn.execute(
             "UPDATE threads SET archived = 1 WHERE id = ?",
