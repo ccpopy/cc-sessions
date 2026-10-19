@@ -4,7 +4,11 @@ use crate::models::EditCapability;
 
 pub(super) fn revision(path: &Path, file_hash: &str) -> AppResult<String> {
     Ok(sha_hex(
-        format!("{}\0{file_hash}", path.canonicalize()?.display()).as_bytes(),
+        format!(
+            "{}\0{file_hash}",
+            crate::rollout_io::revision_path(path)?.display()
+        )
+        .as_bytes(),
     ))
 }
 
@@ -15,7 +19,7 @@ pub(super) fn is_appended_revision(
     loaded: &LoadedFile,
     expected: &str,
 ) -> AppResult<bool> {
-    let prefix = format!("{}\0", path.canonicalize()?.display());
+    let prefix = format!("{}\0", crate::rollout_io::revision_path(path)?.display());
     let mut hash = Sha256::new();
     for line in loaded
         .lines
@@ -271,7 +275,8 @@ fn inspect_descendants(root: &Path, id: &str, blocked: &mut Vec<String>) -> AppR
         }
         for entry in walkdir::WalkDir::new(directory).follow_links(false) {
             let entry = entry.map_err(|e| AppError::Other(format!("无法检查共享历史依赖：{e}")))?;
-            if entry.path().extension().and_then(|s| s.to_str()) != Some("jsonl") {
+            if !entry.file_type().is_file() || !crate::rollout_io::discover_transcript(entry.path())
+            {
                 continue;
             }
             let meta = crate::family::read_session_meta(entry.path())?;

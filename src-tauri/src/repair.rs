@@ -258,9 +258,14 @@ fn read_rollout_project(path: &Path) -> AppResult<Option<(String, Option<String>
         kind: String,
     }
 
-    let file = fs::File::open(path)?;
-    let length = file.metadata()?.len();
-    let mut reader = BufReader::new(file.take(length));
+    let physical = crate::rollout_io::resolve(path)?;
+    let length = fs::metadata(&physical)?.len();
+    let input: Box<dyn Read> = if crate::rollout_io::is_compressed(&physical) {
+        crate::rollout_io::reader_exact(&physical)?
+    } else {
+        Box::new(fs::File::open(&physical)?.take(length))
+    };
+    let mut reader = BufReader::new(input);
     let mut line = Vec::new();
     let mut id = None;
     let mut cwd_tracker = crate::codex_rollout_cwd::EffectiveCwdTracker::default();
@@ -662,7 +667,7 @@ struct RolloutIdentity {
 /// Codex 的 `session_meta` 位于会话头部；找到首个带有效 id 的记录后立即返回，
 /// 避免只为核对 id/provider/source 而解析可能达到数百 MB 的后续对话内容。
 fn read_rollout_identity(path: &Path) -> AppResult<Option<RolloutIdentity>> {
-    let reader = BufReader::new(fs::File::open(path)?);
+    let reader = crate::rollout_io::reader(path)?;
     for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -729,7 +734,7 @@ fn scan_active_rollout_identities(codex: &Path) -> AppResult<Vec<(PathBuf, Rollo
 /// Codex 的替换/续写 rollout 在稳定的 thread UUID 后附加独立的 rollout UUID。
 /// 只识别官方文件名格式，避免把手动备份的 `_backup` 等后缀当成当前历史。
 fn rollout_filename_is_paginated_continuation(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+    let Some(name) = crate::rollout_io::plain_file_name(path) else {
         return false;
     };
     let Some(stem) = name.strip_suffix(".jsonl") else {
@@ -827,8 +832,7 @@ fn read_rollout_brief_impl(
     cancel: Option<&AtomicBool>,
 ) -> AppResult<Option<RolloutBrief>> {
     ensure_not_cancelled(cancel)?;
-    let f = fs::File::open(path)?;
-    let reader = BufReader::new(f);
+    let reader = crate::rollout_io::reader(path)?;
     let mut id: Option<String> = None;
     let mut provider_tracker = crate::codex_rollout_provider::EffectiveProviderTracker::default();
     let mut history_mode: Option<String> = None;
@@ -1418,7 +1422,7 @@ fn family_branch_rollout_exists(
         return Some(true);
     }
     let relative = paths::checked_relative_path(&branch.rollout_relpath).ok()?;
-    Some(codex.join(relative).is_file())
+    Some(crate::rollout_io::resolve(&codex.join(relative)).is_ok())
 }
 
 fn family_metadata_is_consistent(
@@ -3270,6 +3274,11 @@ pub(crate) fn usable_recorded_provider_rollout(
         return Ok(None);
     };
     let rollout = paths::host_path_from_codex_record(codex, recorded);
+    let rollout = match crate::rollout_io::resolve(&rollout) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
     let sessions = paths::sessions_dir(codex);
     if !rollout.is_file()
         || !sessions.is_dir()
@@ -3311,17 +3320,15 @@ pub(crate) fn rollout_record_is_usable_provider(
         archived,
         expected_provider,
     ) || !indexed
-        || !rollout.is_file()
+        || crate::rollout_io::resolve(rollout).is_err()
     {
         return Ok(false);
     }
     let Some(recorded_rollout_path) = recorded_rollout_path else {
         return Ok(false);
     };
-    let recorded_path = PathBuf::from(paths::strip_verbatim(
-        &paths::host_path_string_from_codex_record(codex, recorded_rollout_path),
-    ));
-    if !recorded_path.is_file() || recorded_path.canonicalize()? != rollout.canonicalize()? {
+    let recorded_path = paths::host_path_from_codex_record(codex, recorded_rollout_path);
+    if !crate::rollout_io::same_file(&recorded_path, rollout).unwrap_or(false) {
         return Ok(false);
     }
     let Some(identity) = read_rollout_identity(rollout)? else {
@@ -3565,7 +3572,7 @@ fn write_cloned_rollout(
 ) -> AppResult<()> {
     let source_fingerprint = atomic_file::fingerprint(src_abs)?;
     create_rollout_from_source_snapshot(src_abs, dest_abs, &source_fingerprint, |out| {
-        let reader = BufReader::new(fs::File::open(src_abs)?);
+        let reader = crate::rollout_io::reader_exact(src_abs)?;
         let clone_timestamp = chrono::Utc::now().to_rfc3339();
         let mut found_session_meta = false;
         for line in reader.lines() {
@@ -3776,7 +3783,7 @@ fn write_duplicated_rollout(
 ) -> AppResult<()> {
     let source_fingerprint = atomic_file::fingerprint(src_abs)?;
     let source_meta = {
-        let reader = BufReader::new(fs::File::open(src_abs)?);
+        let reader = crate::rollout_io::reader_exact(src_abs)?;
         let mut found = None;
         for line in reader.lines() {
             let line = line?;
@@ -3803,7 +3810,7 @@ fn write_duplicated_rollout(
 
     create_rollout_from_source_snapshot(src_abs, dest_abs, &source_fingerprint, |out| {
         writeln!(out, "{canonical}")?;
-        let reader = BufReader::new(fs::File::open(src_abs)?);
+        let reader = crate::rollout_io::reader_exact(src_abs)?;
         let mut skipped_canonical = false;
         let mut tail = DuplicateTailState::default();
         for line in reader.lines() {
@@ -4075,8 +4082,7 @@ fn trim_flat(text: &str, max_chars: usize) -> String {
 }
 
 fn collect_stable_prefix(src_abs: &Path, event_index: usize) -> AppResult<StablePrefix> {
-    let src = fs::File::open(src_abs)?;
-    let reader = BufReader::new(src);
+    let reader = crate::rollout_io::reader_exact(src_abs)?;
     let mut lines: Vec<StablePrefixLine> = Vec::new();
     let mut cut: Option<StableCutInfo> = None;
 
@@ -4178,13 +4184,15 @@ fn resolve_fork_source_rollout(
     } else {
         codex.join(supplied)
     };
-    let source_abs = source.canonicalize().map_err(|err| {
-        AppError::NotFound(format!(
-            "源 rollout 不存在或无法访问: {} ({})",
-            source.to_string_lossy(),
-            err
-        ))
-    })?;
+    let source_abs = crate::rollout_io::resolve(&source)
+        .and_then(|p| p.canonicalize())
+        .map_err(|err| {
+            AppError::NotFound(format!(
+                "源 rollout 不存在或无法访问: {} ({})",
+                source.to_string_lossy(),
+                err
+            ))
+        })?;
     let sessions_dir = codex.join("sessions").canonicalize().map_err(|err| {
         AppError::InvalidCodexDir(format!(
             "Codex sessions 目录不存在或无法访问: {} ({})",
@@ -4244,12 +4252,14 @@ fn duplicate_session_locked_with_forker(
     let codex = codex.canonicalize().unwrap_or(codex);
 
     let source = paths::host_path_from_codex_record(&codex, &rollout_path);
-    let source_abs = source.canonicalize().map_err(|error| {
-        AppError::NotFound(format!(
-            "源 rollout 不存在或无法访问: {} ({error})",
-            source.to_string_lossy()
-        ))
-    })?;
+    let source_abs = crate::rollout_io::resolve(&source)
+        .and_then(|p| p.canonicalize())
+        .map_err(|error| {
+            AppError::NotFound(format!(
+                "源 rollout 不存在或无法访问: {} ({error})",
+                source.to_string_lossy()
+            ))
+        })?;
     crate::sessions::validate_codex_rollout_path(&codex, &source_abs, &session_id)?;
     let source_brief = read_rollout_brief(&codex, &source_abs)?.ok_or_else(|| {
         AppError::NotFound(format!(
@@ -4485,11 +4495,7 @@ fn duplicate_paginated_session(
 
 /// 读取 paginated rollout 首行 `history_base.end_ordinal_exclusive`，即从源会话继承的历史行数。
 fn paginated_history_base_len(rollout: &Path) -> AppResult<u64> {
-    let raw = fs::read_to_string(rollout)?;
-    let Some(first) = raw.lines().find(|line| !line.trim().is_empty()) else {
-        return Ok(0);
-    };
-    let meta: Value = serde_json::from_str(first)?;
+    let meta = family::read_session_meta(rollout)?;
     Ok(meta
         .get("payload")
         .and_then(|payload| payload.get("history_base"))
@@ -5794,9 +5800,11 @@ fn list_mismatched_sessions_from_scan(
                     .get(&identity.id)
                     .and_then(|state| state.rollout_path.as_deref())
                     .and_then(|recorded| {
-                        paths::host_path_from_codex_record(codex, recorded)
-                            .canonicalize()
-                            .ok()
+                        crate::rollout_io::resolve(&paths::host_path_from_codex_record(
+                            codex, recorded,
+                        ))
+                        .and_then(|path| path.canonicalize())
+                        .ok()
                     });
                 let matches_recorded = |path: &Path| {
                     recorded_path.as_ref().is_some_and(|recorded| {
@@ -6521,6 +6529,7 @@ fn resolve_current_branch_rollout(
         }
         None => resolve_branch_rollout(codex, branch)?,
     };
+    let path = crate::rollout_io::resolve(&path)?;
     let relative = paths::rollout_relpath(&path.to_string_lossy(), codex);
     let root = relative.components().next().map(|c| c.as_os_str());
     if !matches!(
@@ -6655,6 +6664,8 @@ fn append_branch_extras_locked(
         &target_branch,
         thread_states.get(&target_branch.id),
     )?;
+    let target_abs = crate::rollout_io::materialize_for_write(&target_abs)?;
+    store = family::load(&codex)?;
     target_branch.provider = read_rollout_identity(&target_abs)?
         .ok_or_else(|| AppError::Other("目标分支缺少 session_meta".into()))?
         .model_provider;
@@ -6799,11 +6810,11 @@ fn append_branch_extras_locked(
 fn resolve_branch_rollout(codex: &Path, branch: &FamilyBranch) -> AppResult<PathBuf> {
     let rel = paths::checked_relative_path(&branch.rollout_relpath)?;
     let main = codex.join(&rel);
-    if main.is_file() {
+    if let Ok(main) = crate::rollout_io::resolve(&main) {
         return Ok(main);
     }
     let archived = paths::archived_sessions_dir(codex).join(rel.file_name().unwrap_or_default());
-    if archived.is_file() {
+    if let Ok(archived) = crate::rollout_io::resolve(&archived) {
         return Ok(archived);
     }
     Err(AppError::NotFound(format!(
@@ -6813,7 +6824,7 @@ fn resolve_branch_rollout(codex: &Path, branch: &FamilyBranch) -> AppResult<Path
 }
 
 fn read_rollout_lines(path: &Path) -> AppResult<Vec<String>> {
-    Ok(BufReader::new(fs::File::open(path)?)
+    Ok(crate::rollout_io::reader(path)?
         .lines()
         .collect::<std::io::Result<Vec<_>>>()?)
 }
@@ -9685,6 +9696,15 @@ mod tests {
 
     #[test]
     fn sync_updates_non_active_main_target_and_reports_written_lines() -> AppResult<()> {
+        sync_main_target_scenario(false)
+    }
+
+    #[test]
+    fn sync_automatically_materializes_compressed_target_and_updates_paths() -> AppResult<()> {
+        sync_main_target_scenario(true)
+    }
+
+    fn sync_main_target_scenario(compressed_target: bool) -> AppResult<()> {
         let codex = temp_codex_dir("cc-session-manager-sync-main-target-test");
         let source_id = "sync-main-source";
         let target_id = "sync-main-target";
@@ -9747,6 +9767,27 @@ mod tests {
         )?;
         write_global_state(&codex, serde_json::json!({"local-projects": {}}))?;
 
+        if compressed_target {
+            let packed = target_path.with_extension("jsonl.zst");
+            fs::write(
+                &packed,
+                zstd::stream::encode_all(fs::read(&target_path)?.as_slice(), 3)?,
+            )?;
+            fs::remove_file(&target_path)?;
+            state_db::open(&codex)?.execute(
+                "UPDATE threads SET rollout_path=?1 WHERE id=?2",
+                rusqlite::params![packed.to_string_lossy(), target_id],
+            )?;
+            let mut store = family::load(&codex)?;
+            for record in store.families.values_mut() {
+                for branch in &mut record.chain {
+                    if branch.id == target_id {
+                        branch.rollout_relpath = format!("{target_rel}.zst");
+                    }
+                }
+            }
+            family::save(&codex, &store)?;
+        }
         let report = append_branch_extras_locked(
             codex.to_string_lossy().into_owned(),
             source_id.to_string(),
@@ -9773,6 +9814,17 @@ mod tests {
         assert!(index.contains(target_id));
         assert_thread_project_cwd(&codex, target_id, r"F:\project\example")?;
 
+        if compressed_target {
+            assert!(!target_path.with_extension("jsonl.zst").exists());
+            let store = family::load(&codex)?;
+            let branch = store
+                .families
+                .values()
+                .flat_map(|f| &f.chain)
+                .find(|b| b.id == target_id)
+                .unwrap();
+            assert_eq!(branch.rollout_relpath, target_rel);
+        }
         fs::remove_dir_all(&codex).ok();
         Ok(())
     }

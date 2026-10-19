@@ -8,7 +8,9 @@
 //! - 每次归档时固化 sha256 + line_count，支持后续完整性校验。
 
 use std::fs;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+#[cfg(test)]
+use std::io::BufReader;
+use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
@@ -71,7 +73,7 @@ pub fn save(codex_dir: &Path, store: &FamilyStore) -> AppResult<()> {
 /// 同值；`line_count` 是物理行数（按 `\n` 切分得到的非空片段数），用作参考指标。
 /// 两者语义彼此独立。
 pub fn compute_integrity(path: &Path) -> AppResult<(String, u64)> {
-    compute_integrity_from_reader(&mut BufReader::new(fs::File::open(path)?))
+    compute_integrity_from_reader(&mut crate::rollout_io::reader(path)?)
 }
 
 fn compute_integrity_from_reader(reader: &mut impl BufRead) -> AppResult<(String, u64)> {
@@ -602,10 +604,10 @@ fn verify_integrity_snapshot(
             let abs_main = codex_dir.join(&rel);
             let abs_archived =
                 paths::archived_sessions_dir(codex_dir).join(rel.file_name().unwrap_or_default());
-            let candidate = if abs_main.is_file() {
-                abs_main
-            } else if abs_archived.is_file() {
-                abs_archived
+            let candidate = if let Ok(path) = crate::rollout_io::resolve(&abs_main) {
+                path
+            } else if let Ok(path) = crate::rollout_io::resolve(&abs_archived) {
+                path
             } else {
                 all_ok = false;
                 items.push(FamilyIntegrityItem {
@@ -685,8 +687,15 @@ fn verify_integrity_snapshot(
 
 /// 从 rollout 文件读第一行 session_meta 的 payload（id / model_provider / cwd / originator）。
 pub fn read_session_meta(rollout: &Path) -> AppResult<Value> {
-    let f = fs::File::open(rollout)?;
-    let mut reader = BufReader::new(f);
+    let mut reader = crate::rollout_io::reader(rollout)?;
+    read_session_meta_from_reader(&mut reader)
+}
+
+pub(crate) fn read_physical_session_meta(rollout: &Path) -> AppResult<Value> {
+    read_session_meta_from_reader(&mut crate::rollout_io::reader_exact(rollout)?)
+}
+
+fn read_session_meta_from_reader(reader: &mut dyn BufRead) -> AppResult<Value> {
     let mut first = String::new();
     reader.read_line(&mut first)?;
     let v: Value = serde_json::from_str(first.trim())?;
@@ -725,8 +734,7 @@ fn scan_rollouts_in(root: PathBuf, cancel: Option<&AtomicBool>) -> AppResult<Vec
         if !entry.file_type().is_file() {
             continue;
         }
-        let name = entry.file_name().to_string_lossy();
-        if name.starts_with("rollout-") && name.ends_with(".jsonl") {
+        if crate::rollout_io::discover(entry.path()) {
             out.push(entry.path().to_path_buf());
         }
     }
@@ -836,9 +844,8 @@ fn get_session_family_overlay_locked(codex: &Path) -> AppResult<Vec<FamilyOverla
     let mut out: Vec<FamilyOverlay> = Vec::with_capacity(thread_state_of.len());
     for (id, (rollout_path, provider, source, archived)) in &thread_state_of {
         let rollout = rollout_path.as_deref().map(|raw| {
-            PathBuf::from(paths::strip_verbatim(
-                &paths::host_path_string_from_codex_record(&codex, raw),
-            ))
+            let path = paths::host_path_from_codex_record(codex, raw);
+            crate::rollout_io::resolve(&path).unwrap_or(path)
         });
         let recorded_rollout_available = rollout
             .as_ref()
@@ -873,7 +880,8 @@ fn get_session_family_overlay_locked(codex: &Path) -> AppResult<Vec<FamilyOverla
             .and_then(|family| family.chain.iter().find(|branch| branch.id == *id))
         {
             let relative = paths::checked_relative_path(&branch.rollout_relpath)?;
-            relative.starts_with("sessions") && codex.join(relative).is_file()
+            relative.starts_with("sessions")
+                && crate::rollout_io::resolve(&codex.join(relative)).is_ok()
         } else {
             false
         };

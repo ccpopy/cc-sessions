@@ -8,7 +8,7 @@ pub(in crate::edit) fn rollout_identity(
     loaded: &LoadedFile,
 ) -> AppResult<ProjectionIdentity> {
     let thread = identity(loaded)?;
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let name = crate::rollout_io::plain_file_name(path).unwrap_or("");
     let parsed = name
         .strip_prefix("rollout-")
         .and_then(|s| s.strip_suffix(".jsonl"))
@@ -30,7 +30,9 @@ pub(in crate::edit) fn rollout_identity(
     Ok(ProjectionIdentity {
         thread_id: thread.into(),
         rollout_id: rollout.into(),
-        rollout_path: path.canonicalize()?.to_string_lossy().into(),
+        rollout_path: crate::rollout_io::revision_path(path)?
+            .to_string_lossy()
+            .into(),
         selected_rollout_path: None,
     })
 }
@@ -80,7 +82,7 @@ pub(in crate::edit) fn observe(
     let result = observe_snapshot(path, loaded, &identity, &mut status);
     // The file and SQLite cannot share a transaction. Reject any intervening
     // append/replacement before interpreting a missing row or a stale checkpoint.
-    if atomic_file::fingerprint(path)?.sha256_hex() != loaded.hash {
+    if crate::rollout_io::logical_fingerprint(path)?.sha256_hex() != loaded.hash {
         return Err(failure(
             status,
             "updating",
@@ -122,11 +124,8 @@ fn observe_snapshot(
         }
     })?;
     if let Some(selected) = &image.identity.as_ref().unwrap().selected_rollout_path {
-        if Path::new(&paths::strip_verbatim(selected))
-            .canonicalize()
-            .ok()
-            .as_ref()
-            != Some(&path.canonicalize()?)
+        if !crate::rollout_io::same_file(Path::new(&paths::strip_verbatim(selected)), path)
+            .unwrap_or(false)
         {
             return Err(failure(status.clone(), "identity_pending", "SELECTED_ROLLOUT_CHANGED", "身份待核对：Core 当前选中的日志路径与此预览不同；请刷新会话列表并打开当前日志，未读取或覆盖旧投影"));
         }

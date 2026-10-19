@@ -1608,6 +1608,77 @@ fn paginated_core_summary_and_split_database_recovery_preserve_other_threads() {
 }
 
 #[test]
+fn compressed_paginated_edit_and_undo_keep_native_projection_and_byte_offsets() {
+    let f = Fixture::new();
+    let original = fs::read(&f.path).unwrap();
+    let packed = f.path.with_extension("jsonl.zst");
+    fs::write(
+        &packed,
+        zstd::stream::encode_all(original.as_slice(), 3).unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(&f.path).unwrap();
+    let db = rusqlite::Connection::open(f.root.join("state_5.sqlite")).unwrap();
+    db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY,title TEXT,first_user_message TEXT,preview TEXT,project_id TEXT,rollout_path TEXT); INSERT INTO threads VALUES('thread-1','Named thread','KEEP-A','KEEP-A','unchanged-project',NULL);").unwrap();
+    db.execute(
+        "UPDATE threads SET rollout_path=?1 WHERE id='thread-1'",
+        [packed.to_str().unwrap()],
+    )
+    .unwrap();
+    let capability = inspect_edit_capability("codex", packed.to_str().unwrap()).unwrap();
+    assert!(
+        capability.blocked_reasons.is_empty(),
+        "{:?}",
+        capability.blocked_reasons
+    );
+    assert!(!f.path.exists(), "preview must not materialize a log");
+    apply_edit_text(
+        "codex",
+        packed.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        3,
+        "CHANGED-A",
+        Some(&capability.revision),
+    )
+    .unwrap();
+    assert!(!packed.exists());
+    let loaded = load_file(&f.path).unwrap();
+    let (_, status) = paginated::projection::observe(&f.path, &loaded).unwrap();
+    assert_eq!(status.state, "ready");
+    assert_eq!(
+        status.next_rollout_byte_offset,
+        Some(fs::metadata(&f.path).unwrap().len())
+    );
+    assert!(fs::read_to_string(&f.path).unwrap().contains("CHANGED-A"));
+    // Core may compress the edited log again before the user chooses Undo.
+    fs::write(
+        &packed,
+        zstd::stream::encode_all(fs::read(&f.path).unwrap().as_slice(), 3).unwrap(),
+    )
+    .unwrap();
+    fs::remove_file(&f.path).unwrap();
+    db.execute(
+        "UPDATE threads SET rollout_path=?1 WHERE id='thread-1'",
+        [packed.to_str().unwrap()],
+    )
+    .unwrap();
+    let capability = inspect_edit_capability("codex", packed.to_str().unwrap()).unwrap();
+    undo_last(
+        "codex",
+        packed.to_str().unwrap(),
+        "thread-1",
+        f.backup.to_str().unwrap(),
+        Some(&capability.revision),
+    )
+    .unwrap();
+    assert_eq!(fs::read(&f.path).unwrap(), original);
+    let (_, status) =
+        paginated::projection::observe(&f.path, &load_file(&f.path).unwrap()).unwrap();
+    assert_eq!(status.state, "ready");
+}
+
+#[test]
 fn paginated_native_writer_lock_blocks_without_an_open_rollout() {
     let f = Fixture::new();
     let dir = f.root.join("thread-writer-locks");

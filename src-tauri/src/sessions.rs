@@ -191,7 +191,11 @@ fn query_summaries(
         let agent_nickname: Option<String> = row.get(14)?;
         let agent_role: Option<String> = row.get(15)?;
 
-        let rollout_path = paths::host_path_string_from_codex_record(codex_dir, &rollout_path_raw);
+        let recorded = paths::host_path_from_codex_record(codex_dir, &rollout_path_raw);
+        let rollout_path = crate::rollout_io::resolve(&recorded)
+            .unwrap_or(recorded)
+            .to_string_lossy()
+            .into_owned();
         let cwd = paths::host_path_string_from_codex_record(codex_dir, &cwd_raw);
         let cwd_display = paths::basename_display(&cwd);
         let rollout_bytes = fs::metadata(&rollout_path).map(|m| m.len()).unwrap_or(0);
@@ -407,9 +411,7 @@ fn supplement_archived_summaries(
     let known_names: std::collections::HashSet<String> = existing
         .iter()
         .filter_map(|s| {
-            Path::new(&s.rollout_path)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
+            crate::rollout_io::plain_file_name(Path::new(&s.rollout_path)).map(str::to_owned)
         })
         .collect();
     let mut out = Vec::new();
@@ -419,10 +421,10 @@ fn supplement_archived_summaries(
     };
     for p in archived_rollouts {
         ensure_not_cancelled(cancel)?;
-        let Some(name) = p.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+        let Some(name) = crate::rollout_io::plain_file_name(&p) else {
             continue;
         };
-        if known_names.contains(&name) {
+        if known_names.contains(name) {
             continue;
         }
         let brief = match cancel {
@@ -812,6 +814,7 @@ fn locate_session_rollout(codex: &Path, id: &str) -> AppResult<PathBuf> {
                 &paths::host_path_string_from_codex_record(codex, raw),
             ))
         })
+        .map(|path| crate::rollout_io::resolve(&path).unwrap_or(path))
         .filter(|p| p.is_file());
     let mut discovered = rollout_files_by_id(codex, id)?;
     if discovered.len() > 1 {
@@ -919,6 +922,7 @@ fn move_session_cwd_locked_with_post_project_sync(
     let mut old_cwd = String::new();
     for sid in &ids {
         let rollout = locate_session_rollout(&codex, sid)?;
+        let rollout = crate::rollout_io::materialize_for_write(&rollout)?;
         let current_cwd =
             crate::codex_rollout_cwd::read_effective_cwd(&rollout, sid)?.unwrap_or_default();
         if sid == &id {
@@ -933,6 +937,7 @@ fn move_session_cwd_locked_with_post_project_sync(
             .map(|(id, path)| (id.clone(), vec![path.clone()]))
             .collect(),
     )?;
+    store = family::load(&codex)?;
     let index_ids = crate::repair::read_session_index_ids(&codex)?;
     let state = state_db::open(&codex)?;
     let has_name = crate::repair::threads_table_columns(&state)?
@@ -1170,6 +1175,7 @@ fn set_archived_codex_locked(codex_dir: String, id: String, v: bool) -> AppResul
                 &paths::host_path_string_from_codex_record(&codex, raw),
             ))
         })
+        .map(|path| crate::rollout_io::resolve(&path).unwrap_or(path))
         .filter(|p| p.is_file());
     let mut discovered = rollout_files_by_id(&codex, &id)?;
     if discovered.len() > 1 {
@@ -1187,6 +1193,17 @@ fn set_archived_codex_locked(codex_dir: String, id: String, v: bool) -> AppResul
         )));
     };
     validate_codex_rollout_path(&codex, &current, &id)?;
+    // A stale compressed sibling would reappear in sessions/ after moving the plain file.
+    // Retire it under the same native lock used by write preparation before archiving.
+    let current = if !crate::rollout_io::is_compressed(&current)
+        && current.with_extension("jsonl.zst").try_exists()?
+    {
+        let prepared = crate::rollout_io::materialize_for_write(&current)?;
+        family_store = family::load(&codex)?;
+        prepared
+    } else {
+        current
+    };
     let Some(file_name) = current.file_name().map(|n| n.to_os_string()) else {
         return Err(AppError::Other("rollout 路径缺少文件名".into()));
     };
@@ -1511,10 +1528,9 @@ fn rollout_files_by_id(codex_dir: &Path, id: &str) -> AppResult<Vec<PathBuf>> {
                 )));
             }
             if metadata.is_file()
-                && entry
-                    .file_name()
-                    .to_string_lossy()
-                    .ends_with(&expected_suffix)
+                && crate::rollout_io::discover_transcript(entry.path())
+                && crate::rollout_io::plain_file_name(entry.path())
+                    .is_some_and(|name| name.ends_with(&expected_suffix))
             {
                 matches.push(entry.path().to_path_buf());
             }
@@ -2265,9 +2281,7 @@ pub(crate) fn validate_codex_rollout_path(
     id: &str,
 ) -> AppResult<()> {
     let expected_suffix = format!("-{id}.jsonl");
-    if !path
-        .file_name()
-        .and_then(|name| name.to_str())
+    if !crate::rollout_io::plain_file_name(path)
         .is_some_and(|name| name.ends_with(&expected_suffix))
     {
         return Err(AppError::Path(format!(
@@ -2303,7 +2317,7 @@ pub(crate) fn validate_codex_rollout_path(
                 false,
                 "Codex rollout 操作目标",
             )?;
-            let meta = family::read_session_meta(path)?;
+            let meta = family::read_physical_session_meta(path)?;
             let actual_id = meta
                 .get("payload")
                 .and_then(|payload| payload.get("id"))

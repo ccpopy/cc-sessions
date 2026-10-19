@@ -43,6 +43,7 @@ pub mod provenance;
 pub mod provider_sync;
 pub mod repair;
 pub mod rollout;
+pub(crate) mod rollout_io;
 pub mod sessions;
 pub mod settings;
 pub mod state_db;

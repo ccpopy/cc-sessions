@@ -92,8 +92,8 @@ fn sha256_file(path: &Path) -> AppResult<String> {
 }
 
 fn same_existing_path(left: &Path, right: &Path) -> AppResult<bool> {
-    let left = left.canonicalize()?;
-    let right = right.canonicalize()?;
+    let left = crate::rollout_io::resolve(left)?.canonicalize()?;
+    let right = crate::rollout_io::resolve(right)?.canonicalize()?;
     #[cfg(windows)]
     {
         Ok(paths::strip_verbatim(&left.to_string_lossy())
@@ -106,7 +106,7 @@ fn same_existing_path(left: &Path, right: &Path) -> AppResult<bool> {
 }
 
 fn codex_rollout_filename_id(path: &Path) -> Option<String> {
-    let stem = path.file_stem()?.to_str()?;
+    let stem = crate::rollout_io::plain_file_name(path)?.strip_suffix(".jsonl")?;
     let rest = stem.strip_prefix("rollout-")?;
     if rest.len() < 36 {
         return None;
@@ -186,7 +186,10 @@ fn copy_codex_rollout_for_backup(
     target_cwd: Option<&str>,
 ) -> AppResult<()> {
     let Some(target_cwd) = target_cwd else {
-        fs::copy(source, destination)?;
+        let mut input = crate::rollout_io::reader_exact(source)?;
+        let mut output = File::create(destination)?;
+        std::io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
         return Ok(());
     };
 
@@ -599,7 +602,9 @@ pub fn create_backup_with_dirs(
     let projection_ids = codex_projection_ids_for_backup(&backup_threads, &history_base_chains);
     let mut modified_rollout_ids = HashSet::new();
     for thread in &backup_threads {
-        if sha256_file(&thread.rollout_path)? != sha256_file(&tmp.join(&thread.rollout_relpath))? {
+        if crate::rollout_io::logical_sha256(&thread.rollout_path)?
+            != sha256_file(&tmp.join(&thread.rollout_relpath))?
+        {
             modified_rollout_ids.insert(thread.id.clone());
             if let Some(rollout_id) = codex_rollout_filename_id(&thread.rollout_path) {
                 modified_rollout_ids.insert(rollout_id);
@@ -1335,8 +1340,12 @@ fn load_backup_thread(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let rollout_path = paths::host_path_from_codex_record(codex, &rollout_path_raw);
-    let rollout_relpath = rel_path(&rollout_path.to_string_lossy(), codex)?;
+    let rollout_path = crate::rollout_io::resolve(&paths::host_path_from_codex_record(
+        codex,
+        &rollout_path_raw,
+    ))?;
+    let rollout_relpath =
+        crate::rollout_io::plain_path(&rel_path(&rollout_path.to_string_lossy(), codex)?);
     let rollout_brief =
         crate::repair::read_rollout_brief(codex, &rollout_path)?.ok_or_else(|| {
             AppError::Other(format!(
@@ -1518,7 +1527,8 @@ fn collect_codex_history_base_chain(
             false,
             "Codex history_base 备份源",
         )?;
-        let relpath = rel_path(&source_path.to_string_lossy(), codex)?;
+        let relpath =
+            crate::rollout_io::plain_path(&rel_path(&source_path.to_string_lossy(), codex)?);
         validate_codex_history_base_relpath(&relpath.to_string_lossy(), &thread_id)?;
         // Besides checking the physical UUID above, require a readable session_meta before a
         // dependency can enter a self-contained backup.

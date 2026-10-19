@@ -4,7 +4,6 @@ use crate::error::ensure_not_cancelled;
 use crate::models::EditCapability;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
@@ -134,7 +133,7 @@ pub(super) fn reusable_capability(
     loaded: &Arc<LoadedFile>,
     expected: &str,
 ) -> Option<EditCapability> {
-    let path = path.canonicalize().ok()?;
+    let path = crate::rollout_io::resolve(path).ok()?.canonicalize().ok()?;
     let cache = cache().lock().unwrap_or_else(|e| e.into_inner());
     let inspected = cache
         .entries
@@ -153,7 +152,7 @@ pub(super) fn remember_capability(
     capability: &EditCapability,
     expected: Option<&str>,
 ) {
-    let Ok(path) = path.canonicalize() else {
+    let Ok(path) = crate::rollout_io::resolve(path).and_then(|p| p.canonicalize()) else {
         return;
     };
     let mut cache = cache().lock().unwrap_or_else(|e| e.into_inner());
@@ -207,7 +206,8 @@ fn retained_bytes(loaded: &LoadedFile) -> usize {
 
 pub(super) fn read(path: &Path, cancel: Option<&AtomicBool>) -> AppResult<Arc<LoadedFile>> {
     ensure_not_cancelled(cancel)?;
-    let path = path.canonicalize()?;
+    let path = crate::rollout_io::resolve(path)?.canonicalize()?;
+    let compressed = crate::rollout_io::is_compressed(&path);
     for _ in 0..3 {
         let before = stamp(&path)?;
         let prior = {
@@ -219,19 +219,8 @@ pub(super) fn read(path: &Path, cancel: Option<&AtomicBool>) -> AppResult<Arc<Lo
                 (e.stamp.clone(), e.loaded.clone())
             })
         };
-        let mut file = fs::File::open(&path)?;
-        let mut raw = Vec::new();
-        let mut chunk = [0u8; 64 * 1024];
-        loop {
-            ensure_not_cancelled(cancel)?;
-            let n = file.read(&mut chunk)?;
-            if n == 0 {
-                break;
-            }
-            crate::operation_metrics::record(|c| c.read_bytes += n as u64);
-            raw.extend_from_slice(&chunk[..n]);
-        }
-        if before != stamp(&path)? || before.len != raw.len() as u64 {
+        let raw = crate::rollout_io::read_exact(&path, cancel)?;
+        if before != stamp(&path)? || (!compressed && before.len != raw.len() as u64) {
             continue;
         }
         let hash = sha_hex(&raw);
@@ -244,7 +233,8 @@ pub(super) fn read(path: &Path, cancel: Option<&AtomicBool>) -> AppResult<Arc<Lo
             }
         }
         let append = prior.as_ref().filter(|(previous, loaded)| {
-            previous.identity == before.identity
+            !compressed
+                && previous.identity == before.identity
                 && previous.len < before.len
                 && loaded.trailing_newline
                 && sha_hex(&raw[..previous.len as usize]) == loaded.hash

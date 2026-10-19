@@ -121,8 +121,8 @@ pub(super) fn pending_summary(dir: &Path, path: &Path) -> AppResult<Option<EditP
     let Some(entry) = pending(dir)? else {
         return Ok(None);
     };
-    let hash = atomic_file::fingerprint(path)?.sha256_hex();
-    let same_path = Path::new(&entry.rollout_path).canonicalize()? == path.canonicalize()?;
+    let hash = crate::rollout_io::logical_fingerprint(path)?.sha256_hex();
+    let same_path = crate::rollout_io::same_file(Path::new(&entry.rollout_path), path)?;
     let projection_status = entry
         .history
         .as_ref()
@@ -174,7 +174,7 @@ pub(super) fn reconcile(
     };
     if entry.provider != provider
         || entry.session_id != id
-        || Path::new(&entry.rollout_path).canonicalize()? != path.canonicalize()?
+        || !crate::rollout_io::same_file(Path::new(&entry.rollout_path), path)?
     {
         return Err(AppError::Other(
             "[EDIT_IDENTITY] 操作清单与目标会话不一致".into(),
@@ -234,7 +234,7 @@ pub(super) fn dismiss_conflict(
     };
     if entry.provider != provider
         || entry.session_id != id
-        || Path::new(&entry.rollout_path).canonicalize()? != path.canonicalize()?
+        || !crate::rollout_io::same_file(Path::new(&entry.rollout_path), path)?
     {
         return Err(AppError::Other(
             "[EDIT_IDENTITY] 操作清单与目标会话不一致".into(),
@@ -258,7 +258,7 @@ pub(super) fn dismiss_conflict(
             "[EDIT_INCONSISTENT] 正文仍不一致，已保留操作清单；请先在独立副本核对".into(),
         ));
     }
-    if atomic_file::fingerprint(path)?.sha256_hex() != loaded.hash {
+    if crate::rollout_io::logical_fingerprint(path)?.sha256_hex() != loaded.hash {
         return Err(AppError::Other(
             "[EDIT_CONFLICT] 会话在核对期间更新，请刷新编辑历史".into(),
         ));

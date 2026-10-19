@@ -1,6 +1,6 @@
 [package]
 name = "cc-session-manager"
-version = "0.7.0"
+version = "0.7.1"
 description = "CC Sessions"
 authors = ["zjsmew"]
 edition = "2021"
@@ -59,6 +59,7 @@ url = "2"
 getrandom = "0.2"
 base64 = "0.22"
 libc = "0.2"
+zstd = { version = "0.13", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_Packaging_Appx", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading"] }

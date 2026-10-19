@@ -7,8 +7,7 @@
 //! 4. The UI polls a bounded status snapshot and may cancel the active job.
 
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::BufRead;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -241,7 +240,13 @@ fn execute_search(job: &SearchJob, request: &SearchRequest) -> AppResult<()> {
     let rollout_paths = request
         .rollout_paths
         .iter()
-        .map(String::as_str)
+        .map(|path| {
+            if request.provider == "codex" {
+                path.strip_suffix(".zst").unwrap_or(path)
+            } else {
+                path.as_str()
+            }
+        })
         .collect::<HashSet<_>>();
     let sessions = sessions::list_sessions_cancellable_with_dirs(
         Some(request.provider.clone()),
@@ -331,7 +336,13 @@ fn scan_sessions(
 }
 
 fn session_matches_scope(session: &SessionSummary, rollout_paths: &HashSet<&str>) -> bool {
-    rollout_paths.contains(session.rollout_path.as_str())
+    let path = session.rollout_path.as_str();
+    let path = if session.provider == "codex" {
+        path.strip_suffix(".zst").unwrap_or(path)
+    } else {
+        path
+    };
+    rollout_paths.contains(path)
 }
 
 #[cfg(test)]
@@ -352,7 +363,7 @@ fn scan_session_mode(
     raw_events: bool,
 ) -> AppResult<FileScanOutcome> {
     if session.provider == "codex"
-        && std::path::Path::new(&session.rollout_path).is_file()
+        && crate::rollout_io::resolve(std::path::Path::new(&session.rollout_path)).is_ok()
         && (raw_events
             || crate::logical_history::is_paginated(std::path::Path::new(&session.rollout_path))?)
     {
@@ -383,7 +394,7 @@ fn scan_session_mode(
         }
         _ => {}
     }
-    let file = match File::open(&session.rollout_path) {
+    let mut reader = match crate::rollout_io::reader(std::path::Path::new(&session.rollout_path)) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(FileScanOutcome {
@@ -395,7 +406,6 @@ fn scan_session_mode(
         }
         Err(error) => return Err(error.into()),
     };
-    let mut reader = BufReader::new(file);
     let mut line = String::new();
     let mut line_index = 0usize;
     let mut event_offset = 0usize;
@@ -699,6 +709,38 @@ mod tests {
                 error: None,
             })),
         }
+    }
+
+    #[test]
+    fn compressed_legacy_content_search_preserves_offsets_and_raw_results() {
+        let plain = temp_file(
+            "compressed-search",
+            &[
+                json!({"type":"session_meta","payload":{"id":"compressed"}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"needle 中文"}]}}),
+            ],
+        );
+        let bytes = fs::read(&plain).unwrap();
+        let packed = plain.with_extension("jsonl.zst");
+        fs::write(
+            &packed,
+            zstd::stream::encode_all(bytes.as_slice(), 3).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(&plain).unwrap();
+        for path in [&plain, &packed] {
+            for raw_events in [false, true] {
+                let mut target = session("codex", &packed);
+                target.rollout_path = path.to_string_lossy().into_owned();
+                let outcome =
+                    scan_session_mode(&test_job(), &target, "needle", 0, raw_events).unwrap();
+                assert_eq!(outcome.matches.len(), 1);
+                assert_eq!(outcome.matches[0].event_index, 1);
+                assert!(outcome.matches[0].snippet.contains("needle"));
+                assert!(!outcome.missing);
+            }
+        }
+        fs::remove_dir_all(plain.parent().unwrap()).unwrap();
     }
 
     #[test]

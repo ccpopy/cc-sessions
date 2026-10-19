@@ -14,70 +14,8 @@ pub(super) fn from_lines(lines: &[String], trailing_newline: bool) -> LoadedFile
     }
 }
 
-pub(super) struct WriterGuard {
-    _rollout: fs::File,
-    _coordination: fs::File,
-}
-
-pub(super) fn writer_guard(path: &Path) -> AppResult<WriterGuard> {
-    // Native 0.155 alpha uses this coordination lock before opening/removing a
-    // per-thread writer lock. Hold coordination through publication (upstream
-    // WriterLockCoordinator::try_acquire_for_publication), including on Unix.
-    let loaded = load_file(path)?;
-    let id = loaded
-        .parsed
-        .iter()
-        .flatten()
-        .find(|v| codex_outer(v) == "session_meta")
-        .and_then(|v| v["payload"]["id"].as_str())
-        .ok_or_else(|| unsupported("缺少写入锁身份"))?;
-    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        return Err(unsupported("写入锁身份不合法"));
-    }
-    let directory = safety::codex_root(path)
-        .ok_or_else(|| unsupported("缺少数据根"))?
-        .join("thread-writer-locks");
-    fs::create_dir_all(&directory)?;
-    let coordination = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(directory.join(".coordination.lock"))?;
-    coordination.try_lock().map_err(|e| {
-        AppError::Other(format!(
-            "[EDIT_BUSY] 原生写入协调锁正被使用：{e}；停止会话写入后重试"
-        ))
-    })?;
-    match fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(directory.join(format!("{id}.lock")))
-    {
-        Ok(file) => file.try_lock().map_err(|e| {
-            AppError::Other(format!(
-                "[EDIT_BUSY] 会话仍由原生进程持有：{e}；卸载或关闭该会话后重试"
-            ))
-        })?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.share_mode(1 | 4); // permit readers/atomic replacement, deny an open append writer
-    }
-    let rollout = options.open(path).map_err(|e| {
-        AppError::Other(format!(
-            "[EDIT_BUSY] 无法排除会话写入方：{e}；请关闭该会话的原生写入进程后重试"
-        ))
-    })?;
-    Ok(WriterGuard {
-        _rollout: rollout,
-        _coordination: coordination,
-    })
+pub(super) fn writer_guard(path: &Path) -> AppResult<crate::rollout_io::WriterGuard> {
+    crate::rollout_io::writer_guard(path)
 }
 
 pub(super) fn is_paginated(loaded: &LoadedFile) -> bool {
@@ -537,7 +475,9 @@ fn check_scope(path: &Path, loaded: &LoadedFile, selected: &BTreeSet<usize>) -> 
             }
             for entry in walkdir::WalkDir::new(dir).follow_links(false) {
                 let entry = entry.map_err(|e| unsupported(format!("无法检查共享历史：{e}")))?;
-                if entry.path().extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                if !entry.file_type().is_file()
+                    || !crate::rollout_io::discover_transcript(entry.path())
+                {
                     continue;
                 }
                 let meta = crate::family::read_session_meta(entry.path())?;

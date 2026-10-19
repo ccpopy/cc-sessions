@@ -124,6 +124,7 @@ pub(crate) fn delete_codex_artifacts_batch_with_family_store(
             let db_path = PathBuf::from(paths::strip_verbatim(
                 &paths::host_path_string_from_codex_record(codex_dir, raw_path),
             ));
+            let db_path = crate::rollout_io::resolve(&db_path).unwrap_or(db_path);
             if db_path.is_file() {
                 validate_codex_rollout_path_for_delete(codex_dir, &db_path, id)?;
                 rollout_files.push(db_path);
@@ -289,7 +290,7 @@ pub(crate) fn delete_codex_artifacts_batch_with_family_store(
 }
 
 fn rollout_filename_thread_id(path: &Path) -> Option<String> {
-    let stem = path.file_stem()?.to_str()?;
+    let stem = crate::rollout_io::plain_file_name(path)?.strip_suffix(".jsonl")?;
     let rest = stem.strip_prefix("rollout-")?;
     if rest.len() < 36 {
         return None;
@@ -309,29 +310,39 @@ fn rollout_filename_thread_id(path: &Path) -> Option<String> {
 fn scan_rollout_references(codex_dir: &Path) -> AppResult<Vec<RolloutReference>> {
     let mut rollouts = family::scan_rollouts(codex_dir)?;
     rollouts.extend(family::scan_archived_rollouts(codex_dir)?);
+    // Reads prefer the plain representation, but deletion must remove both siblings.
+    // Otherwise a stale compressed copy would become visible again after deleting JSONL.
+    let siblings: Vec<_> = rollouts
+        .iter()
+        .filter(|path| !crate::rollout_io::is_compressed(path))
+        .map(|path| path.with_extension("jsonl.zst"))
+        .filter(|path| path.is_file())
+        .collect();
+    rollouts.extend(siblings);
     rollouts.sort();
     rollouts.dedup();
 
     Ok(rollouts
         .into_iter()
         .map(|path| {
-            let (payload_thread_id, history_base_thread_id) = family::read_session_meta(&path)
-                .ok()
-                .map(|meta| {
-                    let payload = meta.get("payload").unwrap_or(&meta);
-                    (
-                        payload
-                            .get("id")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string),
-                        payload
-                            .get("history_base")
-                            .and_then(|base| base.get("thread_id"))
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string),
-                    )
-                })
-                .unwrap_or_default();
+            let (payload_thread_id, history_base_thread_id) =
+                family::read_physical_session_meta(&path)
+                    .ok()
+                    .map(|meta| {
+                        let payload = meta.get("payload").unwrap_or(&meta);
+                        (
+                            payload
+                                .get("id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string),
+                            payload
+                                .get("history_base")
+                                .and_then(|base| base.get("thread_id"))
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string),
+                        )
+                    })
+                    .unwrap_or_default();
             let file_thread_id = rollout_filename_thread_id(&path);
             RolloutReference {
                 path,
@@ -384,7 +395,7 @@ fn validate_codex_rollout_path_for_delete(
             false,
             "Codex rollout 删除目标",
         )?;
-        let meta = family::read_session_meta(path)?;
+        let meta = family::read_physical_session_meta(path)?;
         let actual_id = meta
             .get("payload")
             .and_then(|payload| payload.get("id"))

@@ -18,6 +18,7 @@ fn current_path(codex: &Path, id: &str, hint: Option<&Path>) -> AppResult<PathBu
     } else {
         codex.join(path)
     };
+    let path = crate::rollout_io::resolve(&path)?;
     crate::path_safety::validate_descendant(
         &paths::sessions_dir(codex),
         &path,
@@ -44,7 +45,12 @@ fn verify_native(
     provider: Option<&str>,
 ) -> AppResult<()> {
     if thread.id != id
-        || thread.path.as_ref().map(|p| p.canonicalize()).transpose()? != Some(path.canonicalize()?)
+        || thread
+            .path
+            .as_ref()
+            .map(|p| crate::rollout_io::same_file(p, path))
+            .transpose()?
+            != Some(true)
         || provider.is_some_and(|p| thread.model_provider.as_deref() != Some(p))
     {
         return Err(AppError::Other(

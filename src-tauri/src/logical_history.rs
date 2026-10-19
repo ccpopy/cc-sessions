@@ -32,7 +32,7 @@ fn invalid(reason: &str) -> AppError {
 /// Probe only the header; legacy display paths keep their tolerant streaming reader.
 pub(crate) fn is_paginated(path: &Path) -> AppResult<bool> {
     use std::io::BufRead;
-    for line in std::io::BufReader::new(std::fs::File::open(path)?).lines() {
+    for line in crate::rollout_io::reader(path)?.lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
@@ -70,7 +70,7 @@ fn read_segment(
     cancel: Option<&AtomicBool>,
 ) -> AppResult<View> {
     ensure_not_cancelled(cancel)?;
-    let physical = path.canonicalize()?;
+    let physical = crate::rollout_io::resolve(path)?.canonicalize()?;
     if !seen.insert(physical.clone()) || seen.len() > 128 {
         return Err(invalid("继承历史存在环或超过 128 层"));
     }
@@ -119,7 +119,7 @@ pub(crate) fn view(
             )
         })
         .and_then(Path::parent);
-    let mut seen = HashSet::from([path.canonicalize()?]);
+    let mut seen = HashSet::from([crate::rollout_io::resolve(path)?.canonicalize()?]);
     let order = (0..loaded.parsed.len())
         .filter(|&i| loaded.parsed[i].is_some())
         .map(|i| (0, i))
@@ -200,9 +200,9 @@ fn resolve_records(
         for entry in walkdir::WalkDir::new(&managed).follow_links(false) {
             ensure_not_cancelled(cancel)?;
             let entry = entry.map_err(|_| invalid("无法遍历继承历史目录"))?;
-            let name = entry.file_name().to_string_lossy();
+            let name = crate::rollout_io::plain_file_name(entry.path()).unwrap_or("");
             if entry.file_type().is_file()
-                && name.starts_with("rollout-")
+                && crate::rollout_io::discover(entry.path())
                 && (name.ends_with(&format!("-{id}.jsonl"))
                     || name.ends_with(&format!("_{id}.jsonl")))
             {
@@ -215,7 +215,7 @@ fn resolve_records(
         }
     }
     if candidates.len() != 1 {
-        return Err(invalid("继承源缺失、存在歧义或为尚未支持的压缩文件"));
+        return Err(invalid("继承源缺失或存在歧义"));
     }
     let inherited = read_segment(
         &candidates[0],

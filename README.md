@@ -448,6 +448,15 @@ Codex 修复主要处理本地索引和列表可见性，不会重写对话正�
 </details>
 
 <details>
+<summary>Codex 的 .jsonl.zst 会话文件可以读取吗？</summary>
+
+可以。Codex 会把部分旧会话日志无损压缩为 `.jsonl.zst`，CC Sessions 支持读取、预览、搜索和分页历史，也会在数据库仍记录 `.jsonl` 路径时自动查找对应的压缩文件。备份和导出会生成普通 JSONL 副本，不解压或改写来源文件。
+
+编辑消息、改写工作目录或向压缩分支同步内容时，会在取得 Codex 原生写入锁后自动恢复普通日志，无需先到 Codex 中续聊。转换保留会话 ID、消息字节与分页边界，同步当前线程和分支路径；原压缩文件保存在所选 Codex 目录的 `backups/rollout-materializations/`。正在写入、共享历史依赖和预览过期等原有检查继续生效。
+
+</details>
+
+<details>
 <summary>为什么有些推理内容只能删除，不能修改？</summary>
 
 Codex 的部分推理内容经过加密，Claude Code 的部分思考内容带有签名。改写这些数据会让原工具无法识别，因此 CC Sessions 只允许整段删除。

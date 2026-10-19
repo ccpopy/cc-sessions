@@ -434,8 +434,7 @@ fn index_rollouts(codex: &Path) -> AppResult<HashMap<String, RolloutSource>> {
             if !metadata.is_file() {
                 continue;
             }
-            let name = entry.file_name().to_string_lossy();
-            if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
+            if !crate::rollout_io::discover(entry.path()) {
                 continue;
             }
             let abs = entry.path().to_path_buf();
@@ -447,6 +446,7 @@ fn index_rollouts(codex: &Path) -> AppResult<HashMap<String, RolloutSource>> {
 }
 
 fn rollout_source_from_path(codex: &Path, abs: PathBuf) -> AppResult<(String, RolloutSource)> {
+    let abs = crate::rollout_io::resolve(&abs)?;
     validate_codex_rollout_source_path(codex, &abs)?;
     let meta = family::read_session_meta(&abs).map_err(|e| {
         AppError::Other(format!(
@@ -466,7 +466,7 @@ fn rollout_source_from_path(codex: &Path, abs: PathBuf) -> AppResult<(String, Ro
             ))
         })?
         .to_string();
-    let rel = abs
+    let rel = crate::rollout_io::plain_path(&abs)
         .strip_prefix(codex)
         .map(|x| x.to_path_buf())
         .map_err(|_| {
@@ -526,7 +526,8 @@ fn rollout_source_from_state(
     let Some(rollout_path) = rollout_path else {
         return Ok(None);
     };
-    let abs = paths::host_path_from_codex_record(codex, &rollout_path);
+    let abs =
+        crate::rollout_io::resolve(&paths::host_path_from_codex_record(codex, &rollout_path))?;
     if !abs.is_file() {
         return Err(AppError::NotFound(format!(
             "threads.rollout_path 指向的文件不存在: {}",
@@ -3941,7 +3942,7 @@ fn copy_codex_rollout_with_cwd(
 ) -> AppResult<()> {
     let Some(target_cwd) = target_cwd else {
         return replace_import_destination(dest, |target| {
-            let mut source = File::open(src)?;
+            let mut source = crate::rollout_io::reader_exact(src)?;
             let mut hasher = Sha256::new();
             let mut buffer = [0u8; 64 * 1024];
             loop {

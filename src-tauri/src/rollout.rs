@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, OnceLock};
@@ -588,8 +588,7 @@ fn preview_range_impl(path: &str, offset: usize, limit: usize) -> AppResult<Vec<
         let history = crate::logical_history::read(Path::new(path), None)?;
         return Ok(history.raw_events_range(offset, limit).collect());
     }
-    let f = File::open(PathBuf::from(path))?;
-    let reader = BufReader::new(f);
+    let reader = crate::rollout_io::reader(Path::new(path))?;
     let mut out = Vec::with_capacity(preview_capacity_hint(limit));
     let mut event_index = 0usize;
     let mut canonical = false;
@@ -688,8 +687,7 @@ fn user_prompts_impl(
     classify_line: impl Fn(usize, Value) -> Option<PreviewEvent>,
     event_is_agent_activity: impl Fn(&PreviewEvent) -> bool,
 ) -> AppResult<UserPromptList> {
-    let f = File::open(PathBuf::from(path))?;
-    let reader = BufReader::new(f);
+    let reader = crate::rollout_io::reader(Path::new(path))?;
     let mut events = Vec::new();
     let mut canonical = false;
     for (i, line) in reader.lines().enumerate() {
@@ -873,6 +871,8 @@ fn read_rollout_token_total_impl(path: &Path, cancel: Option<&AtomicBool>) -> Ap
     const REVERSE_SCAN_CHUNK_BYTES: usize = 64 * 1024;
 
     ensure_not_cancelled(cancel)?;
+    let physical = crate::rollout_io::resolve(path)?;
+    let path = physical.as_path();
     let metadata = path.metadata()?;
     let file_len = metadata.len();
     let modified = metadata.modified().ok();
@@ -884,6 +884,19 @@ fn read_rollout_token_total_impl(path: &Path, cancel: Option<&AtomicBool>) -> Ap
         }
     }
 
+    if crate::rollout_io::is_compressed(path) {
+        let mut total = 0;
+        for line in crate::rollout_io::reader(path)?.lines() {
+            ensure_not_cancelled(cancel)?;
+            if let Ok(raw) = serde_json::from_str::<Value>(&line?) {
+                if let Some(value) = token_total_from_value(&raw) {
+                    total = value;
+                }
+            }
+        }
+        cache_rollout_token_total(path, file_len, modified, total);
+        return Ok(total);
+    }
     let mut file = File::open(path)?;
     let mut scan_end = file_len;
     let mut line_end = scan_end;
@@ -1012,8 +1025,7 @@ pub fn preview_session_meta(
             )))
         }
     }
-    let f = File::open(PathBuf::from(&rollout_path))?;
-    let mut reader = BufReader::new(f);
+    let mut reader = crate::rollout_io::reader(Path::new(&rollout_path))?;
     let mut first = String::new();
     reader.read_line(&mut first)?;
     let raw: Value = serde_json::from_str(first.trim())?;

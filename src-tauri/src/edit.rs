@@ -212,8 +212,8 @@ fn sha_hex(bytes: &[u8]) -> String {
 }
 
 fn load_file(path: &Path) -> AppResult<LoadedFile> {
-    let raw = fs::read(path)?;
-    crate::operation_metrics::record(|c| c.read_bytes += raw.len() as u64);
+    let physical = crate::rollout_io::resolve(path)?;
+    let raw = crate::rollout_io::read_exact(&physical, None)?;
     let hash = sha_hex(&raw);
     let text = String::from_utf8(raw)
         .map_err(|_| AppError::Other("会话文件不是有效的 UTF-8，拒绝编辑".into()))?;
@@ -1294,6 +1294,7 @@ fn open_op_context(
     expected_revision: Option<&str>,
 ) -> AppResult<OpContext> {
     let path = PathBuf::from(paths::strip_verbatim(rollout_path));
+    let path = crate::rollout_io::resolve(&path)?;
     if !path.is_file() {
         return Err(AppError::NotFound(path.to_string_lossy().into_owned()));
     }
@@ -1308,6 +1309,20 @@ fn open_op_context(
     let loaded = load_file(&path)?;
     safety::check_revision(&path, &loaded, expected_revision)?;
     safety::ensure_writable(provider, &path, &loaded, session_id)?;
+    let prepared = if provider == "codex" {
+        crate::rollout_io::materialize_for_write(&path)?
+    } else {
+        path.clone()
+    };
+    let loaded = if prepared != path {
+        let next = load_file(&prepared)?;
+        safety::check_revision(&prepared, &next, expected_revision)?;
+        safety::ensure_writable(provider, &prepared, &next, session_id)?;
+        next
+    } else {
+        loaded
+    };
+    let path = prepared;
     Ok(OpContext {
         dir,
         journal,
@@ -1742,7 +1757,7 @@ pub fn history(
     }
     snapshots.sort_by(|a, b| b.name.cmp(&a.name));
 
-    let current_hash = if path.is_file() {
+    let current_hash = if crate::rollout_io::resolve(&path).is_ok() {
         Some(load_file(&path)?.hash)
     } else {
         None
@@ -1769,7 +1784,7 @@ pub fn history(
         };
 
     let pending_operation = transaction::pending_summary(&dir, &path)?;
-    let capability = if path.is_file() {
+    let capability = if crate::rollout_io::resolve(&path).is_ok() {
         Some(inspect_edit_capability(provider, rollout_path)?)
     } else {
         None

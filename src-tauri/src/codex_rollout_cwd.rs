@@ -1,6 +1,5 @@
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, Write};
 use std::path::Path;
 
 use serde_json::Value;
@@ -118,8 +117,10 @@ fn inspect(
     target_cwd: Option<&str>,
     expected_source_sha256: Option<&str>,
 ) -> AppResult<(CwdInspection, EffectiveCwdTracker)> {
+    let physical = crate::rollout_io::resolve(source)?;
+    let source = physical.as_path();
     let source_fingerprint = atomic_file::fingerprint(source)?;
-    let mut reader = BufReader::new(File::open(source)?);
+    let mut reader = crate::rollout_io::reader_exact(source)?;
     let mut tracker = EffectiveCwdTracker::default();
     let mut latest_turn_line = None;
     let mut matching_meta_found = false;
@@ -160,7 +161,11 @@ fn inspect(
         )));
     }
     if let Some(expected) = expected_source_sha256 {
-        let actual = hex::encode(source_hasher.finalize());
+        let actual = if crate::rollout_io::is_compressed(source) {
+            source_fingerprint.sha256_hex()
+        } else {
+            hex::encode(source_hasher.finalize())
+        };
         if actual != expected {
             return Err(AppError::Other(format!(
                 "Bundle 源文件在导入期间发生变化，已拒绝提交: expected={expected} actual={actual} source={}",
@@ -201,7 +206,7 @@ fn write_from_inspection(
     target_cwd: &str,
     inspection: &CwdInspection,
 ) -> AppResult<()> {
-    let mut reader = BufReader::new(File::open(source)?);
+    let mut reader = crate::rollout_io::reader_exact(source)?;
     let mut line_number = 0usize;
     loop {
         let mut line = Vec::new();
@@ -285,6 +290,8 @@ pub(crate) fn rewrite_effective_cwd(
     session_id: &str,
     target_cwd: &str,
 ) -> AppResult<bool> {
+    let plain = crate::rollout_io::materialize_for_write(source)?;
+    let source = plain.as_path();
     let (inspection, _) = inspect(source, session_id, Some(target_cwd), None)?;
     if !inspection.needs_rewrite {
         return Ok(false);
@@ -302,7 +309,7 @@ pub(crate) fn rewrite_effective_cwd(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::fs::{self, File};
 
     #[test]
     fn effective_cwd_prefers_and_rewrites_only_latest_turn_context() -> AppResult<()> {

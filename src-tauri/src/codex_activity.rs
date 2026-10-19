@@ -123,7 +123,11 @@ fn sample_each(
         .map(|(id, explicit_paths)| {
             let mut files: BTreeSet<PathBuf> = explicit_paths
                 .iter()
-                .map(|path| path.canonicalize().unwrap_or_else(|_| path.clone()))
+                .map(|path| {
+                    crate::rollout_io::resolve(path)
+                        .and_then(|p| p.canonicalize())
+                        .unwrap_or_else(|_| path.clone())
+                })
                 .collect();
             let row = if has_threads {
                 let mut statement = conn
@@ -143,6 +147,7 @@ fn sample_each(
                     path_column.and_then(|i| row.as_ref().and_then(|r| r.get(i)))
                 {
                     let path = paths::host_path_from_codex_record(codex, raw_path);
+                    let path = crate::rollout_io::resolve(&path).unwrap_or(path);
                     // Do not follow an old external path into another Codex home.
                     if let (Ok(root), Ok(path)) = (codex.canonicalize(), path.canonicalize()) {
                         if path.starts_with(root) {
