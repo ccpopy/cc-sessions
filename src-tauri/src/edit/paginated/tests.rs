@@ -1482,11 +1482,8 @@ fn paginated_unknown_turn_and_live_writer_leave_other_ranges_available() {
             .iter()
             .position(|v| v.as_ref().unwrap()["payload"]["item"]["id"] == "user-2")
             .unwrap();
-        assert!(f
-            .delete(&[index])
-            .unwrap_err()
-            .to_string()
-            .contains("EDIT_BUSY"));
+        let error = f.delete(&[index]).unwrap_err().to_string();
+        assert!(error.contains("EDIT_BUSY"), "{error}");
         assert_eq!(fs::read(&f.path).unwrap(), before);
         drop(writer);
     }

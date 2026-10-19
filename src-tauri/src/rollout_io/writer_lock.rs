@@ -71,7 +71,11 @@ pub(crate) fn writer_guard(path: &Path) -> AppResult<WriterGuard> {
         use std::os::windows::fs::OpenOptionsExt;
         options.share_mode(1 | 4);
     }
-    let rollout = options.open(&physical)?;
+    let rollout = options.open(&physical).map_err(|e| {
+        AppError::Other(format!(
+            "[EDIT_BUSY] 无法排除会话写入方：{e}；请关闭该会话的原生写入进程后重试"
+        ))
+    })?;
     Ok(WriterGuard {
         _rollout: rollout,
         _thread: thread,

@@ -641,6 +641,25 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn materialization_rejects_an_open_rollout_writer() -> AppResult<()> {
+        let fixture = Fixture::new()?;
+        let plain = fixture.path(ID);
+        let bytes = legacy();
+        let packed = compress(&plain, &bytes)?;
+        let source = fs::read(&packed)?;
+        let writer = fs::OpenOptions::new().append(true).open(&packed)?;
+        let error = materialize_for_write(&packed).unwrap_err().to_string();
+        assert!(error.contains("EDIT_BUSY"), "{error}");
+        assert_eq!(fs::read(&packed)?, source);
+        assert!(!plain.exists());
+        drop(writer);
+        assert_eq!(materialize_for_write(&packed)?, plain);
+        assert_eq!(fs::read(&plain)?, bytes);
+        Ok(())
+    }
+
     #[test]
     fn compressed_directory_move_materializes_and_keeps_family_metadata_current() -> AppResult<()> {
         let fixture = Fixture::new()?;
@@ -660,10 +679,8 @@ mod tests {
         assert!(result.rollout_rewritten);
         assert!(!packed.exists());
         let meta = family::read_session_meta(&plain)?;
-        assert_eq!(
-            meta["payload"]["cwd"].as_str(),
-            Some(target.canonicalize()?.to_string_lossy().as_ref())
-        );
+        let cwd = meta["payload"]["cwd"].as_str().unwrap();
+        assert_eq!(Path::new(cwd).canonicalize()?, target.canonicalize()?);
         let store = family::load(&fixture.0)?;
         assert!(store
             .families
