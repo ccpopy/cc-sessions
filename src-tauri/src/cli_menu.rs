@@ -353,7 +353,7 @@ fn browse_sessions(
                 "{:>2}. [{}] {}  {}  {:>10} token  {}  {}",
                 offset + 1,
                 selected,
-                short_timestamp(session.updated_at),
+                short_timestamp(session.last_activity_at_ms() / 1000),
                 if session.archived {
                     "archived"
                 } else {
@@ -2313,14 +2313,18 @@ fn group_projects(sessions: Vec<SessionSummary>) -> Vec<ProjectGroup> {
             cwd_display: session.cwd_display.clone(),
             sessions: Vec::new(),
             latest_updated_at: 0,
+            latest_activity_at_ms: 0,
             total_tokens: 0,
         });
         entry.latest_updated_at = entry.latest_updated_at.max(session.updated_at);
+        entry.latest_activity_at_ms = entry
+            .latest_activity_at_ms
+            .max(session.last_activity_at_ms());
         entry.total_tokens += session.tokens_used;
         entry.sessions.push(session);
     }
     let mut out = groups.into_values().collect::<Vec<_>>();
-    out.sort_by_key(|group| std::cmp::Reverse(group.latest_updated_at));
+    out.sort_by_key(|group| std::cmp::Reverse(group.latest_activity_at_ms));
     out
 }
 
@@ -2329,7 +2333,7 @@ fn sort_sessions_by_size(sessions: &mut [SessionSummary]) {
         a.tokens_used
             .cmp(&b.tokens_used)
             .then_with(|| a.rollout_bytes.cmp(&b.rollout_bytes))
-            .then_with(|| b.updated_at.cmp(&a.updated_at))
+            .then_with(|| a.compare_activity_desc(b))
             .then_with(|| a.id.cmp(&b.id))
     });
 }

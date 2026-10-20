@@ -99,6 +99,7 @@ fn summary_from_meta(session_dir: &Path, meta: AgentSessionMeta) -> AppResult<Se
         tokens_used: 0,
         created_at: meta.created_at_ms / 1000,
         updated_at: meta.updated_at_ms / 1000,
+        activity_at_ms: None,
         // cursor-agent 没有归档概念。
         archived: false,
         git_branch: None,

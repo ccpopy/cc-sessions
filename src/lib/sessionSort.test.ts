@@ -51,3 +51,18 @@ test("排序方向可以原位切换", () => {
   assert.equal(oppositeSortDirection("desc"), "asc");
   assert.equal(oppositeSortDirection("asc"), "desc");
 });
+
+test("Codex 同大小会话按毫秒活动时间和原生 ID 顺序排列", () => {
+  const sessions = [
+    { ...session("b-tie", 10, 100, 3000), provider: "codex", activity_at_ms: 7_001 },
+    { ...session("a-latest", 10, 100, 1000), provider: "codex", activity_at_ms: 7_002 },
+    { ...session("z-tie", 10, 100, 2000), provider: "codex", activity_at_ms: 7_001 },
+  ] as SessionSummary[];
+
+  for (const direction of ["asc", "desc"] as const) {
+    assert.deepEqual(
+      [...sessions].sort((a, b) => compareSessionSize(a, b, direction)).map((item) => item.id),
+      ["a-latest", "z-tie", "b-tie"],
+    );
+  }
+});

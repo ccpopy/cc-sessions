@@ -523,6 +523,7 @@ fn parse_session(path: &Path, cancel: Option<&AtomicBool>) -> AppResult<Option<S
         tokens_used,
         created_at: created_at.unwrap_or(0),
         updated_at: updated_at.or(created_at).unwrap_or(0),
+        activity_at_ms: None,
         archived: false,
         git_branch: None,
         rollout_bytes: bytes,

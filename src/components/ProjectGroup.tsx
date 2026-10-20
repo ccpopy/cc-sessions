@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import type { SessionSummary } from "@/lib/api";
 import { humanTokens, relativeTime } from "@/lib/format";
 import { sessionIdentity } from "@/lib/sessionIdentity";
+import { sessionActivitySeconds } from "@/lib/sessionActivity";
 import { cn } from "@/lib/utils";
 import { useSelection } from "@/stores/selection";
 
@@ -37,7 +38,7 @@ export const ProjectGroupHeader = memo(function ProjectGroupHeader({
 
   const allSelected = ids.length > 0 && selectedCount === ids.length;
   const someSelected = selectedCount > 0 && !allSelected;
-  const latest = Math.max(...sessions.map((session) => session.updated_at));
+  const latest = Math.max(...sessions.map(sessionActivitySeconds));
   const tokens = sessions.reduce((total, session) => total + session.tokens_used, 0);
 
   return (

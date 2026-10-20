@@ -1,6 +1,7 @@
 import type { SessionSummary } from "./api.ts";
 import { dayBucket } from "./format.ts";
 import { sessionIdentity } from "./sessionIdentity.ts";
+import { sessionActivitySeconds } from "./sessionActivity.ts";
 
 export type SessionBucketKey = "today" | "yesterday" | "week" | "month" | "earlier";
 
@@ -51,7 +52,7 @@ export function buildTimeListRows(
 ): TimeListRow[] {
   const grouped = new Map<SessionBucketKey, SessionSummary[]>();
   for (const session of sessions) {
-    const bucket = dayBucket(session.updated_at);
+    const bucket = dayBucket(sessionActivitySeconds(session));
     const items = grouped.get(bucket);
     if (items) items.push(session);
     else grouped.set(bucket, [session]);
@@ -94,7 +95,7 @@ export function buildProjectListGroups(
       cwd,
       cwdDisplay: items[0]?.cwd_display ?? cwd,
       items,
-      latest: Math.max(...items.map((session) => session.updated_at)),
+      latest: Math.max(...items.map(sessionActivitySeconds)),
     }))
     .sort((left, right) => right.latest - left.latest);
 }

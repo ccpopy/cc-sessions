@@ -111,6 +111,7 @@ pub fn list_sessions(data_dir: &Path) -> AppResult<Vec<SessionSummary>> {
             tokens_used: detail.map(|value| value.tokens_used).unwrap_or_default(),
             created_at: created / 1000,
             updated_at: updated / 1000,
+            activity_at_ms: None,
             archived: archived.is_some(),
             git_branch: None,
             rollout_bytes: detail

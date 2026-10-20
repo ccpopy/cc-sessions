@@ -1,4 +1,5 @@
 import type { SessionSummary } from "./api";
+import { compareSessionActivityDesc, sessionActivityMs } from "./sessionActivity.ts";
 
 export type SortDirection = "asc" | "desc";
 
@@ -20,8 +21,11 @@ export function compareSessionSize(
   const bytesDelta = (a.rollout_bytes - b.rollout_bytes) * directionFactor;
   if (bytesDelta !== 0) return bytesDelta;
 
-  // 大小相同时仍优先显示最近更新的会话，避免切换方向后同大小项目来回跳动。
-  const updatedDelta = b.updated_at - a.updated_at;
-  if (updatedDelta !== 0) return updatedDelta;
+  // 大小相同时仍优先显示最近活动的会话，避免切换方向后同大小项目来回跳动。
+  if (a.provider === "codex" && b.provider === "codex") {
+    return compareSessionActivityDesc(a, b);
+  }
+  const activityDelta = sessionActivityMs(b) - sessionActivityMs(a);
+  if (activityDelta !== 0) return activityDelta;
   return a.id.localeCompare(b.id);
 }

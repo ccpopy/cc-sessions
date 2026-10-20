@@ -215,6 +215,7 @@ fn list_composer_sessions(cursor_dir: &Path) -> AppResult<Vec<SessionSummary>> {
             tokens_used: 0,
             created_at: created_ms / 1000,
             updated_at: updated_ms / 1000,
+            activity_at_ms: None,
             archived: archived == Some(1)
                 || header.get("isArchived").and_then(Value::as_bool) == Some(true),
             git_branch: git_branch(&header),

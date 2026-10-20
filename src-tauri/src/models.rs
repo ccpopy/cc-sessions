@@ -190,12 +190,39 @@ pub struct SessionSummary {
     pub tokens_used: i64,
     pub created_at: i64,
     pub updated_at: i64,
+    /// List activity in milliseconds; Codex prefers its native recency timestamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity_at_ms: Option<i64>,
     pub archived: bool,
     pub git_branch: Option<String>,
     pub rollout_bytes: u64,
     pub logs_count: i64,
     pub has_backup: bool,
     pub resume_command: String,
+}
+
+impl SessionSummary {
+    pub fn last_activity_at_ms(&self) -> i64 {
+        self.activity_at_ms
+            .filter(|timestamp| *timestamp > 0)
+            .unwrap_or_else(|| self.updated_at.saturating_mul(1000))
+    }
+
+    pub fn compare_activity_desc(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .last_activity_at_ms()
+            .cmp(&self.last_activity_at_ms())
+            .then_with(|| {
+                if self.provider != other.provider {
+                    // Keep native Codex ties consistent in mixed-provider CLI lists.
+                    self.provider.cmp(&other.provider)
+                } else if self.provider == "codex" {
+                    other.id.cmp(&self.id)
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -251,6 +278,7 @@ pub struct ProjectGroup {
     pub cwd_display: String,
     pub sessions: Vec<SessionSummary>,
     pub latest_updated_at: i64,
+    pub latest_activity_at_ms: i64,
     pub total_tokens: i64,
 }
 

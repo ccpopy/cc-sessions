@@ -47,6 +47,7 @@ import { ArchiveOriginBadge } from "@/components/ArchiveOriginBadge";
 import { isSubagentSession } from "@/lib/sessionSource";
 import { accentBadgeFor, providerLabel } from "@/lib/providerTheme";
 import { sessionDisplayPreview, sessionDisplayTitle } from "@/lib/sessionText";
+import { sessionActivitySeconds } from "@/lib/sessionActivity";
 import { cn } from "@/lib/utils";
 
 type Props = {
@@ -105,6 +106,8 @@ export const SessionCard = memo(function SessionCard({
   duplicating = false,
 }: Props) {
   const displayTitle = sessionDisplayTitle(s.title, s.first_user_message);
+  const activityTime = sessionActivitySeconds(s);
+  const timeLabel = s.provider === "codex" ? "最近活动" : "更新";
   const displayFirstUserMessage = sessionDisplayPreview(s.first_user_message);
   const syncAction = syncActionLabel(overlay?.clone_state, currentProvider);
   const syncBlocked = syncing || syncDisabled;
@@ -139,18 +142,26 @@ export const SessionCard = memo(function SessionCard({
         />
 
         <div className="min-w-0 flex-1">
-          {/* 标题 + 更新时间 */}
+          {/* 标题 + 最近活动时间 */}
           <div className="flex min-w-0 items-start gap-3">
             <div className="line-clamp-1 min-w-0 flex-1 wrap-anywhere text-sm font-semibold leading-snug">
               <Hl text={displayTitle} q={query} />
             </div>
             <Tooltip>
               <TooltipTrigger asChild>
-                <span className="shrink-0 cursor-default whitespace-nowrap text-[11.5px] tabular-nums text-muted-foreground">
-                  {relativeTime(s.updated_at)}
+                <span
+                  className="shrink-0 cursor-default whitespace-nowrap text-[11.5px] tabular-nums text-muted-foreground"
+                  aria-label={`${timeLabel} ${absoluteTime(activityTime)}`}
+                >
+                  {relativeTime(activityTime)}
                 </span>
               </TooltipTrigger>
-              <TooltipContent align="end">更新 {absoluteTime(s.updated_at)}</TooltipContent>
+              <TooltipContent align="end">
+                <div>{timeLabel} {absoluteTime(activityTime)}</div>
+                {s.provider === "codex" && Math.floor(activityTime) !== s.updated_at && (
+                  <div>记录更新 {absoluteTime(s.updated_at)}</div>
+                )}
+              </TooltipContent>
             </Tooltip>
           </div>
 

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { JSDOM } from "jsdom";
 import type { FamilyOverlay, SessionSummary } from "../lib/api";
+import { absoluteTime, relativeTime } from "../lib/format";
 
 const dom = new JSDOM("<div id='root'></div>", { url: "http://localhost", pretendToBeVisual: true });
 Object.assign(globalThis, {
@@ -63,5 +64,22 @@ test("ordinary sessions and subagents are not labelled as Forks", async () => {
       assert.ok(!document.querySelector('button[aria-label^="查看源会话"]'));
       assert.ok(!document.body.textContent?.includes("已派生"));
     }
+  } finally { await act(async () => root.unmount()); }
+});
+
+test("Codex cards display native activity even when the record was updated today", async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const activity = now - 2 * 86400;
+  const root = createRoot(document.getElementById("root")!);
+  try {
+    await act(async () => root.render(<TooltipProvider><SessionCard
+      s={{ ...session, updated_at: now, activity_at_ms: activity * 1000 }}
+      selected={false} onToggleSelect={() => {}} onPreview={() => {}}
+      onCopyResume={() => {}} onRevealCwd={() => {}} overlay={overlay}
+    /></TooltipProvider>));
+    const time = document.querySelector(`[aria-label="最近活动 ${absoluteTime(activity)}"]`);
+    assert.ok(time);
+    assert.equal(time.textContent, relativeTime(activity));
+    assert.notEqual(time.textContent, relativeTime(now));
   } finally { await act(async () => root.unmount()); }
 });

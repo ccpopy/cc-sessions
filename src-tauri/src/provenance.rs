@@ -184,6 +184,7 @@ mod tests {
             tokens_used: 0,
             created_at: 0,
             updated_at: 0,
+            activity_at_ms: None,
             archived: false,
             git_branch: None,
             rollout_bytes: 0,

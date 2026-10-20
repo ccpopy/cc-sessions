@@ -1566,7 +1566,7 @@ fn load_sessions(ctx: &CliContext, provider: String) -> CliResult<Vec<SessionSum
                     ctx.dirs(),
                 )?);
             }
-            list.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
+            list.sort_by(SessionSummary::compare_activity_desc);
             Ok(list)
         }
         other => Err(CliError::message(format!("不支持的 provider: {other}"))),
@@ -1583,14 +1583,14 @@ fn retain_session_scope(list: &mut Vec<SessionSummary>, scope: SessionScope) {
 fn sort_sessions(list: &mut [SessionSummary], sort: SessionSort) {
     match sort {
         SessionSort::Time => {
-            list.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
+            list.sort_by(SessionSummary::compare_activity_desc);
         }
         SessionSort::Size => {
             list.sort_by(|a, b| {
                 a.tokens_used
                     .cmp(&b.tokens_used)
                     .then_with(|| a.rollout_bytes.cmp(&b.rollout_bytes))
-                    .then_with(|| b.updated_at.cmp(&a.updated_at))
+                    .then_with(|| a.compare_activity_desc(b))
                     .then_with(|| a.id.cmp(&b.id))
             });
         }
@@ -1608,14 +1608,18 @@ fn group_projects(list: Vec<SessionSummary>, include_archived: bool) -> Vec<Proj
             cwd_display: session.cwd_display.clone(),
             sessions: Vec::new(),
             latest_updated_at: 0,
+            latest_activity_at_ms: 0,
             total_tokens: 0,
         });
         entry.latest_updated_at = entry.latest_updated_at.max(session.updated_at);
+        entry.latest_activity_at_ms = entry
+            .latest_activity_at_ms
+            .max(session.last_activity_at_ms());
         entry.total_tokens += session.tokens_used;
         entry.sessions.push(session);
     }
     let mut out: Vec<ProjectGroup> = groups.into_values().collect();
-    out.sort_by_key(|group| std::cmp::Reverse(group.latest_updated_at));
+    out.sort_by_key(|group| std::cmp::Reverse(group.latest_activity_at_ms));
     out
 }
 
@@ -1734,11 +1738,11 @@ fn conversion_path_arg(args: &mut Vec<String>) -> CliResult<String> {
 }
 
 fn print_sessions(sessions: &Vec<SessionSummary>) {
-    println!("updated_at\tprovider\tarchived\ttokens\tbytes\tid\tcwd\ttitle");
+    println!("activity_at\tprovider\tarchived\ttokens\tbytes\tid\tcwd\ttitle");
     for session in sessions {
         println!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            session.updated_at,
+            session.last_activity_at_ms() / 1000,
             session.provider,
             session.archived,
             session.tokens_used,
@@ -1751,13 +1755,13 @@ fn print_sessions(sessions: &Vec<SessionSummary>) {
 }
 
 fn print_project_groups(groups: &Vec<ProjectGroup>) {
-    println!("sessions\ttokens\tupdated_at\tcwd");
+    println!("sessions\ttokens\tactivity_at\tcwd");
     for group in groups {
         println!(
             "{}\t{}\t{}\t{}",
             group.sessions.len(),
             group.total_tokens,
-            group.latest_updated_at,
+            group.latest_activity_at_ms / 1000,
             group.cwd
         );
     }

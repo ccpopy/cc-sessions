@@ -1,5 +1,6 @@
 import type { ArchiveOrigin, FamilyOverlay, SessionSummary } from "./api";
 import { isSubagentSession } from "./sessionSource.ts";
+import { compareSessionActivityDesc, sessionActivityMs } from "./sessionActivity.ts";
 
 /**
  * 把 ledger 的归档来源合并进 overlay，统一"徽标显示"与"来源筛选"两个数据源。
@@ -149,8 +150,10 @@ function isNewerFamilyCandidate(
   candidate: FamilyCandidate,
   current: FamilyCandidate,
 ): boolean {
-  if (candidate.session.updated_at !== current.session.updated_at) {
-    return candidate.session.updated_at > current.session.updated_at;
+  const candidateActivity = sessionActivityMs(candidate.session);
+  const currentActivity = sessionActivityMs(current.session);
+  if (candidateActivity !== currentActivity) {
+    return candidateActivity > currentActivity;
   }
   if (candidate.overlay.is_active_branch !== current.overlay.is_active_branch) {
     return candidate.overlay.is_active_branch;
@@ -159,14 +162,6 @@ function isNewerFamilyCandidate(
     return candidate.session.created_at > current.session.created_at;
   }
   return candidate.session.id.localeCompare(current.session.id) < 0;
-}
-
-function compareSessionActivityDesc(left: SessionSummary, right: SessionSummary): number {
-  const updatedDelta = right.updated_at - left.updated_at;
-  if (updatedDelta !== 0) return updatedDelta;
-  const createdDelta = right.created_at - left.created_at;
-  if (createdDelta !== 0) return createdDelta;
-  return left.id.localeCompare(right.id);
 }
 
 /** 导出选择器的会话范围：正常会话 / 子代理会话 / 归档会话 / 不过滤。 */
@@ -243,7 +238,7 @@ const ARCHIVED_GROUP_LABELS: Record<ArchivedOriginGroupKey, string> = {
  *
  * 分组天然跨 provider：各 provider 的归档分支按 origin 混入同一组，
  * 这正是 ledger 的价值——origin 是跨 provider 统一维度。组内保持传入顺序
- * （调用方已按 updated_at 排序）。
+ * （调用方已按最近活动时间排序）。
  */
 export function groupArchivedByOrigin(
   sessions: readonly SessionSummary[],

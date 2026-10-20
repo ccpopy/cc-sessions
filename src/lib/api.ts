@@ -171,6 +171,7 @@ export type SessionSummary = {
   tokens_used: number;
   created_at: number;
   updated_at: number;
+  activity_at_ms?: number | null;
   archived: boolean;
   git_branch: string | null;
   rollout_bytes: number;
@@ -214,6 +215,7 @@ export type ProjectGroup = {
   cwd_display: string;
   sessions: SessionSummary[];
   latest_updated_at: number;
+  latest_activity_at_ms?: number;
   total_tokens: number;
 };
 

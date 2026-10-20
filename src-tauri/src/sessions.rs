@@ -142,6 +142,24 @@ fn select_codex_title(
     index_title.map(String::from).unwrap_or(database_title)
 }
 
+fn codex_activity_time_sql(columns: &[String]) -> String {
+    let mut sources = Vec::new();
+    for (column, multiplier) in [
+        ("recency_at_ms", 1),
+        ("recency_at", 1000),
+        ("updated_at_ms", 1),
+    ] {
+        if columns.iter().any(|name| name == column) {
+            sources.push(format!(
+                "CASE WHEN {column} > 0 THEN {column} * {multiplier} END"
+            ));
+        }
+    }
+    sources.push("updated_at * 1000".into());
+    sources.push("0".into());
+    format!("COALESCE({})", sources.join(", "))
+}
+
 fn query_summaries(
     codex_dir: &Path,
     where_clause: &str,
@@ -156,18 +174,18 @@ fn query_summaries(
         .flatten();
     let index_titles = read_session_index_titles(codex_dir, cancel)?;
     ensure_not_cancelled(cancel)?;
-    let has_name = crate::repair::threads_table_columns(&state)?
-        .iter()
-        .any(|column| column == "name");
+    let columns = crate::repair::threads_table_columns(&state)?;
+    let has_name = columns.iter().any(|column| column == "name");
     let name_column = if has_name { "COALESCE(name,'')" } else { "''" };
+    let activity_column = codex_activity_time_sql(&columns);
 
     let sql = format!(
         "SELECT id, rollout_path, cwd, COALESCE(title,''), {name_column}, COALESCE(first_user_message,''), model, reasoning_effort,
                 COALESCE(tokens_used,0), created_at, updated_at, COALESCE(archived,0),
-                git_branch, source, agent_nickname, agent_role
+                git_branch, source, agent_nickname, agent_role, {activity_column} AS activity_at_ms
          FROM threads
          {where_clause}
-         ORDER BY updated_at DESC"
+         ORDER BY activity_at_ms DESC, id DESC"
     );
     let mut stmt = state.prepare(&sql)?;
     let mut rows = stmt.query(params)?;
@@ -190,6 +208,7 @@ fn query_summaries(
         let source: Option<String> = row.get(13)?;
         let agent_nickname: Option<String> = row.get(14)?;
         let agent_role: Option<String> = row.get(15)?;
+        let activity_at_ms: i64 = row.get(16)?;
 
         let recorded = paths::host_path_from_codex_record(codex_dir, &rollout_path_raw);
         let rollout_path = crate::rollout_io::resolve(&recorded)
@@ -225,6 +244,7 @@ fn query_summaries(
             tokens_used,
             created_at,
             updated_at,
+            activity_at_ms: Some(activity_at_ms),
             archived: archived != 0,
             git_branch,
             rollout_bytes,
@@ -364,8 +384,8 @@ fn list_sessions_impl(
             let extra = supplement_archived_summaries(&codex, &list, cancel)?;
             if !extra.is_empty() {
                 list.extend(extra);
-                list.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
             }
+            list.sort_by(SessionSummary::compare_activity_desc);
             ensure_not_cancelled(cancel)?;
             provenance::annotate_sessions(&codex, &mut list);
             Ok(list)
@@ -458,6 +478,7 @@ fn supplement_archived_summaries(
             tokens_used: brief.tokens_used,
             created_at: brief.created_at_ms / 1000,
             updated_at: brief.updated_at_ms / 1000,
+            activity_at_ms: (brief.updated_at_ms > 0).then_some(brief.updated_at_ms),
             archived: true,
             git_branch: None,
             rollout_bytes: fs::metadata(&p)?.len(),
@@ -499,14 +520,16 @@ pub fn group_sessions_by_project_with_dirs(
             cwd_display: disp,
             sessions: Vec::new(),
             latest_updated_at: 0,
+            latest_activity_at_ms: 0,
             total_tokens: 0,
         });
         g.latest_updated_at = g.latest_updated_at.max(updated);
+        g.latest_activity_at_ms = g.latest_activity_at_ms.max(s.last_activity_at_ms());
         g.total_tokens += tokens;
         g.sessions.push(s);
     }
     let mut out: Vec<ProjectGroup> = groups.into_values().collect();
-    out.sort_by_key(|g| std::cmp::Reverse(g.latest_updated_at));
+    out.sort_by_key(|g| std::cmp::Reverse(g.latest_activity_at_ms));
     Ok(out)
 }
 
@@ -1322,7 +1345,7 @@ fn set_archived_codex_locked(codex_dir: String, id: String, v: bool) -> AppResul
 struct UsableFamilyBranch {
     id: String,
     provider: String,
-    updated_at: i64,
+    activity_at_ms: i64,
     created_at: i64,
 }
 
@@ -1375,16 +1398,20 @@ fn load_usable_family_branches(
     let sessions_root = PathBuf::from(paths::strip_verbatim(
         &paths::sessions_dir(codex_dir).to_string_lossy(),
     ));
+    let columns = crate::repair::threads_table_columns(state)?;
+    let activity_column = codex_activity_time_sql(&columns);
+    let sql = format!(
+        "SELECT rollout_path, COALESCE(archived,0), {activity_column}, COALESCE(created_at,0)
+         FROM threads WHERE id = ?1"
+    );
     let mut usable = Vec::new();
     for (branch_id, provider) in branches {
         let row: Option<(Option<String>, i64, i64, i64)> = state
-            .query_row(
-                "SELECT rollout_path, COALESCE(archived,0), COALESCE(updated_at,0), COALESCE(created_at,0) FROM threads WHERE id = ?1",
-                [&branch_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
+            .query_row(&sql, [&branch_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
             .optional()?;
-        let Some((Some(raw_path), archived, updated_at, created_at)) = row else {
+        let Some((Some(raw_path), archived, activity_at_ms, created_at)) = row else {
             continue;
         };
         if archived != 0 {
@@ -1399,7 +1426,7 @@ fn load_usable_family_branches(
         usable.push(UsableFamilyBranch {
             id: branch_id.clone(),
             provider: provider.clone(),
-            updated_at,
+            activity_at_ms,
             created_at,
         });
     }
@@ -1431,8 +1458,8 @@ fn select_usable_family_representative<'a>(
             }
         })
         .max_by(|left, right| {
-            left.updated_at
-                .cmp(&right.updated_at)
+            left.activity_at_ms
+                .cmp(&right.activity_at_ms)
                 .then_with(|| (left.id == active_id).cmp(&(right.id == active_id)))
                 .then_with(|| left.created_at.cmp(&right.created_at))
                 // 与前端列表一致：其余字段相同时，较小的 id 优先。
@@ -2444,6 +2471,229 @@ mod tests {
             [],
         )?;
         Ok(conn)
+    }
+
+    fn insert_activity_fixture(
+        state: &rusqlite::Connection,
+        codex: &Path,
+        id: &str,
+        updated_at: i64,
+    ) -> AppResult<()> {
+        let path = codex.join("sessions").join(format!("rollout-{id}.jsonl"));
+        fs::write(
+            &path,
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "session_meta", "payload": {"id": id, "cwd": "/fixture", "source": "cli"}
+                })
+            ),
+        )?;
+        state.execute(
+            "INSERT INTO threads (id, rollout_path, cwd, title, first_user_message,
+                tokens_used, created_at, updated_at, archived, source)
+             VALUES (?1, ?2, ?3, ?1, 'fixture', 1, 1000, ?4, 0, 'cli')",
+            params![
+                id,
+                path.to_string_lossy(),
+                codex.join(id).to_string_lossy(),
+                updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn codex_activity_survives_metadata_updates_and_orders_projects() -> AppResult<()> {
+        let codex = temp_dir("activity-metadata");
+        let state = create_codex_threads_table(&codex)?;
+        for column in ["updated_at_ms", "recency_at", "recency_at_ms"] {
+            state.execute(
+                &format!("ALTER TABLE threads ADD COLUMN {column} INTEGER"),
+                [],
+            )?;
+        }
+        insert_activity_fixture(&state, &codex, "older", 1000)?;
+        insert_activity_fixture(&state, &codex, "active", 2000)?;
+        state.execute(
+            "UPDATE threads SET updated_at_ms=updated_at*1000,
+            recency_at=updated_at, recency_at_ms=updated_at*1000+123",
+            [],
+        )?;
+        let initial = list_sessions(None, codex.to_string_lossy().into_owned(), None)?;
+        assert_eq!(
+            initial.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["active", "older"]
+        );
+
+        // The local database report shows this change after opening an older thread.
+        state.execute(
+            "UPDATE threads SET updated_at=3000, updated_at_ms=3000456 WHERE id='older'",
+            [],
+        )?;
+        let list = list_sessions(None, codex.to_string_lossy().into_owned(), None)?;
+        assert_eq!(
+            list.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["active", "older"]
+        );
+        assert_eq!(list[1].updated_at, 3000);
+        assert_eq!(list[1].activity_at_ms, Some(1_000_123));
+        let branches = [
+            ("older".into(), "openai".into()),
+            ("active".into(), "openai".into()),
+        ];
+        let usable = load_usable_family_branches(&codex, &state, &branches)?;
+        assert_eq!(
+            select_usable_family_representative(&usable, Some("openai"), "missing")
+                .expect("available branches")
+                .id,
+            "active"
+        );
+        let groups = group_sessions_by_project(None, codex.to_string_lossy().into_owned(), None)?;
+        assert_eq!(groups[0].sessions[0].id, "active");
+        assert_eq!(groups[1].latest_updated_at, 3000);
+        assert_eq!(groups[1].latest_activity_at_ms, 1_000_123);
+        let persisted: (i64, i64, i64, i64) = state.query_row(
+            "SELECT updated_at, updated_at_ms, recency_at, recency_at_ms FROM threads WHERE id='older'",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        assert_eq!(persisted, (3000, 3_000_456, 1000, 1_000_123));
+        state.execute(
+            "UPDATE threads SET recency_at_ms=4000789 WHERE id='older'",
+            [],
+        )?;
+        assert_eq!(
+            list_sessions(None, codex.to_string_lossy().into_owned(), None)?[0].id,
+            "older"
+        );
+        drop(state);
+        fs::remove_dir_all(codex)?;
+        Ok(())
+    }
+
+    #[test]
+    fn codex_activity_supports_legacy_partial_and_unset_clock_columns() -> AppResult<()> {
+        let cases = [
+            (vec![], 50_000),
+            (vec![("updated_at_ms", Some(50_123))], 50_123),
+            (vec![("recency_at", Some(7))], 7_000),
+            (vec![("recency_at_ms", Some(7_123))], 7_123),
+            (
+                vec![
+                    ("recency_at_ms", None),
+                    ("recency_at", Some(0)),
+                    ("updated_at_ms", Some(50_123)),
+                ],
+                50_123,
+            ),
+            (
+                vec![
+                    ("recency_at_ms", Some(0)),
+                    ("recency_at", Some(7)),
+                    ("updated_at_ms", Some(50_123)),
+                ],
+                7_000,
+            ),
+            (
+                vec![
+                    ("recency_at_ms", Some(7_123)),
+                    ("recency_at", Some(7)),
+                    ("updated_at_ms", Some(50_123)),
+                ],
+                7_123,
+            ),
+            (
+                vec![
+                    ("recency_at_ms", Some(-1)),
+                    ("recency_at", None),
+                    ("updated_at_ms", Some(0)),
+                ],
+                50_000,
+            ),
+        ];
+        for (columns, expected) in cases {
+            let codex = temp_dir("activity-schema");
+            let state = create_codex_threads_table(&codex)?;
+            insert_activity_fixture(&state, &codex, "fixture", 50)?;
+            for (column, value) in columns {
+                state.execute(
+                    &format!("ALTER TABLE threads ADD COLUMN {column} INTEGER"),
+                    [],
+                )?;
+                state.execute(&format!("UPDATE threads SET {column}=?1"), [value])?;
+            }
+            let schema = crate::repair::threads_table_columns(&state)?;
+            let list = query_summaries(&codex, "", &[], None)?;
+            assert_eq!(list[0].activity_at_ms, Some(expected));
+            assert_eq!(list[0].updated_at, 50);
+            assert_eq!(crate::repair::threads_table_columns(&state)?, schema);
+            drop(state);
+            fs::remove_dir_all(codex)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn codex_activity_keeps_milliseconds_and_native_id_ties() -> AppResult<()> {
+        let codex = temp_dir("activity-milliseconds");
+        let state = create_codex_threads_table(&codex)?;
+        state.execute("ALTER TABLE threads ADD COLUMN recency_at_ms INTEGER", [])?;
+        for (id, activity) in [("a-newest", 7_002), ("b-tie", 7_001), ("z-tie", 7_001)] {
+            insert_activity_fixture(&state, &codex, id, 50)?;
+            state.execute(
+                "UPDATE threads SET recency_at_ms=?1 WHERE id=?2",
+                params![activity, id],
+            )?;
+        }
+        let list = list_sessions(None, codex.to_string_lossy().into_owned(), None)?;
+        assert_eq!(
+            list.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["a-newest", "z-tie", "b-tie"]
+        );
+        assert_eq!(list[0].activity_at_ms, Some(7_002));
+        let mut other_provider = list[1].clone();
+        other_provider.provider = "claude".into();
+        other_provider.id = "other".into();
+        let mut mixed = vec![list[2].clone(), list[1].clone(), other_provider];
+        mixed.sort_by(SessionSummary::compare_activity_desc);
+        assert_eq!(
+            mixed.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["other", "z-tie", "b-tie"]
+        );
+        drop(state);
+        fs::remove_dir_all(codex)?;
+        Ok(())
+    }
+
+    #[test]
+    fn compressed_archive_supplement_keeps_activity_order_and_precision() -> AppResult<()> {
+        let codex = temp_dir("activity-compressed-archive");
+        let state = create_codex_threads_table(&codex)?;
+        state.execute("ALTER TABLE threads ADD COLUMN recency_at_ms INTEGER", [])?;
+        insert_activity_fixture(&state, &codex, "metadata-touched", 9000)?;
+        state.execute("UPDATE threads SET recency_at_ms=1000123", [])?;
+        let archive = codex.join("archived_sessions");
+        fs::create_dir_all(&archive)?;
+        let id = "01900000-0000-7000-8000-000000000054";
+        let packed = archive.join(format!("rollout-1970-01-01T00-33-20-{id}.jsonl.zst"));
+        let bytes = format!(
+            "{}\n",
+            serde_json::json!({
+                "timestamp": "1970-01-01T00:33:20.456Z", "type": "session_meta",
+                "payload": {"id": id, "cwd": "/fixture", "source": "cli"}
+            })
+        );
+        fs::write(&packed, zstd::stream::encode_all(bytes.as_bytes(), 3)?)?;
+        let original = fs::read(&packed)?;
+        let list = list_sessions(None, codex.to_string_lossy().into_owned(), None)?;
+        assert_eq!(list[0].id, id);
+        assert!(list[0].archived);
+        assert_eq!(list[0].activity_at_ms, Some(2_000_456));
+        assert_eq!(list[1].id, "metadata-touched");
+        assert_eq!(fs::read(&packed)?, original);
+        assert!(!packed.with_extension("").exists());
+        drop(state);
+        fs::remove_dir_all(codex)?;
+        Ok(())
     }
 
     fn write_codex_project_state_fixture(codex: &Path, ids: &[&str]) -> AppResult<()> {

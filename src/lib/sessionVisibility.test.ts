@@ -55,6 +55,38 @@ function familyOverlay(
   };
 }
 
+test("family fallback follows activity instead of a metadata-only update", () => {
+  const older = { ...session("opened-old", 3000), activity_at_ms: 1_000_123 };
+  const recent = { ...session("recent", 2000), activity_at_ms: 2_000_456 };
+  const overlay = new Map<string, FamilyOverlay>([
+    [older.id, familyOverlay(older.id, "family-1", "openai", false)],
+    [recent.id, familyOverlay(recent.id, "family-1", "openai", false)],
+  ]);
+
+  assert.deepEqual(
+    selectNormalFamilySessions([older, recent], overlay, "openai").map((item) => item.id),
+    ["recent"],
+  );
+  overlay.get(older.id)!.is_active_branch = true;
+  assert.deepEqual(
+    selectNormalFamilySessions([older, recent], overlay, "openai").map((item) => item.id),
+    ["opened-old"],
+  );
+});
+
+test("normal and archived views both order metadata-touched threads by activity", () => {
+  for (const archived of [false, true]) {
+    const older = { ...session("opened-old", 3000), archived, activity_at_ms: 1_000_123 };
+    const recent = { ...session("recent", 2000), archived, activity_at_ms: 2_000_456 };
+    assert.deepEqual(
+      selectSessionsForView([older, recent], new Map(), null, {
+        provider: "codex", showSubagentSessions: false, showArchivedSessions: archived,
+      }).map((item) => item.id),
+      ["recent", "opened-old"],
+    );
+  }
+});
+
 test("changing provider keeps the selected thread instead of choosing its older provider copy", () => {
   const staleActive = session("custom-active", 100);
   const currentBranch = session("openai-current", 500);
