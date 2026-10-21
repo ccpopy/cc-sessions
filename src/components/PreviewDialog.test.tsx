@@ -12,12 +12,21 @@ register(`data:text/javascript,${encodeURIComponent(`
 
 const dom = new JSDOM("<div id='root'></div>", { url: "http://localhost", pretendToBeVisual: true });
 class ResizeObserver {
-  constructor(private callback: (entries: unknown[]) => void) {}
+  private static observers = new Set<ResizeObserver>();
+  private targets = new Set<HTMLElement>();
+  constructor(private callback: (entries: unknown[]) => void) { ResizeObserver.observers.add(this); }
   observe(target: HTMLElement) {
-    queueMicrotask(() => this.callback([{ target, borderBoxSize: [{ blockSize: target.offsetHeight, inlineSize: 800 }] }]));
+    this.targets.add(target);
+    queueMicrotask(() => this.notify(target));
   }
-  unobserve() {}
-  disconnect() {}
+  unobserve(target: HTMLElement) { this.targets.delete(target); }
+  disconnect() { this.targets.clear(); ResizeObserver.observers.delete(this); }
+  private notify(target: HTMLElement) {
+    if (this.targets.has(target)) this.callback([{ target, borderBoxSize: [{ blockSize: target.offsetHeight, inlineSize: 800 }] }]);
+  }
+  static resize(target: HTMLElement) {
+    for (const observer of this.observers) observer.notify(target);
+  }
 }
 Object.assign(globalThis, {
   window: dom.window, document: dom.window.document, HTMLElement: dom.window.HTMLElement,
@@ -50,6 +59,93 @@ const { act } = React;
 const { createRoot } = await import("react-dom/client");
 const { api } = await import("../lib/api");
 const { PreviewDialog } = await import("./PreviewDialog");
+
+test("preview keeps filling a short viewport after virtual rows are measured", async (t) => {
+  const offsets: number[] = [];
+  const events: PreviewEvent[] = Array.from({ length: 800 }, (_, index) => {
+    const visible = index < 4 || index === 200 || (index >= 400 && index < 410);
+    const role = visible ? "user" : "tool";
+    return { index, role, timestamp: "", kind: role, text_summary: `autofill fixture ${index}`,
+      raw: { type: role, uuid: `autofill-${index}`, message: { role, content: `autofill fixture ${index}` } } };
+  });
+  t.mock.method(api, "previewPage", async (...[, , offset, limit]: Parameters<typeof api.previewPage>) => {
+    offsets.push(offset);
+    return { events: events.slice(offset, offset + limit), capability: null };
+  });
+  t.mock.method(api, "previewUserPrompts", async () => ({ total_events: events.length,
+    prompts: events.filter(event => event.role === "user").map(event => ({
+      index: event.index, offset: event.index, timestamp: "", text: event.text_summary,
+      response: { text: "reply", timestamp: "" },
+    })) }));
+  const root = createRoot(document.getElementById("root")!);
+  try {
+    await act(async () => root.render(<PreviewDialog open onOpenChange={() => {}}
+      session={null} customRolloutPath="synthetic-autofill" />));
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 120)); });
+    assert.deepEqual(offsets, [0, 200, 400], "short pages should fill the viewport without clicking or scrolling, then stop when it overflows");
+  } finally {
+    await act(async () => root.unmount());
+  }
+});
+
+test("growing the preview viewport resumes paging without scrolling", async (t) => {
+  const offsets: number[] = [];
+  const events: PreviewEvent[] = Array.from({ length: 600 }, (_, index) => {
+    const role = index < 10 || (index >= 200 && index < 206) ? "user" : "tool";
+    return { index, role, timestamp: "", kind: role, text_summary: `resize fixture ${index}`,
+      raw: { type: role, uuid: `resize-${index}`, message: { role, content: `resize fixture ${index}` } } };
+  });
+  t.mock.method(api, "previewPage", async (...[, , offset, limit]: Parameters<typeof api.previewPage>) => {
+    offsets.push(offset);
+    return { events: events.slice(offset, offset + limit), capability: null };
+  });
+  t.mock.method(api, "previewUserPrompts", async () => ({ total_events: events.length,
+    prompts: events.filter(event => event.role === "user").map(event => ({
+      index: event.index, offset: event.index, timestamp: "", text: event.text_summary,
+      response: { text: "reply", timestamp: "" },
+    })) }));
+  const root = createRoot(document.getElementById("root")!);
+  try {
+    await act(async () => root.render(<PreviewDialog open onOpenChange={() => {}}
+      session={null} customRolloutPath="synthetic-resize" />));
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 80)); });
+    assert.deepEqual(offsets, [0], "initial content already fills the smaller viewport");
+    const viewport = document.querySelector<HTMLElement>("[data-radix-scroll-area-viewport]")!;
+    Object.defineProperties(viewport, {
+      clientHeight: { configurable: true, get: () => 1400 },
+      offsetHeight: { configurable: true, get: () => 1400 },
+    });
+    await act(async () => ResizeObserver.resize(viewport));
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 80)); });
+    assert.deepEqual(offsets, [0, 200], "resizing should fill the newly available space and stop at the next boundary");
+  } finally {
+    await act(async () => root.unmount());
+  }
+});
+
+test("automatic preview paging stops after a read error", async (t) => {
+  const offsets: number[] = [];
+  const events: PreviewEvent[] = Array.from({ length: 200 }, (_, index) => ({
+    index, role: "tool", timestamp: "", kind: "tool", text_summary: "hidden fixture",
+    raw: { type: "tool", uuid: `read-error-${index}` },
+  }));
+  t.mock.method(api, "previewPage", async (...[, , offset]: Parameters<typeof api.previewPage>) => {
+    offsets.push(offset);
+    if (offset > 0) throw new Error("fixture read error");
+    return { events, capability: null };
+  });
+  t.mock.method(api, "previewUserPrompts", async () => ({ total_events: 600, prompts: [] }));
+  const root = createRoot(document.getElementById("root")!);
+  try {
+    await act(async () => root.render(<PreviewDialog open onOpenChange={() => {}}
+      session={null} customRolloutPath="synthetic-read-error" />));
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 120)); });
+    assert.deepEqual(offsets, [0, 200]);
+    assert.match(document.body.textContent ?? "", /fixture read error/);
+  } finally {
+    await act(async () => root.unmount());
+  }
+});
 
 test("loaded long previews and timelines mount only nearby rows without indexing raw JSON until search", async (t) => {
   let serializations = 0;

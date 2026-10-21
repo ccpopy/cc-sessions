@@ -216,6 +216,7 @@ export function PreviewDialog({
   const loadingRef = useRef(false);
   const doneRef = useRef(false);
   const viewportRef = useRef<HTMLDivElement | null>(null);
+  const contentRef = useRef<HTMLDivElement | null>(null);
   const pendingJumpRef = useRef<number | null>(null);
   const completedTimelineJumpRef = useRef<number | null>(null);
   const pendingReadingRef = useRef<{ keys: string[]; anchor: string; offset: number; scrollTop: number } | null>(null);
@@ -583,11 +584,32 @@ export function PreviewDialog({
   useEffect(() => {
     if (!open || loading || done || readError || normalizedFilter) return;
     const viewport = viewportRef.current;
-    if (!viewport) return;
-    // 收起过程、切换消息模式或应用延迟搜索后，继续补页直到结果填满视口。
-    if (viewport.scrollHeight <= viewport.clientHeight + 20) {
-      void loadMore();
-    }
+    const content = contentRef.current;
+    if (!viewport || !content) return;
+    let disposed = false;
+    let frame = 0;
+    const checkAfterLayout = () => {
+      if (disposed || frame) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        if (disposed || viewport.clientHeight <= 0) return;
+        // Use the same boundary as scrolling, after virtual rows have been measured.
+        if (viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 200) {
+          void loadMore();
+        }
+      });
+    };
+    // Measurement, collapsed messages and window resizing can change the boundary
+    // without a scroll event or a change in the number of loaded messages.
+    const observer = new ResizeObserver(checkAfterLayout);
+    observer.observe(viewport);
+    observer.observe(content);
+    checkAfterLayout();
+    return () => {
+      disposed = true;
+      observer.disconnect();
+      if (frame) cancelAnimationFrame(frame);
+    };
   }, [
     done,
     readError,
@@ -1474,7 +1496,7 @@ export function PreviewDialog({
             onWheelCapture={() => { completedTimelineJumpRef.current = null; }}
             onPointerDownCapture={() => { completedTimelineJumpRef.current = null; }}
           >
-            <div className="mx-auto w-full max-w-3xl min-w-0 space-y-4 overflow-x-hidden px-6 py-6">
+            <div ref={contentRef} className="mx-auto w-full max-w-3xl min-w-0 space-y-4 overflow-x-hidden px-6 py-6">
               {!onlyMsg && relatedSubagents.length > 0 && (
                 <SubagentOverview key={session?.id} items={relatedSubagents} />
               )}
