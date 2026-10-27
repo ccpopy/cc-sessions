@@ -126,6 +126,23 @@ jobs:
           releaseDraft: true
           prerelease: false
 
+      - name: Package and verify macOS GUI ZIP
+        if: matrix.label == 'macos-arm64' || matrix.label == 'macos-intel'
+        run: node scripts/package-macos-gui-zip.mjs --platform ${{ matrix.label }}
+
+      - name: Upload macOS GUI ZIP
+        if: matrix.label == 'macos-arm64' || matrix.label == 'macos-intel'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = node -p "require('./package.json').version"
+          $arch = if ('${{ matrix.label }}' -eq 'macos-arm64') { 'aarch64' } else { 'x64' }
+          $asset = "release/CC.Sessions_${version}_${arch}.app.zip"
+          if (!(Test-Path $asset)) { throw "macOS GUI ZIP was not found: $asset" }
+          if ((Get-Item $asset).Length -le 0) { throw "macOS GUI ZIP is empty: $asset" }
+          gh release upload "${{ github.ref_name }}" $asset
+
       - name: Create CLI package
         shell: pwsh
         run: node scripts/package-release.mjs --target cli --build-product

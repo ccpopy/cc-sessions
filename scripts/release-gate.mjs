@@ -23,6 +23,8 @@ export function validateRelease({ needs, sha, tagSha, version, proofs, assets, d
     `CC.Sessions_${version}_x64-setup.exe`,
     `CC.Sessions_${version}_amd64.AppImage`,
     `CC.Sessions_${version}_aarch64.dmg`, `CC.Sessions_${version}_x64.dmg`,
+    `CC.Sessions_aarch64.app.tar.gz`, `CC.Sessions_x64.app.tar.gz`,
+    `CC.Sessions_${version}_aarch64.app.zip`, `CC.Sessions_${version}_x64.app.zip`,
   ];
   for (const name of expected) {
     if (!assets.some((a) => a.name === name && a.size > 0)) throw new Error(`Missing release asset: ${name}`);
