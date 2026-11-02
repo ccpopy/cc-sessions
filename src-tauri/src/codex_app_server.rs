@@ -1,4 +1,6 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+#[cfg(not(windows))]
+use std::io::Read;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -13,6 +15,8 @@ use serde_json::{json, Value};
 use crate::error::{AppError, AppResult};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(not(windows))]
+const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ForkedThread {
@@ -31,11 +35,24 @@ pub(crate) struct CodexAppServer {
 
 impl CodexAppServer {
     pub(crate) fn start(codex_dir: &Path) -> AppResult<Self> {
-        let executable = resolve_codex_executable();
+        let inherited_path = std::env::var_os("PATH");
+        // Finder starts GUI apps with a narrow PATH. Use the user's login shell for
+        // both locating Codex and running a script-based CLI's interpreter (node).
+        #[cfg(not(windows))]
+        let search_path = merge_search_paths(
+            inherited_path.as_deref(),
+            login_shell_path(LOGIN_SHELL_TIMEOUT).as_deref(),
+        );
+        #[cfg(windows)]
+        let search_path = inherited_path;
+        let executable = resolve_codex_executable(search_path.as_deref());
         let mut command = Command::new(&executable);
         command
             .args(["app-server", "--stdio"])
             .env("CODEX_HOME", codex_dir);
+        if let Some(path) = search_path {
+            command.env("PATH", path);
+        }
         Self::start_command(command)
     }
 
@@ -279,14 +296,14 @@ fn parse_thread_result(result: &Value, method: &str) -> AppResult<ForkedThread> 
     })
 }
 
-fn resolve_codex_executable() -> PathBuf {
+fn resolve_codex_executable(search_path: Option<&OsStr>) -> PathBuf {
     let executable_name = if cfg!(windows) {
         OsString::from("codex.exe")
     } else {
         OsString::from("codex")
     };
-    if let Some(path) = std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
+    if let Some(path) = search_path.and_then(|paths| {
+        std::env::split_paths(paths)
             .map(|directory| directory.join(&executable_name))
             .find(|candidate| candidate.is_file())
     }) {
@@ -297,6 +314,100 @@ fn resolve_codex_executable() -> PathBuf {
         return path;
     }
     PathBuf::from(executable_name)
+}
+
+#[cfg(not(windows))]
+fn merge_search_paths(inherited: Option<&OsStr>, login: Option<&OsStr>) -> Option<OsString> {
+    let Some(login) = login.filter(|path| !path.is_empty()) else {
+        return inherited.map(OsStr::to_os_string);
+    };
+    // Keep an explicitly supplied PATH ahead of the shell's extra directories.
+    let directories = inherited
+        .into_iter()
+        .chain(std::iter::once(login))
+        .flat_map(std::env::split_paths);
+    std::env::join_paths(directories)
+        .ok()
+        .or_else(|| inherited.map(OsStr::to_os_string))
+}
+
+#[cfg(not(windows))]
+fn login_shell_path(timeout: Duration) -> Option<OsString> {
+    let shell = std::env::var_os("SHELL")
+        .filter(|shell| Path::new(shell).is_absolute())
+        .unwrap_or_else(|| {
+            if cfg!(target_os = "macos") {
+                OsString::from("/bin/zsh")
+            } else {
+                OsString::from("/bin/sh")
+            }
+        });
+    login_shell_path_with(&shell, timeout)
+}
+
+#[cfg(not(windows))]
+fn login_shell_path_with(shell: &OsStr, timeout: Duration) -> Option<OsString> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut child = Command::new(shell)
+        .args([
+            "-lic",
+            "/usr/bin/printenv PATH | /usr/bin/sed 's/^/CC_SESSIONS_LOGIN_PATH=/'",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let mut stdout = child.stdout.take()?;
+                // A background process started by shell initialization may keep
+                // stdout open after the shell exits. Read available bytes only.
+                let flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
+                if flags < 0
+                    || unsafe {
+                        libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+                    } < 0
+                {
+                    return None;
+                }
+                let mut output = Vec::new();
+                let mut chunk = [0; 4096];
+                loop {
+                    match stdout.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(size) if output.len() + size <= 65_536 => {
+                            output.extend_from_slice(&chunk[..size]);
+                        }
+                        Ok(_) => return None,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(_) => return None,
+                    }
+                }
+                return output
+                    .split(|byte| *byte == b'\n')
+                    .filter_map(|line| line.strip_prefix(b"CC_SESSIONS_LOGIN_PATH="))
+                    .filter(|path| !path.is_empty())
+                    .last()
+                    .map(|path| OsString::from_vec(path.to_vec()));
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -326,6 +437,63 @@ fn windows_desktop_codex_executable() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(windows))]
+    use std::fs;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn gui_path_finds_codex_and_its_node_interpreter() -> AppResult<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "cc-sessions-codex-path-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let codex_bin = root.join("codex-bin");
+        let node_bin = root.join("node-bin");
+        let narrow_bin = root.join("narrow-bin");
+        for directory in [&codex_bin, &node_bin, &narrow_bin] {
+            fs::create_dir_all(directory)?;
+        }
+        let codex = codex_bin.join("codex");
+        let node = node_bin.join("node");
+        let shell = root.join("login-shell");
+        fs::write(&codex, "#!/usr/bin/env node\n")?;
+        fs::write(&node, "#!/bin/sh\nprintf 'app-server started\\n'\n")?;
+        fs::write(
+            &shell,
+            "#!/bin/sh\nroot=$(cd \"$(dirname \"$0\")\" && pwd)\nprintf 'shell greeting\\nCC_SESSIONS_LOGIN_PATH=%s\\nshell goodbye\\n' \"$root/codex-bin:$root/node-bin\"\n",
+        )?;
+        for executable in [&codex, &node, &shell] {
+            fs::set_permissions(executable, fs::Permissions::from_mode(0o755))?;
+        }
+
+        let login_path = login_shell_path_with(shell.as_os_str(), Duration::from_secs(1))
+            .expect("login shell PATH");
+        assert_eq!(
+            resolve_codex_executable(Some(narrow_bin.as_os_str())),
+            PathBuf::from("codex")
+        );
+        for inherited in [narrow_bin.as_os_str(), codex_bin.as_os_str()] {
+            let search_path =
+                merge_search_paths(Some(inherited), Some(&login_path)).expect("combined PATH");
+            assert_eq!(resolve_codex_executable(Some(&search_path)), codex);
+            let output = Command::new(&codex)
+                .args(["app-server", "--stdio"])
+                .env("PATH", search_path)
+                .output()?;
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"app-server started\n");
+        }
+        assert_eq!(
+            merge_search_paths(Some(narrow_bin.as_os_str()), None),
+            Some(narrow_bin.as_os_str().to_os_string())
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     #[test]
     fn negotiates_experimental_capability_before_fork_and_resume() -> AppResult<()> {
