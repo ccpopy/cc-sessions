@@ -447,7 +447,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!(
-            "cc-sessions-codex-path-{}-{}",
+            "cc sessions codex path {}-{}",
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap()
         ));
@@ -479,6 +479,10 @@ mod tests {
         for inherited in [narrow_bin.as_os_str(), codex_bin.as_os_str()] {
             let search_path =
                 merge_search_paths(Some(inherited), Some(&login_path)).expect("combined PATH");
+            assert_eq!(
+                std::env::split_paths(&search_path).next().as_deref(),
+                Some(Path::new(inherited))
+            );
             assert_eq!(resolve_codex_executable(Some(&search_path)), codex);
             let output = Command::new(&codex)
                 .args(["app-server", "--stdio"])
@@ -491,6 +495,38 @@ mod tests {
             merge_search_paths(Some(narrow_bin.as_os_str()), None),
             Some(narrow_bin.as_os_str().to_os_string())
         );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn login_shell_probe_failure_preserves_inherited_path() -> AppResult<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "cc-sessions-shell-probe-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir_all(&root)?;
+        let shell = root.join("shell");
+        assert!(login_shell_path_with(shell.as_os_str(), Duration::from_millis(50)).is_none());
+        for script in [
+            "#!/bin/sh\nprintf 'shell greeting\\n'\n",
+            "#!/bin/sh\nexit 1\n",
+            "#!/bin/sh\nexec /bin/sleep 2\n",
+        ] {
+            fs::write(&shell, script)?;
+            fs::set_permissions(&shell, fs::Permissions::from_mode(0o755))?;
+            let login = login_shell_path_with(shell.as_os_str(), Duration::from_millis(50));
+            assert!(login.is_none());
+            let inherited = OsStr::new("/usr/bin:/bin");
+            assert_eq!(
+                merge_search_paths(Some(inherited), login.as_deref()),
+                Some(inherited.to_os_string())
+            );
+        }
         fs::remove_dir_all(root)?;
         Ok(())
     }
