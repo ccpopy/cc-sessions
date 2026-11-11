@@ -50,12 +50,12 @@ export function RenameSessionDialog({ open, onOpenChange, session, onSubmit }: P
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>重命名会话</DialogTitle>
-          <DialogDescription>
-            名称写入 Codex 的 threads 数据库，官方 App 与本软件共用；该会话的全部
-            provider 分支会一并改名，切换供应商后名称不再丢失。
+          <DialogDescription className={session?.provider === "codex" ? undefined : "sr-only"}>
+            {session?.provider === "codex" ? "同组分支会一并改名。" : "输入新的会话名称。"}
           </DialogDescription>
         </DialogHeader>
         <Input
+          aria-label="会话名称"
           value={title}
           onChange={(e) => setTitle(e.target.value)}
           onKeyDown={(e) => {

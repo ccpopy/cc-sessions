@@ -1,4 +1,3 @@
-export const SESSION_BUSY_EVENT = "cc-sessions:session-busy";
 const marker = "[SESSION_BUSY]";
 
 /** Reports may carry failures per item instead of rejecting the whole command. Read only error
@@ -23,11 +22,6 @@ export function sessionBusyMessages(value: unknown): string[] {
   }
   visit(value, typeof value === "string");
   return [...messages];
-}
-
-export function notifySessionBusy(value: unknown): void {
-  const messages = sessionBusyMessages(value);
-  if (messages.length) window.dispatchEvent(new CustomEvent(SESSION_BUSY_EVENT, { detail: messages }));
 }
 
 /** Keep the transport marker out of notices while preserving ordinary payload strings. */

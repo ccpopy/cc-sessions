@@ -34,7 +34,6 @@ type Props = {
   sourceLabel: string;
   sessionId: string;
   rolloutPath: string;
-  fork: ActionState<PreviewEvent>;
   edit: ActionState<PreviewEvent> & {
     text: string;
     onTextChange: (text: string) => void;
@@ -53,7 +52,6 @@ export function PreviewMutationDialogs({
   sourceLabel,
   sessionId,
   rolloutPath,
-  fork,
   edit,
   deleteEvent,
   deleteSelection,
@@ -61,42 +59,6 @@ export function PreviewMutationDialogs({
 }: Props) {
   return (
     <>
-      <AlertDialog
-        open={Boolean(fork.target)}
-        onOpenChange={(open) => !open && !fork.running && fork.onClose()}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>{provider === "codex" ? "从此处创建回溯分支" : "复制到此处"}</AlertDialogTitle>
-            <AlertDialogDescription>
-              {provider === "opencode"
-                ? "按消息顺序复制从开头到所选内容所属的整条消息，包含这条消息的全部文字、思考和工具内容块，在同一项目下创建独立副本。原会话保持原样，副本不继承待办、分享、撤销或子会话状态。"
-                : provider === "claude"
-                ? "复制从会话开头到所选消息的主对话记录（包含这条消息），在同一项目下创建独立副本。原会话保持原样，副本不包含文件撤销历史。"
-                : "系统会只复制当前节点之前的有效会话历史，生成一个新的 active 会话分支；原会话会归档到分支历史中，不会被删除。"}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <div className="rounded-md border bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-            <div className="font-mono">{provider === "opencode" ? "内容块" : "line"} {fork.target ? fork.target.index + 1 : ""}</div>
-            {fork.target?.text_summary && (
-              <div className="mt-1 line-clamp-2 text-foreground">{fork.target.text_summary}</div>
-            )}
-          </div>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={fork.running}>取消</AlertDialogCancel>
-            <AlertDialogAction
-              disabled={fork.running}
-              onClick={(event) => {
-                event.preventDefault();
-                fork.onConfirm();
-              }}
-            >
-              {fork.running ? "创建中…" : provider === "codex" ? "创建分支" : "复制到此处"}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-
       <Dialog
         open={Boolean(edit.target)}
         onOpenChange={(open) => !open && !edit.running && edit.onClose()}
@@ -107,7 +69,6 @@ export function PreviewMutationDialogs({
             <DialogDescription className="sr-only">修改当前会话事件中的可编辑文本。</DialogDescription>
           </DialogHeader>
           <div className="space-y-3">
-            <p className="text-xs text-muted-foreground">修改原会话，保存前自动备份，可在编辑历史中撤销。{edit.blocks.length > 1 && "请分别编辑文本块，图片及其他内容保持原位。"}</p>
             {(edit.target?.raw as any)?.payload?.item?.delivery === "async" && <p className="text-xs text-muted-foreground">请保留问题与选项的数量和分隔换行，可修改各项文字。</p>}
             <div className="max-h-[50vh] space-y-3 overflow-auto">
             {edit.target && edit.blocks.length > 0 ? ((edit.target.raw as any).payload.item.content as any[]).map((block, index) => {
@@ -121,10 +82,11 @@ export function PreviewMutationDialogs({
               onChange={(event) => edit.onTextChange(event.target.value)}
               rows={10}
               className="max-h-[50vh] font-mono text-sm"
+              aria-label="消息文本"
               placeholder="消息文本"
             />}
             </div>
-            <details className="text-xs text-muted-foreground"><summary className="cursor-pointer">操作详情</summary><div className="mt-2 break-all">{sourceLabel} · {sessionId}<br />{rolloutPath}<br />line {edit.target ? edit.target.index + 1 : ""}<br />本地保存不代表本次修改已通过原生客户端验证。外部更新后需刷新并重新选择。</div></details>
+            <details className="text-xs text-muted-foreground"><summary className="cursor-pointer">操作详情</summary><div className="mt-2 break-all">{sourceLabel} · {sessionId}<br />{rolloutPath}<br />line {edit.target ? edit.target.index + 1 : ""}</div></details>
           </div>
           <div className="flex justify-end gap-2">
             <Button variant="outline" disabled={edit.running} onClick={edit.onClose}>取消</Button>
@@ -192,7 +154,7 @@ function DeletePlanDialog({
         <AlertDialogHeader>
           <AlertDialogTitle>{title}</AlertDialogTitle>
           <AlertDialogDescription>
-            {deleteDescription(provider, selectedRange)}
+            {deleteDescription(provider)}
           </AlertDialogDescription>
         </AlertDialogHeader>
         {plan && plan.blocked.length === 0 && (
@@ -217,8 +179,8 @@ function DeletePlanDialog({
             {messages.map((m) => <div key={m.target?.item_id ?? m.line_no} className="text-xs"><span className="text-muted-foreground">{m.role === "user" ? "你" : m.role === "assistant" ? "助手" : "工具 / 过程"}{m.target && ` · 回合 ${[...turns].indexOf(m.target.turn_id) + 1}`}</span><div className="mt-1 whitespace-pre-wrap break-words">{m.summary || "（无文本）"}</div></div>)}
           </div></ScrollArea>
         )}
-        {plan && <details className="min-w-0 text-xs text-muted-foreground"><summary className="cursor-pointer">底层记录与验证详情</summary>
-          <div className="my-2 whitespace-pre-wrap break-all">{identity}<br />涉及 {plan.lines.length} 条底层记录；本地保存不代表本次操作已完成原生验证。</div>
+        {plan && <details className="min-w-0 text-xs text-muted-foreground"><summary className="cursor-pointer">底层记录</summary>
+          <div className="my-2 whitespace-pre-wrap break-all">{identity}<br />涉及 {plan.lines.length} 条底层记录。</div>
           <ScrollArea className="rounded-md border bg-muted/40" viewportClassName="max-h-72">
             <div className="space-y-1.5 p-2 pr-3">
               {selectedRange && (
@@ -264,11 +226,9 @@ function DeletePlanDialog({
   );
 }
 
-function deleteDescription(provider: SessionProvider, selectedRange: boolean) {
+function deleteDescription(provider: SessionProvider) {
   if (provider === "opencode") {
-    return selectedRange
-      ? "将删除选取范围内的事件（含首尾），并按同轮消息补全安全删除范围；用户消息会连同本轮响应删除，assistant 过程或回答会删除本轮完整响应链。删除前会保存当前会话快照，不影响数据库中的其他会话。"
-      : "OpenCode 会按同轮消息安全删除：选择用户消息会同时删除本轮完整响应；选择推理、工具或回答时，会删除该轮完整 assistant 响应链并保留用户提问。只快照当前会话，不会覆盖整个数据库。";
+    return "将一并删除关联的本轮响应，完整范围如下。删除前自动备份，可在编辑历史中撤销。";
   }
   return "删除前自动备份，可在编辑历史中撤销。删除历史不会撤销已执行的代码修改、命令或其他外部操作，也不会重新执行工具。";
 }

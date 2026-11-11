@@ -397,4 +397,108 @@ test("user previews render question answers and attachments while retaining expa
   }
 });
 
+test("branch action runs directly, prevents repeated writes and permits retry after failure", async (t) => {
+  const event: PreviewEvent = { index: 0, role: "user", kind: "message", timestamp: "", text_summary: "branch fixture",
+    raw: { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "branch fixture" }] } } };
+  t.mock.method(api, "previewPage", async () => ({ events: [event], capability: {
+    revision: "revision", file_sha256: "hash", thread_id: "branch-session", format: "legacy",
+    blocked_reasons: [], diagnostics: [], content_mappings: [],
+  } }));
+  t.mock.method(api, "previewUserPrompts", async () => ({ total_events: 1, prompts: [{ index: 0, offset: 0, timestamp: "", text: "branch fixture", response: null }] }));
+  let reject!: (error: Error) => void;
+  let resolve!: (value: unknown) => void;
+  const calls: unknown[] = [];
+  t.mock.method(api, "forkSessionAtEvent", (args: unknown) => {
+    calls.push(args);
+    return new Promise((ok, fail) => { resolve = ok; reject = fail; });
+  });
+  const closed: boolean[] = [];
+  const session = { provider: "codex", id: "branch-session", rollout_path: "branch-rollout", cwd: "", title: "Branch", logs_count: 1 } as SessionSummary;
+  const root = createRoot(document.getElementById("root")!);
+  try {
+    await act(async () => root.render(<PreviewDialog open onOpenChange={value => closed.push(value)} session={session} codexDir="codex-root" />));
+    const branch = () => [...document.querySelectorAll("button")].find(button => button.textContent === "从此处分支")!;
+    assert.ok(branch(), document.body.textContent ?? "");
+    await act(async () => { branch().click(); branch().click(); });
+    assert.equal(calls.length, 1);
+    assert.equal(document.querySelector('[role="alertdialog"]'), null, "a clear branch action should not open another confirmation");
+    assert.equal(branch().disabled, true);
+    await act(async () => reject(new Error("retryable failure")));
+    assert.equal(branch().disabled, false);
+    assert.deepEqual(closed, []);
+    await act(async () => branch().click());
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls[1], { session_id: "branch-session", rollout_path: "branch-rollout", event_index: 0, codex_dir: "codex-root" });
+    await act(async () => resolve({ new_id: "new-session", included_lines: 1 }));
+    assert.deepEqual(closed, [false]);
+  } finally { await act(async () => root.unmount()); }
+});
+
+test("branch completion does not close a newer preview after navigation", async (t) => {
+  const event: PreviewEvent = { index: 0, role: "assistant", kind: "message", timestamp: "", text_summary: "branch navigation fixture",
+    raw: { type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "branch navigation fixture" }] } } };
+  t.mock.method(api, "previewPage", async () => ({ events: [event], capability: {
+    revision: "revision", file_sha256: "hash", thread_id: "branch-session", format: "legacy",
+    blocked_reasons: [], diagnostics: [], content_mappings: [],
+  } }));
+  t.mock.method(api, "previewUserPrompts", async () => ({ total_events: 1, prompts: [] }));
+  let resolve!: (value: unknown) => void;
+  const calls: unknown[] = [];
+  t.mock.method(api, "forkSessionAtEvent", (args: unknown) => {
+    calls.push(args);
+    return new Promise(ok => { resolve = ok; });
+  });
+  const closed: boolean[] = [];
+  let refreshed = 0;
+  const first = { provider: "codex", id: "first-session", rollout_path: "first-rollout", cwd: "", title: "First", logs_count: 1 } as SessionSummary;
+  const second = { ...first, id: "second-session", rollout_path: "second-rollout", title: "Second" };
+  const root = createRoot(document.getElementById("root")!);
+  const render = (open: boolean, session: SessionSummary) => act(async () => root.render(<PreviewDialog open={open}
+    onOpenChange={value => closed.push(value)} session={session} codexDir="codex-root" onForked={() => { refreshed++; }} />));
+  try {
+    await render(true, first);
+    const branch = () => [...document.querySelectorAll("button")].find(button => button.textContent === "从此处分支")!;
+    await act(async () => branch().click());
+    await render(false, first);
+    await render(true, second);
+    await act(async () => resolve({ new_id: "new-session", included_lines: 1 }));
+    assert.deepEqual(closed, [], "the old operation must not close the newly opened session");
+    assert.equal(refreshed, 1, "the session list still receives the completed fork");
+    assert.match(document.querySelector('[role="dialog"]')!.textContent!, /Second/);
+    await act(async () => branch().click());
+    assert.deepEqual(calls, [
+      { session_id: "first-session", rollout_path: "first-rollout", event_index: 0, codex_dir: "codex-root" },
+      { session_id: "second-session", rollout_path: "second-rollout", event_index: 0, codex_dir: "codex-root" },
+    ], "each direct action uses its own session rather than a retained fork target");
+    await act(async () => resolve({ new_id: "second-branch", included_lines: 1 }));
+    assert.deepEqual(closed, [false]);
+  } finally { await act(async () => root.unmount()); }
+});
+
+test("history undo is direct while restoring a snapshot retains overwrite confirmation", async () => {
+  const { PreviewEditHistoryDialog } = await import("./PreviewEditHistoryDialog");
+  const history = { entries: [], snapshots: [{ name: "original.jsonl", created_at: "2026-01-01T00:00:00Z" }],
+    undo_available: true, restore_available: true, undo_blocked_reason: null, pending_operation: null } as unknown as import("../lib/api").EditHistory;
+  let undos = 0;
+  const restores: string[] = [];
+  const root = createRoot(document.getElementById("root")!);
+  const button = (text: string) => [...document.querySelectorAll("button")].find(item => item.textContent === text)!;
+  try {
+    await act(async () => root.render(<PreviewEditHistoryDialog open history={history} mutating={false}
+      onOpenChange={() => {}} onUndo={() => undos++} onRestore={name => restores.push(name)} blockedReason={null}
+      onReconcile={() => {}} onDismissConflict={() => {}} />));
+    await act(async () => button("撤销最近一次").click());
+    assert.equal(undos, 1);
+    assert.equal(document.querySelector('[role="alertdialog"]'), null);
+    await act(async () => button("还原").click());
+    assert.deepEqual(restores, []);
+    assert.match(document.querySelector('[role="alertdialog"]')!.textContent!, /覆盖当前会话/);
+    await act(async () => button("取消").click());
+    assert.deepEqual(restores, []);
+    await act(async () => button("还原").click());
+    await act(async () => button("还原快照").click());
+    assert.deepEqual(restores, ["original.jsonl"]);
+  } finally { await act(async () => root.unmount()); }
+});
+
 test.after(() => dom.window.close());

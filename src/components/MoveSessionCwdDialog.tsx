@@ -78,12 +78,7 @@ export function MoveSessionCwdDialog({
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>移动会话到其他项目</DialogTitle>
-          <DialogDescription>
-            {session?.provider === "claude"
-              ? "移动主 transcript、同名 sidecar 与 companion 文件，并同步改写 JSONL cwd 和 history 项目路径。"
-              : session?.provider === "opencode"
-                ? "在同一 SQLite 事务中更新会话及其子会话的项目标识、目录和兼容 path 字段。"
-                : "更新会话和相关分支的工作目录。Codex App 打开时也可执行，操作后重启 App 刷新列表；项目归属会在可写时同步。"}
+          <DialogDescription className="sr-only">选择新的项目目录。
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-2">
@@ -130,12 +125,11 @@ export function MoveSessionCwdDialog({
                   保留输入路径大小写（高级）
                 </Label>
                 <p className="text-xs leading-5 text-muted-foreground">
-                  默认使用系统解析后的标准路径。仅在需要精确匹配 Claude 已有的 Windows
-                  路径变体时开启。
+                  匹配已有 Windows 路径时使用。
                 </p>
                 {preserveClaudePathCase && (
                   <p className="text-xs leading-5 text-amber-600 dark:text-amber-400">
-                    这可能继续保留同一目录的多个 Claude 项目变体。
+                    可能保留重复的项目条目。
                   </p>
                 )}
               </div>
@@ -155,7 +149,7 @@ export function MoveSessionCwdDialog({
             disabled={saving || picking || !targetCwd.trim()}
           >
             {saving && <Loader2 className="h-4 w-4 animate-spin" />}
-            保存
+            移动到此项目
           </Button>
         </DialogFooter>
       </DialogContent>

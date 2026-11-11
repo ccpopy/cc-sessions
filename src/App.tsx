@@ -5,7 +5,6 @@ import { Toaster } from "sonner";
 import { SidebarProvider } from "@/components/ui/sidebar";
 import { Button } from "@/components/ui/button";
 import { Sidebar } from "@/components/Sidebar";
-import { SessionBusyDialog } from "@/components/SessionBusyDialog";
 import { useHotkeys } from "@/hooks/useHotkeys";
 import { webuiDefaultProvider } from "@/lib/runtime";
 import { useSettings } from "@/stores/settings";
@@ -95,7 +94,6 @@ export default function App() {
         </Suspense>
       </main>
       <Toaster position="top-center" richColors closeButton />
-      <SessionBusyDialog />
       {!settings && (
         <LoadingBoot
           error={settingsError}

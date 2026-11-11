@@ -2,18 +2,15 @@ import { invoke } from "@tauri-apps/api/core";
 import { copyText } from "@/lib/clipboard";
 import { isTauriRuntime, isWebRuntime, webuiApiToken } from "@/lib/runtime";
 import { compareVersions, normalizeVersion } from "@/lib/version";
-import { cleanSessionBusyErrors, notifySessionBusy, sessionBusyMessages } from "@/lib/session-activity";
+import { cleanSessionBusyErrors, sessionBusyMessages } from "@/lib/session-activity";
 
 async function invokeCommand<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   try {
     const result = await invokeCommandRaw<T>(command, args);
-    // Background job reports are cumulative; show them once at completion.
-    if (!(result && typeof result === "object" && "state" in result && result.state === "running")) {
-      if (result && typeof result === "object") notifySessionBusy(result);
-    }
+    // The invoking view owns feedback, including busy-session errors. Do not open a
+    // second global dialog over its toast or inline error.
     return cleanSessionBusyErrors(result);
   } catch (error) {
-    notifySessionBusy(error);
     if (sessionBusyMessages(error).length) {
       throw new Error(cleanSessionBusyErrors(error instanceof Error ? error.message : String(error), true));
     }

@@ -23,7 +23,6 @@ import { ConvertSessionDialog } from "@/components/ConvertSessionDialog";
 import { DangerDialog } from "@/components/DangerDialog";
 import { RenameSessionDialog } from "@/components/RenameSessionDialog";
 import { MoveSessionCwdDialog } from "@/components/MoveSessionCwdDialog";
-import { ForkRecommendationDialog } from "@/components/ForkRecommendationDialog";
 import { EmptyState } from "@/components/EmptyState";
 import { FamilyHistorySheet } from "@/components/FamilyHistorySheet";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -53,7 +52,7 @@ import {
   type SessionProvider,
   type SessionSummary,
 } from "@/lib/api";
-import { humanBytes, humanTokens } from "@/lib/format";
+import { humanBytes } from "@/lib/format";
 import { basename } from "@/lib/cwd";
 import { sessionIdentity } from "@/lib/sessionIdentity";
 import { providerLabel } from "@/lib/providerTheme";
@@ -122,7 +121,6 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const [exportTarget, setExportTarget] = useState<SessionSummary | null>(null);
   const [renameTarget, setRenameTarget] = useState<SessionSummary | null>(null);
   const [moveTarget, setMoveTarget] = useState<SessionSummary | null>(null);
-  const [duplicateTarget, setDuplicateTarget] = useState<SessionSummary | null>(null);
   const [convertTarget, setConvertTarget] = useState<SessionSummary | null>(null);
   const [backupTargets, setBackupTargets] = useState<SessionSummary[]>([]);
   const [deleteTargets, setDeleteTargets] = useState<SessionSummary[]>([]);
@@ -433,12 +431,6 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     },
     [settings, publishDuplicateState, refresh, refreshOverlay],
   );
-
-  const confirmDuplicate = useCallback(async () => {
-    if (!duplicateTarget) return;
-    await onDuplicate(duplicateTarget);
-    setDuplicateTarget(null);
-  }, [duplicateTarget, onDuplicate]);
 
   const onCloneOne = useCallback(
     async (s: SessionSummary) => {
@@ -888,7 +880,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             onBackup={onBackup}
             onDelete={onDelete}
             onClone={isCodex ? onCloneOne : undefined}
-            onDuplicate={isCodex || provider === "claude" || provider === "opencode" ? setDuplicateTarget : undefined}
+            onDuplicate={isCodex || provider === "claude" || provider === "opencode" ? onDuplicate : undefined}
             onOpenFamily={isCodex ? onOpenFamily : undefined}
             onOpenForkSource={isCodex ? onOpenForkSource : undefined}
             onExportMarkdown={setExportTarget}
@@ -1024,14 +1016,6 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             throw e;
           }
         }}
-      />
-
-      <ForkRecommendationDialog
-        open={!!duplicateTarget}
-        onOpenChange={(value) => !value && setDuplicateTarget(null)}
-        session={duplicateTarget}
-        running={!!duplicateTarget && duplicatingSessionIds.has(duplicateTarget.id)}
-        onConfirm={confirmDuplicate}
       />
 
       <FamilyHistorySheet
@@ -1173,7 +1157,6 @@ function DeleteSummary({
   overlay: Map<string, FamilyOverlay>;
 }) {
   const totalBytes = targets.reduce((a, b) => a + b.rollout_bytes, 0);
-  const totalTokens = targets.reduce((a, b) => a + b.tokens_used, 0);
   const familiesToDelete = new Map<string, number>();
   for (const target of targets) {
     const item = overlay.get(target.id);
@@ -1197,50 +1180,18 @@ function DeleteSummary({
       <div className="min-w-0 whitespace-normal">
         {deletesFamily ? (
           <>
-            将整组删除 <b>{familiesToDelete.size}</b> 条 active 会话及其全部{" "}
-            <b>{totalFamilyBranches}</b> 个 provider/历史分支
-            {scopedTargets > 0 && <>，并单独删除另外 <b>{scopedTargets}</b> 个所选会话或历史分支</>}。
-            只有选中 family 的 active 分支才会整组删除；单独选中的非 active 历史分支不会影响当前 active 会话。
-          </>
-        ) : provider === "codex" ? (
-          <>
-            将删除 <b>{targets.length}</b> 个所选会话或历史分支对应的 threads、日志、rollout 与索引。
-            非 active 历史分支只删除自身，不会影响同一 family 的当前 active 会话。
-          </>
-        ) : provider === "claude" ? (
-          <>
-            将删除 <b>{targets.length}</b> 个 jsonl 会话文件
-            （共 <b>{humanBytes(totalBytes)}</b>，
-            <b>{humanTokens(totalTokens)}</b> token）及同名 sidecar。删除最后一个同 ID 副本时，还会清理
-            history.jsonl 匹配行、tasks/&lt;id&gt; 与 file-history/&lt;id&gt;；仍有同 ID 副本时这些共享数据会保留。
-            项目 memory、.claude.json、session-env 和 shell-snapshots 不会被删除。
-          </>
-        ) : provider === "cursor" ? (
-          <>
-            将从 Cursor 的 <code>state.vscdb</code> 删除 <b>{targets.length}</b> 个会话的会话头、
-            气泡索引与全部气泡，<b>并连同它们的子会话一起删除</b>，不会触碰项目工作区文件。
-            被其它会话共用的子会话会保留。
-            删除只释放库内页面，磁盘占用需要到「清理」页执行「压缩数据库」才会回收。
+            删除 <b>{familiesToDelete.size}</b> 组会话及其全部 <b>{totalFamilyBranches}</b> 个历史分支
+            {scopedTargets > 0 && <>，另含 <b>{scopedTargets}</b> 个所选会话或分支</>}。
           </>
         ) : (
-          <>
-            将从 <code>opencode.db</code> 删除 <b>{targets.length}</b> 个会话及其消息、片段和关联记录。
-            OpenCode 使用 SQLite 外键级联清理，不会触碰项目工作区文件。
-          </>
+          <>删除 <b>{targets.length}</b> 条会话及关联记录（{humanBytes(totalBytes)}）{provider === "cursor" ? "，包括子会话。" : "。"}</>
         )}
       </div>
-      <div className="text-destructive">此操作不可撤销，也不会自动备份。</div>
-      {provider === "codex" && (
-        <div className="text-amber-600 dark:text-amber-400">
-          Codex App 运行时也可删除空闲会话；检测到目标会话写入时会停止并提示。{DESKTOP_DELETE_RESTART_NOTICE}
-        </div>
-      )}
+      <div className="text-destructive">不可撤销，不会自动备份。</div>
       {provider === "cursor" && (
-        <div className="text-amber-600 dark:text-amber-400">
-          需要先完全退出 Cursor，否则删除会被拒绝——Cursor 运行时会用内存里的旧会话状态覆盖改动。
-        </div>
+        <div className="text-amber-600 dark:text-amber-400">请先完全退出 Cursor。</div>
       )}
-      {targets.length > 1 && (
+      {targets.length > 0 && (
         <ul className="max-h-36 min-w-0 max-w-full space-y-0.5 overflow-y-auto overflow-x-hidden rounded-md border bg-muted/30 p-2 text-xs">
           {targets.slice(0, 5).map((t) => (
             <li key={sessionIdentity(t)} className="grid min-w-0 grid-cols-[max-content_minmax(0,1fr)] items-center gap-2">

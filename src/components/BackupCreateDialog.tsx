@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { AlertTriangle, Loader2 } from "lucide-react";
+import { Archive, Loader2 } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -82,26 +82,26 @@ export function BackupCreateDialog({ open, onOpenChange, provider, sessions, onD
       <DialogContent className="max-w-xl">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
-            <AlertTriangle className="h-5 w-5 text-amber-500" />
+            <Archive className="h-5 w-5 text-muted-foreground" />
             创建备份
           </DialogTitle>
-          <DialogDescription>
-            备份将包含 {sessions.length} 个会话；备份与删除是独立动作。
+          <DialogDescription className="sr-only">
+            设置备份名称与备注。
           </DialogDescription>
         </DialogHeader>
 
         <div className="min-w-0 space-y-4 overflow-auto pr-1">
           <div className="space-y-2">
-            <Label>备份名</Label>
-            <Input value={name} onChange={(e) => setName(e.target.value)} />
+            <Label htmlFor="backup-name">备份名</Label>
+            <Input id="backup-name" value={name} onChange={(e) => setName(e.target.value)} />
           </div>
           <div className="space-y-2">
-            <Label>备注（可选）</Label>
-            <Textarea value={note} onChange={(e) => setNote(e.target.value)} rows={2} />
+            <Label htmlFor="backup-note">备注（可选）</Label>
+            <Textarea id="backup-note" value={note} onChange={(e) => setNote(e.target.value)} rows={2} />
           </div>
           <div className="rounded-md border bg-muted/40 p-3">
             <div className="mb-1 flex items-center justify-between text-xs text-muted-foreground">
-              <span>包含会话</span>
+              <span>{sessions.length} 条会话</span>
               <span>预估 {humanBytes(totalBytes)}</span>
             </div>
             <ul className="max-h-40 min-w-0 space-y-1 overflow-auto text-xs">

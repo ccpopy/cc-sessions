@@ -103,8 +103,6 @@ export function PreviewEditHistoryDialog({
                       {editKindLabel(entry.kind)}
                     </Badge>
                     <span className="min-w-0 flex-1 truncate">{entry.description}</span>
-                    <span className="text-muted-foreground">本地已提交 · 原生未验证</span>
-                    <span className="w-full break-all font-mono text-[10px] text-muted-foreground">{entry.op_id}</span>
                   </div>
                 ))}
               </div>
@@ -113,7 +111,7 @@ export function PreviewEditHistoryDialog({
               <div className="mb-1.5 text-xs font-medium">原始快照</div>
               {history.snapshots.length === 0 ? (
                 <div className="text-xs text-muted-foreground">
-                  暂无快照（首次改写或删除时会自动创建）
+                  暂无快照
                 </div>
               ) : (
                 <div className="max-h-40 space-y-1 overflow-auto rounded-md border bg-muted/30 p-2">
@@ -145,7 +143,7 @@ export function PreviewEditHistoryDialog({
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogTitle>确认还原快照</AlertDialogTitle>
-          <AlertDialogDescription>将用所选快照覆盖当前会话内容，并保存还原前状态。如果检测到外部新增或修改，本次还原将被拒绝。</AlertDialogDescription>
+          <AlertDialogDescription>将用所选快照覆盖当前会话，当前内容会自动备份。</AlertDialogDescription>
         </AlertDialogHeader>
         <div className="break-all font-mono text-xs">{restoreTarget}</div>
         <AlertDialogFooter>
@@ -158,7 +156,7 @@ export function PreviewEditHistoryDialog({
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogTitle>放弃未完成的操作清单</AlertDialogTitle>
-          <AlertDialogDescription>会话在该操作之后已有其他变化，无法自动核对。仅在身份、当前版本和原生历史通过检查后归档操作清单；会话内容不会修改，快照继续保留。正文或投影仍不一致时会保留保护，此操作不能修复历史。</AlertDialogDescription>
+          <AlertDialogDescription>仅归档未完成的操作清单，保留会话和快照；不会修复历史冲突。</AlertDialogDescription>
         </AlertDialogHeader>
         <div className="break-all font-mono text-xs">{dismissTarget}</div>
         <AlertDialogFooter>

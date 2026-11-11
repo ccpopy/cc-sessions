@@ -4,7 +4,6 @@ import {
   GitBranch,
   Loader2,
   Radio,
-  ShieldAlert,
   Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -63,18 +62,18 @@ export function FamilyHistorySheet({
     new Map(),
   );
   const [loading, setLoading] = useState(false);
-  const [rollbackTarget, setRollbackTarget] = useState<FamilyBranch | null>(null);
-  const [syncTarget, setSyncTarget] = useState<SyncTarget | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<FamilyBranch | null>(null);
   const [running, setRunning] = useState(false);
   const requestSeq = useRef(0);
+  const mutationInFlight = useRef(false);
+  const scope = JSON.stringify([open, sessionId, codexDir]);
+  const scopeRef = useRef(scope);
+  scopeRef.current = scope;
 
   const load = useCallback(async () => {
     const requestId = ++requestSeq.current;
     setFamily(null);
     setSyncStates({});
-    setRollbackTarget(null);
-    setSyncTarget(null);
     setDeleteTarget(null);
     if (!sessionId || !codexDir) {
       setLoading(false);
@@ -137,15 +136,14 @@ export function FamilyHistorySheet({
       requestSeq.current += 1;
       setFamily(null);
       setSyncStates({});
-      setRollbackTarget(null);
-      setSyncTarget(null);
       setDeleteTarget(null);
       setLoading(false);
     }
   }, [open, load]);
 
-  const doRollback = async () => {
-    if (!family || !rollbackTarget) return;
+  const doRollback = async (rollbackTarget: FamilyBranch) => {
+    if (!family || mutationInFlight.current) return;
+    mutationInFlight.current = true;
     setRunning(true);
     try {
       const syncState = syncStates[rollbackTarget.id];
@@ -164,22 +162,23 @@ export function FamilyHistorySheet({
           ? `已同步 ${synchronizedLines} 行并切换到 ${rollbackTarget.provider} 分支`
           : `已切换到 ${rollbackTarget.provider} 分支`,
       );
-      await load();
+      if (scopeRef.current === scope) await load();
       onChanged?.();
-      setRollbackTarget(null);
     } catch (e) {
       toast.error(String((e as Error)?.message ?? e));
     } finally {
+      mutationInFlight.current = false;
       setRunning(false);
     }
   };
 
   const doDelete = async () => {
-    if (!family || !deleteTarget) return;
+    if (!family || !deleteTarget || mutationInFlight.current) return;
+    mutationInFlight.current = true;
     setRunning(true);
     try {
       const result = await api.deleteFamilyBranch(codexDir, family.family_id, deleteTarget.id);
-      await load();
+      if (scopeRef.current === scope) await load();
       await onChanged?.();
       if (!result.ok) {
         throw new Error(result.error ?? `分支 ${deleteTarget.id} 未删除干净`);
@@ -195,12 +194,14 @@ export function FamilyHistorySheet({
     } catch (e) {
       toast.error(String((e as Error)?.message ?? e));
     } finally {
+      mutationInFlight.current = false;
       setRunning(false);
     }
   };
 
-  const doSync = async () => {
-    if (!family || !syncTarget) return;
+  const doSync = async (syncTarget: SyncTarget) => {
+    if (!family || mutationInFlight.current) return;
+    mutationInFlight.current = true;
     setRunning(true);
     try {
       if (syncTarget.direction === "into_active") {
@@ -214,12 +215,12 @@ export function FamilyHistorySheet({
           `已把当前分支的 ${r.appended_lines} 行增量同步到 ${syncTarget.branch.provider} 分支（共 ${r.total_lines} 行）`,
         );
       }
-      await load();
+      if (scopeRef.current === scope) await load();
       onChanged?.();
-      setSyncTarget(null);
     } catch (e) {
       toast.error(String((e as Error)?.message ?? e));
     } finally {
+      mutationInFlight.current = false;
       setRunning(false);
     }
   };
@@ -240,9 +241,8 @@ export function FamilyHistorySheet({
               </Badge>
             )}
           </SheetTitle>
-          <SheetDescription className="break-words">
-            这里管理已有的历史分支。迁移服务商会保留原会话，不再自动创建分支。任意时刻只有一个“当前分支”
-            对 Codex App 和主会话列表可见，历史分支只在这里查看和切换。
+          <SheetDescription className="sr-only">
+            查看、切换和同步会话分支。
           </SheetDescription>
         </SheetHeader>
 
@@ -258,23 +258,13 @@ export function FamilyHistorySheet({
             </div>
           ) : !family ? (
             <div className="py-8 text-center text-xs text-muted-foreground">
-              此会话尚未进入分支记录。
-              <br />
-              （原地迁移服务商不会创建分支）
+              暂无分支
             </div>
           ) : (
             <div className="min-w-0 max-w-full space-y-3 overflow-hidden">
-              <div className="min-w-0 max-w-full overflow-hidden rounded-md border bg-muted/20 p-3 text-xs">
-                <div className="flex min-w-0 items-center gap-2">
-                  <span className="shrink-0 text-muted-foreground">分组 ID</span>
-                  <code className="min-w-0 wrap-anywhere font-mono text-[11px]">
-                    {family.family_id}
-                  </code>
-                </div>
-                <div className="mt-1 min-w-0 wrap-anywhere text-muted-foreground">
-                  {family.title || "（无标题）"}
-                </div>
-              </div>
+              <h3 className="min-w-0 break-words text-sm font-medium" title={family.family_id}>
+                {family.title || "未命名会话"}
+              </h3>
 
               <div className="min-w-0 max-w-full space-y-2 overflow-hidden">
                 {family.chain.map((b, idx) => {
@@ -317,11 +307,11 @@ export function FamilyHistorySheet({
                                   : "h-5 px-1.5 font-normal"
                               }
                             >
-                              {b.provider || "(未知 provider)"}
+                              {b.provider || "未知服务商"}
                             </Badge>
                             {isCurrent && (
                               <Badge variant="outline" className="h-5 px-1.5 font-normal text-emerald-600">
-                                当前 provider
+                                当前服务
                               </Badge>
                             )}
                             {isActive ? (
@@ -347,36 +337,19 @@ export function FamilyHistorySheet({
                               {safeDate(b.created_at)}
                             </span>
                           </div>
-                          <div className="min-w-0 wrap-anywhere font-mono text-[11px] text-muted-foreground">
-                            {b.id}
-                          </div>
-                          <div
-                            className="min-w-0 wrap-anywhere font-mono text-[11px] leading-5 text-muted-foreground"
-                            title={b.rollout_relpath}
-                          >
-                            {b.rollout_relpath}
-                          </div>
-                          {(b.sha256 || b.line_count != null) && (
-                            <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
-                              {b.sha256 ? (
-                                <>
-                                  <CheckCircle2 className="h-3 w-3 shrink-0 text-emerald-500" />
-                                  <span className="shrink-0">校验：</span>
-                                  <code className="wrap-anywhere font-mono">
-                                    {b.sha256.slice(0, 10)}…
-                                  </code>
-                                  {b.line_count != null && (
-                                    <span>· {b.line_count} 行</span>
-                                  )}
-                                </>
-                              ) : (
-                                <>
-                                  <ShieldAlert className="h-3 w-3 shrink-0 text-amber-500" />
-                                  <span>尚未固化校验信息（归档后自动记录）</span>
-                                </>
+                          <details className="text-[11px] text-muted-foreground">
+                            <summary className="w-fit cursor-pointer py-1 hover:text-foreground">文件信息</summary>
+                            <div className="space-y-1 pt-1 font-mono wrap-anywhere">
+                              <div>{b.id}</div>
+                              <div>{b.rollout_relpath}</div>
+                              {(b.sha256 || b.line_count != null) && (
+                                <div className="flex items-center gap-1.5">
+                                  {b.sha256 && <><CheckCircle2 className="h-3 w-3 text-emerald-500" /><span>{b.sha256.slice(0, 10)}…</span></>}
+                                  {b.line_count != null && <span>{b.line_count} 行</span>}
+                                </div>
                               )}
                             </div>
-                          )}
+                          </details>
                           {!isActive && syncState && (
                             <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
                               <BranchSyncBadge state={syncState} />
@@ -390,7 +363,8 @@ export function FamilyHistorySheet({
                             <Button
                               variant="ghost"
                               size="sm"
-                              onClick={() => setSyncTarget({ branch: b, direction: "into_active" })}
+                              disabled={running}
+                              onClick={() => void doSync({ branch: b, direction: "into_active" })}
                               className="shrink-0 gap-1.5"
                               title="将此分支相对当前分支的新增内容追加到当前分支（不切换 provider）"
                             >
@@ -401,7 +375,8 @@ export function FamilyHistorySheet({
                             <Button
                               variant="ghost"
                               size="sm"
-                              onClick={() => setSyncTarget({ branch: b, direction: "into_branch" })}
+                              disabled={running}
+                              onClick={() => void doSync({ branch: b, direction: "into_branch" })}
                               className="shrink-0 gap-1.5"
                               title="将当前分支的新增内容追加到此历史分支（不切换 provider）"
                             >
@@ -411,14 +386,16 @@ export function FamilyHistorySheet({
                           <Button
                             variant="outline"
                             size="sm"
-                            onClick={() => setRollbackTarget(b)}
+                            disabled={running || syncState?.relation === "missing"}
+                            onClick={() => void doRollback(b)}
                             className="shrink-0 gap-1.5"
                           >
-                            设为当前
+                            {canSyncIntoBranch(syncState) ? "同步并设为当前" : "设为当前"}
                           </Button>
                           <Button
                             variant="ghost"
                             size="sm"
+                            disabled={running}
                             onClick={() => setDeleteTarget(b)}
                             className="shrink-0 gap-1.5 text-destructive hover:bg-destructive/10 hover:text-destructive"
                             title="从家族中删除该历史分支（不可恢复）"
@@ -437,128 +414,29 @@ export function FamilyHistorySheet({
         </ScrollArea>
 
         <AlertDialog
-          open={!!rollbackTarget}
-          onOpenChange={(v) => !v && setRollbackTarget(null)}
-        >
-          <AlertDialogContent>
-            <AlertDialogHeader>
-              <AlertDialogTitle>切换当前分支</AlertDialogTitle>
-              <AlertDialogDescription className="break-words">
-                {rollbackTarget && canSyncIntoBranch(syncStates[rollbackTarget.id]) ? (
-                  <>
-                    目标分支落后当前分支 {syncStates[rollbackTarget.id].appendable_lines_to_branch} 行。
-                    确认后会先同步这些增量，再归档当前分支并恢复 <b>{rollbackTarget.provider}</b>
-                    分支，避免从旧基线继续对话造成真实分叉。
-                  </>
-                ) : (
-                  <>
-                    将当前分支（provider=
-                    {family?.chain.find((x) => x.id === family.active_id)?.provider ?? "-"}
-                    ）归档至 <code>archived_sessions/</code>
-                    ，并从归档恢复 <b>{rollbackTarget?.provider}</b> 下的目标分支。
-                  </>
-                )}
-                {rollbackTarget && syncStates[rollbackTarget.id]?.relation === "diverged" && (
-                  <>
-                    <br />
-                    两个分支都已有不同的新记录，无法自动合并；切换只会改变当前可见分支，不会消除“已分叉”状态。
-                  </>
-                )}
-                {rollbackTarget && syncStates[rollbackTarget.id]?.relation === "active_ahead"
-                  && !canSyncIntoBranch(syncStates[rollbackTarget.id]) && (
-                  <>
-                    <br />
-                    目标分支未包含当前分支的全部历史。切换会保留各自的历史，不会自动合并。
-                  </>
-                )}
-                <br />
-                此操作不会删除任何文件，随时可再切回。
-              </AlertDialogDescription>
-            </AlertDialogHeader>
-            <AlertDialogFooter>
-              <AlertDialogCancel>取消</AlertDialogCancel>
-              <AlertDialogAction disabled={running} onClick={doRollback}>
-                {running
-                  ? "执行中…"
-                  : rollbackTarget && canSyncIntoBranch(syncStates[rollbackTarget.id])
-                    ? "同步并切换"
-                    : rollbackTarget && syncStates[rollbackTarget.id]?.relation === "diverged"
-                      ? "仍要切换"
-                      : "确认切换"}
-              </AlertDialogAction>
-            </AlertDialogFooter>
-          </AlertDialogContent>
-        </AlertDialog>
-
-        <AlertDialog
           open={!!deleteTarget}
-          onOpenChange={(v) => !v && setDeleteTarget(null)}
+          onOpenChange={(v) => !v && !running && setDeleteTarget(null)}
         >
           <AlertDialogContent>
             <AlertDialogHeader>
               <AlertDialogTitle>删除历史分支</AlertDialogTitle>
               <AlertDialogDescription className="break-words">
-                将彻底删除 <b>{deleteTarget?.provider}</b> 分支：
-                包括其 rollout 文件、threads 记录、logs 与 session_index
-                条目；如果此分支已在归档目录中，归档副本也会一并删除。
-                <br />
-                若其他会话仍继承此分支的历史，将停止删除并指出依赖的会话。切换当前分支不会解除这种依赖。
-                <br />
-                此操作不可撤销，且不会创建备份。
+                删除 <b>{deleteTarget?.provider}</b> 分支及其关联记录。不可撤销，不会自动备份。
               </AlertDialogDescription>
             </AlertDialogHeader>
             <AlertDialogFooter>
-              <AlertDialogCancel>取消</AlertDialogCancel>
+              <AlertDialogCancel disabled={running}>取消</AlertDialogCancel>
               <AlertDialogAction
                 disabled={running}
-                onClick={doDelete}
+                onClick={(event) => { event.preventDefault(); void doDelete(); }}
                 className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
               >
-                {running ? "执行中…" : "确认删除"}
+                {running ? "删除中…" : "删除分支"}
               </AlertDialogAction>
             </AlertDialogFooter>
           </AlertDialogContent>
         </AlertDialog>
 
-        <AlertDialog
-          open={!!syncTarget}
-          onOpenChange={(v) => !v && setSyncTarget(null)}
-        >
-          <AlertDialogContent>
-            <AlertDialogHeader>
-              <AlertDialogTitle>
-                {syncTarget?.direction === "into_branch" ? "同步当前分支新增内容" : "合并分支新增内容"}
-              </AlertDialogTitle>
-              <AlertDialogDescription className="break-words text-justify">
-                {syncTarget?.direction === "into_branch" ? (
-                  <>
-                    把当前分支相对 <b>{syncTarget.branch.provider}</b> 历史分支的新增对话，
-                    追加到该历史分支的 rollout 文件。当前 provider 不会切换，Codex App
-                    仍继续显示当前分支；之后切回该历史分支时，它会带上这些新增上下文。
-                  </>
-                ) : (
-                  <>
-                    把 <b>{syncTarget?.branch.provider}</b> 分支相对当前分支的新增对话，
-                    追加到当前分支的 rollout 文件。provider 保持不变，Codex App
-                    会继续以当前分支显示。
-                  </>
-                )}
-                <br />
-                只有一边完整包含另一边时才允许同步；如果两边都各自产生了不同新对话，操作会直接失败。
-              </AlertDialogDescription>
-            </AlertDialogHeader>
-            <AlertDialogFooter>
-              <AlertDialogCancel>取消</AlertDialogCancel>
-              <AlertDialogAction disabled={running} onClick={doSync}>
-                {running
-                  ? "执行中…"
-                  : syncTarget?.direction === "into_branch"
-                    ? "确认同步"
-                    : "确认合并"}
-              </AlertDialogAction>
-            </AlertDialogFooter>
-          </AlertDialogContent>
-        </AlertDialog>
       </SheetContent>
     </Sheet>
   );

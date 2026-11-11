@@ -90,18 +90,17 @@ function CodexRepairRoute() {
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const strategy: SwitchStrategy = "follow";
-  const [confirmBatch, setConfirmBatch] = useState(false);
   const [confirmProjectConfigRepair, setConfirmProjectConfigRepair] = useState(false);
   const [confirmPrune, setConfirmPrune] = useState<
-    null | "index" | "threads" | "family" | "subagents"
+    null | "index" | "threads" | "subagents"
   >(null);
-  const [confirmBackfill, setConfirmBackfill] = useState(false);
   const [running, setRunning] = useState<string | null>(null);
   const [refreshingAfterRepair, setRefreshingAfterRepair] = useState(false);
   const [providerSyncProgress, setProviderSyncProgress] = useState<ProviderSyncStatus | null>(null);
   const [dryRun, setDryRun] = useState(false);
   const refreshFlight = useRef<{ codexDir: string; generation: number; promise: Promise<void> } | null>(null);
   const refreshGeneration = useRef(0);
+  const repairFlight = useRef<{ generation: number } | null>(null);
   const refreshMounted = useRef(false);
   const refreshDir = useRef(codexDir);
   refreshDir.current = codexDir;
@@ -212,6 +211,9 @@ function CodexRepairRoute() {
 
   const run = async (key: string, fn: () => Promise<void>) => {
     const generation = refreshGeneration.current;
+    if (repairFlight.current?.generation === generation) return;
+    const flight = { generation };
+    repairFlight.current = flight;
     setRunning(key);
     setRefreshingAfterRepair(false);
     try {
@@ -219,6 +221,8 @@ function CodexRepairRoute() {
     } catch (e) {
       toast.error(String((e as Error)?.message ?? e));
     } finally {
+      if (repairFlight.current !== flight) return;
+      repairFlight.current = null;
       if (refreshGeneration.current !== generation) return;
       if (!dryRun && refreshMounted.current && refreshDir.current === codexDir) {
         if (["project_config_repair", "clone", "clone_do"].includes(key)) {
@@ -278,7 +282,7 @@ function CodexRepairRoute() {
         {running === `check_${kind}` && <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />}
         {label}
       </Button>
-      <span role="status">{checkedAt[kind] ? `上次检查：${checkedAt[kind]}（普通刷新不重复检查）` : "尚未检查或结果已失效，请按需检查"}</span>
+      <span role="status">{checkedAt[kind] ? `上次检查：${checkedAt[kind]}` : "未检查"}</span>
     </div>
   );
 
@@ -315,6 +319,42 @@ function CodexRepairRoute() {
     }
   };
 
+  const migrateProviders = () =>
+    run("clone_do", async () => {
+      setProviderSyncProgress(null);
+      const r = await api.runProviderSync({
+        codex_dir: codexDir,
+        strategy,
+        dry_run: false,
+      }, setProviderSyncProgress);
+      const ok = r.filter((x) => x.ok).length;
+      const failed = r.filter((x) => !x.ok);
+      await refresh(true);
+      if (r.length === 0) {
+        toast.info("当前没有需要同步的会话");
+      } else if (ok > 0) {
+        toast.success(`完成：${ok}/${r.length}`);
+      }
+      if (failed.length > 0) {
+        const detail = failed
+          .map((item) => item.error ?? `${item.source_id} 未处理`)
+          .slice(0, 3)
+          .join("\n");
+        if (failed.length === r.length) {
+          throw new Error(detail || "所有会话同步均失败");
+        }
+        toast.error(`${failed.length} 条会话同步失败`, { description: detail });
+      }
+    });
+
+  const backfillOrigins = () => {
+    void run("backfill_origins", async () => {
+      const r = await api.backfillArchiveOrigins(codexDir, false);
+      setBackfillPreview(r);
+      showBackfillResult(r, false);
+    });
+  };
+
   return (
     <>
       <TopBar title="修复" onRefresh={() => void refresh()} refreshing={refreshing} showListTools={false} />
@@ -335,7 +375,7 @@ function CodexRepairRoute() {
                     诊断总览
                     <Tooltip>
                       <TooltipTrigger asChild>
-                        <Info className="h-3.5 w-3.5 text-muted-foreground" />
+                        <button type="button" aria-label="查看说明" className="inline-flex shrink-0"><Info className="h-3.5 w-3.5 text-muted-foreground" /></button>
                       </TooltipTrigger>
                       <TooltipContent className="max-w-sm text-xs">
                         检查本地会话文件、索引文件（session_index.jsonl）和数据库（threads
@@ -422,11 +462,10 @@ function CodexRepairRoute() {
                         效果预览
                         <Tooltip>
                           <TooltipTrigger asChild>
-                            <Info className="h-3 w-3 text-muted-foreground" />
+                            <button type="button" aria-label="查看说明" className="inline-flex shrink-0"><Info className="h-3 w-3 text-muted-foreground" /></button>
                           </TooltipTrigger>
                           <TooltipContent className="max-w-xs text-xs">
-                            打开后下面的修复按钮只会扫描并报告"将要做什么"，不会实际写入
-                            任何文件或数据库。想先看看效果再动手，就打开它。
+                            仅预览，不写入文件或数据库。
                           </TooltipContent>
                         </Tooltip>
                       </Label>
@@ -659,7 +698,7 @@ function CodexRepairRoute() {
                     项目级 Codex 配置
                     <Tooltip>
                       <TooltipTrigger asChild>
-                        <Info className="h-3.5 w-3.5 text-muted-foreground" />
+                        <button type="button" aria-label="查看说明" className="inline-flex shrink-0"><Info className="h-3.5 w-3.5 text-muted-foreground" /></button>
                       </TooltipTrigger>
                       <TooltipContent className="max-w-sm text-xs">
                         扫描每条 Codex 会话的工作目录，检查 <code>.codex/config.toml</code>{" "}
@@ -777,9 +816,6 @@ function CodexRepairRoute() {
                         让它满足已配置的 min/max 约束。不自动修改 min/max 边界值。
                       </TooltipContent>
                     </Tooltip>
-                    <span className="text-xs text-muted-foreground">
-                      {dryRun ? "当前：效果预览（不写入）" : "当前：实际执行（会写入项目配置）"}
-                    </span>
                   </div>
                 </CardContent>
               </Card>
@@ -791,7 +827,7 @@ function CodexRepairRoute() {
                     服务商 (Provider) 迁移
                     <Tooltip>
                       <TooltipTrigger asChild>
-                        <Info className="h-3.5 w-3.5 text-muted-foreground" />
+                        <button type="button" aria-label="查看说明" className="inline-flex shrink-0"><Info className="h-3.5 w-3.5 text-muted-foreground" /></button>
                       </TooltipTrigger>
                       <TooltipContent className="max-w-sm text-xs">
                         切换服务商后，可把原会话迁移到当前 provider，保留会话 ID 和历史。
@@ -824,8 +860,7 @@ function CodexRepairRoute() {
                     />
                   </div>
                   <div className="min-w-0 rounded-md bg-muted/30 p-3 text-xs text-muted-foreground [overflow-wrap:anywhere]">
-                    自动备份后，将原会话迁移到当前服务商，保留会话 ID 和历史，不新增分支。
-                    请先停止目标会话生成；迁移后重新打开该会话。需要独立副本时可使用会话列表中的“完整 Fork”。
+                    迁移前请停止会话生成，完成后重新打开。自动备份并保留原 ID 和历史。
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
                     <Tooltip>
@@ -861,7 +896,7 @@ function CodexRepairRoute() {
                                 }
                               });
                             } else {
-                              setConfirmBatch(true);
+                              void migrateProviders();
                             }
                           }}
                           disabled={!!running || !provider?.current}
@@ -888,9 +923,7 @@ function CodexRepairRoute() {
                           : "正在扫描需要同步的会话…"
                         : providerSyncRunning
                           ? "正在准备同步…"
-                        : dryRun
-                          ? "当前：效果预览（不写入）"
-                          : "当前：实际执行（会写入磁盘）"}
+                        : null}
                     </span>
                   </div>
                 </CardContent>
@@ -903,7 +936,7 @@ function CodexRepairRoute() {
                     会话完整性校验
                     <Tooltip>
                       <TooltipTrigger asChild>
-                        <Info className="h-3.5 w-3.5 text-muted-foreground" />
+                        <button type="button" aria-label="查看说明" className="inline-flex shrink-0"><Info className="h-3.5 w-3.5 text-muted-foreground" /></button>
                       </TooltipTrigger>
                       <TooltipContent className="max-w-sm text-xs">
                         检查 family 中各分支的 rollout 是否存在，并对已固化 sha256
@@ -958,7 +991,16 @@ function CodexRepairRoute() {
                                     showFamilyPruneResult(report, true);
                                   });
                                 } else {
-                                  setConfirmPrune("family");
+                                  void run("prune_family", async () => {
+                                    const report = await api.pruneOrphanEntries({
+                                      codex_dir: codexDir,
+                                      prune_index: false, prune_threads: false,
+                                      prune_family: true, prune_subagents: false,
+                                      dry_run: false,
+                                    });
+                                    showFamilyPruneResult(report, false);
+                                    await refresh(true);
+                                  });
                                 }
                               }}
                               disabled={!!running || familyCleanupCount === 0}
@@ -1078,7 +1120,7 @@ function CodexRepairRoute() {
                     归档来源标记
                     <Tooltip>
                       <TooltipTrigger asChild>
-                        <Info className="h-3.5 w-3.5 text-muted-foreground" />
+                        <button type="button" aria-label="查看说明" className="inline-flex shrink-0"><Info className="h-3.5 w-3.5 text-muted-foreground" /></button>
                       </TooltipTrigger>
                       <TooltipContent className="max-w-sm text-xs">
                         为 <code>archived_sessions/</code> 下缺少记录的归档会话补写来源标记
@@ -1115,7 +1157,7 @@ function CodexRepairRoute() {
                                     showBackfillResult(report, true);
                                   });
                                 } else {
-                                  setConfirmBackfill(true);
+                                  void backfillOrigins();
                                 }
                               }}
                               disabled={!!running || backfillPreview.scanned === 0}
@@ -1157,10 +1199,8 @@ function CodexRepairRoute() {
               修复 {projectConfig?.repairable_count ?? 0} 个项目级 Codex 配置
             </AlertDialogTitle>
             <AlertDialogDescription>
-              将写入对应工作目录下的 <code>.codex/config.toml</code>，只补写或改写{" "}
-              <code>features.multi_agent_v2.default_wait_timeout_ms</code>，
-              不自动修改 <code>min_wait_timeout_ms</code> 或{" "}
-              <code>max_wait_timeout_ms</code>。这些配置会影响 Codex App 恢复该项目里的历史会话。
+              将更新项目 <code>.codex/config.toml</code> 中的{" "}
+              <code>default_wait_timeout_ms</code>，保留 min/max 边界值。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -1182,53 +1222,6 @@ function CodexRepairRoute() {
         </AlertDialogContent>
       </AlertDialog>
 
-      <AlertDialog open={confirmBatch} onOpenChange={setConfirmBatch}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>批量同步 {diag?.provider_mismatched_families ?? 0} 条对话记录</AlertDialogTitle>
-            <AlertDialogDescription>
-              目标服务商 (provider)：<b>{provider?.current}</b>。
-              自动备份后原地迁移，保留原会话 ID、历史和已有分支，不创建新副本。
-              请先停止目标会话生成，并在迁移后重新打开该会话。
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>取消</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() =>
-                run("clone_do", async () => {
-                  setProviderSyncProgress(null);
-                  const r = await api.runProviderSync({
-                    codex_dir: codexDir,
-                    strategy,
-                    dry_run: false,
-                  }, setProviderSyncProgress);
-                  const ok = r.filter((x) => x.ok).length;
-                  const failed = r.filter((x) => !x.ok);
-                  await refresh(true);
-                  if (r.length === 0) {
-                    toast.info("当前没有需要同步的会话");
-                  } else if (ok > 0) {
-                    toast.success(`完成：${ok}/${r.length}`);
-                  }
-                  if (failed.length > 0) {
-                    const detail = failed
-                      .map((item) => item.error ?? `${item.source_id} 未处理`)
-                      .slice(0, 3)
-                      .join("\n");
-                    if (failed.length === r.length) {
-                      throw new Error(detail || "所有会话同步均失败");
-                    }
-                    toast.error(`${failed.length} 条会话同步失败`, { description: detail });
-                  }
-                })
-              }
-            >
-              确认执行
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
 
       <AlertDialog
         open={confirmPrune !== null}
@@ -1243,38 +1236,25 @@ function CodexRepairRoute() {
                 ? "清理索引残留"
                 : confirmPrune === "threads"
                   ? "清理数据库残留"
-                  : confirmPrune === "subagents"
-                    ? "清理孤儿子代理"
-                    : "清理 family 残留"}
+                  : "清理孤儿子代理"}
             </AlertDialogTitle>
             <AlertDialogDescription>
               {confirmPrune === "index" ? (
                 <>
                   即将从 <code>session_index.jsonl</code> 删除{" "}
                   <b>{diag?.orphan_in_index.length ?? 0}</b> 行。这些条目指向的会话文件已经不存在，
-                  删除后不可撤销。对应的历史会话文件不会因此被再次修改。
+                  删除后不可撤销。
                 </>
               ) : confirmPrune === "threads" ? (
                 <>
                   即将从应用数据库的 <code>threads</code> 表删除{" "}
                   <b>{diag?.orphan_in_threads.length ?? 0}</b> 行。这些条目指向的会话文件已经不存在，
-                  删除后不可撤销。对应的历史会话文件不会因此被再次修改。
-                </>
-              ) : confirmPrune === "subagents" ? (
-                <>
-                  即将删除 <b>{diag?.orphan_subagent_count ?? 0}</b> 个父会话已消失的子代理会话：
-                  应用数据库 <code>threads</code> 行、本地会话文件（rollout）和子代理关系记录一并移除，
-                  嵌套的子代理后代也会一起删除。删除后不可撤销。若父会话仍存在（含已归档），
-                  其子代理不会计入此数量。
+                  删除后不可撤销。
                 </>
               ) : (
                 <>
-                  即将按预览修复 <code>session_family.json</code>：移除{" "}
-                  <b>{familyPrunePreview?.family_branches_removed ?? 0}</b> 个缺失分支和{" "}
-                  <b>{familyPrunePreview?.families_removed ?? 0}</b> 个空 family，恢复{" "}
-                  <b>{familyPrunePreview?.families_recovered ?? 0}</b> 个可唯一确定的 active_id，并校正{" "}
-                  <b>{familyPrunePreview?.families_normalized ?? 0}</b> 个 family 的 active/root/状态元数据。
-                  无法唯一判断的 family 会跳过；现存 rollout JSONL 不会被改写。
+                  将永久删除 <b>{diag?.orphan_subagent_count ?? 0}</b> 个孤儿子代理及其后代的
+                  会话文件、数据库记录和关系记录。此操作不可撤销。
                 </>
               )}
             </AlertDialogDescription>
@@ -1292,15 +1272,13 @@ function CodexRepairRoute() {
                     ? "prune_index"
                     : kind === "threads"
                       ? "prune_threads"
-                      : kind === "subagents"
-                        ? "prune_subagents"
-                        : "prune_family";
+                      : "prune_subagents";
                 void run(runKey, async () => {
                   const r = await api.pruneOrphanEntries({
                     codex_dir: codexDir,
                     prune_index: kind === "index",
                     prune_threads: kind === "threads",
-                    prune_family: kind === "family",
+                    prune_family: false,
                     prune_subagents: kind === "subagents",
                     dry_run: false,
                   });
@@ -1308,10 +1286,8 @@ function CodexRepairRoute() {
                     toast.success(`已从 session_index 删除 ${r.index_removed} 行`);
                   } else if (kind === "threads") {
                     toast.success(`已从 threads 表删除 ${r.threads_removed} 行`);
-                  } else if (kind === "subagents") {
-                    toast.success(`已删除 ${r.subagents_removed} 个孤儿子代理会话`);
                   } else {
-                    showFamilyPruneResult(r, false);
+                    toast.success(`已删除 ${r.subagents_removed} 个孤儿子代理会话`);
                   }
                   if (r.desktop_restart_required) {
                     toast.warning("清理已完成，但 Desktop 列表尚未刷新", {
@@ -1328,40 +1304,6 @@ function CodexRepairRoute() {
         </AlertDialogContent>
       </AlertDialog>
 
-      <AlertDialog open={confirmBackfill} onOpenChange={setConfirmBackfill}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>补全归档来源标记</AlertDialogTitle>
-            <AlertDialogDescription>
-              即将为{" "}
-              <b>
-                {(backfillPreview?.fork_marked ?? 0) +
-                  (backfillPreview?.provider_sync_marked ?? 0) +
-                  (backfillPreview?.unknown_marked ?? 0)}
-              </b>{" "}
-              个归档会话写入来源标记（Fork {(backfillPreview?.fork_marked ?? 0)}、
-              ProviderSync {(backfillPreview?.provider_sync_marked ?? 0)}、未知{" "}
-              {(backfillPreview?.unknown_marked ?? 0)}）。该标记写入 CC Sessions 自己的归档
-              账本，不修改任何官方会话数据；已有记录不会被覆盖。
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>取消</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => {
-                setConfirmBackfill(false);
-                void run("backfill_origins", async () => {
-                  const r = await api.backfillArchiveOrigins(codexDir, false);
-                  setBackfillPreview(r);
-                  showBackfillResult(r, false);
-                });
-              }}
-            >
-              确认补全
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
     </>
   );
 }
@@ -1376,38 +1318,80 @@ function ClaudeRepairRoute() {
   const [dryRun, setDryRun] = useState(false);
   const [confirmPrune, setConfirmPrune] = useState(false);
   const [guiDryRun, setGuiDryRun] = useState(false);
-  const [confirmGuiFix, setConfirmGuiFix] = useState(false);
+  const repairGeneration = useRef(0);
+  const refreshMounted = useRef(false);
+  const refreshScope = useRef({ directory: claudeDir });
+  if (refreshScope.current.directory !== claudeDir) refreshScope.current = { directory: claudeDir };
+  const scope = refreshScope.current;
+  const repairFlight = useRef<{ generation: number } | null>(null);
 
   const refresh = useCallback(async () => {
-    if (!claudeDir) return;
+    const generation = repairGeneration.current;
+    const isCurrent = () => refreshMounted.current && refreshScope.current === scope &&
+      repairGeneration.current === generation;
+    if (!claudeDir || !isCurrent()) return;
     setLoading(true);
     try {
-      setReport(await api.diagnoseClaudeHistoryOrphans(claudeDir));
+      const nextReport = await api.diagnoseClaudeHistoryOrphans(claudeDir);
+      if (!isCurrent()) return;
+      setReport(nextReport);
     } catch (e) {
-      toast.error(`Claude history 诊断失败：${String((e as Error)?.message ?? e)}`);
+      if (isCurrent()) toast.error(`Claude history 诊断失败：${String((e as Error)?.message ?? e)}`);
     }
+    if (!isCurrent()) return;
     try {
-      setGuiReport(await api.diagnoseClaudeGuiVisibility(claudeDir));
+      const nextGuiReport = await api.diagnoseClaudeGuiVisibility(claudeDir);
+      if (isCurrent()) setGuiReport(nextGuiReport);
     } catch (e) {
-      toast.error(`GUI 会话可见性诊断失败：${String((e as Error)?.message ?? e)}`);
+      if (isCurrent()) toast.error(`GUI 会话可见性诊断失败：${String((e as Error)?.message ?? e)}`);
     } finally {
-      setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
-  }, [claudeDir]);
+  }, [claudeDir, scope]);
 
   useEffect(() => {
+    repairGeneration.current += 1;
+    refreshMounted.current = true;
+    setRunning(null);
+    setReport(null);
+    setGuiReport(null);
     void refresh();
+    return () => {
+      repairGeneration.current += 1;
+      refreshMounted.current = false;
+    };
   }, [refresh]);
 
   const run = async (key: string, fn: () => Promise<void>) => {
+    const generation = repairGeneration.current;
+    if (repairFlight.current?.generation === generation) return;
+    const flight = { generation };
+    repairFlight.current = flight;
     setRunning(key);
     try {
       await fn();
     } catch (e) {
       toast.error(String((e as Error)?.message ?? e));
     } finally {
-      setRunning(null);
+      if (repairFlight.current !== flight) return;
+      repairFlight.current = null;
+      if (repairGeneration.current === generation) setRunning(null);
     }
+  };
+
+  const repairGuiTitles = () => {
+    void run("claude_gui_fix", async () => {
+      const result = await api.repairClaudeGuiVisibility(claudeDir, false);
+      if (result.errors.length > 0) {
+        toast.warning(
+          `已修复 ${result.fixed} 条，${result.errors.length} 条失败`,
+          { description: result.errors.slice(0, 3).join("\n") },
+        );
+      } else {
+        toast.success(`已为 ${result.fixed} 条会话补写标题`);
+      }
+      await refresh();
+    });
   };
 
   return (
@@ -1430,7 +1414,7 @@ function ClaudeRepairRoute() {
                   history.jsonl 残留
                   <Tooltip>
                     <TooltipTrigger asChild>
-                      <Info className="h-3.5 w-3.5 text-muted-foreground" />
+                      <button type="button" aria-label="查看说明" className="inline-flex shrink-0"><Info className="h-3.5 w-3.5 text-muted-foreground" /></button>
                     </TooltipTrigger>
                     <TooltipContent className="max-w-sm text-xs">
                       将 Claude 的 <code>history.jsonl</code> 与 <code>projects</code>{" "}
@@ -1476,6 +1460,7 @@ function ClaudeRepairRoute() {
                       id="claude-history-dry-run"
                       checked={dryRun}
                       onCheckedChange={setDryRun}
+                      disabled={!!running}
                     />
                     <Label htmlFor="claude-history-dry-run" className="text-xs">
                       效果预览
@@ -1521,7 +1506,7 @@ function ClaudeRepairRoute() {
                   GUI 会话列表修复
                   <Tooltip>
                     <TooltipTrigger asChild>
-                      <Info className="h-3.5 w-3.5 text-muted-foreground" />
+                      <button type="button" aria-label="查看说明" className="inline-flex shrink-0"><Info className="h-3.5 w-3.5 text-muted-foreground" /></button>
                     </TooltipTrigger>
                     <TooltipContent className="max-w-sm text-xs">
                       Claude Code 的 GUI（如 VS Code 插件）只读取会话文件头尾各 64KB
@@ -1553,7 +1538,7 @@ function ClaudeRepairRoute() {
                 {(guiReport?.issues.length ?? 0) > 0 ? (
                   <div className="min-w-0 space-y-1 rounded-md border bg-muted/20 p-2">
                     <div className="px-1 pb-1 text-[11px] text-muted-foreground">
-                      以下会话在 GUI 历史列表中不可见，将补写的标题来自会话首条用户消息：
+                      待补写标题
                     </div>
                     <div className="max-h-48 space-y-1 overflow-y-auto">
                       {guiReport?.issues.map((issue) => (
@@ -1585,6 +1570,7 @@ function ClaudeRepairRoute() {
                       id="claude-gui-dry-run"
                       checked={guiDryRun}
                       onCheckedChange={setGuiDryRun}
+                      disabled={!!running}
                     />
                     <Label htmlFor="claude-gui-dry-run" className="text-xs">
                       效果预览
@@ -1600,14 +1586,14 @@ function ClaudeRepairRoute() {
                           toast.success(`预览：将为 ${result.fixed} 条会话补写标题`);
                         });
                       } else {
-                        setConfirmGuiFix(true);
+                        void repairGuiTitles();
                       }
                     }}
                     disabled={!!running || (guiReport?.issues.length ?? 0) === 0}
                     className="gap-1.5"
                   >
                     <Wand2 className="h-3.5 w-3.5" />
-                    补写标题，恢复 GUI 显示
+                    修复会话标题
                     {(guiReport?.issues.length ?? 0) > 0 && (
                       <Badge
                         variant="outline"
@@ -1653,40 +1639,7 @@ function ClaudeRepairRoute() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-      <AlertDialog open={confirmGuiFix} onOpenChange={setConfirmGuiFix}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>补写会话标题，恢复 GUI 显示</AlertDialogTitle>
-            <AlertDialogDescription>
-              将为 <b>{guiReport?.issues.length ?? 0}</b> 条会话在其 jsonl 文件末尾追加一条{" "}
-              <code>custom-title</code> 记录（与 Claude Code 官方"重命名会话"的写入格式一致），
-              不会改动既有内容。完成后这些会话会重新出现在 VS Code 等 GUI 的历史列表中。
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>取消</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => {
-                setConfirmGuiFix(false);
-                void run("claude_gui_fix", async () => {
-                  const result = await api.repairClaudeGuiVisibility(claudeDir, false);
-                  if (result.errors.length > 0) {
-                    toast.warning(
-                      `已修复 ${result.fixed} 条，${result.errors.length} 条失败`,
-                      { description: result.errors.slice(0, 3).join("\n") },
-                    );
-                  } else {
-                    toast.success(`已为 ${result.fixed} 条会话补写标题`);
-                  }
-                  await refresh();
-                });
-              }}
-            >
-              确认修复
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+
     </>
   );
 }
@@ -1801,8 +1754,7 @@ function CursorRepairRoute() {
             </CardHeader>
             <CardContent className="min-w-0 space-y-3">
               <div className="text-xs text-muted-foreground">
-                Cursor 删除会话时留下的检查点、代码差异、文件快照都还在库里，从不回收。
-                这里可以把它们真正清掉。诊断要做一次全库可达性扫描，6 GB 的库上约半分钟。
+                扫描残留数据，大型数据库可能需要半分钟。
               </div>
               {report && (
                 <div className="grid min-w-0 gap-2 sm:grid-cols-3">
@@ -1828,13 +1780,6 @@ function CursorRepairRoute() {
               </div>
             </CardContent>
           </Card>
-
-          {!report && !loading && (
-            <EmptyState
-              title="尚未诊断"
-              description="点击「开始诊断」扫描 Cursor 数据库中的残留数据"
-            />
-          )}
 
           {report?.groups.map((group) => (
             <Card key={group.kind} className="min-w-0 overflow-hidden">
@@ -1903,8 +1848,7 @@ function CursorRepairRoute() {
             <Card className="min-w-0 overflow-hidden">
               <CardContent className="min-w-0 space-y-3 pt-6">
                 <div className="text-xs text-muted-foreground">
-                  清理和压缩都需要先完全退出 Cursor，否则会被拒绝。清理只把库内页面标成空闲，
-                  文件不会变小；<b>压缩数据库</b>才会把磁盘还回去，几 GB 的库可能要几分钟。
+                  请先退出 Cursor。清理后压缩数据库可释放磁盘空间，可能需要几分钟。
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
                   <Button
@@ -2027,7 +1971,7 @@ function Stat({
         {hint && (
           <Tooltip>
             <TooltipTrigger asChild>
-              <Info className="h-3 w-3 shrink-0 text-muted-foreground/70" />
+              <button type="button" aria-label="查看说明" className="inline-flex shrink-0"><Info className="h-3 w-3 shrink-0 text-muted-foreground/70" /></button>
             </TooltipTrigger>
             <TooltipContent className="max-w-sm text-xs">{hint}</TooltipContent>
           </Tooltip>
@@ -2138,14 +2082,6 @@ function DiffRow({
         <div className="min-w-0 truncate font-mono text-[11px] text-muted-foreground">
           {preview}
         </div>
-        {recommendation && (
-          <div className="min-w-0 text-[11px] text-muted-foreground">
-            <span className="mr-1 rounded-sm bg-muted/60 px-1 py-0.5 text-[10px] font-medium text-foreground/70">
-              建议
-            </span>
-            <span className="[overflow-wrap:anywhere]">{recommendation}</span>
-          </div>
-        )}
       </div>
     </div>
   );

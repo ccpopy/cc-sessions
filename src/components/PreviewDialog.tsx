@@ -182,7 +182,7 @@ export function PreviewDialog({
   const [processExpansionOverrides, setProcessExpansionOverrides] = useState<
     Record<string, boolean>
   >({});
-  const [forkTarget, setForkTarget] = useState<PreviewEvent | null>(null);
+  const forkInFlightRef = useRef(false);
   const [forking, setForking] = useState(false);
   const [editTarget, setEditTarget] = useState<PreviewEvent | null>(null);
   const [editText, setEditText] = useState("");
@@ -230,7 +230,7 @@ export function PreviewDialog({
     || (provider === "claude" && !!claudeDir && !isSubagentSession(session))
     || (provider === "opencode" && !!opencodeDir)
   );
-  const forkLabel = provider === "codex" ? "回溯" : "复制到此处";
+  const forkLabel = provider === "codex" ? "从此处分支" : "复制到此处";
   // 备份/导入预览（customRolloutPath）不允许编辑，只能编辑真实会话文件
   const canMutateSession =
     !customRolloutPath && !!session && !!backupDir && !!rolloutPath && !readError
@@ -549,7 +549,7 @@ export function PreviewDialog({
     setSessionInfoOpen(false);
     resetAndReload();
     return () => { generationRef.current += 1; cancelLoadAllRef.current = true; };
-  }, [open, rolloutPath, resetAndReload]);
+  }, [open, session?.id, rolloutPath, resetAndReload]);
 
   const timelineIndexSet = useMemo(
     () => (prompts === null ? null : new Set(prompts.map((prompt) => prompt.index))),
@@ -933,21 +933,18 @@ export function PreviewDialog({
     }
   };
 
-  const requestForkAt = (event: PreviewEvent) => {
-    if (!canForkSession || forking || !isStableForkNode(event, provider)) return;
-    setForkTarget(event);
-  };
-
-  const confirmForkAt = async () => {
-    if (!canForkSession || !session || !rolloutPath || !forkTarget || forking) return;
+  const requestForkAt = async (event: PreviewEvent) => {
+    if (!open || !canForkSession || !session || !rolloutPath || forkInFlightRef.current || !isStableForkNode(event, provider)) return;
+    const generation = generationRef.current;
+    forkInFlightRef.current = true;
     setForking(true);
     try {
       const target = {
         session_id: session.id,
         rollout_path: rolloutPath,
-        event_index: forkTarget.index,
+        event_index: event.index,
       };
-      const opencodeCutoff = provider === "opencode" ? openCodeForkPoint(forkTarget) : null;
+      const opencodeCutoff = provider === "opencode" ? openCodeForkPoint(event) : null;
       if (provider === "opencode" && !opencodeCutoff) throw new Error("所选消息不支持复制，请刷新预览后重试");
       const report = provider === "opencode"
         ? await api.copyOpenCodeSession({ ...target, opencode_dir: opencodeDir!, cutoff: opencodeCutoff! })
@@ -955,7 +952,7 @@ export function PreviewDialog({
           ? await api.forkClaudeSessionAtEvent({
               ...target,
               claude_dir: claudeDir!,
-              message_uuid: (forkTarget.raw as { uuid: string }).uuid,
+              message_uuid: (event.raw as { uuid: string }).uuid,
             })
           : await api.forkSessionAtEvent({ ...target, codex_dir: codexDir! });
       const count = "message_count" in report
@@ -967,14 +964,14 @@ export function PreviewDialog({
       if ("desktop_restart_required" in report && report.desktop_restart_required) {
         toast.info("操作已完成，重启 Codex App 后刷新会话列表");
       }
-      setForkTarget(null);
-      onOpenChange(false);
+      if (generation === generationRef.current) onOpenChange(false);
       await onForked?.();
     } catch (e: any) {
       toast.error(provider === "codex" ? "创建回溯分支失败" : "复制会话失败", {
         description: String(e?.message ?? e),
       });
     } finally {
+      forkInFlightRef.current = false;
       setForking(false);
     }
   };
@@ -1613,7 +1610,7 @@ export function PreviewDialog({
     </Dialog>
     <Dialog open={sessionInfoOpen} onOpenChange={setSessionInfoOpen}>
       <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-[640px]">
-        <DialogHeader><DialogTitle>会话信息</DialogTitle><DialogDescription>数据来源、历史诊断与本地修改详情。</DialogDescription></DialogHeader>
+        <DialogHeader><DialogTitle>会话信息</DialogTitle><DialogDescription className="sr-only">数据来源与编辑状态。</DialogDescription></DialogHeader>
         <dl className="space-y-2 break-all text-xs"><dt className="text-muted-foreground">来源</dt><dd>{sourceLabel}</dd><dt className="text-muted-foreground">会话 ID</dt><dd className="font-mono">{session?.id}</dd><dt className="text-muted-foreground">路径</dt><dd className="font-mono">{rolloutPath}</dd><dt className="text-muted-foreground">工作目录</dt><dd>{session?.cwd}</dd><dt className="text-muted-foreground">已加载 / 总底层记录</dt><dd>{events.length} / {totalEvents || "未知"}</dd></dl>
         {!!capability?.blocked_reasons.length && <div className="space-y-2 rounded-md border p-3 text-xs"><strong>编辑暂不可用</strong>{capability.blocked_reasons.map((reason, i) => <p key={i} className="break-all">{reason}</p>)}<Button variant="outline" size="sm" disabled={mutating || loading} onClick={() => void reloadPreservingView()}>重新检查</Button></div>}
         {capability?.projection && <details className="rounded-md border p-3 text-xs"><summary className="cursor-pointer">日志身份与投影同步详情</summary><p className="my-2">{capability.projection.message}</p><pre className="whitespace-pre-wrap break-all">{JSON.stringify(capability.projection, null, 2)}</pre></details>}
@@ -1628,12 +1625,6 @@ export function PreviewDialog({
       sessionId={session?.id ?? ""}
       rolloutPath={rolloutPath}
       onSelectTurn={(turn) => void selectWholeTurn(turn)}
-      fork={{
-        target: forkTarget,
-        running: forking,
-        onClose: () => setForkTarget(null),
-        onConfirm: () => void confirmForkAt(),
-      }}
       edit={{
         target: editTarget,
         running: mutating,

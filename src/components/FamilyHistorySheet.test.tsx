@@ -48,7 +48,7 @@ function button(label: string) {
   return element;
 }
 
-test("branch provider labels and switch confirmation use verified rollout metadata", async (t) => {
+test("branch switches directly using verified rollout metadata", async (t) => {
   const notices: string[] = [];
   t.mock.method(toast, "success", (message: string) => { notices.push(message); return 1; });
   t.mock.method(api, "rollbackFamilyActive", async () => {});
@@ -57,7 +57,7 @@ test("branch provider labels and switch confirmation use verified rollout metada
     assert.ok(!document.body.textContent?.includes("custom"));
     assert.ok(document.body.textContent?.includes("sessions/current.jsonl"));
     await act(async () => button("设为当前").click());
-    await act(async () => button("确认切换").click());
+    assert.equal(document.querySelector('[role="alertdialog"]'), null);
     assert.deepEqual(notices, ["已切换到 openai 分支"]);
   } finally { await act(async () => root.unmount()); }
 });
@@ -70,8 +70,7 @@ test("paginated ahead history can switch without promising or invoking line sync
   try {
     assert.ok(!document.body.textContent?.includes("同步到此分支"));
     await act(async () => button("设为当前").click());
-    assert.ok(document.body.textContent?.includes("不会自动合并"));
-    await act(async () => button("确认切换").click());
+    assert.equal(document.querySelector('[role="alertdialog"]'), null);
     assert.deepEqual(calls, ["switch"]);
   } finally { await act(async () => root.unmount()); }
 });
@@ -85,8 +84,104 @@ test("legacy ahead history keeps sync-and-switch behavior", async (t) => {
   const root = await mount(t, "active_ahead", 2);
   try {
     assert.ok(button("同步到此分支"));
-    await act(async () => button("设为当前").click());
-    await act(async () => button("同步并切换").click());
+    await act(async () => button("同步并设为当前").click());
+    assert.equal(document.querySelector('[role="alertdialog"]'), null);
     assert.deepEqual(calls, ["append", "switch"]);
+  } finally { await act(async () => root.unmount()); }
+});
+
+
+test("safe synchronization runs directly and blocks repeat clicks until finished", async (t) => {
+  let complete!: (value: { source_id: string; target_id: string; appended_lines: number; total_lines: number }) => void;
+  let calls = 0;
+  t.mock.method(api, "syncActiveIntoBranch", () => {
+    calls++;
+    return new Promise((resolve) => { complete = resolve; });
+  });
+  const root = await mount(t, "active_ahead", 2);
+  try {
+    await act(async () => {
+      const action = button("同步到此分支");
+      action.click(); action.click();
+    });
+    assert.equal(calls, 1);
+    assert.equal(document.querySelector('[role="alertdialog"]'), null);
+    assert.equal(button("同步到此分支").disabled, true);
+    await act(async () => complete({ source_id: "child", target_id: "parent", appended_lines: 2, total_lines: 5 }));
+    assert.equal(button("同步到此分支").disabled, false);
+  } finally { await act(async () => root.unmount()); }
+});
+
+test("failed direct switch shows feedback and can be retried", async (t) => {
+  let attempts = 0;
+  const errors: string[] = [];
+  t.mock.method(toast, "error", (error: string) => { errors.push(error); return 1; });
+  t.mock.method(api, "rollbackFamilyActive", async () => {
+    if (++attempts === 1) throw new Error("会话正在写入，请稍后重试");
+  });
+  const root = await mount(t, "same");
+  try {
+    await act(async () => button("设为当前").click());
+    assert.deepEqual(errors, ["会话正在写入，请稍后重试"]);
+    assert.equal(document.querySelector('[role="alertdialog"]'), null);
+    await act(async () => button("设为当前").click());
+    assert.equal(attempts, 2);
+  } finally { await act(async () => root.unmount()); }
+});
+
+test("switching divergent histories does not merge them", async (t) => {
+  const calls: string[] = [];
+  t.mock.method(api, "rollbackFamilyActive", async () => { calls.push("switch"); });
+  t.mock.method(api, "syncActiveIntoBranch", async () => { throw new Error("must not merge divergent history"); });
+  const root = await mount(t, "diverged");
+  try {
+    assert.ok(document.body.textContent?.includes("已分叉"));
+    await act(async () => button("设为当前").click());
+    assert.deepEqual(calls, ["switch"]);
+  } finally { await act(async () => root.unmount()); }
+});
+
+test("deletion keeps one confirmation; cancelling does not delete", async (t) => {
+  let deletes = 0;
+  t.mock.method(api, "deleteFamilyBranch", async () => { deletes++; return { ok: true }; });
+  const root = await mount(t, "same");
+  try {
+    await act(async () => button("删除").click());
+    assert.ok(document.querySelector('[role="alertdialog"]'));
+    assert.ok(document.body.textContent?.includes("不可撤销"));
+    assert.equal(deletes, 0);
+    await act(async () => button("取消").click());
+    assert.equal(document.querySelector('[role="alertdialog"]'), null);
+    assert.equal(deletes, 0);
+    await act(async () => button("删除").click());
+    await act(async () => button("删除分支").click());
+    assert.equal(deletes, 1);
+    assert.equal(document.querySelector('[role="alertdialog"]'), null);
+  } finally { await act(async () => root.unmount()); }
+});
+
+test("file details remain available on demand, not expanded by default", async (t) => {
+  const root = await mount(t, "same");
+  try {
+    const details = document.querySelector("details");
+    assert.ok(details);
+    assert.equal(details.open, false);
+    assert.match(details.textContent ?? "", /sessions\/current.jsonl/);
+    await act(async () => details.querySelector("summary")!.click());
+    assert.equal(details.open, true);
+  } finally { await act(async () => root.unmount()); }
+});
+
+test("closing during a switch does not reopen or reload a stale branch sheet", async (t) => {
+  let finish!: () => void;
+  t.mock.method(api, "rollbackFamilyActive", () => new Promise<void>((resolve) => { finish = resolve; }));
+  const root = await mount(t, "same");
+  const readsBefore = (api.getFamilyStore as unknown as { mock: { callCount: () => number } }).mock.callCount();
+  try {
+    await act(async () => button("设为当前").click());
+    await act(async () => root.render(<FamilyHistorySheet open={false} onOpenChange={() => {}} sessionId="parent" codexDir="fixture" currentProvider="openai" />));
+    await act(async () => finish());
+    assert.equal(document.querySelector('[role="dialog"]'), null);
+    assert.equal((api.getFamilyStore as unknown as { mock: { callCount: () => number } }).mock.callCount(), readsBefore);
   } finally { await act(async () => root.unmount()); }
 });
