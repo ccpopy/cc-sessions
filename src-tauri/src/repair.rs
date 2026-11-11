@@ -1194,7 +1194,7 @@ pub fn diagnose_codex_state(codex_dir: String) -> AppResult<DiagnosticReport> {
             threads_active_ids.push(id.clone());
         }
     }
-    let mut orphan_subagent_ids = if paths::state_db_path(&codex).is_file() {
+    let mut orphan_subagent_ids = if paths::state_db_path(&codex)?.is_file() {
         let conn = state_db::open_ro(&codex)?;
         find_orphan_subagent_ids_from_threads(&conn, &all_rollout_ids, || {
             Ok(scan.thread_states.keys().cloned().collect())
@@ -1615,7 +1615,7 @@ fn prune_orphan_entries_locked(
         }
     }
 
-    let state_db_exists = paths::state_db_path(&codex).is_file();
+    let state_db_exists = paths::state_db_path(&codex)?.is_file();
     let orphan_ids = if prune_threads && state_db_exists {
         let state = state_db::open_ro(&codex)?;
         let mut stmt = state.prepare("SELECT id FROM threads")?;
@@ -2659,10 +2659,10 @@ fn rebuild_threads_table_locked(
     let mut skipped = 0u32;
     let mut errors: Vec<String> = Vec::new();
 
-    if !paths::state_db_path(&codex).is_file() {
+    if !paths::state_db_path(&codex)?.is_file() {
         return Err(AppError::InvalidCodexDir(format!(
             "state_5.sqlite 不存在: {}",
-            paths::state_db_path(&codex).to_string_lossy()
+            paths::state_db_path(&codex)?.to_string_lossy()
         )));
     }
 
@@ -2715,7 +2715,7 @@ fn rebuild_threads_table_locked(
 }
 
 fn ensure_state_db_exists(codex: &Path) -> AppResult<()> {
-    let path = paths::state_db_path(codex);
+    let path = paths::state_db_path(codex)?;
     if path.is_file() {
         return Ok(());
     }
@@ -3108,7 +3108,7 @@ fn read_thread_states_for_ids<'a>(
 ) -> AppResult<BTreeMap<String, ThreadRepairState>> {
     use rusqlite::OptionalExtension;
     let mut states = BTreeMap::new();
-    if !paths::state_db_path(codex).is_file() {
+    if !paths::state_db_path(codex)?.is_file() {
         return Ok(states);
     }
     let conn = state_db::open_ro(codex)?;
@@ -3136,7 +3136,7 @@ fn read_thread_states_for_ids<'a>(
 fn read_thread_state_map(codex: &Path) -> AppResult<BTreeMap<String, ThreadRepairState>> {
     crate::operation_metrics::record(|c| c.thread_table_scans += 1);
     let mut out = BTreeMap::new();
-    if !paths::state_db_path(codex).is_file() {
+    if !paths::state_db_path(codex)?.is_file() {
         return Ok(out);
     }
     let conn = state_db::open_ro(codex)?;
@@ -4769,6 +4769,22 @@ impl OfficialProviderThreadForker {
         }
     }
 
+    fn validate_native_thread(&self, thread_id: &str) -> AppResult<()> {
+        use rusqlite::OptionalExtension;
+        let state = state_db::open_ro(&self.codex)?;
+        let cwd: Option<String> = state
+            .query_row(
+                "SELECT COALESCE(cwd, '') FROM threads WHERE id = ?1",
+                [thread_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(cwd) = cwd {
+            crate::codex_app_server::validate_native_thread_cwd(&cwd)?;
+        }
+        Ok(())
+    }
+
     fn app_server(&mut self) -> AppResult<&mut crate::codex_app_server::CodexAppServer> {
         if self.app_server.is_none() {
             self.app_server = Some(crate::codex_app_server::CodexAppServer::start(&self.codex)?);
@@ -4784,6 +4800,7 @@ impl ProviderThreadForker for OfficialProviderThreadForker {
         &mut self,
         thread_id: &str,
     ) -> AppResult<crate::codex_app_server::ForkedThread> {
+        self.validate_native_thread(thread_id)?;
         self.app_server()?.read_thread(thread_id)
     }
 
@@ -4792,6 +4809,7 @@ impl ProviderThreadForker for OfficialProviderThreadForker {
         thread_id: &str,
         provider: &str,
     ) -> AppResult<crate::codex_app_server::ForkedThread> {
+        self.validate_native_thread(thread_id)?;
         self.app_server()?.resume_for_provider(thread_id, provider)
     }
 
@@ -4804,6 +4822,7 @@ impl ProviderThreadForker for OfficialProviderThreadForker {
         thread_id: &str,
         model_provider: &str,
     ) -> AppResult<crate::codex_app_server::ForkedThread> {
+        self.validate_native_thread(thread_id)?;
         self.app_server()?
             .fork_thread_for_provider(thread_id, model_provider)
     }
@@ -4813,6 +4832,7 @@ impl ProviderThreadForker for OfficialProviderThreadForker {
         thread_id: &str,
         model_provider: &str,
     ) -> AppResult<crate::codex_app_server::ForkedThread> {
+        self.validate_native_thread(thread_id)?;
         self.app_server()?
             .fork_thread(thread_id, model_provider, false)
     }
@@ -7988,7 +8008,7 @@ mod tests {
         assert!(error.to_string().contains("不在 sessions"), "{error}");
         assert_eq!(fs::read(&external)?, external_before);
         assert!(family::scan_rollouts(&codex)?.is_empty());
-        assert!(!paths::state_db_path(&codex).exists());
+        assert!(!paths::state_db_path(&codex)?.exists());
 
         fs::remove_dir_all(codex).ok();
         fs::remove_dir_all(external_root).ok();
@@ -8434,6 +8454,29 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn official_provider_rejects_linux_cwd_in_a_local_windows_home_before_start() -> AppResult<()> {
+        let codex = temp_codex_dir("native-local-home-linux-cwd");
+        let state = create_full_state(&codex)?;
+        state.execute(
+            "INSERT INTO threads (id, cwd) VALUES ('wsl-thread', '/home/alice/project')",
+            [],
+        )?;
+        drop(state);
+        let before = fs::read(codex.join("state_5.sqlite"))?;
+        let mut native = OfficialProviderThreadForker::new(codex.clone());
+        let error = native
+            .read_provider_thread("wsl-thread")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("原 WSL 发行版"), "{error}");
+        assert!(native.app_server.is_none());
+        assert_eq!(fs::read(codex.join("state_5.sqlite"))?, before);
+        fs::remove_dir_all(codex)?;
+        Ok(())
+    }
+
     #[test]
     fn provider_migration_uses_latest_owned_settings() -> AppResult<()> {
         let codex = temp_codex_dir("provider-migration-effective-settings");
@@ -8483,10 +8526,12 @@ mod tests {
 
     #[test]
     fn provider_migration_round_trip_preserves_history_and_identity() -> AppResult<()> {
-        for (paginated, cli_version) in [
-            (false, "0.155.0-alpha.16"),
-            (true, "0.162.0-alpha.17.2"),
-            (true, "future-client"),
+        for (paginated, cli_version, nested_sqlite) in [
+            (false, "0.155.0-alpha.16", false),
+            (true, "0.162.0-alpha.17.2", false),
+            (true, "future-client", false),
+            (false, "0.155.0-alpha.16", true),
+            (true, "0.162.0-alpha.17.2", true),
         ] {
             let codex = temp_codex_dir("provider-migration-roundtrip");
             let id = "01a1362e-9b85-7672-ab8f-d17e68b2cc0e";
@@ -8495,6 +8540,13 @@ mod tests {
             } else {
                 prepare_provider_switch_fixture(&codex, id)?
             };
+            if nested_sqlite {
+                fs::create_dir_all(codex.join("sqlite"))?;
+                fs::rename(
+                    codex.join("state_5.sqlite"),
+                    codex.join("sqlite/state_5.sqlite"),
+                )?;
+            }
             let mut meta: Value =
                 serde_json::from_str(fs::read_to_string(&source)?.lines().next().unwrap())?;
             meta["payload"]["cli_version"] = Value::String(cli_version.into());
@@ -12040,7 +12092,7 @@ mod tests {
         fs::write(&global_state_path, "{broken global state")?;
 
         let rollout_before = fs::read(&rollout)?;
-        let state_path = paths::state_db_path(&codex);
+        let state_path = paths::state_db_path(&codex)?;
         let state_before = fs::read(&state_path)?;
         let index_path = paths::session_index_path(&codex);
         let index_before = fs::read(&index_path)?;

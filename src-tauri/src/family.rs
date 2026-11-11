@@ -811,7 +811,7 @@ fn get_session_family_overlay_locked(codex: &Path) -> AppResult<Vec<FamilyOverla
         String,
         (Option<String>, Option<String>, Option<String>, bool),
     > = std::collections::BTreeMap::new();
-    if paths::state_db_path(&codex).is_file() {
+    if paths::state_db_path(&codex)?.is_file() {
         let conn = state_db::open_ro(&codex)?;
         let mut stmt = conn.prepare(
             "SELECT id, rollout_path, model_provider, source, COALESCE(archived,0) FROM threads",
@@ -1533,7 +1533,7 @@ mod tests {
         let codex = temp_codex_dir("cc-session-manager-overlay-fork-test");
         let sessions = paths::sessions_dir(&codex);
         fs::create_dir_all(&sessions)?;
-        let conn = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let conn = rusqlite::Connection::open(paths::state_db_path(&codex)?)?;
         conn.execute(
             "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, model_provider TEXT, source TEXT, archived INTEGER)",
             [],
@@ -1659,7 +1659,7 @@ mod tests {
             paths::session_index_path(&codex),
             "{\"id\":\"overlay-source\"}\n{\"id\":\"overlay-target\"}\n",
         )?;
-        let conn = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let conn = rusqlite::Connection::open(paths::state_db_path(&codex)?)?;
         conn.execute(
             "CREATE TABLE threads (
                 id TEXT PRIMARY KEY,
@@ -1746,7 +1746,7 @@ mod tests {
             .expect("source overlay");
         assert_eq!(source.clone_state, "clonable");
 
-        let conn = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let conn = rusqlite::Connection::open(paths::state_db_path(&codex)?)?;
         conn.execute(
             "UPDATE threads SET archived = 0 WHERE id = ?",
             ["overlay-target"],
@@ -1772,7 +1772,7 @@ mod tests {
             paths::session_index_path(&codex),
             "{\"id\":\"missing-active\"}\n",
         )?;
-        let conn = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let conn = rusqlite::Connection::open(paths::state_db_path(&codex)?)?;
         conn.execute(
             "CREATE TABLE threads (
                 id TEXT PRIMARY KEY,

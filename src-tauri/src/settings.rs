@@ -240,7 +240,7 @@ pub fn default_cursor_dir() -> String {
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn validate_codex_dir(path: String) -> AppResult<DirValidation> {
     let p = PathBuf::from(&path);
-    let (exists, has_state, has_sessions) = paths::validate_codex_dir(&p);
+    let (exists, has_state, has_sessions) = paths::validate_codex_dir(&p)?;
     let threads_count = if has_state {
         state_db::count_threads(&p).unwrap_or(0)
     } else {

@@ -452,7 +452,7 @@ fn attach_thread_history_database_for_delete(
     codex_dir: &Path,
     transaction: &rusqlite::Transaction<'_>,
 ) -> AppResult<bool> {
-    let history_path = codex_dir.join("thread_history_1.sqlite");
+    let history_path = crate::paths::thread_history_db_path(codex_dir)?;
     let metadata = match fs::symlink_metadata(&history_path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -491,7 +491,7 @@ fn attach_thread_history_database_for_delete(
 }
 
 fn preflight_thread_history_database_for_delete(codex_dir: &Path) -> AppResult<()> {
-    let history_path = codex_dir.join("thread_history_1.sqlite");
+    let history_path = crate::paths::thread_history_db_path(codex_dir)?;
     let metadata = match fs::symlink_metadata(&history_path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -558,7 +558,7 @@ fn attach_logs_database_for_delete(
     codex_dir: &Path,
     transaction: &rusqlite::Transaction<'_>,
 ) -> AppResult<bool> {
-    let logs_path = codex_dir.join("logs_2.sqlite");
+    let logs_path = crate::paths::logs_db_path(codex_dir)?;
     let metadata = match fs::symlink_metadata(&logs_path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),

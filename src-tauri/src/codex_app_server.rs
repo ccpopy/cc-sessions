@@ -35,6 +35,8 @@ pub(crate) struct CodexAppServer {
 
 impl CodexAppServer {
     pub(crate) fn start(codex_dir: &Path) -> AppResult<Self> {
+        validate_native_codex_home(codex_dir)?;
+        let sqlite_dir = crate::paths::codex_sqlite_dir(codex_dir)?;
         let inherited_path = std::env::var_os("PATH");
         // Finder starts GUI apps with a narrow PATH. Use the user's login shell for
         // both locating Codex and running a script-based CLI's interpreter (node).
@@ -49,6 +51,10 @@ impl CodexAppServer {
         let mut command = Command::new(&executable);
         command
             .args(["app-server", "--stdio"])
+            // Use the same database location as CC Sessions, including legacy
+            // layouts, without changing the user's Codex configuration.
+            .arg("-c")
+            .arg(sqlite_home_override(&sqlite_dir))
             .env("CODEX_HOME", codex_dir);
         if let Some(path) = search_path {
             command.env("PATH", path);
@@ -245,6 +251,41 @@ impl CodexAppServer {
     }
 }
 
+/// Access to a WSL home through UNC does not make its Linux paths usable by
+/// Windows Codex. Even starting app-server may update its database, so reject
+/// this before looking up or spawning the host executable.
+fn validate_native_codex_home(codex_dir: &Path) -> AppResult<()> {
+    if crate::paths::is_wsl_unc_path(codex_dir) {
+        return Err(AppError::Path(
+            "不能通过 WSL UNC 路径启动本机 Codex app-server；请在该 WSL 发行版内运行 cc-sessions 和 Codex，并使用 Linux 格式的 CODEX_HOME 路径后再迁移、Fork 或恢复会话。尚未启动本机 Codex。".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn sqlite_home_override(sqlite_dir: &Path) -> String {
+    format!(
+        "sqlite_home={}",
+        toml::Value::String(sqlite_dir.to_string_lossy().into_owned())
+    )
+}
+
+pub(crate) fn validate_native_thread_cwd(cwd: &str) -> AppResult<()> {
+    validate_native_thread_cwd_for_platform(cwd, cfg!(windows))
+}
+
+fn validate_native_thread_cwd_for_platform(cwd: &str, windows: bool) -> AppResult<()> {
+    let cwd = crate::paths::strip_verbatim(cwd);
+    // A forward-slash UNC path is a Windows network path, not a Linux root.
+    let linux_absolute = cwd.starts_with('/') && !cwd.starts_with("//");
+    if windows && (linux_absolute || crate::paths::is_wsl_unc_path(Path::new(&cwd))) {
+        return Err(AppError::Path(
+            "会话使用 Linux/WSL 工作目录，不能使用 Windows Codex 迁移、Fork 或恢复；请在原 WSL 发行版内运行 cc-sessions 和 Codex。已阻止本次原生操作，未改写会话路径。".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl Drop for CodexAppServer {
     fn drop(&mut self) {
         self.stdin.take();
@@ -437,6 +478,88 @@ fn windows_desktop_codex_executable() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_native_rejects_linux_and_wsl_thread_cwds() {
+        for cwd in [
+            "/home/alice/project",
+            "/mnt/c/Users/alice/project",
+            "/",
+            r"\\wsl.localhost\Ubuntu\home\alice\project",
+            r"\\wsl$\Debian\home\alice\project",
+            r"\\?\UNC\wsl.localhost\Ubuntu\home\alice\project",
+            "//WSL.LOCALHOST/Ubuntu/home/alice/project",
+        ] {
+            let error = validate_native_thread_cwd_for_platform(cwd, true)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("原 WSL 发行版"), "{error}");
+            assert!(error.contains("未改写会话路径"), "{error}");
+        }
+    }
+
+    #[test]
+    fn native_cwd_validation_preserves_host_paths() -> AppResult<()> {
+        for cwd in [
+            r"C:\Users\alice\project",
+            "C:/Users/alice/project",
+            r"\\?\C:\Users\alice\project",
+            r"\\server\share\project",
+            "//server/share/project",
+        ] {
+            validate_native_thread_cwd_for_platform(cwd, true)?;
+        }
+        for cwd in ["/home/alice/project", "/mnt/c/Users/alice/project", "/"] {
+            validate_native_thread_cwd_for_platform(cwd, false)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sqlite_home_override_round_trips_paths_as_toml_strings() {
+        for path in [
+            "/home/alice/.codex",
+            "/home/alice/database with spaces/数据库",
+            "/tmp/quoted\"path\nnew-line",
+            r"C:\Users\alice\Codex Data",
+            r"\\server\share\Codex Data",
+        ] {
+            let assignment = sqlite_home_override(Path::new(path));
+            let parsed: toml::Table = toml::from_str(&assignment).unwrap();
+            assert_eq!(parsed["sqlite_home"].as_str(), Some(path));
+        }
+    }
+
+    #[test]
+    fn native_start_rejects_wsl_homes_before_spawning_codex() {
+        for home in [
+            r"\\wsl.localhost\Ubuntu\home\alice\.codex",
+            r"\\wsl$\Debian\home\alice\.codex",
+            r"\\?\UNC\wsl.localhost\Ubuntu\home\alice\.codex",
+            "//WSL.LOCALHOST/Ubuntu/home/alice/.codex",
+        ] {
+            // Exercise the public start path without relying on an installed CLI.
+            let error = match CodexAppServer::start(Path::new(home)) {
+                Ok(_) => panic!("WSL home must not launch host Codex: {home}"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains("WSL"), "{error}");
+            assert!(error.contains("CODEX_HOME"), "{error}");
+            assert!(error.contains("尚未启动"), "{error}");
+        }
+    }
+
+    #[test]
+    fn native_home_validation_preserves_local_and_non_wsl_network_homes() -> AppResult<()> {
+        for home in [
+            "/home/alice/.codex",
+            r"C:\Users\alice\.codex",
+            r"\\server\share\.codex",
+        ] {
+            validate_native_codex_home(Path::new(home))?;
+        }
+        Ok(())
+    }
 
     #[cfg(not(windows))]
     use std::fs;

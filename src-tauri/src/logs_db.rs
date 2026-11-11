@@ -7,7 +7,7 @@ use crate::state_db::ReadOnlyConnection;
 
 pub fn open(codex_dir: &Path) -> AppResult<Connection> {
     let conn = Connection::open_with_flags(
-        codex_dir.join("logs_2.sqlite"),
+        crate::paths::logs_db_path(codex_dir)?,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     conn.pragma_update(None, "journal_mode", "WAL")?;

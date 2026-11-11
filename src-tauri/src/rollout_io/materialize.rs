@@ -29,7 +29,7 @@ pub(crate) fn materialize_for_write(path: &Path) -> AppResult<PathBuf> {
         .then(|| atomic_file::fingerprint(&family_path))
         .transpose()?;
     let mut store = crate::family::load(root)?;
-    let state = crate::paths::state_db_path(root)
+    let state = crate::paths::state_db_path(root)?
         .is_file()
         .then(|| crate::state_db::open(root))
         .transpose()?;

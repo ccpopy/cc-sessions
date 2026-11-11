@@ -514,7 +514,7 @@ pub fn create_backup_with_dirs(
     }
 
     let state = state_db::open_ro(&codex)?;
-    let logs = if codex.join("logs_2.sqlite").is_file() {
+    let logs = if crate::paths::logs_db_path(&codex)?.is_file() {
         Some(logs_db::open_ro(&codex)?)
     } else {
         None
@@ -1642,7 +1642,7 @@ fn export_codex_thread_history(
     modified_rollout_ids: &HashSet<String>,
 ) -> AppResult<u32> {
     let mut output = File::create(destination)?;
-    let database_path = codex.join("thread_history_1.sqlite");
+    let database_path = crate::paths::thread_history_db_path(codex)?;
     let metadata = match fs::symlink_metadata(&database_path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -3268,7 +3268,7 @@ fn attach_codex_thread_history_for_restore(
     codex: &Path,
     backup_rows: &[CodexThreadHistoryBackupRow],
 ) -> AppResult<Option<HashMap<String, HashSet<String>>>> {
-    let history_path = codex.join("thread_history_1.sqlite");
+    let history_path = crate::paths::thread_history_db_path(codex)?;
     let metadata = match fs::symlink_metadata(&history_path) {
         Ok(metadata) => Some(metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -3581,7 +3581,7 @@ fn restore_one(
         return Ok(result);
     }
     let backup_log_rows = read_backup_log_rows(backup, target)?;
-    let logs_path = codex.join("logs_2.sqlite");
+    let logs_path = crate::paths::logs_db_path(codex)?;
     let logs_exist = match fs::symlink_metadata(&logs_path) {
         Ok(metadata) => {
             if path_safety::metadata_is_link_or_reparse(&metadata) || !metadata.is_file() {
@@ -4051,7 +4051,7 @@ mod tests {
             serde_json::to_vec_pretty(&manifest)?,
         )?;
         fs::create_dir_all(&codex)?;
-        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex)?)?;
         state.execute(
             "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT)",
             [],
@@ -4357,7 +4357,7 @@ mod tests {
 
     fn create_minimal_codex_restore_state(codex: &Path) -> AppResult<()> {
         fs::create_dir_all(codex)?;
-        let state = rusqlite::Connection::open(paths::state_db_path(codex))?;
+        let state = rusqlite::Connection::open(paths::state_db_path(codex)?)?;
         state.execute(
             "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT)",
             [],
@@ -4382,7 +4382,7 @@ mod tests {
             serde_json::json!({"type": "session_meta", "payload": {"id": id, "model_provider": "openai"}})
         );
         fs::write(&rollout, &original)?;
-        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex)?)?;
         state.execute(
             "INSERT INTO threads VALUES (?1, ?2, '', 'Long path fixture')",
             rusqlite::params![id, rollout.to_string_lossy().as_ref()],
@@ -4581,7 +4581,7 @@ mod tests {
         )?;
         let source_before = fs::read(&source_rollout)?;
 
-        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex)?)?;
         state.execute_batch(
             "CREATE TABLE threads (
                 id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT,
@@ -4664,7 +4664,7 @@ mod tests {
         // local-project root, and the source machine projectId is not reused.
         let target_codex = root.join("target-codex");
         fs::create_dir_all(&target_codex)?;
-        let target_state = rusqlite::Connection::open(paths::state_db_path(&target_codex))?;
+        let target_state = rusqlite::Connection::open(paths::state_db_path(&target_codex)?)?;
         target_state.execute(
             "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT)",
             [],
@@ -4779,7 +4779,7 @@ mod tests {
                     .join("\n")
             ),
         )?;
-        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex)?)?;
         state.execute_batch(
             "CREATE TABLE threads (
                 id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT,
@@ -4853,7 +4853,7 @@ mod tests {
 
         let restored_codex = root.join("restored-codex");
         fs::create_dir_all(&restored_codex)?;
-        let restored_state = rusqlite::Connection::open(paths::state_db_path(&restored_codex))?;
+        let restored_state = rusqlite::Connection::open(paths::state_db_path(&restored_codex)?)?;
         restored_state.execute_batch(
             "CREATE TABLE threads (
                 id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT,
@@ -4992,7 +4992,7 @@ mod tests {
                 })
             ),
         )?;
-        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex)?)?;
         state.execute_batch(
             "CREATE TABLE threads (
                 id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT,
@@ -5133,7 +5133,7 @@ mod tests {
             ),
         )?;
 
-        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex)?)?;
         state.execute_batch(
             "CREATE TABLE threads (
                 id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT,
@@ -5626,7 +5626,7 @@ mod tests {
         assert!(global_state["projectless-thread-ids"]
             .as_array()
             .is_some_and(Vec::is_empty));
-        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex)?)?;
         let restored_cwd: String =
             state.query_row("SELECT cwd FROM threads WHERE id = ?", [id], |row| {
                 row.get(0)
@@ -5701,7 +5701,7 @@ mod tests {
         let id = "restore-project-preflight";
         let relative = PathBuf::from(format!("sessions/2026/07/10/rollout-{id}.jsonl"));
         fs::create_dir_all(&codex)?;
-        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex)?)?;
         state.execute(
             "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT)",
             [],
@@ -5719,7 +5719,7 @@ mod tests {
             }),
             r"F:\work\repo",
         )?;
-        let state_path = paths::state_db_path(&codex);
+        let state_path = paths::state_db_path(&codex)?;
         let state_before = fs::read(&state_path)?;
         let global_path = paths::codex_global_state_json_path(&codex);
         fs::write(
@@ -5820,7 +5820,7 @@ mod tests {
             serde_json::to_vec_pretty(&manifest)?,
         )?;
 
-        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex)?)?;
         state.execute(
             "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT)",
             [],
@@ -6005,7 +6005,7 @@ mod tests {
         let relative = PathBuf::from(format!("sessions/2026/07/10/rollout-{id}.jsonl"));
         fs::create_dir_all(&codex)?;
 
-        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex)?)?;
         state.execute(
             "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT)",
             [],

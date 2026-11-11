@@ -242,7 +242,7 @@ pub(super) fn codex_root(path: &Path) -> Option<PathBuf> {
 }
 
 fn inspect_dependencies(root: &Path, id: &str, blocked: &mut Vec<String>) -> AppResult<()> {
-    let history = root.join("thread_history_1.sqlite");
+    let history = crate::paths::thread_history_db_path(root)?;
     if history.try_exists()? {
         let db = rusqlite::Connection::open_with_flags(
             history,

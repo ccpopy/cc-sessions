@@ -80,7 +80,7 @@ fn read_session_index_titles(
 /// 返回 Codex 当前对外展示的会话标题：显式 name 优先，活跃索引其次，title 兜底。
 pub(crate) fn codex_display_title(codex_dir: &Path, id: &str) -> AppResult<Option<String>> {
     let index_title = read_session_index_titles(codex_dir, None)?.remove(id);
-    if !paths::state_db_path(codex_dir).is_file() {
+    if !paths::state_db_path(codex_dir)?.is_file() {
         return Ok(index_title);
     }
     let state = state_db::open_ro(codex_dir)?;
@@ -734,10 +734,10 @@ pub fn rename_session_with_dirs(
 
 fn rename_session_locked(codex_dir: String, id: String, title: String) -> AppResult<u32> {
     let codex = PathBuf::from(&codex_dir);
-    if !paths::state_db_path(&codex).is_file() {
+    if !paths::state_db_path(&codex)?.is_file() {
         return Err(AppError::InvalidCodexDir(format!(
             "state_5.sqlite 不存在，无法重命名会话: {}",
-            paths::state_db_path(&codex).to_string_lossy()
+            paths::state_db_path(&codex)?.to_string_lossy()
         )));
     }
 
@@ -929,10 +929,10 @@ fn move_session_cwd_locked_with_post_project_sync(
     after_project_sync: impl FnOnce() -> AppResult<()>,
 ) -> AppResult<MoveSessionCwdReport> {
     let codex = PathBuf::from(&codex_dir);
-    if !paths::state_db_path(&codex).is_file() {
+    if !paths::state_db_path(&codex)?.is_file() {
         return Err(AppError::InvalidCodexDir(format!(
             "state_5.sqlite 不存在，无法移动工作目录: {}",
-            paths::state_db_path(&codex).to_string_lossy()
+            paths::state_db_path(&codex)?.to_string_lossy()
         )));
     }
 
@@ -3048,6 +3048,55 @@ mod tests {
     }
 
     #[test]
+    fn nested_sqlite_lists_and_renames_without_relocating_rollouts_or_index() -> AppResult<()> {
+        let codex = temp_dir("codex-nested-sqlite");
+        let id = "019d-nested-layout-active";
+        let rollouts = codex_family_fixture(
+            &codex,
+            "nested-family",
+            id,
+            &[FamilyBranchFixture {
+                id,
+                archived: false,
+            }],
+        )?;
+        fs::create_dir_all(codex.join("sqlite"))?;
+        fs::rename(
+            codex.join("state_5.sqlite"),
+            codex.join("sqlite/state_5.sqlite"),
+        )?;
+        let rollout = &rollouts[id];
+        let before = fs::read(rollout)?;
+        let listed = list_sessions(
+            Some("codex".into()),
+            codex.to_string_lossy().into_owned(),
+            None,
+        )?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+        rename_session_with_lock(
+            Some("codex".into()),
+            codex.to_string_lossy().into_owned(),
+            id.into(),
+            "nested title".into(),
+            &family::FamilyLock::default(),
+        )?;
+        let state = state_db::open_ro(&codex)?;
+        let title: String =
+            state.query_row("SELECT title FROM threads WHERE id=?1", [id], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(title, "nested title");
+        assert!(fs::read_to_string(paths::session_index_path(&codex))?.contains("nested title"));
+        assert_eq!(fs::read(rollout)?, before);
+        assert!(!codex.join("state_5.sqlite").exists());
+        assert!(!codex.join("sqlite/session_index.jsonl").exists());
+        drop(state);
+        fs::remove_dir_all(codex)?;
+        Ok(())
+    }
+
+    #[test]
     fn rename_session_updates_family_without_readding_archived_index_entries() -> AppResult<()> {
         let codex = temp_dir("codex-rename-session-family");
         let family_id = "family-rename";
@@ -3079,7 +3128,7 @@ mod tests {
         )?;
         assert_eq!(renamed, 2);
 
-        let conn = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let conn = rusqlite::Connection::open(paths::state_db_path(&codex)?)?;
         let matching: i64 = conn.query_row(
             "SELECT COUNT(*) FROM threads WHERE id IN (?1, ?2) AND title = ?3",
             params![archived_id, active_id, "家族新名称"],
@@ -4565,7 +4614,7 @@ mod tests {
                 .get(session_id)
                 .expect("fixture rollout")
                 .clone(),
-            paths::state_db_path(&codex),
+            paths::state_db_path(&codex)?,
             paths::session_index_path(&codex),
             paths::family_store_path(&codex),
             paths::codex_global_state_json_path(&codex),
@@ -4840,7 +4889,7 @@ mod tests {
         let store = family::load(&codex)?;
         assert!(!store.families.contains_key(family_id));
         assert!(!store.index.contains_key(active_id));
-        let conn = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let conn = rusqlite::Connection::open(paths::state_db_path(&codex)?)?;
         let remaining: i64 = conn.query_row(
             "SELECT COUNT(*) FROM threads WHERE id = ?",
             [active_id],
@@ -4898,7 +4947,7 @@ mod tests {
             "family must not promote a branch"
         );
         assert!(store.index.is_empty());
-        let conn = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let conn = rusqlite::Connection::open(paths::state_db_path(&codex)?)?;
         let remaining: i64 = conn.query_row(
             "SELECT COUNT(*) FROM threads WHERE id IN (?1, ?2)",
             params![archived_id, active_id],
@@ -4967,7 +5016,7 @@ mod tests {
             Some(family_id)
         );
 
-        let conn = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let conn = rusqlite::Connection::open(paths::state_db_path(&codex)?)?;
         let remaining: i64 = conn.query_row(
             "SELECT COUNT(*) FROM threads WHERE id IN (?1, ?2)",
             params![archived_id, active_id],
@@ -5084,7 +5133,7 @@ mod tests {
         assert_eq!(fs::read(paths::family_store_path(&codex))?, family_before);
         assert_eq!(fs::read(paths::session_index_path(&codex))?, index_before);
         assert_eq!(fs::read(&paths_by_id[active_id])?, rollout_before);
-        let conn = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let conn = rusqlite::Connection::open(paths::state_db_path(&codex)?)?;
         let remaining: i64 = conn.query_row(
             "SELECT COUNT(*) FROM threads WHERE id = ?",
             [active_id],
@@ -5277,7 +5326,7 @@ mod tests {
             BranchStatus::Archived
         ));
 
-        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex)?)?;
         for (id, expected_archived) in [(historical_id, 0_i64), (active_id, 1_i64)] {
             let archived: i64 = state.query_row(
                 "SELECT CAST(archived AS INTEGER) FROM threads WHERE id = ?",
@@ -5328,7 +5377,7 @@ mod tests {
         }
         family::save(&codex, &fixture_store)?;
 
-        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex)?)?;
         state.execute(
             "UPDATE threads SET updated_at = ?1 WHERE id = ?2",
             params![1770000200_i64, active_id],
@@ -5373,7 +5422,7 @@ mod tests {
             BranchStatus::Archived
         ));
 
-        let state = rusqlite::Connection::open(paths::state_db_path(&codex))?;
+        let state = rusqlite::Connection::open(paths::state_db_path(&codex)?)?;
         for id in [active_id, restored_id] {
             let archived: i64 = state.query_row(
                 "SELECT CAST(archived AS INTEGER) FROM threads WHERE id = ?",
@@ -5560,7 +5609,7 @@ mod tests {
         )?;
         drop(history);
         let rollout_before = fs::read(&rollout)?;
-        let state_before = fs::read(paths::state_db_path(&codex))?;
+        let state_before = fs::read(paths::state_db_path(&codex)?)?;
 
         let error = delete_one(&codex, ARCHIVE_TEST_ID)
             .expect_err("incomplete thread history schema must reject deletion");
@@ -5570,7 +5619,7 @@ mod tests {
             "{error}"
         );
         assert_eq!(fs::read(&rollout)?, rollout_before);
-        assert_eq!(fs::read(paths::state_db_path(&codex))?, state_before);
+        assert_eq!(fs::read(paths::state_db_path(&codex)?)?, state_before);
         let history = rusqlite::Connection::open(codex.join("thread_history_1.sqlite"))?;
         let rows: i64 = history.query_row(
             "SELECT COUNT(*) FROM thread_turns WHERE thread_id = ?1",
@@ -5954,7 +6003,7 @@ mod tests {
         let codex = temp_dir("codex-delete-project-state-failure");
         let rollout = archive_fixture(&codex);
         let index_path = paths::session_index_path(&codex);
-        let state_path = paths::state_db_path(&codex);
+        let state_path = paths::state_db_path(&codex)?;
         let global_state_path = paths::codex_global_state_json_path(&codex);
         fs::write(&global_state_path, "{broken global state")?;
         let rollout_before = fs::read(&rollout)?;

@@ -258,6 +258,21 @@ CLI 默认读取与桌面版相同的数据位置。需要指定其他目录时�
 cc-sessions --codex-dir "\\wsl.localhost\Ubuntu\home\me\.codex" list
 ```
 
+### Codex 的 WSL 数据库与服务商迁移
+
+`--codex-dir` 始终填写 Codex 数据根目录（例如 `~/.codex`），不要因为数据库在 `~/.codex/sqlite/state_5.sqlite` 就改填 `~/.codex/sqlite`。会话文件、`config.toml` 和索引仍从数据根目录读取。
+
+数据库位置优先读取该根目录 `config.toml` 的 `sqlite_home`，其次是当前进程的 `CODEX_SQLITE_HOME`。未显式指定时，支持根目录和 `sqlite/` 子目录两种布局；如果两处都有 `state_5.sqlite`，会提示先确认实际位置，不会猜测、移动数据库或创建空库。配置文件里的相对路径以该配置文件所在目录为基准。此解析不替代 Codex 的完整托管/项目配置加载。
+
+Windows 可通过上述 WSL UNC 路径浏览数据，但服务商迁移和原生会话分支需要在同一个 WSL 发行版里运行 Linux 版 CC Sessions 与 Linux 版 Codex。Windows 版不会调用本机 Codex 去恢复 Linux 工作目录。若 WSL 中没有可运行的 `codex`，需先准备 Linux 版 Codex CLI 并确保 `codex --version` 正常，然后运行：
+
+```bash
+./cc-sessions --codex-dir "$HOME/.codex" list
+./cc-sessions --codex-dir "$HOME/.codex" webui
+```
+
+在浏览器打开终端显示的本地地址，确认列出的会话正确后，再执行服务商迁移。迁移启动的原生进程使用同一个 SQLite 目录，不会改写用户的 `config.toml`。
+
 ### 自带网页界面
 
 ```bash

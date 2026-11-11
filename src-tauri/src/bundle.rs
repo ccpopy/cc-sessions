@@ -3662,7 +3662,7 @@ fn run_codex_import_atomic<T>(
         &mut crate::mutation_journal::MutationJournal,
     ) -> AppResult<T>,
 ) -> AppResult<T> {
-    let has_state_db = paths::state_db_path(codex).is_file();
+    let has_state_db = paths::state_db_path(codex)?.is_file();
     let state = if has_state_db {
         state_db::open(codex)?
     } else {

@@ -101,7 +101,7 @@ fn sample_each(
     }
     // Query the live DB by primary key. Never compare DB/WAL timestamps or copy the database:
     // activity in a different thread must not block this selection.
-    let database = paths::state_db_path(codex);
+    let database = paths::state_db_path(codex)?;
     let conn = if database.is_file() {
         Some(Connection::open_with_flags(
             database,
@@ -279,7 +279,7 @@ mod tests {
         let continuation = root.join("continuation.jsonl");
         fs::write(&rollout, b"selected\n")?;
         fs::write(&continuation, b"continuation\n")?;
-        let conn = Connection::open(paths::state_db_path(&root))?;
+        let conn = Connection::open(paths::state_db_path(&root)?)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, updated_at INTEGER);")?;
         conn.execute(
             "INSERT INTO threads VALUES ('selected', ?1, 0), ('other', '', 0)",

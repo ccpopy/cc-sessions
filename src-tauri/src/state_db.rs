@@ -35,7 +35,7 @@ impl Drop for SqliteSnapshot {
 
 pub fn open(codex_dir: &Path) -> AppResult<Connection> {
     let conn = Connection::open_with_flags(
-        codex_dir.join("state_5.sqlite"),
+        paths::state_db_path(codex_dir)?,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -48,10 +48,20 @@ pub fn open_ro(codex_dir: &Path) -> AppResult<ReadOnlyConnection> {
 }
 
 pub(crate) fn open_ro_db(codex_dir: &Path, db_name: &str) -> AppResult<ReadOnlyConnection> {
-    let (db_path, snapshot) = if paths::is_wsl_unc_path(codex_dir) {
-        snapshot_sqlite_db(codex_dir, db_name)?
+    let source = match db_name {
+        "state_5.sqlite" => paths::state_db_path(codex_dir)?,
+        "logs_2.sqlite" => paths::logs_db_path(codex_dir)?,
+        _ => paths::codex_sqlite_dir(codex_dir)?.join(db_name),
+    };
+    let (db_path, snapshot) = if paths::is_wsl_unc_path(&source) {
+        snapshot_sqlite_db(
+            source
+                .parent()
+                .ok_or_else(|| AppError::Path("SQLite 路径缺少父目录".into()))?,
+            db_name,
+        )?
     } else {
-        (codex_dir.join(db_name), None)
+        (source, None)
     };
     let conn = Connection::open_with_flags(
         db_path,
@@ -144,4 +154,72 @@ fn sanitize_snapshot_name(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nested_sqlite_reads_writes_and_validates_without_moving_session_root() -> AppResult<()> {
+        let root = std::env::temp_dir().join(format!(
+            "cc-state-layout-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("sqlite"))?;
+        fs::create_dir_all(root.join("sessions"))?;
+        let database = root.join("sqlite/state_5.sqlite");
+        let seed = Connection::open(&database)?;
+        seed.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE threads (id TEXT); INSERT INTO threads VALUES ('first');")?;
+        // The writer remains open, so the read must include its committed WAL.
+        assert_eq!(count_threads(&root)?, 1);
+        assert_eq!(paths::validate_codex_dir(&root)?, (true, true, true));
+        let writer = open(&root)?;
+        writer.execute("INSERT INTO threads VALUES ('second')", [])?;
+        assert_eq!(count_threads(&root)?, 2);
+        assert_eq!(
+            paths::thread_history_db_path(&root)?,
+            root.join("sqlite/thread_history_1.sqlite")
+        );
+        assert_eq!(
+            paths::logs_db_path(&root)?,
+            root.join("sqlite/logs_2.sqlite")
+        );
+        assert!(!root.join("state_5.sqlite").exists());
+        assert!(!root.join("sqlite/sessions").exists());
+        drop(writer);
+        drop(seed);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn missing_explicit_database_is_not_created_or_replaced_by_fallback() -> AppResult<()> {
+        let root = std::env::temp_dir().join(format!(
+            "cc-state-missing-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("sqlite"))?;
+        fs::write(root.join("config.toml"), "sqlite_home = 'missing'")?;
+        fs::write(root.join("state_5.sqlite"), b"root sentinel")?;
+        fs::write(root.join("sqlite/state_5.sqlite"), b"nested sentinel")?;
+        assert!(open_ro(&root).is_err());
+        assert!(open(&root).is_err());
+        assert!(!root.join("missing").exists());
+        assert_eq!(fs::read(root.join("state_5.sqlite"))?, b"root sentinel");
+        assert_eq!(
+            fs::read(root.join("sqlite/state_5.sqlite"))?,
+            b"nested sentinel"
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
 }

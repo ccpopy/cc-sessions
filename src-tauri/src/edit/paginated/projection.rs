@@ -195,9 +195,10 @@ fn fill_snapshot_columns(
 }
 
 pub(in crate::edit) fn path(rollout: &Path) -> AppResult<PathBuf> {
-    Ok(safety::codex_root(rollout)
-        .ok_or_else(|| unsupported("分页日志必须位于已识别的数据根 sessions/archived_sessions 中"))?
-        .join("thread_history_1.sqlite"))
+    let root = safety::codex_root(rollout).ok_or_else(|| {
+        unsupported("分页日志必须位于已识别的数据根 sessions/archived_sessions 中")
+    })?;
+    paths::thread_history_db_path(&root)
 }
 fn identity(loaded: &LoadedFile) -> AppResult<&str> {
     loaded

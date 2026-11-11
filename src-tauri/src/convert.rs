@@ -310,7 +310,7 @@ fn write_codex_session(
             ));
         }
     }
-    let state = paths::state_db_path(&codex)
+    let state = paths::state_db_path(&codex)?
         .is_file()
         .then(|| state_db::open(&codex))
         .transpose()?;
@@ -3827,7 +3827,7 @@ mod tests {
         let existing_rollout = codex.join("sessions/2026/07/20/rollout-existing.jsonl");
         fs::create_dir_all(existing_rollout.parent().unwrap()).unwrap();
         fs::write(&existing_rollout, b"existing rollout\n").unwrap();
-        fs::File::create(paths::state_db_path(&codex)).unwrap();
+        fs::File::create(paths::state_db_path(&codex).unwrap()).unwrap();
         let state = state_db::open(&codex).unwrap();
         state
             .execute(
@@ -3916,7 +3916,7 @@ mod tests {
             )],
         );
 
-        fs::File::create(paths::state_db_path(&codex)).unwrap();
+        fs::File::create(paths::state_db_path(&codex).unwrap()).unwrap();
         let state = state_db::open(&codex).unwrap();
         state
             .execute(
