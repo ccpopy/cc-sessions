@@ -114,6 +114,7 @@ async function createSourcePackage() {
   const archivePath = path.join(outputRoot, `${packageName}.zip`);
 
   await cleanDir(stage);
+  await copyLicenseNotices(stage);
 
   const directories = [
     "img",
@@ -128,7 +129,6 @@ async function createSourcePackage() {
   const files = [
     ".gitattributes",
     ".gitignore",
-    "LICENSE",
     "README.md",
     "app-icon.svg",
     "components.json",
@@ -176,6 +176,7 @@ async function createPortablePackage() {
       : null;
 
   await cleanDir(stage);
+  await copyLicenseNotices(stage);
   await fs.copyFile(exePath, path.join(stage, executableName()));
   await fs.writeFile(path.join(stage, "cc-session-manager.portable"), "portable\n", "utf8");
   const readme = [
@@ -243,6 +244,7 @@ async function createProductPackage() {
   const archivePath = path.join(outputRoot, `${packageName}.zip`);
 
   await cleanDir(stage);
+  await copyLicenseNotices(stage);
   for (const filePath of packageFiles) {
     const relativePath = path.relative(bundleDir, filePath);
     const destination = path.join(stage, relativePath);
@@ -296,6 +298,7 @@ async function createCliPackage() {
   const archivePath = path.join(outputRoot, `${packageName}.zip`);
 
   await cleanDir(stage);
+  await copyLicenseNotices(stage);
   await fs.copyFile(exePath, path.join(stage, cliExecutableName()));
   await fs.writeFile(path.join(stage, "cc-sessions.portable"), "portable\n", "utf8");
   const distPath = path.join(repoRoot, "dist");
@@ -350,6 +353,12 @@ function run(command, args, options = {}) {
   });
   if (result.status !== 0) {
     throw new Error(`${command} ${args.join(" ")} failed with exit code ${result.status}.`);
+  }
+}
+
+async function copyLicenseNotices(destinationRoot) {
+  for (const item of ["LICENSE", "third_party_licenses/magpie-MIT.txt"]) {
+    await copyRepoItem(item, destinationRoot);
   }
 }
 
