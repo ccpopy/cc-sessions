@@ -273,6 +273,8 @@ Windows 可通过上述 WSL UNC 路径浏览数据，但服务商迁移和原生
 
 在浏览器打开终端显示的本地地址，确认列出的会话正确后，再执行服务商迁移。迁移启动的原生进程使用同一个 SQLite 目录，不会改写用户的 `config.toml`。
 
+Codex 0.167.1 的服务商兼容迁移仅支持已关闭、未被原生进程持锁的 paginated 会话，包括普通、zstd 和 history_base 继承历史。操作会先备份，再由原生 Codex 保存目标服务商设置，成功前校验数据库与历史中的有效设置一致；不修改会话 ID、不新建分支。legacy 历史、未知版本或已加载会话不会使用此兼容写入。详细复现与验证范围见 [`scripts/provider-migration-validation.md`](scripts/provider-migration-validation.md)。
+
 ### 自带网页界面
 
 ```bash

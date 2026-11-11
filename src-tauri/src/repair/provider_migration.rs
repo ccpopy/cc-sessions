@@ -4,6 +4,9 @@ use crate::codex_app_server::ForkedThread;
 use crate::models::ProviderDirs;
 use sha2::{Digest, Sha256};
 
+#[path = "provider_migration/paginated_compat.rs"]
+mod paginated_compat;
+
 fn current_path(codex: &Path, id: &str, hint: Option<&Path>) -> AppResult<PathBuf> {
     let states = read_thread_states_for_ids(codex, [id])?;
     let raw = states.get(id).and_then(|s| s.rollout_path.as_deref());
@@ -92,6 +95,117 @@ fn history_stamp(path: &Path, limit: Option<usize>) -> AppResult<HistoryStamp> {
     })
 }
 
+// Resume may add settings records, which history_stamp intentionally excludes.
+// Check routing-independent metadata separately, including columns present on older clients.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct MetadataStamp {
+    rollout: Vec<Option<String>>,
+    database: BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    first_meta_sha256: Option<String>,
+    #[serde(default)]
+    owned_settings: Option<BTreeMap<String, Value>>,
+}
+
+impl MetadataStamp {
+    fn matches(&self, current: &Self) -> bool {
+        let mut current = current.clone();
+        // A newly forked thread can have no title yet. Core derives its first title
+        // from inherited history on resume; no existing title is being replaced.
+        // Explicit names and every previously nonempty title remain protected.
+        if self
+            .database
+            .get("title")
+            .is_some_and(|title| title.as_deref() == Some(""))
+        {
+            current.database.insert("title".into(), Some(String::new()));
+        }
+        // Older receipts did not capture these additional fields.
+        if self.first_meta_sha256.is_none() {
+            current.first_meta_sha256 = None;
+        }
+        if self.owned_settings.is_none() {
+            current.owned_settings = None;
+        }
+        &current == self
+    }
+}
+
+fn metadata_stamp(codex: &Path, id: &str, path: &Path) -> AppResult<MetadataStamp> {
+    let brief = read_rollout_brief(codex, path)?
+        .ok_or_else(|| AppError::Other("迁移源 rollout 缺少元数据".into()))?;
+    let state = state_db::open_ro(codex)?;
+    let columns = threads_table_columns(&state)?;
+    let mut database = BTreeMap::new();
+    for column in [
+        "cwd",
+        "source",
+        "sandbox_policy",
+        "approval_mode",
+        "memory_mode",
+        "title",
+        "name",
+        "archived",
+        "archived_at",
+        "created_at",
+        // Core may normalize created_at_ms from the rollout header on resume.
+        // Preserve the stable creation second instead of rejecting that rounding.
+    ] {
+        if columns.iter().any(|name| name == column) {
+            let value = state.query_row(
+                &format!("SELECT CAST({column} AS TEXT) FROM threads WHERE id=?1"),
+                [id],
+                |row| row.get::<_, Option<String>>(0),
+            )?;
+            database.insert(column.into(), value);
+        }
+    }
+    let physical_meta = crate::family::read_physical_session_meta(path)?;
+    let first_meta_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&physical_meta)?));
+    let history = crate::logical_history::read_view(path, None)?;
+    let mut header_id = None;
+    let mut owned_settings = BTreeMap::new();
+    for record in history.records() {
+        let payload = &record["payload"];
+        if record["type"] == "session_meta" {
+            header_id = payload["id"].as_str();
+        } else if record["type"] == "event_msg"
+            && payload["type"] == "thread_settings_applied"
+            && payload["thread_id"].as_str().or(header_id) == Some(id)
+        {
+            // Each event is a settings snapshot. Compare only these known routing-
+            // independent fields, including nested permission objects, not model choices.
+            owned_settings.clear();
+            for field in [
+                "cwd",
+                "runtime_workspace_roots",
+                "approval_policy",
+                "approvals_reviewer",
+                "permission_profile",
+                "active_permission_profile",
+                "sandbox_policy",
+                "memory_mode",
+            ] {
+                if let Some(value) = payload["thread_settings"].get(field) {
+                    owned_settings.insert(field.into(), value.clone());
+                }
+            }
+        }
+    }
+    Ok(MetadataStamp {
+        first_meta_sha256: Some(first_meta_sha256),
+        owned_settings: Some(owned_settings),
+        rollout: vec![
+            brief.cwd,
+            brief.source,
+            brief.sandbox_policy,
+            brief.approval_mode,
+            brief.memory_mode,
+        ],
+        database,
+    })
+}
+
 fn receipt(
     backup: &Path,
     id: &str,
@@ -99,13 +213,14 @@ fn receipt(
     to: &str,
     status: &str,
     history: &HistoryStamp,
+    metadata: Option<&MetadataStamp>,
 ) -> AppResult<()> {
     atomic_file::overwrite_with_writer(&backup.join("provider-migration.json"), |file| {
         serde_json::to_writer_pretty(
             file,
             &serde_json::json!({
                 "thread_id": id, "from_provider": from, "to_provider": to, "status": status,
-                "history": history
+                "history": history, "metadata": metadata
             }),
         )?;
         Ok(())
@@ -114,13 +229,7 @@ fn receipt(
 
 /// A killed process can leave a durable prepared receipt. Reconcile only this thread's
 /// receipts before another write; appended turns are allowed when the original prefix survives.
-fn reconcile_interrupted(
-    codex: &Path,
-    id: &str,
-    path: &Path,
-    provider: &str,
-    native_provider: Option<&str>,
-) -> AppResult<()> {
+fn reconcile_interrupted(codex: &Path, id: &str, path: &Path, provider: &str) -> AppResult<()> {
     let root = codex.join("backups/provider-migrations");
     if !root.is_dir() {
         return Ok(());
@@ -153,6 +262,12 @@ fn reconcile_interrupted(
             continue;
         }
         let expected: HistoryStamp = serde_json::from_value(record["history"].clone())?;
+        let metadata: Option<MetadataStamp> = record
+            .get("metadata")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?;
         let from = record["from_provider"]
             .as_str()
             .ok_or_else(|| AppError::Other("迁移恢复记录缺少原服务商".into()))?;
@@ -161,10 +276,16 @@ fn reconcile_interrupted(
             .ok_or_else(|| AppError::Other("迁移恢复记录缺少目标服务商".into()))?;
         let persisted = read_rollout_brief(codex, path)?.and_then(|b| b.model_provider);
         if history_stamp(path, Some(expected.records))? != expected
-            || (persisted.as_deref() != Some(provider) && native_provider != Some(provider))
+            || persisted.as_deref() != Some(provider)
+            || metadata.as_ref().is_some_and(|expected| {
+                let Ok(current) = metadata_stamp(codex, id, path) else {
+                    return true;
+                };
+                !expected.matches(&current)
+            })
             || (provider != from && provider != to)
         {
-            return Err(AppError::Other(format!("[needs_recovery] 会话 {id} 上次迁移尚未核对完成，原历史或服务商与恢复记录不一致；请先核对迁移前备份：{}", backup.display())));
+            return Err(AppError::Other(format!("[needs_recovery] 会话 {id} 上次迁移尚未核对完成，原历史、服务商或会话元数据与恢复记录不一致；请先核对迁移前备份：{}", backup.display())));
         }
         receipt(
             &backup,
@@ -177,6 +298,7 @@ fn reconcile_interrupted(
                 "failed_unchanged"
             },
             &expected,
+            metadata.as_ref(),
         )?;
     }
     Ok(())
@@ -250,14 +372,14 @@ pub(super) fn migrate(
         .get(id)
         .and_then(|state| state.model_provider.as_deref())
         .ok_or_else(|| AppError::Other("原生读取未返回当前服务商，尚未修改会话".into()))?;
-    reconcile_interrupted(
-        codex,
-        id,
-        &source,
-        original_provider,
-        before.model_provider.as_deref(),
-    )?;
-    if original_provider == provider && read_session_index_ids(codex)?.contains(id) {
+    reconcile_interrupted(codex, id, &source, original_provider)?;
+    // A DB-only retag can be undone by index repair. Require durable rollout agreement,
+    // while allowing legacy thread/read to continue reporting the creation provider.
+    let persisted_provider = read_rollout_brief(codex, &source)?.and_then(|b| b.model_provider);
+    if original_provider == provider
+        && persisted_provider.as_deref() == Some(provider)
+        && read_session_index_ids(codex)?.contains(id)
+    {
         sync_local_metadata(codex, id, provider, &source)?;
         native.close_provider_thread();
         report.ok = true;
@@ -275,6 +397,7 @@ pub(super) fn migrate(
         )?,
     };
     let history_before = history_stamp(&source, None)?;
+    let metadata_before = metadata_stamp(codex, id, &source)?;
     let backup = crate::backup::create_backup_with_dirs(
         Some("codex".into()),
         ProviderDirs::new(codex.to_string_lossy().into_owned()),
@@ -299,9 +422,12 @@ pub(super) fn migrate(
             provider,
             "prepared",
             &history_before,
+            Some(&metadata_before),
         )?;
         guard.ensure_unchanged()?;
-        if history_stamp(&source, None)? != history_before {
+        if history_stamp(&source, None)? != history_before
+            || !metadata_before.matches(&metadata_stamp(codex, id, &source)?)
+        {
             return Err(AppError::SessionBusy(id.into()));
         }
         Ok(())
@@ -311,7 +437,30 @@ pub(super) fn migrate(
         return Ok(report);
     }
 
-    let resumed = native.resume_provider_thread(id, provider);
+    let mut resumed = native.resume_provider_thread(id, provider);
+    let mut compatibility_staged = false;
+    if let Err(error) = &resumed {
+        // This client must relinquish any native state before acquiring Core's
+        // publication lock. Only the verified routing mismatch can stage a row.
+        native.close_provider_thread();
+        match paginated_compat::prepare(
+            codex,
+            id,
+            &source,
+            original_provider,
+            provider,
+            error,
+            &history_before,
+            &metadata_before,
+        ) {
+            Ok(true) => {
+                compatibility_staged = true;
+                resumed = native.resume_provider_thread(id, provider);
+            }
+            Ok(false) => {}
+            Err(error) => resumed = Err(error),
+        }
+    }
     // Close our writer before independently reopening; do not keep a routing service running.
     native.close_provider_thread();
     let verification = (|| -> AppResult<PathBuf> {
@@ -329,13 +478,17 @@ pub(super) fn migrate(
                 "原生迁移后的 threads 服务商尚未持久化".into(),
             ));
         }
-        if reopened.model_provider.as_deref() != Some(provider)
-            && read_rollout_brief(codex, &path)?
-                .and_then(|b| b.model_provider)
-                .as_deref()
-                != Some(provider)
+        if read_rollout_brief(codex, &path)?
+            .and_then(|b| b.model_provider)
+            .as_deref()
+            != Some(provider)
         {
             return Err(AppError::Other("原生历史未保存目标服务商设置".into()));
+        }
+        if !metadata_before.matches(&metadata_stamp(codex, id, &path)?) {
+            return Err(AppError::Other(
+                "迁移期间会话工作目录、权限或元数据发生变化".into(),
+            ));
         }
         if history_stamp(&path, None)? != history_before {
             return Err(AppError::Other(
@@ -358,6 +511,7 @@ pub(super) fn migrate(
                     provider,
                     "completed",
                     &history_before,
+                    Some(&metadata_before),
                 )
             })();
             match finalized {
@@ -371,8 +525,23 @@ pub(super) fn migrate(
             }
         }
         Err(check_error) => {
+            if compatibility_staged {
+                // If anything has changed, this refuses the rollback and the
+                // durable receipt below remains needs_recovery with its backup.
+                let _ = paginated_compat::rollback_unchanged(
+                    codex,
+                    id,
+                    original_provider,
+                    provider,
+                    &history_before,
+                    &metadata_before,
+                );
+            }
             let unchanged = current_path(codex, id, None).ok().is_some_and(|path| {
                 history_stamp(&path, None).ok().as_ref() == Some(&history_before)
+                    && metadata_stamp(codex, id, &path)
+                        .ok()
+                        .is_some_and(|current| metadata_before.matches(&current))
                     && read_thread_states_for_ids(codex, [id])
                         .ok()
                         .and_then(|s| s.get(id).and_then(|s| s.model_provider.clone()))
@@ -411,6 +580,7 @@ pub(super) fn migrate(
                 provider,
                 status,
                 &history_before,
+                Some(&metadata_before),
             ) {
                 report.error = Some(format!(
                     "{} 迁移状态写入失败：{error}",

@@ -31,6 +31,7 @@ pub(crate) struct CodexAppServer {
     stdin: Option<ChildStdin>,
     stdout_lines: Receiver<std::io::Result<String>>,
     next_request_id: u64,
+    native_version: Option<String>,
 }
 
 impl CodexAppServer {
@@ -102,8 +103,9 @@ impl CodexAppServer {
             stdin: Some(stdin),
             stdout_lines,
             next_request_id: 1,
+            native_version: None,
         };
-        server.request(
+        let initialized = server.request(
             "initialize",
             json!({
                 "clientInfo": {
@@ -115,6 +117,12 @@ impl CodexAppServer {
                 "capabilities": { "experimentalApi": true }
             }),
         )?;
+        server.native_version = initialized
+            .get("userAgent")
+            .and_then(Value::as_str)
+            .and_then(|agent| agent.split_whitespace().next())
+            .and_then(|product| product.rsplit_once('/'))
+            .map(|(_, version)| version.to_owned());
         server.notify("initialized", json!({}))?;
         Ok(server)
     }
@@ -229,6 +237,23 @@ impl CodexAppServer {
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("未知错误");
+                if method == "thread/resume"
+                    && error["code"].as_i64() == Some(-32600)
+                    && error["data"]["type"] == "modelProviderMismatch"
+                {
+                    if let (Some(saved), Some(current)) = (
+                        error["data"]["modelProvider"].as_str(),
+                        error["data"]["currentModelProvider"].as_str(),
+                    ) {
+                        return Err(AppError::NativeProviderMismatch {
+                            method: method.into(),
+                            message: message.into(),
+                            native_version: self.native_version.clone(),
+                            model_provider: saved.into(),
+                            current_model_provider: current.into(),
+                        });
+                    }
+                }
                 return Err(AppError::Other(format!(
                     "Codex app-server {method} 失败：{message}"
                 )));
@@ -699,6 +724,111 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
         let resumed = server.resume_for_provider("source-thread", "custom")?;
         assert_eq!(resumed.id, "source-thread");
         assert_eq!(resumed.model_provider.as_deref(), Some("custom"));
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_only_structured_resume_routing_errors() -> AppResult<()> {
+        for (agent, kind, code, current, structured, version) in [
+            (
+                "cc_sessions/0.167.1 (test)",
+                "modelProviderMismatch",
+                -32600,
+                true,
+                true,
+                Some("0.167.1"),
+            ),
+            (
+                "cc_sessions/0.168.0 (test)",
+                "modelProviderMismatch",
+                -32600,
+                true,
+                true,
+                Some("0.168.0"),
+            ),
+            (
+                "unknown-agent",
+                "modelProviderMismatch",
+                -32600,
+                true,
+                true,
+                None,
+            ),
+            (
+                "cc_sessions/0.167.1 (test)",
+                "modelProviderPolicyConflict",
+                -32600,
+                true,
+                false,
+                None,
+            ),
+            (
+                "cc_sessions/0.167.1 (test)",
+                "modelProviderMismatch",
+                -32603,
+                true,
+                false,
+                None,
+            ),
+            (
+                "cc_sessions/0.167.1 (test)",
+                "modelProviderMismatch",
+                -32600,
+                false,
+                false,
+                None,
+            ),
+            ("cc_sessions/0.167.1 (test)", "", -32600, true, false, None),
+        ] {
+            let mut data = json!({"type":kind, "modelProvider":"source"});
+            if current {
+                data["currentModelProvider"] = json!("target");
+            }
+            let reply = json!({"code":code, "message":"modelProviderMismatch text is not evidence", "data":data});
+            let mut command = Command::new("node");
+            command
+                .env("FIXTURE_AGENT", agent)
+                .env("FIXTURE_ERROR", reply.to_string())
+                .args([
+                    "--input-type=commonjs",
+                    "-e",
+                    r#"
+const readline = require('node:readline');
+readline.createInterface({ input: process.stdin }).on('line', line => {
+    const { id, method } = JSON.parse(line);
+    if (id === undefined) return;
+    const reply = method === 'initialize'
+        ? { result: { userAgent: process.env.FIXTURE_AGENT } }
+        : { error: JSON.parse(process.env.FIXTURE_ERROR) };
+    process.stdout.write(JSON.stringify({ id, ...reply }) + '\n');
+});
+"#,
+                ]);
+            let mut server = CodexAppServer::start_command(command)?;
+            let error = server.resume_for_provider("thread", "target").unwrap_err();
+            if structured {
+                match error {
+                    AppError::NativeProviderMismatch {
+                        native_version,
+                        model_provider,
+                        current_model_provider,
+                        ..
+                    } => {
+                        assert_eq!(native_version.as_deref(), version);
+                        assert_eq!(model_provider, "source");
+                        assert_eq!(current_model_provider, "target");
+                    }
+                    other => panic!("expected structured routing error, got {other}"),
+                }
+            } else {
+                assert!(matches!(error, AppError::Other(_)));
+            }
+            // Identical data on another RPC must not authorize migration.
+            assert!(matches!(
+                server.fork_thread_for_provider("thread", "target"),
+                Err(AppError::Other(_))
+            ));
+        }
         Ok(())
     }
 

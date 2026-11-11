@@ -7170,20 +7170,43 @@ mod tests {
             provider: &str,
         ) -> AppResult<crate::codex_app_server::ForkedThread> {
             self.resume_count += 1;
+            if self.resume_outcome.starts_with("mismatch_") && self.resume_count == 1 {
+                return Err(AppError::NativeProviderMismatch {
+                    method: "thread/resume".into(),
+                    message: "synthetic modelProviderMismatch".into(),
+                    native_version: Some(
+                        if self.resume_outcome == "mismatch_future" {
+                            "0.168.0"
+                        } else {
+                            "0.167.1"
+                        }
+                        .into(),
+                    ),
+                    model_provider: "custom".into(),
+                    current_model_provider: provider.into(),
+                });
+            }
+            if self.resume_outcome == "mismatch_then_fail" && self.resume_count > 1 {
+                return Err(AppError::Other(
+                    "synthetic resume failed before persistence".into(),
+                ));
+            }
             if self.resume_outcome == "before_write" {
                 return Err(AppError::Other("native resume unavailable".into()));
             }
             let before = self.read_provider_thread(id)?;
             let path = before.path.as_ref().unwrap();
             let mut file = fs::OpenOptions::new().append(true).open(path)?;
-            writeln!(
-                file,
-                "{}",
-                serde_json::json!({"type": "event_msg", "payload": {
-                    "type": "thread_settings_applied", "thread_id": id,
-                    "thread_settings": {"model_provider_id": provider}
-                }})
-            )?;
+            if self.resume_outcome != "database_only" {
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({"type": "event_msg", "payload": {
+                        "type": "thread_settings_applied", "thread_id": id,
+                        "thread_settings": {"model_provider_id": provider}
+                    }})
+                )?;
+            }
             if self.resume_outcome == "concurrent_history" {
                 writeln!(
                     file,
@@ -7198,6 +7221,56 @@ mod tests {
                 "UPDATE threads SET model_provider=?1 WHERE id=?2",
                 [provider, id],
             )?;
+            if let Some(column) = self.resume_outcome.strip_prefix("change_db_") {
+                assert!(["cwd", "sandbox_policy", "approval_mode", "source"].contains(&column));
+                state.execute(
+                    &format!("UPDATE threads SET {column}='unexpected' WHERE id=?1"),
+                    [id],
+                )?;
+            }
+            if matches!(
+                self.resume_outcome,
+                "change_settings_permissions" | "foreign_settings_permissions"
+            ) {
+                let settings_owner = if self.resume_outcome == "foreign_settings_permissions" {
+                    "other-thread"
+                } else {
+                    id
+                };
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({
+                        "type": "event_msg", "payload": {
+                            "type": "thread_settings_applied", "thread_id": settings_owner,
+                            "thread_settings": {
+                                "model_provider_id": provider,
+                                "permission_profile": {"type": "unrestricted"},
+                                "approvals_reviewer": "unexpected"
+                            }
+                        }
+                    })
+                )?;
+            }
+            if matches!(
+                self.resume_outcome,
+                "change_header_source" | "change_header_instructions"
+            ) {
+                drop(file);
+                let raw = fs::read_to_string(path)?;
+                let mut lines = raw.lines();
+                let mut header: Value = serde_json::from_str(lines.next().unwrap())?;
+                let field = if self.resume_outcome == "change_header_instructions" {
+                    "base_instructions"
+                } else {
+                    "source"
+                };
+                header["payload"][field] = Value::String("unexpected".into());
+                fs::write(
+                    path,
+                    format!("{header}\n{}\n", lines.collect::<Vec<_>>().join("\n")),
+                )?;
+            }
             if self.resume_outcome == "lost_reply" {
                 return Err(AppError::Other("response lost".into()));
             }
@@ -8525,6 +8598,101 @@ mod tests {
     }
 
     #[test]
+    fn provider_migration_167_compatibility_is_locked_and_persisted() -> AppResult<()> {
+        for (outcome, paginated, locked, expected_ok, expected_calls) in [
+            ("mismatch_ok", true, false, true, 2),
+            ("mismatch_then_fail", true, false, false, 2),
+            ("mismatch_future", true, false, false, 1),
+            ("mismatch_ok", false, false, false, 1),
+            ("mismatch_ok", true, true, false, 1),
+        ] {
+            let codex = temp_codex_dir("provider-migration-167-compatibility");
+            let id = "01a1362e-9b85-7672-ab8f-d17e68b2cc0e";
+            let path = if paginated {
+                prepare_paginated_provider_switch_fixture(&codex, id)?
+            } else {
+                prepare_provider_switch_fixture(&codex, id)?
+            };
+            let state = state_db::open(&codex)?;
+            state.execute_batch(
+                "ALTER TABLE threads ADD COLUMN history_mode TEXT NOT NULL DEFAULT 'legacy'",
+            )?;
+            state.execute(
+                "UPDATE threads SET history_mode=?1 WHERE id=?2",
+                rusqlite::params![if paginated { "paginated" } else { "legacy" }, id],
+            )?;
+            drop(state);
+            let bytes_before = fs::read(&path)?;
+            let locks = codex.join("thread-writer-locks");
+            fs::create_dir_all(&locks)?;
+            let held = if locked {
+                let file = fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(locks.join(format!("{id}.lock")))?;
+                file.try_lock()
+                    .map_err(|e| AppError::Other(e.to_string()))?;
+                Some(file)
+            } else {
+                None
+            };
+            let mut native = FakeProviderThreadForker::new(codex.clone());
+            native.resume_outcome = outcome;
+            let report = clone_session_for_provider_locked_with_hint(
+                codex.to_string_lossy().into_owned(),
+                id.into(),
+                Some("openai".into()),
+                SwitchStrategy::Follow,
+                false,
+                Some(&path),
+                &mut native,
+            )?;
+            assert_eq!(
+                report.ok, expected_ok,
+                "{outcome}/{paginated}/{locked}: {:?}",
+                report.error
+            );
+            assert_eq!(native.resume_count, expected_calls);
+            assert_eq!(native.fork_count, 0);
+            let expected_provider = if expected_ok { "openai" } else { "custom" };
+            assert_eq!(
+                read_thread_states_for_ids(&codex, [id])?[id]
+                    .model_provider
+                    .as_deref(),
+                Some(expected_provider)
+            );
+            assert_eq!(
+                read_rollout_brief(&codex, &path)?
+                    .unwrap()
+                    .model_provider
+                    .as_deref(),
+                Some(expected_provider)
+            );
+            assert!(fs::read(&path)?.starts_with(&bytes_before));
+            let backup = PathBuf::from(report.backup_path.unwrap());
+            let receipt: Value =
+                serde_json::from_slice(&fs::read(backup.join("provider-migration.json"))?)?;
+            assert_eq!(
+                receipt["status"],
+                if expected_ok {
+                    "completed"
+                } else {
+                    "failed_unchanged"
+                }
+            );
+            assert_eq!(
+                fs::read(backup.join(path.strip_prefix(&codex).unwrap()))?,
+                bytes_before
+            );
+            drop(held);
+            fs::remove_dir_all(codex)?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn provider_migration_round_trip_preserves_history_and_identity() -> AppResult<()> {
         for (paginated, cli_version, nested_sqlite) in [
             (false, "0.155.0-alpha.16", false),
@@ -8601,6 +8769,17 @@ mod tests {
                 assert!(list_mismatched_session_ids(&codex, provider)?.is_empty());
                 assert!(fs::read(&source)?.starts_with(&initial));
             }
+            let no_op = clone_session_for_provider_locked_with_hint(
+                codex.to_string_lossy().into_owned(),
+                id.into(),
+                Some("openai".into()),
+                SwitchStrategy::Follow,
+                false,
+                Some(&source),
+                &mut native,
+            )?;
+            assert!(no_op.ok, "{:?}", no_op.error);
+            assert!(no_op.backup_path.is_none());
             assert_eq!(native.resume_count, 3);
             assert_eq!(native.fork_count, 0);
             assert_eq!(native.delete_count, 0);
@@ -8618,11 +8797,102 @@ mod tests {
     }
 
     #[test]
+    fn provider_migration_does_not_trust_database_only_target() -> AppResult<()> {
+        for outcome in ["ok", "before_write", "database_only"] {
+            let codex = temp_codex_dir("provider-migration-db-only-target");
+            let id = "same-id";
+            let source = prepare_paginated_provider_switch_fixture(&codex, id)?;
+            state_db::open(&codex)?.execute(
+                "UPDATE threads SET model_provider='openai' WHERE id=?1",
+                [id],
+            )?;
+            let mut native = FakeProviderThreadForker::new(codex.clone());
+            native.resume_outcome = outcome;
+            let report = clone_session_for_provider_locked_with_hint(
+                codex.to_string_lossy().into_owned(),
+                id.into(),
+                Some("openai".into()),
+                SwitchStrategy::Follow,
+                false,
+                Some(&source),
+                &mut native,
+            )?;
+            assert_eq!(
+                native.resume_count, 1,
+                "{outcome} must not take the no-op shortcut"
+            );
+            assert_eq!(report.ok, outcome == "ok", "{outcome}: {:?}", report.error);
+            assert!(report.backup_path.is_some());
+            assert_eq!(
+                read_rollout_brief(&codex, &source)?
+                    .unwrap()
+                    .model_provider
+                    .as_deref(),
+                Some(if outcome == "ok" { "openai" } else { "custom" })
+            );
+            fs::remove_dir_all(codex)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn provider_migration_rejects_metadata_changes_and_keeps_recovery_pending() -> AppResult<()> {
+        for outcome in [
+            "change_db_cwd",
+            "change_db_sandbox_policy",
+            "change_db_approval_mode",
+            "change_db_source",
+            "change_header_source",
+            "change_header_instructions",
+            "change_settings_permissions",
+        ] {
+            let codex = temp_codex_dir("provider-migration-metadata-change");
+            let id = "same-id";
+            let source = prepare_paginated_provider_switch_fixture(&codex, id)?;
+            let mut native = FakeProviderThreadForker::new(codex.clone());
+            native.resume_outcome = outcome;
+            let report = clone_session_for_provider_locked_with_hint(
+                codex.to_string_lossy().into_owned(),
+                id.into(),
+                Some("openai".into()),
+                SwitchStrategy::Follow,
+                false,
+                Some(&source),
+                &mut native,
+            )?;
+            assert!(!report.ok, "{outcome}");
+            let receipt: Value = serde_json::from_slice(&fs::read(
+                PathBuf::from(report.backup_path.unwrap()).join("provider-migration.json"),
+            )?)?;
+            assert_eq!(receipt["status"], "needs_recovery", "{outcome}");
+            native.resume_outcome = "ok";
+            let retry = clone_session_for_provider_locked_with_hint(
+                codex.to_string_lossy().into_owned(),
+                id.into(),
+                Some("openai".into()),
+                SwitchStrategy::Follow,
+                false,
+                Some(&source),
+                &mut native,
+            );
+            assert!(
+                retry.is_err(),
+                "{outcome} must not clear unresolved metadata changes"
+            );
+            assert_eq!(native.resume_count, 1);
+            fs::remove_dir_all(codex)?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn provider_migration_verifies_interrupted_and_failed_native_writes() -> AppResult<()> {
         for (outcome, ok, status) in [
             ("before_write", false, "failed_unchanged"),
             ("lost_reply", true, "completed"),
+            ("foreign_settings_permissions", true, "completed"),
             ("wrong_id", false, "needs_recovery"),
+            ("database_only", false, "needs_recovery"),
             ("concurrent_history", false, "needs_recovery"),
         ] {
             let codex = temp_codex_dir("provider-migration-failure");
@@ -8648,6 +8918,34 @@ mod tests {
                 )?)?["status"],
                 status
             );
+            if outcome == "database_only" {
+                // Simulate a crash after compatibility CAS, before Core persisted settings.
+                let receipt_path = backup.join("provider-migration.json");
+                let mut record: Value = serde_json::from_slice(&fs::read(&receipt_path)?)?;
+                record["status"] = Value::String("prepared".into());
+                fs::write(&receipt_path, serde_json::to_vec(&record)?)?;
+                let receipt_before = fs::read(&receipt_path)?;
+                let source_before = fs::read(&source)?;
+                native.resume_outcome = "ok";
+                let error = clone_session_for_provider_locked_with_hint(
+                    codex.to_string_lossy().into_owned(),
+                    id.into(),
+                    Some("openai".into()),
+                    SwitchStrategy::Follow,
+                    false,
+                    Some(&source),
+                    &mut native,
+                )
+                .expect_err("staged DB target is not a completed migration");
+                assert!(error.to_string().contains("needs_recovery"));
+                assert_eq!(native.resume_count, 1);
+                assert_eq!(fs::read(&source)?, source_before);
+                assert_eq!(fs::read(&receipt_path)?, receipt_before);
+                assert_eq!(
+                    read_thread_state_map(&codex)?[id].model_provider.as_deref(),
+                    Some("openai")
+                );
+            }
             assert_eq!(
                 fs::read(backup.join(source.strip_prefix(&codex).unwrap()))?,
                 before
