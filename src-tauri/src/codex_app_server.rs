@@ -120,9 +120,11 @@ impl CodexAppServer {
         server.native_version = initialized
             .get("userAgent")
             .and_then(Value::as_str)
-            .and_then(|agent| agent.split_whitespace().next())
-            .and_then(|product| product.rsplit_once('/'))
-            .map(|(_, version)| version.to_owned());
+            // The originator may contain spaces (e.g. "Codex Desktop").
+            // Split off the product name before reading the version token.
+            .and_then(|agent| agent.split_once('/'))
+            .and_then(|(_, suffix)| suffix.split_whitespace().next())
+            .map(str::to_owned);
         server.notify("initialized", json!({}))?;
         Ok(server)
     }
@@ -737,6 +739,22 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
                 true,
                 true,
                 Some("0.167.1"),
+            ),
+            (
+                "Codex Desktop/0.167.1 (Ubuntu 26.4.0; x86_64) xterm-256color (cc_sessions; 0.7.4)",
+                "modelProviderMismatch",
+                -32600,
+                true,
+                true,
+                Some("0.167.1"),
+            ),
+            (
+                "Codex Desktop/0.167.0-alpha.4.1 (Ubuntu 26.4.0; x86_64)",
+                "modelProviderMismatch",
+                -32600,
+                true,
+                true,
+                Some("0.167.0-alpha.4.1"),
             ),
             (
                 "cc_sessions/0.168.0 (test)",

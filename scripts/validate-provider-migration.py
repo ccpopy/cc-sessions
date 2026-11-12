@@ -14,6 +14,8 @@ import contextlib, hashlib, http.server, json, os, pathlib, queue, shutil, sqlit
 
 ROOT = None
 BINARY = None
+ORIGINATOR = None
+SPLIT_SQLITE = False
 
 
 class Mock(http.server.BaseHTTPRequestHandler):
@@ -190,14 +192,20 @@ class Native:
 
 def setup(home, port):
     home.mkdir(parents=True, exist_ok=False)
+    if SPLIT_SQLITE:
+        sqlite_directory(home).mkdir(parents=True, exist_ok=False)
     text = 'project_doc_max_bytes=0\nmodel="mock-model"\nmodel_provider="source"\n[features]\nshell_snapshot=false\n'
     for name in ["source", "target", "longer_provider"]:
         text += f'[model_providers.{name}]\nname="{name}"\nbase_url="http://127.0.0.1:{port}/v1"\nwire_api="responses"\nrequires_openai_auth=false\nrequest_max_retries=0\nstream_max_retries=0\n'
     (home / "config.toml").write_text(text)
 
 
+def sqlite_directory(home):
+    return ROOT / "sqlite" / home.name if SPLIT_SQLITE else home
+
+
 def row(home, tid):
-    with sqlite3.connect(home / "state_5.sqlite") as c:
+    with sqlite3.connect(sqlite_directory(home) / "state_5.sqlite") as c:
         c.row_factory = sqlite3.Row
         return dict(c.execute("SELECT * FROM threads WHERE id=?", (tid,)).fetchone())
 
@@ -221,7 +229,7 @@ def fixture(home, port, mode):
 
 
 def retag(home, tid, to):
-    with sqlite3.connect(home / "state_5.sqlite") as c:
+    with sqlite3.connect(sqlite_directory(home) / "state_5.sqlite") as c:
         c.execute("UPDATE threads SET model_provider=? WHERE id=?", (to, tid))
 
 
@@ -254,7 +262,7 @@ def backup(home, tid, path):
     b.mkdir()
     p = physical(path)
     shutil.copy2(p, b / p.name)
-    with sqlite3.connect(home / "state_5.sqlite") as src, sqlite3.connect(
+    with sqlite3.connect(sqlite_directory(home) / "state_5.sqlite") as src, sqlite3.connect(
         b / "state_5.sqlite"
     ) as dst:
         src.backup(dst)
@@ -452,6 +460,10 @@ def child_env(home):
         XDG_CONFIG_HOME=str(home / "probe-config"),
         XDG_DATA_HOME=str(home / "probe-data"),
     )
+    if SPLIT_SQLITE:
+        env["CODEX_SQLITE_HOME"] = str(sqlite_directory(home))
+    if ORIGINATOR is not None:
+        env["CODEX_INTERNAL_ORIGINATOR_OVERRIDE"] = ORIGINATOR
     env["PATH"] = str(ROOT / "bin") + os.pathsep + env.get("PATH", "")
     return env
 
@@ -589,12 +601,16 @@ def product_case(out, port, mode, packed, loaded, inherited=False):
 def main():
     import argparse
 
-    global ROOT, BINARY, CC
+    global ROOT, BINARY, CC, ORIGINATOR, SPLIT_SQLITE
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--codex", type=pathlib.Path, required=True)
     parser.add_argument("--cc-sessions", type=pathlib.Path, required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
+    parser.add_argument("--originator", help="Synthetic originator, e.g. 'Codex Desktop'")
+    parser.add_argument("--split-sqlite", action="store_true", help="Keep SQLite outside each CODEX_HOME")
     args = parser.parse_args()
+    ORIGINATOR = args.originator
+    SPLIT_SQLITE = args.split_sqlite
     ROOT = args.output.resolve()
     BINARY = args.codex.resolve()
     CC = args.cc_sessions.resolve()
@@ -612,6 +628,8 @@ def main():
     threading.Thread(target=server.serve_forever, daemon=True).start()
     report = {
         "version": version,
+        "originator": ORIGINATOR,
+        "split_sqlite": SPLIT_SQLITE,
         "magpie_reference": "1f99f6f0b54a0627be425c09af31260705c16857",
         "cc_comparison_base": "8bdb72ec40465a8f49434638fdc3c326b42f9363",
         "cases": [],

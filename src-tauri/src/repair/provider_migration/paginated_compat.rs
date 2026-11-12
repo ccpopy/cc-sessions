@@ -166,6 +166,8 @@ mod tests {
         for (version, saved, current, expected) in [
             ("0.167.1", "source", "target", true),
             ("0.167.2", "source", "target", false),
+            ("0.167.0-alpha.4.1", "source", "target", false),
+            ("0.167.1-alpha.1", "source", "target", false),
             ("0.167.1", "other", "target", false),
             ("0.167.1", "source", "other", false),
         ] {

@@ -68,3 +68,19 @@ python scripts/validate-provider-migration.py \
 - GUI/default-features Rust 检查受当前 Linux 缺少 GLib/GTK/WebKit 开发库限制，不能等同于跨平台 CI 全绿。
 
 以上为补丁开发阶段的验证记录；发行提交的跨平台 CI 与构建状态请以对应 GitHub Actions 运行结果为准。
+
+## Issue #58 后续：Desktop originator 与分离数据库
+
+带空格的 `Codex Desktop/0.167.1` 现在按 `/` 分隔产品名后再读取版本，避免先按空白拆分导致版本丢失。`0.167.0-alpha.4.1` 会被完整识别，但仍不满足兼容写入门禁。
+
+可在合成数据中复现桌面运行环境，并让 SQLite 位于数据根之外：
+
+```sh
+python scripts/validate-provider-migration.py \
+  --codex /path/to/codex-0.167.1 \
+  --cc-sessions src-tauri/target/debug/cc-sessions \
+  --output /tmp/provider-desktop-split-new \
+  --originator 'Codex Desktop' --split-sqlite
+```
+
+两项参数均可省略；脚本仍会清除其他继承的 Codex 配置与认证环境。单独启用 Desktop originator、同时启用分离 SQLite 的两组矩阵分别 14/14 通过，包括普通/压缩/继承历史的迁移、重建、冷加载、模拟续写和备份恢复，以及 legacy/持锁场景的预期拒绝。此验证不代表已经在报告者的 Windows/WSL 桌面中验收。

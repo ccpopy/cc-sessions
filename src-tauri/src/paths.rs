@@ -572,6 +572,32 @@ mod tests {
     }
 
     #[test]
+    fn external_sqlite_home_does_not_rebase_config_or_sessions() -> AppResult<()> {
+        let home = SqliteFixture::new();
+        let database = SqliteFixture::new();
+        home.config("model_provider = 'custom'");
+        // A Windows-side DB must not win over the WSL engine's explicit path.
+        home.touch("state_5.sqlite");
+        database.touch("state_5.sqlite");
+        database.touch("thread_history_1.sqlite");
+        assert_eq!(
+            resolve_codex_sqlite_dir(&home.0, database.0.to_str())?,
+            database.0
+        );
+        assert_eq!(config_toml_path(&home.0), home.0.join("config.toml"));
+        assert_eq!(sessions_dir(&home.0), home.0.join("sessions"));
+        assert_eq!(
+            session_index_path(&home.0),
+            home.0.join("session_index.jsonl")
+        );
+        assert_eq!(
+            read_codex_path_config(&home.0)?["model_provider"].as_str(),
+            Some("custom")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn sqlite_environment_is_trimmed_and_relative_to_process_cwd() -> AppResult<()> {
         let f = SqliteFixture::new();
         assert_eq!(

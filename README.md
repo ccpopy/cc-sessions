@@ -271,6 +271,17 @@ Windows 可通过上述 WSL UNC 路径浏览数据，但服务商迁移和原生
 ./cc-sessions --codex-dir "$HOME/.codex" webui
 ```
 
+如果桌面应用的 WSL 引擎将配置/会话和数据库分开存储，应分别指定两处实际路径，而不是默认使用 WSL 的 `~/.codex`：
+
+```bash
+export CODEX_HOME="/mnt/c/Users/<Windows用户名>/.codex"
+export CODEX_SQLITE_HOME="/home/<WSL用户名>/.codex/sqlite"
+./cc-sessions --codex-dir "$CODEX_HOME" list
+./cc-sessions --codex-dir "$CODEX_HOME" webui
+```
+
+以上路径仅为示例，以该引擎的实际环境为准。CC Sessions 的数据根需显式传入 `--codex-dir`；`CODEX_HOME` 本身不会覆盖其默认值或 WebUI 保存的路径。桌面应用可能已提供 Linux Codex，但需确认当前 `PATH` 找到的具体版本。`0.167.0-alpha.4.1` 等 alpha 版本不等同于 `0.167.1`，不会因版本解析修复而自动开启兼容迁移。
+
 在浏览器打开终端显示的本地地址，确认列出的会话正确后，再执行服务商迁移。迁移启动的原生进程使用同一个 SQLite 目录，不会改写用户的 `config.toml`。
 
 Codex 0.167.1 的服务商兼容迁移仅支持已关闭、未被原生进程持锁的 paginated 会话，包括普通、zstd 和 history_base 继承历史。操作会先备份，再由原生 Codex 保存目标服务商设置，成功前校验数据库与历史中的有效设置一致；不修改会话 ID、不新建分支。legacy 历史、未知版本或已加载会话不会使用此兼容写入。详细复现与验证范围见 [`scripts/provider-migration-validation.md`](scripts/provider-migration-validation.md)。
