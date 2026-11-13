@@ -550,6 +550,7 @@ git push origin vX.Y.Z
 
 ## 特别感谢
 
+- [yeahfeng](https://github.com/yeahfeng) 提供了 WSL 分离数据库布局与 Codex Desktop 版本识别的问题报告，并参与了迁移修复的复现和回归测试（[#58](https://github.com/ccpopy/cc-sessions/issues/58)）。
 - [linux.do](https://linux.do) 社区提供了讨论、测试和问题反馈。
 - [codex-session-cloner](https://github.com/goodnightzsj/codex-session-cloner) 为会话修复和导入导出实现提供了参考。
 - [thful](https://github.com/thful) 参与了 Markdown 导出测试并反馈问题。
