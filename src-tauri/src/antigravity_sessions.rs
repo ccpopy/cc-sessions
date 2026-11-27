@@ -119,7 +119,8 @@ fn collect_sessions(cli_dir: &Path, app_dir: &Path) -> AppResult<Vec<SessionSumm
     if !same_dir(cli_dir, app_dir) && has_store_data(app_dir) {
         for session in scan_store(app_dir, "app", deadline)? {
             match by_id.get(&session.id) {
-                Some(existing) if existing.updated_at >= session.updated_at => {}
+                Some(existing)
+                    if existing.last_activity_at_ms() >= session.last_activity_at_ms() => {}
                 _ => {
                     by_id.insert(session.id.clone(), session);
                 }
@@ -205,15 +206,19 @@ fn scan_store(root: &Path, store: &str, deadline: Instant) -> AppResult<Vec<Sess
         let annotation = read_annotation(root, &record.conversation_id);
         let tmeta = read_transcript_meta(&transcript, rollout_bytes, file_mtime_ms, deadline);
 
-        let updated_ms = [
+        let recorded_ms = [
             record.last_modified_ms,
             record.last_user_input_ms,
             tmeta.last_event_ms,
-            file_mtime_ms,
         ]
         .into_iter()
         .max()
         .unwrap_or(0);
+        let updated_ms = if recorded_ms > 0 {
+            recorded_ms
+        } else {
+            file_mtime_ms
+        };
         let created_ms = if tmeta.created_at_ms > 0 {
             tmeta.created_at_ms
         } else {
@@ -459,7 +464,11 @@ fn resolve_transcript_path(root: &Path, id: &str) -> Option<PathBuf> {
     if !is_safe_id(id) {
         return None;
     }
-    let logs = root.join("brain").join(id).join(".system_generated").join("logs");
+    let logs = root
+        .join("brain")
+        .join(id)
+        .join(".system_generated")
+        .join("logs");
     let full = logs.join("transcript_full.jsonl");
     if full.is_file() {
         return Some(full);
@@ -528,7 +537,10 @@ fn scan_transcript_file(path: &Path, full: bool) -> AppResult<TranscriptMeta> {
         let Ok(obj) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
-        if let Some(ts) = obj.get("created_at").and_then(Value::as_str).and_then(parse_timestamp_ms)
+        if let Some(ts) = obj
+            .get("created_at")
+            .and_then(Value::as_str)
+            .and_then(parse_timestamp_ms)
         {
             if meta.created_at_ms == 0 {
                 meta.created_at_ms = ts;
@@ -576,7 +588,11 @@ fn scan_transcript_file(path: &Path, full: bool) -> AppResult<TranscriptMeta> {
 }
 
 fn step_tokens(obj: &Value) -> i64 {
-    let input = obj.get("input_tokens").and_then(Value::as_i64).unwrap_or(0).max(0);
+    let input = obj
+        .get("input_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .max(0);
     let cache = obj
         .get("cache_read_tokens")
         .and_then(Value::as_i64)
@@ -655,7 +671,11 @@ fn parse_pbtxt_annotation(content: &str) -> AnnotationInfo {
                     }
                     let val = &content[val_start..i];
                     info.archived = val == "true" || val == "1";
-                } else if depth == 0 && key == "title" && i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+                } else if depth == 0
+                    && key == "title"
+                    && i < bytes.len()
+                    && (bytes[i] == b'"' || bytes[i] == b'\'')
+                {
                     let mut combined = String::new();
                     while i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
                         combined.push_str(&parse_pbtxt_string(bytes, &mut i));
@@ -792,12 +812,10 @@ pub fn preview_meta(locator: &str) -> AppResult<SessionMetaBrief> {
     let timestamp = if meta.created_at_ms > 0 {
         timestamp_from_millis(meta.created_at_ms)
     } else {
-        summary
-            .as_ref()
-            .and_then(|row| {
-                let ms = row.last_modified_ms.max(row.last_user_input_ms);
-                (ms > 0).then(|| timestamp_from_millis(ms)).flatten()
-            })
+        summary.as_ref().and_then(|row| {
+            let ms = row.last_modified_ms.max(row.last_user_input_ms);
+            (ms > 0).then(|| timestamp_from_millis(ms)).flatten()
+        })
     };
 
     Ok(SessionMetaBrief {
@@ -843,7 +861,13 @@ fn stream_transcript_events(
         let Ok(obj) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
-        expand_transcript_step(&obj, line_idx, &locator.store, &mut pending_tools, &mut events);
+        expand_transcript_step(
+            &obj,
+            line_idx,
+            &locator.store,
+            &mut pending_tools,
+            &mut events,
+        );
     }
     Ok(events)
 }
@@ -860,10 +884,7 @@ fn expand_transcript_step(
         .get("step_index")
         .and_then(Value::as_u64)
         .unwrap_or(line_idx as u64);
-    let created_at = obj
-        .get("created_at")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let created_at = obj.get("created_at").and_then(Value::as_str).unwrap_or("");
     let status = obj.get("status").and_then(Value::as_str).unwrap_or("");
     let mut sub_idx = 0usize;
 
@@ -1152,7 +1173,9 @@ fn normalize_tool_args(args: Option<&Value>) -> Value {
     let mut out = serde_json::Map::with_capacity(map.len());
     for (key, value) in map {
         let normalized = match value {
-            Value::String(raw) => serde_json::from_str::<Value>(raw).unwrap_or_else(|_| value.clone()),
+            Value::String(raw) => {
+                serde_json::from_str::<Value>(raw).unwrap_or_else(|_| value.clone())
+            }
             other => other.clone(),
         };
         out.insert(key.clone(), normalized);
@@ -1167,7 +1190,12 @@ fn extract_media_attachments(media: Option<&Value>) -> Vec<Value> {
     let mut out = Vec::new();
     for item in items {
         let mime = item.get("mime_type").and_then(Value::as_str).unwrap_or("");
-        let Some(uri) = item.get("uri").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) else {
+        let Some(uri) = item
+            .get("uri")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
             continue;
         };
         let is_image = mime.starts_with("image/") || has_image_extension(uri);
@@ -1341,7 +1369,11 @@ pub(crate) fn parse_timestamp_ms(raw: &str) -> Option<i64> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(&normalized) {
         return Some(dt.timestamp_millis());
     }
-    for fmt in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S"] {
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+    ] {
         if let Ok(naive) = NaiveDateTime::parse_from_str(trimmed, fmt) {
             return Some(naive.and_utc().timestamp_millis());
         }
@@ -1572,7 +1604,9 @@ mod tests {
         write_transcript(
             &cli_dir,
             cli_only_id,
-            &[json!({"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-26T01:00:00Z", "content": "<USER_REQUEST>\ncli subagent\n</USER_REQUEST>"})],
+            &[
+                json!({"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-26T01:00:00Z", "content": "<USER_REQUEST>\ncli subagent\n</USER_REQUEST>"}),
+            ],
             false,
         );
         create_summaries_db(
@@ -1605,13 +1639,17 @@ mod tests {
         write_transcript(
             &app_dir,
             shared_id,
-            &[json!({"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-25T01:00:00Z", "content": "old app"})],
+            &[
+                json!({"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-25T01:00:00Z", "content": "old app"}),
+            ],
             false,
         );
         write_transcript(
             &app_dir,
             app_only_id,
-            &[json!({"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-27T02:00:00Z", "content": "<USER_REQUEST>\napp task\n</USER_REQUEST>"})],
+            &[
+                json!({"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-27T02:00:00Z", "content": "<USER_REQUEST>\napp task\n</USER_REQUEST>"}),
+            ],
             true,
         );
         create_summaries_db(
@@ -1651,7 +1689,9 @@ mod tests {
         );
         fs::create_dir_all(app_dir.join("annotations")).unwrap();
         fs::write(
-            app_dir.join("annotations").join(format!("{app_only_id}.pbtxt")),
+            app_dir
+                .join("annotations")
+                .join(format!("{app_only_id}.pbtxt")),
             "title:\"Annotated App Title\" archived:true\n",
         )
         .unwrap();
@@ -1672,9 +1712,16 @@ mod tests {
 
         let shared_item = list.iter().find(|s| s.id == shared_id).unwrap();
         assert_eq!(shared_item.title, "Shared CLI");
+        assert_eq!(
+            shared_item.updated_at,
+            parse_timestamp_ms("2026-11-27 01:00:10.000000+00:00").unwrap() / 1000
+        );
         assert_eq!(shared_item.tokens_used, 175);
         assert_eq!(shared_item.model.as_deref(), Some("gemini-4-neon-xhigh"));
-        assert_eq!(shared_item.resume_command, format!("agy --conversation {shared_id}"));
+        assert_eq!(
+            shared_item.resume_command,
+            format!("agy --conversation {shared_id}")
+        );
         assert_eq!(shared_item.source.as_deref(), Some("cli"));
         assert!(shared_item.agent_nickname.is_none());
 
@@ -1699,7 +1746,9 @@ mod tests {
         write_transcript(
             &cli_dir,
             id,
-            &[json!({"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-27T01:00:00Z", "content": "<USER_REQUEST>\nhello fallback\n</USER_REQUEST>"})],
+            &[
+                json!({"step_index": 0, "type": "USER_INPUT", "created_at": "2026-11-27T01:00:00Z", "content": "<USER_REQUEST>\nhello fallback\n</USER_REQUEST>"}),
+            ],
             false,
         );
         fs::create_dir_all(cli_dir.join("cache")).unwrap();
@@ -1778,10 +1827,16 @@ mod tests {
         assert_eq!(events.len(), 7);
         assert_eq!(events[0].role, "user");
         assert_eq!(events[0].text_summary, "check image");
-        assert_eq!(events[0].raw["antigravity"]["media"][0]["path"], "C:/tmp/shot.png");
+        assert_eq!(
+            events[0].raw["antigravity"]["media"][0]["path"],
+            "C:/tmp/shot.png"
+        );
         assert_eq!(events[1].role, "reasoning");
         assert_eq!(events[2].role, "tool_call");
-        assert_eq!(events[2].raw["message"]["content"][0]["input"]["StartLine"], 1);
+        assert_eq!(
+            events[2].raw["message"]["content"][0]["input"]["StartLine"],
+            1
+        );
         assert_eq!(events[3].role, "tool_result");
         assert_eq!(events[3].raw["message"]["content"][0]["is_error"], true);
         assert_eq!(

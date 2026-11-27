@@ -257,9 +257,9 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             to_result_value(settings::validate_cursor_dir(string_arg(&args, "path")?))
         }
         "default_cursor_dir" => to_value(settings::default_cursor_dir()),
-        "validate_antigravity_dir" => {
-            to_result_value(settings::validate_antigravity_dir(string_arg(&args, "path")?))
-        }
+        "validate_antigravity_dir" => to_result_value(settings::validate_antigravity_dir(
+            string_arg(&args, "path")?,
+        )),
         "default_antigravity_dir" => to_value(settings::default_antigravity_dir()),
         "list_sessions" => to_result_value(sessions::list_sessions_with_dirs(
             opt_string_arg(&args, "provider")?,

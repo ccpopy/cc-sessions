@@ -2351,8 +2351,8 @@ fn load_sessions(
     include_archived: bool,
     scope: SessionScope,
 ) -> MenuResult<Vec<SessionSummary>> {
-    let mut list =
-        sessions::list_sessions_with_dirs(Some(provider.to_string()), ctx.dirs()).map_err(to_string)?;
+    let mut list = sessions::list_sessions_with_dirs(Some(provider.to_string()), ctx.dirs())
+        .map_err(to_string)?;
     if !include_archived {
         list.retain(|session| !session.archived);
     }

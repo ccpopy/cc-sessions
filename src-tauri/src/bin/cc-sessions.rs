@@ -142,8 +142,11 @@ fn run_cli() -> CliResult<()> {
         .unwrap_or_else(|| paths::default_cursor_dir().to_string_lossy().into_owned());
     let antigravity_dir_arg = take_value(&mut args, "--antigravity-dir")?;
     let antigravity_dir_explicit = antigravity_dir_arg.is_some();
-    let antigravity_dir = antigravity_dir_arg
-        .unwrap_or_else(|| paths::default_antigravity_dir().to_string_lossy().into_owned());
+    let antigravity_dir = antigravity_dir_arg.unwrap_or_else(|| {
+        paths::default_antigravity_dir()
+            .to_string_lossy()
+            .into_owned()
+    });
 
     if help {
         print_help();
@@ -1584,9 +1587,9 @@ fn installed_providers(ctx: &CliContext) -> Vec<&'static str> {
 
 fn load_sessions(ctx: &CliContext, provider: String) -> CliResult<Vec<SessionSummary>> {
     match provider.as_str() {
-        "codex" | "claude" | "opencode" | "cursor" | "antigravity" => {
-            Ok(sessions::list_sessions_with_dirs(Some(provider), ctx.dirs())?)
-        }
+        "codex" | "claude" | "opencode" | "cursor" | "antigravity" => Ok(
+            sessions::list_sessions_with_dirs(Some(provider), ctx.dirs())?,
+        ),
         "all" => {
             let mut list = Vec::new();
             for current in installed_providers(ctx) {
