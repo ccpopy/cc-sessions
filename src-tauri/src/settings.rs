@@ -238,6 +238,13 @@ pub fn default_cursor_dir() -> String {
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
+pub fn default_antigravity_dir() -> String {
+    paths::default_antigravity_dir()
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg_attr(feature = "desktop", tauri::command)]
 pub fn validate_codex_dir(path: String) -> AppResult<DirValidation> {
     let p = PathBuf::from(&path);
     let (exists, has_state, has_sessions) = paths::validate_codex_dir(&p)?;
@@ -294,6 +301,24 @@ pub fn validate_cursor_dir(path: String) -> AppResult<DirValidation> {
     Ok(DirValidation {
         valid: count > 0 || database.is_file(),
         has_state_db: database.is_file(),
+        has_sessions: count > 0,
+        threads_count: count,
+    })
+}
+
+/// Antigravity 同时扫描 CLI（`~/.gemini/antigravity-cli`）与 App（`~/.gemini/antigravity`）两处存储。
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn validate_antigravity_dir(path: String) -> AppResult<DirValidation> {
+    let cli_dir = PathBuf::from(&path);
+    let app_dir = paths::default_antigravity_app_dir();
+    let has_state_db = cli_dir.join("conversation_summaries.db").is_file()
+        || app_dir.join("conversation_summaries.db").is_file();
+    let count = crate::antigravity_sessions::validate_data_dir(&cli_dir, &app_dir)?;
+    Ok(DirValidation {
+        valid: count > 0
+            || crate::antigravity_sessions::has_store_data(&cli_dir)
+            || crate::antigravity_sessions::has_store_data(&app_dir),
+        has_state_db,
         has_sessions: count > 0,
         threads_count: count,
     })

@@ -102,11 +102,38 @@ export function extractPreviewEventText(event: PreviewEvent): string {
 }
 
 export function canonicalMessageImages(event: PreviewEvent): Array<{ name: string; path: string }> {
-  const raw = event.raw as { payload?: { type?: unknown; item?: { content?: unknown } } } | null;
+  const raw = event.raw as {
+    payload?: { type?: unknown; item?: { content?: unknown } };
+    antigravity?: { media?: unknown };
+  } | null;
+  const images: Array<{ name: string; path: string }> = [];
   const content = raw?.payload?.item?.content;
-  if (raw?.payload?.type !== "item_completed" || !Array.isArray(content)) return [];
-  return content.flatMap((item) => item?.type === "local_image" && typeof item.path === "string"
-    ? [{ name: item.path.split(/[\\/]/).pop() || "图片", path: item.path }] : []);
+  if (raw?.payload?.type === "item_completed" && Array.isArray(content)) {
+    for (const item of content) {
+      if (item?.type === "local_image" && typeof item.path === "string") {
+        images.push({ name: item.path.split(/[\\/]/).pop() || "图片", path: item.path });
+      }
+    }
+  }
+  const agMedia = raw?.antigravity?.media;
+  if (Array.isArray(agMedia)) {
+    for (const item of agMedia) {
+      if (!item || typeof item !== "object") continue;
+      if (typeof item.mime_type === "string" && item.mime_type && !item.mime_type.startsWith("image/")) {
+        continue;
+      }
+      const mediaPath = typeof item.path === "string" ? item.path.trim() : "";
+      if (mediaPath) {
+        images.push({
+          name: typeof item.name === "string" && item.name.trim()
+            ? item.name
+            : mediaPath.split(/[\\/]/).pop() || "图片",
+          path: mediaPath,
+        });
+      }
+    }
+  }
+  return images;
 }
 
 export function sessionEventTargets(events: PreviewEvent[]): SessionEventTarget[] {

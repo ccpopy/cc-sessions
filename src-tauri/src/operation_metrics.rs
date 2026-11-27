@@ -74,6 +74,12 @@ impl Measurement {
                 Ok(_) => "cursor_ide",
                 Err(_) => "cursor",
             }
+        } else if provider == "antigravity" {
+            match crate::antigravity_sessions::decode_locator(locator) {
+                Ok(locator) if locator.store == "cli" => "antigravity_cli",
+                Ok(_) => "antigravity_app",
+                Err(_) => "antigravity",
+            }
         } else {
             provider
         };
@@ -109,6 +115,9 @@ impl Measurement {
                 "cursor" => "cursor",
                 "cursor_ide" => "cursor_ide",
                 "cursor_cli" => "cursor_cli",
+                "antigravity" => "antigravity",
+                "antigravity_cli" => "antigravity_cli",
+                "antigravity_app" => "antigravity_app",
                 _ => "unknown",
             },
             operation_id: if output.is_some() {

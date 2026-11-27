@@ -9,7 +9,16 @@ export function useSessions(provider: SessionProvider, query: string) {
   const claudeDir = settings?.claude_dir ?? "";
   const opencodeDir = settings?.opencode_dir ?? "";
   const cursorDir = settings?.cursor_dir ?? "";
-  const scope = JSON.stringify([settingsReady, provider, codexDir, claudeDir, opencodeDir, cursorDir]);
+  const antigravityDir = settings?.antigravity_dir ?? "";
+  const scope = JSON.stringify([
+    settingsReady,
+    provider,
+    codexDir,
+    claudeDir,
+    opencodeDir,
+    cursorDir,
+    antigravityDir,
+  ]);
   const [allSessions, setAllSessions] = useState<SessionSummary[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -49,6 +58,7 @@ export function useSessions(provider: SessionProvider, query: string) {
           claudeDir,
           opencodeDir,
           cursorDir,
+          antigravityDir,
         });
         if (!providerDir) {
           setError(missingDirectoryMessage(provider));
@@ -62,7 +72,14 @@ export function useSessions(provider: SessionProvider, query: string) {
           while (isCurrent()) {
             const observedGeneration = generation.current;
             try {
-              const list = await api.listSessions(provider, codexDir, claudeDir, opencodeDir, cursorDir);
+              const list = await api.listSessions(
+                provider,
+                codexDir,
+                claudeDir,
+                opencodeDir,
+                cursorDir,
+                antigravityDir,
+              );
               if (!isCurrent()) return;
               if (observedGeneration !== generation.current) continue;
               setAllSessions(list);
@@ -85,7 +102,7 @@ export function useSessions(provider: SessionProvider, query: string) {
     });
     inFlight.current = { scope, requestId, promise };
     return promise;
-  }, [claudeDir, codexDir, cursorDir, opencodeDir, provider, scope, settingsReady]);
+  }, [antigravityDir, claudeDir, codexDir, cursorDir, opencodeDir, provider, scope, settingsReady]);
 
   useEffect(() => {
     requestSeq.current += 1;
@@ -167,6 +184,7 @@ export function useProjectGroups(provider: SessionProvider) {
       claudeDir: settings.claude_dir,
       opencodeDir: settings.opencode_dir,
       cursorDir: settings.cursor_dir,
+      antigravityDir: settings.antigravity_dir,
     });
     if (!providerDir) {
       setGroups([]);
@@ -182,6 +200,7 @@ export function useProjectGroups(provider: SessionProvider) {
         settings.claude_dir,
         settings.opencode_dir,
         settings.cursor_dir,
+        settings.antigravity_dir,
       );
       if (request === requestSeq.current) setGroups(next);
     } catch (error) {
@@ -191,7 +210,14 @@ export function useProjectGroups(provider: SessionProvider) {
     } finally {
       if (request === requestSeq.current) setLoading(false);
     }
-  }, [settings?.codex_dir, settings?.claude_dir, settings?.opencode_dir, settings?.cursor_dir, provider]);
+  }, [
+    settings?.codex_dir,
+    settings?.claude_dir,
+    settings?.opencode_dir,
+    settings?.cursor_dir,
+    settings?.antigravity_dir,
+    provider,
+  ]);
 
   useEffect(() => {
     void refresh();
@@ -203,7 +229,13 @@ export function useProjectGroups(provider: SessionProvider) {
 /** 当前 provider 需要哪个目录才能列出会话。 */
 function providerDirectory(
   provider: SessionProvider,
-  dirs: { codexDir: string; claudeDir: string; opencodeDir: string; cursorDir: string },
+  dirs: {
+    codexDir: string;
+    claudeDir: string;
+    opencodeDir: string;
+    cursorDir: string;
+    antigravityDir: string;
+  },
 ): string {
   switch (provider) {
     case "claude":
@@ -212,6 +244,8 @@ function providerDirectory(
       return dirs.opencodeDir;
     case "cursor":
       return dirs.cursorDir;
+    case "antigravity":
+      return dirs.antigravityDir;
     default:
       return dirs.codexDir;
   }
@@ -225,6 +259,8 @@ function missingDirectoryMessage(provider: SessionProvider): string {
       return "尚未配置 OpenCode 数据目录";
     case "cursor":
       return "尚未配置 Cursor 用户数据目录";
+    case "antigravity":
+      return "尚未配置 Antigravity CLI 目录";
     default:
       return "尚未配置 Codex 目录";
   }

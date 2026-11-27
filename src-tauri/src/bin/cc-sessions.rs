@@ -66,6 +66,8 @@ struct CliContext {
     opencode_dir_explicit: bool,
     cursor_dir: String,
     cursor_dir_explicit: bool,
+    antigravity_dir: String,
+    antigravity_dir_explicit: bool,
     family_lock: family::FamilyLock,
 }
 
@@ -77,6 +79,8 @@ impl CliContext {
             opencode_dir: Some(self.opencode_dir.clone()),
             cursor_dir: Some(self.cursor_dir.clone()),
             cursor_agent_dir: None,
+            antigravity_dir: Some(self.antigravity_dir.clone()),
+            antigravity_app_dir: None,
         }
     }
 }
@@ -136,6 +140,10 @@ fn run_cli() -> CliResult<()> {
     let cursor_dir_explicit = cursor_dir_arg.is_some();
     let cursor_dir = cursor_dir_arg
         .unwrap_or_else(|| paths::default_cursor_dir().to_string_lossy().into_owned());
+    let antigravity_dir_arg = take_value(&mut args, "--antigravity-dir")?;
+    let antigravity_dir_explicit = antigravity_dir_arg.is_some();
+    let antigravity_dir = antigravity_dir_arg
+        .unwrap_or_else(|| paths::default_antigravity_dir().to_string_lossy().into_owned());
 
     if help {
         print_help();
@@ -153,6 +161,8 @@ fn run_cli() -> CliResult<()> {
         opencode_dir_explicit,
         cursor_dir,
         cursor_dir_explicit,
+        antigravity_dir,
+        antigravity_dir_explicit,
         family_lock: family::FamilyLock::default(),
     };
 
@@ -163,6 +173,7 @@ fn run_cli() -> CliResult<()> {
             ctx.claude_dir.clone(),
             ctx.opencode_dir.clone(),
             ctx.cursor_dir.clone(),
+            ctx.antigravity_dir.clone(),
         )
         .map_err(CliError::message);
     };
@@ -176,6 +187,7 @@ fn run_cli() -> CliResult<()> {
                 ctx.claude_dir.clone(),
                 ctx.opencode_dir.clone(),
                 ctx.cursor_dir.clone(),
+                ctx.antigravity_dir.clone(),
             )
             .map_err(CliError::message)
         }
@@ -211,11 +223,12 @@ fn print_help() {
 
 全局选项:
   --json                    输出 JSON
-  --provider <codex|claude|opencode|cursor|all>  会话、统计与 webui 使用的 provider
+  --provider <codex|claude|opencode|cursor|antigravity|all>  会话、统计与 webui 使用的 provider
   --codex-dir <路径>         默认读取 ~/.codex
   --claude-dir <路径>        默认读取 ~/.claude
   --opencode-dir <路径>      默认读取 ~/.local/share/opencode
   --cursor-dir <路径>        Cursor 用户数据目录，默认 <配置目录>/Cursor/User
+  --antigravity-dir <路径>   Antigravity CLI 数据目录，默认 ~/.gemini/antigravity-cli
   -h, --help                显示帮助
 
 常用命令:
@@ -350,15 +363,15 @@ fn cmd_webui(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
     webui::validate_host(&host)?;
     let default_provider = match ctx.provider.as_deref() {
         None => None,
-        Some("codex" | "claude" | "opencode" | "cursor") => ctx.provider.clone(),
+        Some("codex" | "claude" | "opencode" | "cursor" | "antigravity") => ctx.provider.clone(),
         Some("all") => {
             return Err(CliError::message(
-                "webui 不支持 --provider all；请使用 codex、claude 或 opencode",
+                "webui 不支持 --provider all；请使用 codex、claude、opencode、cursor 或 antigravity",
             ))
         }
         Some(other) => {
             return Err(CliError::message(format!(
-                "webui 不支持的 provider: {other}；请使用 codex、claude 或 opencode"
+                "webui 不支持的 provider: {other}；请使用 codex、claude、opencode、cursor 或 antigravity"
             )))
         }
     };
@@ -374,6 +387,8 @@ fn cmd_webui(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
         opencode_dir_explicit: ctx.opencode_dir_explicit,
         cursor_dir: ctx.cursor_dir.clone(),
         cursor_dir_explicit: ctx.cursor_dir_explicit,
+        antigravity_dir: ctx.antigravity_dir.clone(),
+        antigravity_dir_explicit: ctx.antigravity_dir_explicit,
     })?;
     Ok(())
 }
@@ -557,8 +572,11 @@ fn cmd_convert(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
     let rollout_path = conversion_path_arg(&mut args)?;
     ensure_no_args(&args)?;
     let source_provider = concrete_provider(ctx)?;
-    if source_provider == "opencode" {
-        return Err(CliError::message("OpenCode 会话暂不支持转换"));
+    if source_provider == "opencode" || source_provider == "antigravity" {
+        return Err(CliError::message(format!(
+            "{} 会话暂不支持转换",
+            source_provider
+        )));
     }
     if let Some(target) = target_provider.as_deref() {
         if !matches!(target, "claude" | "codex") {
@@ -1498,6 +1516,7 @@ fn cmd_settings(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
                 println!("claude_dir\t{}", settings.claude_dir);
                 println!("opencode_dir\t{}", settings.opencode_dir);
                 println!("cursor_dir\t{}", settings.cursor_dir);
+                println!("antigravity_dir\t{}", settings.antigravity_dir);
                 println!("backup_dir\t{}", settings.backup_dir);
                 println!("refresh_interval_ms\t{}", settings.refresh_interval_ms);
             })
@@ -1511,6 +1530,7 @@ fn cmd_settings(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
                 println!("claude_dir\t{}", settings.claude_dir);
                 println!("opencode_dir\t{}", settings.opencode_dir);
                 println!("cursor_dir\t{}", settings.cursor_dir);
+                println!("antigravity_dir\t{}", settings.antigravity_dir);
                 println!("backup_dir\t{}", settings.backup_dir);
                 println!("refresh_interval_ms\t{}", settings.refresh_interval_ms);
             })
@@ -1521,11 +1541,13 @@ fn cmd_settings(ctx: &CliContext, mut args: Vec<String>) -> CliResult<()> {
             let claude = settings::validate_claude_dir(ctx.claude_dir.clone())?;
             let opencode = settings::validate_opencode_dir(ctx.opencode_dir.clone())?;
             let cursor = settings::validate_cursor_dir(ctx.cursor_dir.clone())?;
+            let antigravity = settings::validate_antigravity_dir(ctx.antigravity_dir.clone())?;
             let report = HashMap::from([
                 ("codex", serde_json::to_value(codex)?),
                 ("claude", serde_json::to_value(claude)?),
                 ("opencode", serde_json::to_value(opencode)?),
                 ("cursor", serde_json::to_value(cursor)?),
+                ("antigravity", serde_json::to_value(antigravity)?),
             ]);
             output(ctx, &report, |report| {
                 for (name, value) in report {
@@ -1549,15 +1571,22 @@ fn installed_providers(ctx: &CliContext) -> Vec<&'static str> {
     {
         providers.push("cursor");
     }
+    let antigravity_dir = PathBuf::from(&ctx.antigravity_dir);
+    if cc_session_manager_lib::antigravity_sessions::has_store_data(&antigravity_dir)
+        || cc_session_manager_lib::antigravity_sessions::has_store_data(
+            &paths::default_antigravity_app_dir(),
+        )
+    {
+        providers.push("antigravity");
+    }
     providers
 }
 
 fn load_sessions(ctx: &CliContext, provider: String) -> CliResult<Vec<SessionSummary>> {
     match provider.as_str() {
-        "codex" | "claude" | "opencode" | "cursor" => Ok(sessions::list_sessions_with_dirs(
-            Some(provider),
-            ctx.dirs(),
-        )?),
+        "codex" | "claude" | "opencode" | "cursor" | "antigravity" => {
+            Ok(sessions::list_sessions_with_dirs(Some(provider), ctx.dirs())?)
+        }
         "all" => {
             let mut list = Vec::new();
             for current in installed_providers(ctx) {
@@ -1626,7 +1655,7 @@ fn group_projects(list: Vec<SessionSummary>, include_archived: bool) -> Vec<Proj
 fn session_provider(ctx: &CliContext) -> CliResult<String> {
     let provider = ctx.provider.clone().unwrap_or_else(|| "codex".to_string());
     match provider.as_str() {
-        "codex" | "claude" | "opencode" | "cursor" | "all" => Ok(provider),
+        "codex" | "claude" | "opencode" | "cursor" | "antigravity" | "all" => Ok(provider),
         other => Err(CliError::message(format!("不支持的 provider: {other}"))),
     }
 }
@@ -1635,7 +1664,7 @@ fn concrete_provider(ctx: &CliContext) -> CliResult<String> {
     let provider = session_provider(ctx)?;
     if provider == "all" {
         Err(CliError::message(
-            "此命令只支持 --provider codex、claude 或 opencode",
+            "此命令只支持 --provider codex、claude、opencode、cursor 或 antigravity",
         ))
     } else {
         Ok(provider)
@@ -1969,6 +1998,8 @@ mod tests {
             opencode_dir_explicit: false,
             cursor_dir: "cursor".into(),
             cursor_dir_explicit: false,
+            antigravity_dir: "antigravity".into(),
+            antigravity_dir_explicit: false,
             family_lock: family::FamilyLock::default(),
         }
     }

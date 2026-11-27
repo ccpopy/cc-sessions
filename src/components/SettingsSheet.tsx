@@ -48,6 +48,7 @@ export function SettingsSheet({ trigger }: Props) {
   const [claude, setClaude] = useState("");
   const [opencode, setOpenCode] = useState("");
   const [cursor, setCursor] = useState("");
+  const [antigravity, setAntigravity] = useState("");
   const [backup, setBackup] = useState("");
   const [updateProxy, setUpdateProxy] = useState("");
   const [updateMirror, setUpdateMirror] = useState(DEFAULT_DOWNLOAD_MIRROR);
@@ -55,6 +56,7 @@ export function SettingsSheet({ trigger }: Props) {
   const [claudeValidation, setClaudeValidation] = useState<DirValidation | null>(null);
   const [opencodeValidation, setOpenCodeValidation] = useState<DirValidation | null>(null);
   const [cursorValidation, setCursorValidation] = useState<DirValidation | null>(null);
+  const [antigravityValidation, setAntigravityValidation] = useState<DirValidation | null>(null);
   const [updateState, setUpdateState] = useState<UpdateCheckResult>({ state: "idle" });
   const [currentVersion, setCurrentVersion] = useState("");
   const [currentVersionError, setCurrentVersionError] = useState("");
@@ -68,6 +70,7 @@ export function SettingsSheet({ trigger }: Props) {
     setClaude(settings.claude_dir);
     setOpenCode(settings.opencode_dir);
     setCursor(settings.cursor_dir);
+    setAntigravity(settings.antigravity_dir ?? "");
     setBackup(settings.backup_dir);
     setUpdateProxy(settings.update_network?.proxy_url ?? "");
     setUpdateMirror(settings.update_network?.download_mirror ?? DEFAULT_DOWNLOAD_MIRROR);
@@ -135,6 +138,18 @@ export function SettingsSheet({ trigger }: Props) {
     return () => window.clearTimeout(id);
   }, [cursor]);
 
+  useEffect(() => {
+    if (!antigravity) return;
+    const id = window.setTimeout(async () => {
+      try {
+        setAntigravityValidation(await api.validateAntigravityDir(antigravity));
+      } catch {
+        setAntigravityValidation(null);
+      }
+    }, 200);
+    return () => window.clearTimeout(id);
+  }, [antigravity]);
+
   const pick = async (setter: (s: string) => void, cur: string) => {
     const picked = await pickDirectoryPath({ defaultPath: cur });
     if (picked) setter(picked);
@@ -156,12 +171,17 @@ export function SettingsSheet({ trigger }: Props) {
     setCursor(await api.defaultCursorDir());
   };
 
+  const restoreAntigravityDefault = async () => {
+    setAntigravity(await api.defaultAntigravityDir());
+  };
+
   const persistSettings = async () => {
     await save({
       codex_dir: codex,
       claude_dir: claude,
       opencode_dir: opencode,
       cursor_dir: cursor,
+      antigravity_dir: antigravity,
       backup_dir: backup,
       update_network: updateNetwork(),
     });
@@ -281,6 +301,18 @@ export function SettingsSheet({ trigger }: Props) {
             onRestoreDefault={restoreCursorDefault}
           >
             <ValidationBadge v={cursorValidation} provider="cursor" />
+          </DirField>
+          <Separator />
+
+          <DirField
+            label="Antigravity CLI 目录"
+            value={antigravity}
+            onChange={setAntigravity}
+            placeholder={"C:\\Users\\<me>\\.gemini\\antigravity-cli"}
+            onPick={() => pick(setAntigravity, antigravity)}
+            onRestoreDefault={restoreAntigravityDefault}
+          >
+            <ValidationBadge v={antigravityValidation} provider="antigravity" />
           </DirField>
           <Separator />
 
@@ -558,7 +590,7 @@ function ValidationBadge({
   provider,
 }: {
   v: DirValidation | null;
-  provider: "codex" | "claude" | "opencode" | "cursor";
+  provider: "codex" | "claude" | "opencode" | "cursor" | "antigravity";
 }) {
   if (!v) return null;
   if (v.valid) {
@@ -573,8 +605,17 @@ function ValidationBadge({
   if (provider === "codex" && !v.has_state_db) reasons.push("缺 state_5.sqlite");
   if (provider === "opencode" && !v.has_state_db) reasons.push("缺 opencode.db");
   if (provider === "cursor" && !v.has_state_db) reasons.push("缺 state.vscdb");
+  if (provider === "antigravity" && !v.has_state_db) reasons.push("缺 conversation_summaries.db");
   if (!v.has_sessions) {
-    reasons.push(provider === "codex" ? "缺 sessions/" : provider === "claude" ? "缺 projects/" : "数据库不可用");
+    reasons.push(
+      provider === "codex"
+        ? "缺 sessions/"
+        : provider === "claude"
+          ? "缺 projects/"
+          : provider === "antigravity"
+            ? "未发现会话记录"
+            : "数据库不可用",
+    );
   }
   return (
     <Badge variant="outline" className="gap-1 border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400">

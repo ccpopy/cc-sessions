@@ -57,6 +57,8 @@ const config: Config = {
           "opencode-fg": "hsl(var(--provider-opencode-fg) / <alpha-value>)",
           cursor: "hsl(var(--provider-cursor) / <alpha-value>)",
           "cursor-fg": "hsl(var(--provider-cursor-fg) / <alpha-value>)",
+          antigravity: "hsl(var(--provider-antigravity) / <alpha-value>)",
+          "antigravity-fg": "hsl(var(--provider-antigravity-fg) / <alpha-value>)",
         },
         sidebar: {
           DEFAULT: "hsl(var(--sidebar-background))",

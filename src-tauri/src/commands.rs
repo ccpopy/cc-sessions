@@ -34,13 +34,20 @@ pub fn start_content_search(
     claude_dir: Option<String>,
     opencode_dir: Option<String>,
     cursor_dir: Option<String>,
+    antigravity_dir: Option<String>,
     query: String,
     rollout_paths: Vec<String>,
     raw_events: Option<bool>,
 ) -> AppResult<ContentSearchStart> {
     crate::content_search::start_content_search(
         provider,
-        provider_dirs(codex_dir, claude_dir, opencode_dir, cursor_dir),
+        provider_dirs_with_antigravity(
+            codex_dir,
+            claude_dir,
+            opencode_dir,
+            cursor_dir,
+            antigravity_dir,
+        ),
         query,
         rollout_paths,
         raw_events.unwrap_or(false),
@@ -1149,12 +1156,24 @@ fn provider_dirs(
     opencode_dir: Option<String>,
     cursor_dir: Option<String>,
 ) -> ProviderDirs {
+    provider_dirs_with_antigravity(codex_dir, claude_dir, opencode_dir, cursor_dir, None)
+}
+
+fn provider_dirs_with_antigravity(
+    codex_dir: String,
+    claude_dir: Option<String>,
+    opencode_dir: Option<String>,
+    cursor_dir: Option<String>,
+    antigravity_dir: Option<String>,
+) -> ProviderDirs {
     ProviderDirs {
         codex_dir,
         claude_dir,
         opencode_dir,
         cursor_dir,
         cursor_agent_dir: None,
+        antigravity_dir,
+        antigravity_app_dir: None,
     }
 }
 
@@ -1165,11 +1184,18 @@ pub async fn list_sessions(
     claude_dir: Option<String>,
     opencode_dir: Option<String>,
     cursor_dir: Option<String>,
+    antigravity_dir: Option<String>,
 ) -> AppResult<Vec<SessionSummary>> {
     run_blocking(move || {
         crate::sessions::list_sessions_with_dirs(
             provider,
-            provider_dirs(codex_dir, claude_dir, opencode_dir, cursor_dir),
+            provider_dirs_with_antigravity(
+                codex_dir,
+                claude_dir,
+                opencode_dir,
+                cursor_dir,
+                antigravity_dir,
+            ),
         )
     })
     .await
@@ -1182,11 +1208,18 @@ pub async fn group_sessions_by_project(
     claude_dir: Option<String>,
     opencode_dir: Option<String>,
     cursor_dir: Option<String>,
+    antigravity_dir: Option<String>,
 ) -> AppResult<Vec<ProjectGroup>> {
     run_blocking(move || {
         crate::sessions::group_sessions_by_project_with_dirs(
             provider,
-            provider_dirs(codex_dir, claude_dir, opencode_dir, cursor_dir),
+            provider_dirs_with_antigravity(
+                codex_dir,
+                claude_dir,
+                opencode_dir,
+                cursor_dir,
+                antigravity_dir,
+            ),
         )
     })
     .await
@@ -1199,12 +1232,19 @@ pub async fn search_sessions(
     claude_dir: Option<String>,
     opencode_dir: Option<String>,
     cursor_dir: Option<String>,
+    antigravity_dir: Option<String>,
     query: String,
 ) -> AppResult<Vec<SessionSummary>> {
     run_blocking(move || {
         crate::sessions::search_sessions_with_dirs(
             provider,
-            provider_dirs(codex_dir, claude_dir, opencode_dir, cursor_dir),
+            provider_dirs_with_antigravity(
+                codex_dir,
+                claude_dir,
+                opencode_dir,
+                cursor_dir,
+                antigravity_dir,
+            ),
             query,
         )
     })
@@ -1345,6 +1385,7 @@ pub async fn stats_snapshot(
     claude_dir: Option<String>,
     opencode_dir: Option<String>,
     cursor_dir: Option<String>,
+    antigravity_dir: Option<String>,
     from_ts: Option<i64>,
     to_ts: Option<i64>,
     bucket: String,
@@ -1355,7 +1396,13 @@ pub async fn stats_snapshot(
     run_blocking(move || {
         crate::stats::stats_snapshot(
             provider,
-            provider_dirs(codex_dir, claude_dir, opencode_dir, cursor_dir),
+            provider_dirs_with_antigravity(
+                codex_dir,
+                claude_dir,
+                opencode_dir,
+                cursor_dir,
+                antigravity_dir,
+            ),
             from_ts,
             to_ts,
             bucket,

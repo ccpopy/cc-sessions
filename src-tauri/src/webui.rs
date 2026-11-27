@@ -39,6 +39,8 @@ pub struct WebuiConfig {
     pub opencode_dir_explicit: bool,
     pub cursor_dir: String,
     pub cursor_dir_explicit: bool,
+    pub antigravity_dir: String,
+    pub antigravity_dir_explicit: bool,
 }
 
 struct WebuiState {
@@ -72,11 +74,15 @@ pub fn run(config: WebuiConfig) -> AppResult<()> {
     if !settings_exists || config.cursor_dir_explicit {
         initial_settings.cursor_dir = config.cursor_dir;
     }
+    if !settings_exists || config.antigravity_dir_explicit {
+        initial_settings.antigravity_dir = config.antigravity_dir;
+    }
     if !settings_exists
         || config.codex_dir_explicit
         || config.claude_dir_explicit
         || config.opencode_dir_explicit
         || config.cursor_dir_explicit
+        || config.antigravity_dir_explicit
     {
         settings::write_settings_file(&settings_file, &initial_settings)?;
     }
@@ -251,6 +257,10 @@ fn dispatch_invoke(state: &WebuiState, command: &str, args: Value) -> AppResult<
             to_result_value(settings::validate_cursor_dir(string_arg(&args, "path")?))
         }
         "default_cursor_dir" => to_value(settings::default_cursor_dir()),
+        "validate_antigravity_dir" => {
+            to_result_value(settings::validate_antigravity_dir(string_arg(&args, "path")?))
+        }
+        "default_antigravity_dir" => to_value(settings::default_antigravity_dir()),
         "list_sessions" => to_result_value(sessions::list_sessions_with_dirs(
             opt_string_arg(&args, "provider")?,
             provider_dirs_arg(&args)?,
@@ -1056,6 +1066,8 @@ fn provider_dirs_arg(args: &Value) -> AppResult<crate::models::ProviderDirs> {
         opencode_dir: opt_string_arg(args, "opencodeDir")?,
         cursor_dir: opt_string_arg(args, "cursorDir")?,
         cursor_agent_dir: None,
+        antigravity_dir: opt_string_arg(args, "antigravityDir")?,
+        antigravity_app_dir: None,
     })
 }
 

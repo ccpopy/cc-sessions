@@ -53,6 +53,7 @@ import { cn } from "@/lib/utils";
 type Props = {
   s: SessionSummary;
   selected: boolean;
+  selectable?: boolean;
   onToggleSelect: () => void;
   onPreview: (s: SessionSummary) => void;
   onCopyResume: (s: SessionSummary) => void;
@@ -81,6 +82,7 @@ type Props = {
 export const SessionCard = memo(function SessionCard({
   s,
   selected,
+  selectable = true,
   onToggleSelect,
   onPreview,
   onCopyResume,
@@ -120,7 +122,10 @@ export const SessionCard = memo(function SessionCard({
   const requiresActivation = Boolean(
     overlay?.family_id && !overlay.is_active_branch && !isUsableCurrentProviderBranch,
   );
-  const canCopyResume = !(s.provider === "claude" && isSubagent) && !requiresActivation;
+  const canCopyResume =
+    !(s.provider === "claude" && isSubagent) &&
+    (s.provider !== "antigravity" || Boolean(s.resume_command?.trim())) &&
+    !requiresActivation;
 
   return (
     <div
@@ -133,13 +138,20 @@ export const SessionCard = memo(function SessionCard({
           "border-emerald-500/45 bg-emerald-500/[0.035] before:opacity-100 dark:border-emerald-500/35 dark:bg-emerald-500/[0.07]",
       )}
     >
-      <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-x-3 p-4">
-        <Checkbox
-          checked={selected}
-          onCheckedChange={onToggleSelect}
-          className="mt-0.5"
-          aria-label="选择会话"
-        />
+      <div
+        className={cn(
+          "min-w-0 p-4",
+          selectable ? "grid grid-cols-[auto_minmax(0,1fr)] gap-x-3" : "block",
+        )}
+      >
+        {selectable && (
+          <Checkbox
+            checked={selected}
+            onCheckedChange={onToggleSelect}
+            className="mt-0.5"
+            aria-label="选择会话"
+          />
+        )}
 
         <div className="min-w-0 flex-1">
           {/* 标题 + 最近活动时间 */}
@@ -569,6 +581,14 @@ function subagentLabel(
     return {
       label: "子会话",
       title: `OpenCode 子会话 · 父会话 ${openCodeParent[1]}`,
+    };
+  }
+  const antigravityParent =
+    s.provider === "antigravity" && s.source?.trim().match(/^parent\s*:\s*(.+)$/i);
+  if (antigravityParent) {
+    return {
+      label: "子会话",
+      title: `Antigravity 子会话 · 父会话 ${antigravityParent[1]}`,
     };
   }
   const role = s.agent_role?.trim();

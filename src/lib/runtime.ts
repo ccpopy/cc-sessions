@@ -3,7 +3,7 @@ declare global {
     __TAURI_INTERNALS__?: unknown;
     __CC_SESSIONS_WEBUI__?: {
       apiToken?: string;
-      defaultProvider?: "codex" | "claude" | "opencode" | "cursor";
+      defaultProvider?: "codex" | "claude" | "opencode" | "cursor" | "antigravity";
     };
   }
 }
@@ -20,9 +20,9 @@ export function webuiApiToken() {
   return window.__CC_SESSIONS_WEBUI__?.apiToken;
 }
 
-export function webuiDefaultProvider(): "codex" | "claude" | "opencode" | "cursor" {
+export function webuiDefaultProvider(): "codex" | "claude" | "opencode" | "cursor" | "antigravity" {
   const provider = window.__CC_SESSIONS_WEBUI__?.defaultProvider;
-  return provider === "claude" || provider === "opencode" || provider === "cursor"
+  return provider === "claude" || provider === "opencode" || provider === "cursor" || provider === "antigravity"
     ? provider
     : "codex";
 }

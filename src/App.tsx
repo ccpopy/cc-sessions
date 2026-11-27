@@ -26,12 +26,13 @@ export default function App() {
   const initTheme = useTheme((s) => s.init);
   const toggleTheme = useTheme((s) => s.toggle);
   const defaultProvider = webuiDefaultProvider();
-  // OpenCode 没有修复页，落回 Codex；其余 provider 都有自己的。
-  const defaultRepairProvider = defaultProvider === "opencode" ? "codex" : defaultProvider;
+  // OpenCode 与 Antigravity 没有修复页（Antigravity 仅只读会话页），落回 Codex；其余 provider 都有自己的。
+  const defaultRepairProvider =
+    defaultProvider === "opencode" || defaultProvider === "antigravity" ? "codex" : defaultProvider;
   const defaultSessionsPath = `/${defaultProvider}/sessions`;
   const defaultRepairPath = `/${defaultRepairProvider}/repair`;
-  const defaultBackupsPath = `/${defaultProvider}/backups`;
-  const defaultTransferPath = `/${defaultProvider}/transfer`;
+  const defaultBackupsPath = `/${defaultProvider === "antigravity" ? "codex" : defaultProvider}/backups`;
+  const defaultTransferPath = `/${defaultProvider === "antigravity" ? "codex" : defaultProvider}/transfer`;
 
   useEffect(() => {
     void load().catch(() => {
@@ -83,6 +84,7 @@ export default function App() {
             <Route path="/cursor/backups" element={<BackupsRoute key="cursor-backups" provider="cursor" />} />
             <Route path="/cursor/backups/:name" element={<BackupDetailRoute key="cursor-backup-detail" provider="cursor" />} />
             <Route path="/cursor/transfer" element={<TransferRoute key="cursor-transfer" provider="cursor" />} />
+            <Route path="/antigravity/sessions" element={<SessionsRoute key="antigravity-sessions" provider="antigravity" />} />
             <Route path="/sessions" element={<Navigate to={defaultSessionsPath} replace />} />
             <Route path="/repair" element={<Navigate to={defaultRepairPath} replace />} />
             <Route path="/backups" element={<Navigate to={defaultBackupsPath} replace />} />

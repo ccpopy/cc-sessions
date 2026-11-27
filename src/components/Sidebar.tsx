@@ -11,6 +11,7 @@ import {
   MessageSquare,
   MousePointer2,
   NotebookText,
+  Orbit,
   Package,
   Settings,
   Sparkles,
@@ -107,6 +108,14 @@ const providers: ProviderDefinition[] = [
       { to: "/cursor/repair", icon: Wrench, label: "清理" },
       { to: "/cursor/backups", icon: Archive, label: "备份" },
       { to: "/cursor/transfer", icon: Package, label: "导出 / 导入" },
+    ],
+  },
+  {
+    id: "antigravity",
+    label: "Antigravity",
+    icon: Orbit,
+    items: [
+      { to: "/antigravity/sessions", icon: MessageSquare, label: "会话" },
     ],
   },
 ];
@@ -329,7 +338,13 @@ function DirCard({ label, path, accent }: { label: string; path: string; accent:
 
 function providerFromPath(pathname: string): SessionProvider | null {
   const segment = pathname.split("/").filter(Boolean)[0];
-  if (segment === "codex" || segment === "claude" || segment === "opencode" || segment === "cursor") {
+  if (
+    segment === "codex" ||
+    segment === "claude" ||
+    segment === "opencode" ||
+    segment === "cursor" ||
+    segment === "antigravity"
+  ) {
     return segment;
   }
   return null;
@@ -343,5 +358,6 @@ function providerDirectory(
   if (provider === "claude") return settings.claude_dir;
   if (provider === "opencode") return settings.opencode_dir;
   if (provider === "cursor") return settings.cursor_dir;
+  if (provider === "antigravity") return settings.antigravity_dir;
   return settings.codex_dir;
 }

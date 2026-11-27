@@ -1454,7 +1454,14 @@ export function PreviewDialog({
             )}
             <PreviewToolbarActions
               hasSession={!!session}
-              canOpenEditHistory={!customRolloutPath && !!session && !!backupDir && provider !== "cursor"}
+              canCopyResume={provider !== "antigravity" || Boolean(session?.resume_command?.trim())}
+              canOpenEditHistory={
+                !customRolloutPath &&
+                !!session &&
+                !!backupDir &&
+                provider !== "cursor" &&
+                provider !== "antigravity"
+              }
               onCopySessionId={copySessionId}
               onCopyResume={copyResume}
               onRevealDirectory={reveal}

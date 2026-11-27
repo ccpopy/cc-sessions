@@ -187,7 +187,7 @@ pub fn cancel_content_search(job_id: u64) -> AppResult<()> {
 fn validate_request(request: &SearchRequest) -> AppResult<()> {
     if !matches!(
         request.provider.as_str(),
-        "codex" | "claude" | "opencode" | "cursor"
+        "codex" | "claude" | "opencode" | "cursor" | "antigravity"
     ) {
         return Err(AppError::Other(format!(
             "不支持的 provider: {}",
@@ -392,6 +392,12 @@ fn scan_session_mode(
                 crate::cursor_sessions::load_preview_events_from_locator(&session.rollout_path)?;
             return scan_event_sequence(job, session, query, completed_bytes, events, false);
         }
+        "antigravity" => {
+            let events = crate::antigravity_sessions::load_preview_events_from_locator(
+                &session.rollout_path,
+            )?;
+            return scan_event_sequence(job, session, query, completed_bytes, events, false);
+        }
         _ => {}
     }
     let mut reader = match crate::rollout_io::reader(std::path::Path::new(&session.rollout_path)) {
@@ -578,8 +584,8 @@ fn search_event_key(event: &crate::models::PreviewEvent, raw: bool) -> Option<St
 fn classify_event(provider: &str, index: usize, raw: Value) -> Option<crate::models::PreviewEvent> {
     match provider {
         "codex" => Some(rollout::classify_preview(index, raw)),
-        // Cursor 与 OpenCode 都会先合成 Claude 形状的记录再分类。
-        "claude" | "cursor" => crate::claude_sessions::classify_preview(index, raw),
+        // Cursor、OpenCode 与 Antigravity 都会先合成 Claude 形状的记录再分类。
+        "claude" | "cursor" | "antigravity" => crate::claude_sessions::classify_preview(index, raw),
         _ => None,
     }
 }
@@ -1020,6 +1026,8 @@ mod tests {
                 opencode_dir: Some(root.join("opencode").to_string_lossy().into_owned()),
                 cursor_dir: Some(root.join("cursor").to_string_lossy().into_owned()),
                 cursor_agent_dir: Some(root.join("cursor-agent").to_string_lossy().into_owned()),
+                antigravity_dir: Some(root.join("antigravity-cli").to_string_lossy().into_owned()),
+                antigravity_app_dir: Some(root.join("antigravity").to_string_lossy().into_owned()),
             },
             query: "needle".to_string(),
             rollout_paths: Vec::new(),

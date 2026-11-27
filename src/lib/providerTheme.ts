@@ -14,6 +14,7 @@ const LABELS: Record<SessionProvider, string> = {
   claude: "Claude",
   opencode: "OpenCode",
   cursor: "Cursor",
+  antigravity: "Antigravity",
 };
 
 /** 把 provider 标识转成界面文案；未知取值原样返回，便于排查后端新增来源。 */
@@ -28,6 +29,7 @@ export const accentDot: Record<AccentKey, string> = {
   claude: "bg-provider-claude",
   opencode: "bg-provider-opencode",
   cursor: "bg-provider-cursor",
+  antigravity: "bg-provider-antigravity",
   global: "bg-foreground/60",
 };
 
@@ -37,6 +39,7 @@ export const accentBar: Record<AccentKey, string> = {
   claude: "bg-provider-claude/90",
   opencode: "bg-provider-opencode/90",
   cursor: "bg-provider-cursor/90",
+  antigravity: "bg-provider-antigravity/90",
   global: "bg-foreground/70",
 };
 
@@ -46,6 +49,7 @@ export const accentActiveBar: Record<AccentKey, string> = {
   claude: "bg-provider-claude shadow-[0_0_10px_-1px_hsl(var(--provider-claude)/0.55)]",
   opencode: "bg-provider-opencode shadow-[0_0_10px_-1px_hsl(var(--provider-opencode)/0.5)]",
   cursor: "bg-provider-cursor shadow-[0_0_10px_-1px_hsl(var(--provider-cursor)/0.5)]",
+  antigravity: "bg-provider-antigravity shadow-[0_0_10px_-1px_hsl(var(--provider-antigravity)/0.5)]",
   global: "bg-foreground/80",
 };
 
@@ -55,6 +59,7 @@ export const accentActiveIcon: Record<AccentKey, string> = {
   claude: "text-provider-claude-fg",
   opencode: "text-provider-opencode-fg",
   cursor: "text-provider-cursor-fg",
+  antigravity: "text-provider-antigravity-fg",
   global: "text-foreground",
 };
 
@@ -64,6 +69,7 @@ export const accentActiveTint: Record<AccentKey, string> = {
   claude: "bg-provider-claude/10 ring-1 ring-inset ring-provider-claude/20",
   opencode: "bg-provider-opencode/10 ring-1 ring-inset ring-provider-opencode/20",
   cursor: "bg-provider-cursor/10 ring-1 ring-inset ring-provider-cursor/20",
+  antigravity: "bg-provider-antigravity/10 ring-1 ring-inset ring-provider-antigravity/20",
   global: "bg-sidebar-accent ring-1 ring-inset ring-border/60",
 };
 
@@ -73,6 +79,7 @@ export const accentMark: Record<SessionProvider, string> = {
   claude: "bg-provider-claude/10 text-provider-claude-fg ring-1 ring-inset ring-provider-claude/25",
   opencode: "bg-provider-opencode/10 text-provider-opencode-fg ring-1 ring-inset ring-provider-opencode/25",
   cursor: "bg-provider-cursor/10 text-provider-cursor-fg ring-1 ring-inset ring-provider-cursor/25",
+  antigravity: "bg-provider-antigravity/10 text-provider-antigravity-fg ring-1 ring-inset ring-provider-antigravity/25",
 };
 
 /** 会话卡片上的 provider 徽章。 */
@@ -81,6 +88,7 @@ export const accentBadge: Record<SessionProvider, string> = {
   claude: "border-provider-claude/40 bg-provider-claude/10 text-provider-claude-fg",
   opencode: "border-provider-opencode/35 bg-provider-opencode/10 text-provider-opencode-fg",
   cursor: "border-provider-cursor/35 bg-provider-cursor/10 text-provider-cursor-fg",
+  antigravity: "border-provider-antigravity/35 bg-provider-antigravity/10 text-provider-antigravity-fg",
 };
 
 /** 列表项选中态：与会话卡片一致的"左侧色条 + 淡底"写法。 */
@@ -89,6 +97,7 @@ export const accentRow: Record<SessionProvider, string> = {
   claude: "border-provider-claude/30 bg-provider-claude/[0.07] before:bg-provider-claude",
   opencode: "border-provider-opencode/30 bg-provider-opencode/[0.07] before:bg-provider-opencode",
   cursor: "border-provider-cursor/30 bg-provider-cursor/[0.07] before:bg-provider-cursor",
+  antigravity: "border-provider-antigravity/30 bg-provider-antigravity/[0.07] before:bg-provider-antigravity",
 };
 
 export function accentBadgeFor(provider: string): { label: string; className: string } {

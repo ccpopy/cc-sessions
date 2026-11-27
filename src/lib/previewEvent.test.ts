@@ -164,6 +164,31 @@ test("canonical paginated messages support identified edits without changing for
   assert.equal(editableText(assistant), "完成");
 });
 
+test("canonicalMessageImages supports antigravity media attachments", () => {
+  const user = event(
+    {
+      antigravity: {
+        media: [
+          {
+            path: "C:/fixture/screenshot.png",
+            name: "screenshot.png",
+            mime_type: "image/png",
+          },
+          {
+            path: "C:/fixture/notes.pdf",
+            mime_type: "application/pdf",
+          },
+        ],
+      },
+    },
+    "user",
+  );
+
+  assert.deepEqual(canonicalMessageImages(user), [
+    { name: "screenshot.png", path: "C:/fixture/screenshot.png" },
+  ]);
+});
+
 test("Claude copy boundaries require an identified main-chain message", () => {
   const raw = { type: "user", uuid: "message-uuid", message: { role: "user", content: "hello" } };
   assert.equal(isStableForkNode(event(raw), "claude"), true);

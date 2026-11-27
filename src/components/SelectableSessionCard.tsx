@@ -25,6 +25,7 @@ export type SessionCardHandlers = {
 
 type Props = SessionCardHandlers & {
   session: SessionSummary;
+  selectable?: boolean;
   query?: string;
   showProject?: boolean;
   overlay?: FamilyOverlay;
@@ -36,6 +37,7 @@ type Props = SessionCardHandlers & {
 
 export const SelectableSessionCard = memo(function SelectableSessionCard({
   session,
+  selectable = true,
   ...props
 }: Props) {
   const identity = sessionIdentity(session);
@@ -46,7 +48,8 @@ export const SelectableSessionCard = memo(function SelectableSessionCard({
   return (
     <SessionCard
       s={session}
-      selected={selected}
+      selected={selectable && selected}
+      selectable={selectable}
       onToggleSelect={onToggleSelect}
       {...props}
     />

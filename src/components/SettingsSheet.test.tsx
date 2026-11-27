@@ -19,7 +19,7 @@ const { useSettings } = await import("../stores/settings");
 import type { AppUpdateInfo, Settings } from "../lib/api";
 
 const initial: Settings = {
-  codex_dir: "codex", claude_dir: "claude", opencode_dir: "opencode", cursor_dir: "cursor",
+  codex_dir: "codex", claude_dir: "claude", opencode_dir: "opencode", cursor_dir: "cursor", antigravity_dir: "antigravity",
   backup_dir: "backup", open_command: "", refresh_interval_ms: 1000,
   preview_only_messages: true, preview_collapse_process: true,
   update_network: { proxy_url: "", download_mirror: "" },
@@ -37,7 +37,13 @@ async function mount(t: TestContext, desktop = true, settings = initial) {
   else delete window.__TAURI_INTERNALS__;
   useSettings.setState({ settings: structuredClone(settings), loading: false, error: null });
   t.mock.method(api, "appVersion", async () => "0.6.12");
-  for (const name of ["validateCodexDir", "validateClaudeDir", "validateOpenCodeDir", "validateCursorDir"] as const) {
+  for (const name of [
+    "validateCodexDir",
+    "validateClaudeDir",
+    "validateOpenCodeDir",
+    "validateCursorDir",
+    "validateAntigravityDir",
+  ] as const) {
     t.mock.method(api, name, async () => ({ valid: true, has_state_db: true, has_sessions: true, threads_count: 0 }));
   }
   const root = createRoot(document.getElementById("root")!);

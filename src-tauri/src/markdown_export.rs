@@ -118,6 +118,9 @@ pub fn export_session_markdown(
     let source = match provider.as_deref().unwrap_or("codex") {
         "opencode" => crate::opencode_sessions::resolve_locator(&rollout_path)?.0,
         "cursor" => PathBuf::from(crate::cursor_sessions::decode_locator(&rollout_path)?.path),
+        "antigravity" => {
+            PathBuf::from(crate::antigravity_sessions::decode_locator(&rollout_path)?.transcript)
+        }
         _ => PathBuf::from(crate::paths::strip_verbatim(&rollout_path)),
     };
     let output = out_path
@@ -665,6 +668,7 @@ fn render_preamble(
         "codex" => "Codex",
         "opencode" => "OpenCode",
         "cursor" => "Cursor",
+        "antigravity" => "Antigravity",
         other => other,
     };
     let mut out = String::new();

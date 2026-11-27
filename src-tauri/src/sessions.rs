@@ -414,6 +414,15 @@ fn list_sessions_impl(
             provenance::annotate_sessions(&codex, &mut list);
             Ok(list)
         }
+        "antigravity" => {
+            let mut list = crate::antigravity_sessions::list_sessions(
+                &dirs.antigravity_path(),
+                &dirs.antigravity_app_path(),
+            )?;
+            ensure_not_cancelled(cancel)?;
+            provenance::annotate_sessions(&codex, &mut list);
+            Ok(list)
+        }
         other => Err(AppError::Other(format!("不支持的 provider: {other}"))),
     };
     if let Ok(sessions) = &result {
@@ -664,6 +673,7 @@ pub fn set_archived_with_dirs(
         "opencode" => crate::opencode_sessions::set_archived(&dirs.opencode_path(), &id, v),
         "cursor" => crate::cursor_mutate::set_archived(&dirs, &id, v),
         "claude" => Err(AppError::Other("Claude 会话不支持归档".into())),
+        "antigravity" => Err(AppError::Other("Antigravity 会话当前仅支持只读查看".into())),
         other => Err(AppError::Other(format!("不支持的 provider: {other}"))),
     })
 }
@@ -716,6 +726,9 @@ pub fn rename_session_with_dirs(
         return family::with_lock(lock, &claude, |_guard| {
             crate::claude_transfer::rename_session(&claude, &id, rollout_path.as_deref(), &title)
         });
+    }
+    if provider == "antigravity" {
+        return Err(AppError::Other("Antigravity 会话当前仅支持只读查看".into()));
     }
     if provider != "codex" {
         return Err(AppError::Other(format!("不支持的 provider: {provider}")));
@@ -1170,6 +1183,7 @@ pub fn move_session_cwd_with_provider_dirs_and_options(
                 crate::opencode_transfer::move_session_cwd(&data_dir, &id, &target_cwd)
             })
         }
+        "antigravity" => Err(AppError::Other("Antigravity 会话当前仅支持只读查看".into())),
         other => Err(AppError::Other(format!("不支持的 provider: {other}"))),
     }
 }
@@ -1624,6 +1638,7 @@ pub fn delete_session_with_dirs(
             .ok_or_else(|| AppError::Other("Claude 删除未返回结果".to_string())),
         "opencode" => crate::opencode_sessions::delete_session(&dirs.opencode_path(), &target.id),
         "cursor" => crate::cursor_mutate::delete_session(&dirs, &target.id),
+        "antigravity" => Err(AppError::Other("Antigravity 会话当前仅支持只读查看".into())),
         other => Err(AppError::Other(format!("不支持的 provider: {other}"))),
     })
 }
@@ -1708,6 +1723,7 @@ pub fn delete_sessions_with_dirs(
                 })
                 .collect())
         }
+        "antigravity" => Err(AppError::Other("Antigravity 会话当前仅支持只读查看".into())),
         other => Err(AppError::Other(format!("不支持的 provider: {other}"))),
     })
 }

@@ -574,6 +574,7 @@ fn preview_range_by_provider(
         "claude" => crate::claude_sessions::preview_range(path, offset, limit),
         "opencode" => crate::opencode_sessions::preview_range(path, offset, limit),
         "cursor" => crate::cursor_sessions::preview_range(path, offset, limit),
+        "antigravity" => crate::antigravity_sessions::preview_range(path, offset, limit),
         other => Err(crate::error::AppError::Other(format!(
             "不支持的 provider: {other}"
         ))),
@@ -659,6 +660,7 @@ pub fn preview_session_user_prompts(
         ),
         "opencode" => crate::opencode_sessions::preview_user_prompts(&rollout_path),
         "cursor" => crate::cursor_sessions::preview_user_prompts(&rollout_path),
+        "antigravity" => crate::antigravity_sessions::preview_user_prompts(&rollout_path),
         other => Err(crate::error::AppError::Other(format!(
             "不支持的 provider: {other}"
         ))),
@@ -1018,6 +1020,7 @@ pub fn preview_session_meta(
         "claude" => return crate::claude_sessions::preview_meta(&rollout_path),
         "opencode" => return crate::opencode_sessions::preview_meta(&rollout_path),
         "cursor" => return crate::cursor_sessions::preview_meta(&rollout_path),
+        "antigravity" => return crate::antigravity_sessions::preview_meta(&rollout_path),
         "codex" => {}
         other => {
             return Err(crate::error::AppError::Other(format!(

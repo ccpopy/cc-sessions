@@ -57,7 +57,10 @@ export function selectSessionsForView(
 ): SessionSummary[] {
   const isCodex = options.provider === "codex";
   const supportsArchive =
-    isCodex || options.provider === "opencode" || options.provider === "cursor";
+    isCodex
+    || options.provider === "opencode"
+    || options.provider === "cursor"
+    || options.provider === "antigravity";
   const includeHiddenRecords = options.includeHiddenRecords ?? false;
   const candidates: SessionSummary[] = [];
 

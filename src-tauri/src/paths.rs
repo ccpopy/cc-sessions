@@ -173,6 +173,20 @@ pub fn cursor_agent_chats_dir(agent_dir: &Path) -> PathBuf {
     agent_dir.join("chats")
 }
 
+/// Antigravity CLI（`agy`）默认的数据目录 `~/.gemini/antigravity-cli`。
+pub fn default_antigravity_dir() -> PathBuf {
+    dirs::home_dir()
+        .map(|home| home.join(".gemini").join("antigravity-cli"))
+        .unwrap_or_else(|| PathBuf::from(".gemini/antigravity-cli"))
+}
+
+/// Antigravity 2.0 桌面端默认的数据目录 `~/.gemini/antigravity`。
+pub fn default_antigravity_app_dir() -> PathBuf {
+    dirs::home_dir()
+        .map(|home| home.join(".gemini").join("antigravity"))
+        .unwrap_or_else(|| PathBuf::from(".gemini/antigravity"))
+}
+
 pub fn default_backup_dir() -> PathBuf {
     let cc_root = default_codex_dir();
     cc_root

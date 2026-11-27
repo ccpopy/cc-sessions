@@ -87,6 +87,37 @@ test("normal and archived views both order metadata-touched threads by activity"
   }
 });
 
+test("antigravity respects archived and subagent visibility filters", () => {
+  const active = { ...session("ag-active", 300), provider: "antigravity" as const, archived: false };
+  const archived = { ...session("ag-archived", 400), provider: "antigravity" as const, archived: true };
+  const child = {
+    ...session("ag-child", 500),
+    provider: "antigravity" as const,
+    archived: false,
+    source: "parent:ag-active",
+    agent_nickname: "Researcher",
+  };
+
+  assert.deepEqual(
+    selectSessionsForView([active, archived, child], new Map(), null, {
+      provider: "antigravity", showSubagentSessions: false, showArchivedSessions: false,
+    }).map((item) => item.id),
+    ["ag-active"],
+  );
+  assert.deepEqual(
+    selectSessionsForView([active, archived, child], new Map(), null, {
+      provider: "antigravity", showSubagentSessions: false, showArchivedSessions: true,
+    }).map((item) => item.id),
+    ["ag-archived"],
+  );
+  assert.deepEqual(
+    selectSessionsForView([active, archived, child], new Map(), null, {
+      provider: "antigravity", showSubagentSessions: true, showArchivedSessions: false,
+    }).map((item) => item.id),
+    ["ag-child"],
+  );
+});
+
 test("changing provider keeps the selected thread instead of choosing its older provider copy", () => {
   const staleActive = session("custom-active", 100);
   const currentBranch = session("openai-current", 500);

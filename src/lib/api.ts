@@ -44,7 +44,7 @@ async function invokeCommandRaw<T>(command: string, args?: Record<string, unknow
 }
 
 export type CoreSessionProvider = "codex" | "claude";
-export type SessionProvider = CoreSessionProvider | "opencode" | "cursor";
+export type SessionProvider = CoreSessionProvider | "opencode" | "cursor" | "antigravity";
 export type StatsProvider = "all" | SessionProvider;
 
 export type UpdateNetworkSettings = {
@@ -57,6 +57,7 @@ export type Settings = {
   claude_dir: string;
   opencode_dir: string;
   cursor_dir: string;
+  antigravity_dir: string;
   backup_dir: string;
   open_command: string;
   refresh_interval_ms: number;
@@ -1086,17 +1087,64 @@ export const api = {
   defaultClaudeDir: () => invokeCommand<string>("default_claude_dir"),
   defaultOpenCodeDir: () => invokeCommand<string>("default_opencode_dir"),
   defaultCursorDir: () => invokeCommand<string>("default_cursor_dir"),
+  defaultAntigravityDir: () => invokeCommand<string>("default_antigravity_dir"),
   validateCodexDir: (path: string) => invokeCommand<DirValidation>("validate_codex_dir", { path }),
   validateClaudeDir: (path: string) => invokeCommand<DirValidation>("validate_claude_dir", { path }),
   validateOpenCodeDir: (path: string) => invokeCommand<DirValidation>("validate_opencode_dir", { path }),
   validateCursorDir: (path: string) => invokeCommand<DirValidation>("validate_cursor_dir", { path }),
+  validateAntigravityDir: (path: string) =>
+    invokeCommand<DirValidation>("validate_antigravity_dir", { path }),
 
-  listSessions: (provider: SessionProvider, codexDir: string, claudeDir?: string, opencodeDir?: string, cursorDir?: string) =>
-    invokeCommand<SessionSummary[]>("list_sessions", { provider, codexDir, claudeDir, opencodeDir, cursorDir }),
-  groupByProject: (provider: SessionProvider, codexDir: string, claudeDir?: string, opencodeDir?: string, cursorDir?: string) =>
-    invokeCommand<ProjectGroup[]>("group_sessions_by_project", { provider, codexDir, claudeDir, opencodeDir, cursorDir }),
-  searchSessions: (provider: SessionProvider, codexDir: string, claudeDir: string | undefined, opencodeDir: string | undefined, cursorDir: string | undefined, query: string) =>
-    invokeCommand<SessionSummary[]>("search_sessions", { provider, codexDir, claudeDir, opencodeDir, cursorDir, query }),
+  listSessions: (
+    provider: SessionProvider,
+    codexDir: string,
+    claudeDir?: string,
+    opencodeDir?: string,
+    cursorDir?: string,
+    antigravityDir?: string,
+  ) =>
+    invokeCommand<SessionSummary[]>("list_sessions", {
+      provider,
+      codexDir,
+      claudeDir,
+      opencodeDir,
+      cursorDir,
+      antigravityDir,
+    }),
+  groupByProject: (
+    provider: SessionProvider,
+    codexDir: string,
+    claudeDir?: string,
+    opencodeDir?: string,
+    cursorDir?: string,
+    antigravityDir?: string,
+  ) =>
+    invokeCommand<ProjectGroup[]>("group_sessions_by_project", {
+      provider,
+      codexDir,
+      claudeDir,
+      opencodeDir,
+      cursorDir,
+      antigravityDir,
+    }),
+  searchSessions: (
+    provider: SessionProvider,
+    codexDir: string,
+    claudeDir: string | undefined,
+    opencodeDir: string | undefined,
+    cursorDir: string | undefined,
+    query: string,
+    antigravityDir?: string,
+  ) =>
+    invokeCommand<SessionSummary[]>("search_sessions", {
+      provider,
+      codexDir,
+      claudeDir,
+      opencodeDir,
+      cursorDir,
+      antigravityDir,
+      query,
+    }),
   startContentSearch: (p: {
     rawEvents?: boolean;
     provider: SessionProvider;
@@ -1104,6 +1152,7 @@ export const api = {
     claudeDir: string;
     opencodeDir: string;
     cursorDir: string;
+    antigravityDir?: string;
     query: string;
     rolloutPaths: readonly string[];
   }) => invokeCommand<{ job_id: number }>("start_content_search", p),
@@ -1377,6 +1426,7 @@ export const api = {
     claude_dir?: string;
     opencode_dir?: string;
     cursor_dir?: string;
+    antigravity_dir?: string;
     from_ts: number | null;
     to_ts: number | null;
     bucket: "day" | "week";
@@ -1390,6 +1440,7 @@ export const api = {
       claudeDir: p.claude_dir,
       opencodeDir: p.opencode_dir,
       cursorDir: p.cursor_dir,
+      antigravityDir: p.antigravity_dir,
       fromTs: p.from_ts,
       toTs: p.to_ts,
       bucket: p.bucket,

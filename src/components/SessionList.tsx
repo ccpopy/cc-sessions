@@ -17,6 +17,7 @@ import { useView } from "@/stores/view";
 type Props = SessionCardHandlers & {
   sessions: SessionSummary[];
   scrollElementRef: RefObject<HTMLDivElement | null>;
+  selectable?: boolean;
   backupIndex?: Record<string, string[]>;
   overlay?: Map<string, FamilyOverlay>;
   currentProvider?: string | null;
@@ -32,6 +33,7 @@ type Props = SessionCardHandlers & {
 export const SessionList = memo(function SessionList({
   sessions,
   scrollElementRef,
+  selectable = true,
   backupIndex,
   overlay,
   currentProvider,
@@ -71,6 +73,7 @@ export const SessionList = memo(function SessionList({
   const viewProps: SessionListViewProps = {
     sessions: viewSessions,
     handlers,
+    selectable,
     query,
     scrollElementRef,
     overlay,

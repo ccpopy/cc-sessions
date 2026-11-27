@@ -27,6 +27,8 @@ pub struct Settings {
     pub opencode_dir: String,
     #[serde(default = "default_cursor_dir")]
     pub cursor_dir: String,
+    #[serde(default = "default_antigravity_dir")]
+    pub antigravity_dir: String,
     pub backup_dir: String,
     #[serde(default = "default_open_cmd")]
     pub open_command: String,
@@ -63,6 +65,12 @@ fn default_cursor_dir() -> String {
         .into_owned()
 }
 
+fn default_antigravity_dir() -> String {
+    crate::paths::default_antigravity_dir()
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn default_refresh_ms() -> u64 {
     5000
 }
@@ -73,12 +81,14 @@ impl Default for Settings {
         let claude = crate::paths::default_claude_dir();
         let opencode = crate::paths::default_opencode_dir();
         let cursor = crate::paths::default_cursor_dir();
+        let antigravity = crate::paths::default_antigravity_dir();
         let backup = crate::paths::default_backup_dir();
         Self {
             codex_dir: codex.to_string_lossy().into_owned(),
             claude_dir: claude.to_string_lossy().into_owned(),
             opencode_dir: opencode.to_string_lossy().into_owned(),
             cursor_dir: cursor.to_string_lossy().into_owned(),
+            antigravity_dir: antigravity.to_string_lossy().into_owned(),
             backup_dir: backup.to_string_lossy().into_owned(),
             open_command: "auto".into(),
             refresh_interval_ms: 5000,
@@ -103,6 +113,9 @@ pub struct ProviderDirs {
     /// cursor-agent 的家目录。不在设置页暴露（一个 Cursor 目录已经够用），
     /// 但必须可覆盖：否则任何走到 Cursor 分支的代码都会读到本机真实的 `~/.cursor`。
     pub cursor_agent_dir: Option<String>,
+    pub antigravity_dir: Option<String>,
+    /// Antigravity 2.0 桌面端数据目录 `~/.gemini/antigravity`；仅测试覆盖用。
+    pub antigravity_app_dir: Option<String>,
 }
 
 impl ProviderDirs {
@@ -122,6 +135,7 @@ impl ProviderDirs {
             "claude" => Ok(self.claude_path()),
             "opencode" => Ok(self.opencode_path()),
             "cursor" => Ok(self.cursor_path()),
+            "antigravity" => Ok(self.antigravity_path()),
             other => Err(crate::error::AppError::Other(format!(
                 "不支持的 provider: {other}"
             ))),
@@ -148,6 +162,17 @@ impl ProviderDirs {
         resolve(
             &self.cursor_agent_dir,
             crate::paths::default_cursor_agent_dir,
+        )
+    }
+
+    pub fn antigravity_path(&self) -> std::path::PathBuf {
+        resolve(&self.antigravity_dir, crate::paths::default_antigravity_dir)
+    }
+
+    pub fn antigravity_app_path(&self) -> std::path::PathBuf {
+        resolve(
+            &self.antigravity_app_dir,
+            crate::paths::default_antigravity_app_dir,
         )
     }
 }

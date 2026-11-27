@@ -47,6 +47,8 @@
     --provider-opencode-fg: 221 83% 53%;
     --provider-cursor: 265 70% 55%;
     --provider-cursor-fg: 264 72% 47%;
+    --provider-antigravity: 192 85% 42%;
+    --provider-antigravity-fg: 194 88% 30%;
   }
 
   .dark {
@@ -90,6 +92,8 @@
     --provider-opencode-fg: 212 96% 78%;
     --provider-cursor: 265 82% 70%;
     --provider-cursor-fg: 262 88% 80%;
+    --provider-antigravity: 192 85% 58%;
+    --provider-antigravity-fg: 190 90% 74%;
   }
 }
 

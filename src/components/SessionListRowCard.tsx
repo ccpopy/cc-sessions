@@ -10,6 +10,7 @@ import type { SessionListRow } from "@/lib/sessionListModel";
 export type SessionListViewProps = {
   sessions: SessionSummary[];
   handlers: SessionCardHandlers;
+  selectable?: boolean;
   query: string;
   scrollElementRef: RefObject<HTMLDivElement | null>;
   overlay?: Map<string, FamilyOverlay>;
@@ -22,6 +23,7 @@ export type SessionListViewProps = {
 export function SessionListRowCard({
   row,
   handlers,
+  selectable = true,
   query,
   overlay,
   currentProvider,
@@ -35,6 +37,7 @@ export function SessionListRowCard({
   return (
     <SelectableSessionCard
       session={session}
+      selectable={selectable}
       query={query}
       showProject={row.showProject}
       overlay={overlay?.get(session.id)}

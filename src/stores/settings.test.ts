@@ -4,7 +4,7 @@ import { api, type Settings } from "../lib/api";
 import { useSettings } from "./settings";
 
 const initial: Settings = {
-  codex_dir: "codex", claude_dir: "claude", opencode_dir: "opencode", cursor_dir: "cursor",
+  codex_dir: "codex", claude_dir: "claude", opencode_dir: "opencode", cursor_dir: "cursor", antigravity_dir: "antigravity",
   backup_dir: "backup", open_command: "", refresh_interval_ms: 1000,
   preview_only_messages: true, preview_collapse_process: true,
   update_network: { proxy_url: "", download_mirror: "" },

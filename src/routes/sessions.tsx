@@ -86,10 +86,15 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const isCodex = provider === "codex";
   const isOpenCode = provider === "opencode";
   const isCursor = provider === "cursor";
-  const supportsArchive = isCodex || isOpenCode || isCursor;
+  const isAntigravity = provider === "antigravity";
+  const supportsArchiveView = isCodex || isOpenCode || isCursor || isAntigravity;
+  const supportsArchiveMutation = isCodex || isOpenCode || isCursor;
   // Cursor 的子会话只随父会话管理，没有独立视图。
   const supportsSubagentView = !isCursor;
-  const { index: backupIndex, error: backupIndexError } = useBackupIndex(provider);
+  const { index: backupIndex, error: backupIndexError } = useBackupIndex(
+    provider,
+    !isAntigravity,
+  );
   const selected = useSelection((s) => s.selected);
   const setSelection = useSelection((s) => s.set);
   const clearSelection = useSelection((s) => s.clear);
@@ -154,7 +159,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
   const cloning =
     providerSyncState.batchActive || providerSyncState.sessionIds.size > 0;
   const showHiddenRecords = useMemo(() => isExplicitHiddenRecordQuery(query), [query]);
-  const hasActiveVisibilityFilter = showSubagentSessions || (supportsArchive && showArchivedSessions);
+  const hasActiveVisibilityFilter = showSubagentSessions || (supportsArchiveView && showArchivedSessions);
   const overlayScope = JSON.stringify([provider, settings?.codex_dir ?? ""]);
   const refreshScope = JSON.stringify([
     provider,
@@ -162,6 +167,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     settings?.claude_dir ?? "",
     settings?.opencode_dir ?? "",
     settings?.cursor_dir ?? "",
+    settings?.antigravity_dir ?? "",
     query,
   ]);
   const overlayScopeRef = useRef(overlayScope);
@@ -362,7 +368,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
     [searchResultIds, selected],
   );
   const canSelectSearchResults =
-    query.trim().length > 0 && !loading && searchResultIds.length > 0;
+    !isAntigravity && query.trim().length > 0 && !loading && searchResultIds.length > 0;
   const allSearchResultsSelected =
     canSelectSearchResults && selectedSearchResultCount === searchResultIds.length;
   const toggleSearchResultSelection = useCallback(() => {
@@ -642,8 +648,8 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         stats={loading ? "加载中…" : `${visibleSessions.length} 条`}
         onRefresh={() => refreshAll()}
         refreshing={loading}
-        onBulkBackup={onBulkBackup}
-        onBulkDelete={onBulkDelete}
+        onBulkBackup={isAntigravity ? undefined : onBulkBackup}
+        onBulkDelete={isAntigravity ? undefined : onBulkDelete}
         onContentSearch={() => setContentSearchOpen(true)}
         showListTools
       >
@@ -698,7 +704,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
                 className="gap-1.5 px-2 [&>span:first-child]:hidden"
               >
                 <Network className="h-3.5 w-3.5 text-muted-foreground" />
-                <span className="whitespace-nowrap">{isOpenCode ? "子会话" : "子代理"}</span>
+                <span className="whitespace-nowrap">{isOpenCode || isAntigravity ? "子会话" : "子代理"}</span>
                 <span
                   aria-hidden="true"
                   data-state={showSubagentSessions ? "checked" : "unchecked"}
@@ -712,7 +718,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
                 </span>
               </DropdownMenuCheckboxItem>
             )}
-            {supportsArchive && (
+            {supportsArchiveView && (
               <DropdownMenuCheckboxItem
                 checked={showArchivedSessions}
                 onCheckedChange={(checked) => setArchivedView(checked === true)}
@@ -847,8 +853,8 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
               query
                 ? "尝试清除搜索或换个关键字"
                 : showSubagentSessions
-                  ? isOpenCode
-                    ? "OpenCode 产生子会话后会自动出现在此"
+                  ? isOpenCode || isAntigravity
+                    ? `${providerLabel(provider)} 产生子会话后会自动出现在此`
                     : "产生子代理后会自动出现在此"
                 : provider === "codex"
                   ? "打开 Codex 后会自动出现在此"
@@ -856,7 +862,9 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
                     ? "打开 Claude Code 后会自动出现在此"
                     : provider === "cursor"
                       ? "在 Cursor 中创建会话后会自动出现在此"
-                      : "在 OpenCode 中创建会话后会自动出现在此"
+                      : provider === "antigravity"
+                        ? "使用 Antigravity CLI 或 Antigravity 创建会话后会自动出现在此"
+                        : "在 OpenCode 中创建会话后会自动出现在此"
             }
             icon={<MessageSquare className="h-10 w-10" />}
           />
@@ -864,6 +872,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
           <SessionList
             sessions={visibleSessions}
             scrollElementRef={sessionScrollRef}
+            selectable={!isAntigravity}
             backupIndex={backupIndex}
             overlay={overlay}
             currentProvider={currentProvider}
@@ -876,17 +885,17 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
             onPreview={onPreview}
             onCopyResume={onCopyResume}
             onRevealCwd={onReveal}
-            onArchiveToggle={supportsArchive ? onArchiveToggle : undefined}
-            onBackup={onBackup}
-            onDelete={onDelete}
+            onArchiveToggle={supportsArchiveMutation ? onArchiveToggle : undefined}
+            onBackup={isAntigravity ? undefined : onBackup}
+            onDelete={isAntigravity ? undefined : onDelete}
             onClone={isCodex ? onCloneOne : undefined}
             onDuplicate={isCodex || provider === "claude" || provider === "opencode" ? onDuplicate : undefined}
             onOpenFamily={isCodex ? onOpenFamily : undefined}
             onOpenForkSource={isCodex ? onOpenForkSource : undefined}
             onExportMarkdown={setExportTarget}
-            onConvert={isOpenCode ? undefined : setConvertTarget}
-            onRename={setRenameTarget}
-            onMoveCwd={isCursor ? undefined : setMoveTarget}
+            onConvert={isOpenCode || isAntigravity ? undefined : setConvertTarget}
+            onRename={isAntigravity ? undefined : setRenameTarget}
+            onMoveCwd={isCursor || isAntigravity ? undefined : setMoveTarget}
             onSetArchiveOrigin={isCodex ? onSetArchiveOrigin : undefined}
           />
         )}
@@ -900,6 +909,7 @@ export default function SessionsRoute({ provider = "codex" }: { provider?: Sessi
         claudeDir={settings.claude_dir}
         opencodeDir={settings.opencode_dir}
         cursorDir={settings.cursor_dir}
+        antigravityDir={settings.antigravity_dir}
         showSubagentSessions={showSubagentSessions}
         showArchivedSessions={showArchivedSessions}
         rolloutPaths={contentSearchRolloutPaths}

@@ -1,5 +1,6 @@
 #[cfg(feature = "desktop")]
 pub mod app_update;
+pub mod antigravity_sessions;
 pub mod archive_ledger;
 pub mod atomic_file;
 pub mod backup;
@@ -88,10 +89,12 @@ pub fn run() {
             settings::default_claude_dir,
             settings::default_opencode_dir,
             settings::default_cursor_dir,
+            settings::default_antigravity_dir,
             settings::validate_codex_dir,
             settings::validate_claude_dir,
             settings::validate_opencode_dir,
             settings::validate_cursor_dir,
+            settings::validate_antigravity_dir,
             fs_ops::reveal_cwd,
             fs_ops::open_latest_release_page,
             fs_ops::open_repository_page,

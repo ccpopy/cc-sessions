@@ -56,6 +56,7 @@ struct MenuContext {
     claude_dir: String,
     opencode_dir: String,
     cursor_dir: String,
+    antigravity_dir: String,
     family_lock: family::FamilyLock,
 }
 
@@ -67,6 +68,8 @@ impl MenuContext {
             opencode_dir: Some(self.opencode_dir.clone()),
             cursor_dir: Some(self.cursor_dir.clone()),
             cursor_agent_dir: None,
+            antigravity_dir: Some(self.antigravity_dir.clone()),
+            antigravity_app_dir: None,
         }
     }
 }
@@ -77,6 +80,7 @@ pub fn run(
     claude_dir: String,
     opencode_dir: String,
     cursor_dir: String,
+    antigravity_dir: String,
 ) -> MenuResult<()> {
     let mut ctx = MenuContext {
         provider,
@@ -84,6 +88,7 @@ pub fn run(
         claude_dir,
         opencode_dir,
         cursor_dir,
+        antigravity_dir,
         family_lock: family::FamilyLock::default(),
     };
 
@@ -103,17 +108,19 @@ fn main_menu(ctx: &mut MenuContext) -> MenuResult<Flow> {
             ("Claude 目录", ctx.claude_dir.as_str()),
             ("OpenCode 目录", ctx.opencode_dir.as_str()),
             ("Cursor 目录", ctx.cursor_dir.as_str()),
+            ("Antigravity 目录", ctx.antigravity_dir.as_str()),
         ],
     );
     println!("1. Codex 会话");
     println!("2. Claude 会话");
     println!("3. OpenCode 会话");
     println!("4. Cursor 会话");
-    println!("5. 统计");
-    println!("6. 备份");
-    println!("7. 导入 / 导出 Bundle");
-    println!("8. 修复 / 诊断");
-    println!("9. 设置与路径检查");
+    println!("5. Antigravity 会话");
+    println!("6. 统计");
+    println!("7. 备份");
+    println!("8. 导入 / 导出 Bundle");
+    println!("9. 修复 / 诊断");
+    println!("10. 设置与路径检查");
     println!("h. 帮助");
     println!("0. 退出");
 
@@ -122,11 +129,12 @@ fn main_menu(ctx: &mut MenuContext) -> MenuResult<Flow> {
         "2" => run_child(|| sessions_menu(ctx, "claude")),
         "3" => run_child(|| sessions_menu(ctx, "opencode")),
         "4" => run_child(|| sessions_menu(ctx, "cursor")),
-        "5" => run_child(|| stats_menu(ctx)),
-        "6" => run_child(|| backup_menu(ctx)),
-        "7" => run_child(|| bundle_menu(ctx)),
-        "8" => run_child(|| repair_menu(ctx)),
-        "9" => run_child(|| settings_menu(ctx)),
+        "5" => run_child(|| sessions_menu(ctx, "antigravity")),
+        "6" => run_child(|| stats_menu(ctx)),
+        "7" => run_child(|| backup_menu(ctx)),
+        "8" => run_child(|| bundle_menu(ctx)),
+        "9" => run_child(|| repair_menu(ctx)),
+        "10" => run_child(|| settings_menu(ctx)),
         "h" | "H" => {
             show_interactive_help()?;
             Ok(Flow::Main)
@@ -365,8 +373,13 @@ fn browse_sessions(
             );
             println!("    {}", compact(&session.cwd, 90));
         }
-        println!("n. 下一页    p. 上一页    s. 选择    u. 取消选择    c. 清空选择");
-        println!("d. 删除已选  b. 返回上一层    m. 返回主菜单    0. 退出");
+        let allow_delete = provider != "antigravity";
+        if allow_delete {
+            println!("n. 下一页    p. 上一页    s. 选择    u. 取消选择    c. 清空选择");
+            println!("d. 删除已选  b. 返回上一层    m. 返回主菜单    0. 退出");
+        } else {
+            println!("n. 下一页    p. 上一页    b. 返回上一层    m. 返回主菜单    0. 退出");
+        }
         println!("当前页: {}/{}", page + 1, total_pages);
 
         let input = prompt("输入序号选择会话: ")?;
@@ -379,22 +392,22 @@ fn browse_sessions(
             "p" | "P" => {
                 page = page.saturating_sub(1);
             }
-            "s" | "S" => {
+            "s" | "S" if allow_delete => {
                 let indexes = prompt_page_indexes(end - start, "选择当前页序号")?;
                 for index in indexes {
                     selected_keys.insert(session_selection_key(&sessions[start + index]));
                 }
             }
-            "u" | "U" => {
+            "u" | "U" if allow_delete => {
                 let indexes = prompt_page_indexes(end - start, "取消选择当前页序号")?;
                 for index in indexes {
                     selected_keys.remove(&session_selection_key(&sessions[start + index]));
                 }
             }
-            "c" | "C" => {
+            "c" | "C" if allow_delete => {
                 selected_keys.clear();
             }
-            "d" | "D" => {
+            "d" | "D" if allow_delete => {
                 let selected = sessions
                     .iter()
                     .filter(|session| selected_keys.contains(&session_selection_key(session)))
@@ -476,6 +489,9 @@ fn session_action_menu(
     provider: &str,
     session: SessionSummary,
 ) -> MenuResult<SessionActionResult> {
+    if provider == "antigravity" {
+        return readonly_session_action_menu(provider, session);
+    }
     if matches!(provider, "opencode" | "cursor") {
         return simple_session_action_menu(ctx, provider, session);
     }
@@ -539,6 +555,46 @@ fn session_action_menu(
             }
             "11" => return Ok(SessionActionResult::Back),
             "12" => return Ok(SessionActionResult::Main),
+            "0" => return Ok(SessionActionResult::Exit),
+            _ => {
+                println!("无效选择。");
+                pause()?;
+            }
+        }
+    }
+}
+
+/// Antigravity 仅支持只读查看、元信息与 resume 命令展示。
+fn readonly_session_action_menu(
+    provider: &str,
+    session: SessionSummary,
+) -> MenuResult<SessionActionResult> {
+    loop {
+        print_header(
+            &format!("{} 会话操作（只读）", provider_label(provider)),
+            &[
+                ("ID", session.id.as_str()),
+                ("标题", session.title.as_str()),
+                ("目录", session.cwd.as_str()),
+            ],
+        );
+        println!("1. 预览会话内容");
+        println!("2. 查看元信息");
+        if !session.resume_command.trim().is_empty() {
+            println!("3. 显示 resume 命令");
+        }
+        println!("4. 返回上一层");
+        println!("5. 返回主菜单");
+        println!("0. 退出");
+
+        match prompt("请选择: ")?.as_str() {
+            "1" => preview_session(provider, &session)?,
+            "2" => show_session_meta(provider, &session)?,
+            "3" if !session.resume_command.trim().is_empty() => {
+                show_resume_command(provider, &session)?
+            }
+            "4" => return Ok(SessionActionResult::Back),
+            "5" => return Ok(SessionActionResult::Main),
             "0" => return Ok(SessionActionResult::Exit),
             _ => {
                 println!("无效选择。");
@@ -1226,11 +1282,15 @@ fn stats_provider(ctx: &MenuContext) -> MenuResult<String> {
     println!("2. Codex");
     println!("3. Claude");
     println!("4. OpenCode");
+    println!("5. Cursor");
+    println!("6. Antigravity");
     match prompt("请选择: ")?.as_str() {
         "1" => Ok("all".to_string()),
         "2" => Ok("codex".to_string()),
         "3" => Ok("claude".to_string()),
         "4" => Ok("opencode".to_string()),
+        "5" => Ok("cursor".to_string()),
+        "6" => Ok("antigravity".to_string()),
         _ => Err("无效统计范围。".to_string()),
     }
 }
@@ -2192,8 +2252,10 @@ fn settings_menu(ctx: &mut MenuContext) -> MenuResult<Flow> {
         println!("3. 修改本次运行的 Codex 目录");
         println!("4. 修改本次运行的 Claude 目录");
         println!("5. 修改本次运行的 OpenCode 目录");
-        println!("6. 返回上一层");
-        println!("7. 返回主菜单");
+        println!("6. 修改本次运行的 Cursor 目录");
+        println!("7. 修改本次运行的 Antigravity CLI 目录");
+        println!("8. 返回上一层");
+        println!("9. 返回主菜单");
         println!("0. 退出");
 
         match prompt("请选择: ")?.as_str() {
@@ -2208,8 +2270,14 @@ fn settings_menu(ctx: &mut MenuContext) -> MenuResult<Flow> {
             "5" => {
                 ctx.opencode_dir = prompt_default("OpenCode 目录", &ctx.opencode_dir)?;
             }
-            "6" => return Ok(Flow::Back),
-            "7" => return Ok(Flow::Main),
+            "6" => {
+                ctx.cursor_dir = prompt_default("Cursor 目录", &ctx.cursor_dir)?;
+            }
+            "7" => {
+                ctx.antigravity_dir = prompt_default("Antigravity CLI 目录", &ctx.antigravity_dir)?;
+            }
+            "8" => return Ok(Flow::Back),
+            "9" => return Ok(Flow::Main),
             "0" => return Ok(Flow::Exit),
             _ => {
                 println!("无效选择。");
@@ -2224,6 +2292,8 @@ fn settings_defaults() -> MenuResult<()> {
     println!("codex_dir              {}", defaults.codex_dir);
     println!("claude_dir             {}", defaults.claude_dir);
     println!("opencode_dir           {}", defaults.opencode_dir);
+    println!("cursor_dir             {}", defaults.cursor_dir);
+    println!("antigravity_dir        {}", defaults.antigravity_dir);
     println!("backup_dir             {}", defaults.backup_dir);
     println!("refresh_interval_ms    {}", defaults.refresh_interval_ms);
     pause()?;
@@ -2234,17 +2304,28 @@ fn settings_validate(ctx: &MenuContext) -> MenuResult<()> {
     let codex = settings::validate_codex_dir(ctx.codex_dir.clone()).map_err(to_string)?;
     let claude = settings::validate_claude_dir(ctx.claude_dir.clone()).map_err(to_string)?;
     let opencode = settings::validate_opencode_dir(ctx.opencode_dir.clone()).map_err(to_string)?;
+    let cursor = settings::validate_cursor_dir(ctx.cursor_dir.clone()).map_err(to_string)?;
+    let antigravity =
+        settings::validate_antigravity_dir(ctx.antigravity_dir.clone()).map_err(to_string)?;
     println!(
-        "codex   valid={} state_db={} sessions={} threads={}",
+        "codex       valid={} state_db={} sessions={} threads={}",
         codex.valid, codex.has_state_db, codex.has_sessions, codex.threads_count
     );
     println!(
-        "claude  valid={} projects={} sessions={}",
+        "claude      valid={} projects={} sessions={}",
         claude.valid, claude.has_sessions, claude.threads_count
     );
     println!(
-        "opencode valid={} db={} sessions={}",
+        "opencode    valid={} db={} sessions={}",
         opencode.valid, opencode.has_state_db, opencode.threads_count
+    );
+    println!(
+        "cursor      valid={} db={} sessions={}",
+        cursor.valid, cursor.has_state_db, cursor.threads_count
+    );
+    println!(
+        "antigravity valid={} db={} sessions={}",
+        antigravity.valid, antigravity.has_state_db, antigravity.threads_count
     );
     pause()?;
     Ok(())
@@ -2270,13 +2351,8 @@ fn load_sessions(
     include_archived: bool,
     scope: SessionScope,
 ) -> MenuResult<Vec<SessionSummary>> {
-    let mut list = sessions::list_sessions_with_opencode(
-        Some(provider.to_string()),
-        ctx.codex_dir.clone(),
-        Some(ctx.claude_dir.clone()),
-        Some(ctx.opencode_dir.clone()),
-    )
-    .map_err(to_string)?;
+    let mut list =
+        sessions::list_sessions_with_dirs(Some(provider.to_string()), ctx.dirs()).map_err(to_string)?;
     if !include_archived {
         list.retain(|session| !session.archived);
     }
@@ -2530,6 +2606,7 @@ fn provider_label(provider: &str) -> &'static str {
         "claude" => "Claude",
         "opencode" => "OpenCode",
         "cursor" => "Cursor",
+        "antigravity" => "Antigravity",
         _ => "未知",
     }
 }

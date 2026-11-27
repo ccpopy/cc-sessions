@@ -24,6 +24,10 @@ fn load_sessions(provider: &str, dirs: &ProviderDirs) -> AppResult<Vec<SessionSu
         "cursor" => {
             crate::cursor_sessions::list_sessions(&dirs.cursor_path(), &dirs.cursor_agent_path())
         }
+        "antigravity" => crate::antigravity_sessions::list_sessions(
+            &dirs.antigravity_path(),
+            &dirs.antigravity_app_path(),
+        ),
         "all" => {
             let mut out =
                 crate::sessions::list_sessions(Some("codex".into()), dirs.codex_dir.clone(), None)?;
@@ -41,6 +45,16 @@ fn load_sessions(provider: &str, dirs: &ProviderDirs) -> AppResult<Vec<SessionSu
                 out.extend(crate::cursor_sessions::list_sessions(
                     &cursor,
                     &cursor_agent,
+                )?);
+            }
+            let antigravity = dirs.antigravity_path();
+            let antigravity_app = dirs.antigravity_app_path();
+            if crate::antigravity_sessions::has_store_data(&antigravity)
+                || crate::antigravity_sessions::has_store_data(&antigravity_app)
+            {
+                out.extend(crate::antigravity_sessions::list_sessions(
+                    &antigravity,
+                    &antigravity_app,
                 )?);
             }
             Ok(out)
@@ -471,6 +485,8 @@ mod tests {
             opencode_dir: Some(root.join("opencode").to_string_lossy().into_owned()),
             cursor_dir: Some(root.join("cursor").to_string_lossy().into_owned()),
             cursor_agent_dir: Some(root.join("cursor-agent").to_string_lossy().into_owned()),
+            antigravity_dir: Some(root.join("antigravity-cli").to_string_lossy().into_owned()),
+            antigravity_app_dir: Some(root.join("antigravity").to_string_lossy().into_owned()),
         }
     }
 
